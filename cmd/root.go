@@ -11,7 +11,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"w1ncray/panel"
+	"github.com/W1nCwC/W1nCray/panel"
 )
 
 var configFile string
@@ -52,16 +52,21 @@ func findConfig() (string, error) {
 	return "", fmt.Errorf("no config file found; use -c to set one")
 }
 
+// setAssetLocation lets Xray find geoip.dat/geosite.dat next to the config
+// unless the location is set explicitly.
+func setAssetLocation(configPath string) {
+	if os.Getenv("XRAY_LOCATION_ASSET") == "" && os.Getenv("xray.location.asset") == "" {
+		os.Setenv("XRAY_LOCATION_ASSET", filepath.Dir(configPath))
+	}
+}
+
 func run() error {
 	showVersion()
 	path, err := findConfig()
 	if err != nil {
 		return err
 	}
-	// Let Xray find geoip.dat/geosite.dat next to the config by default.
-	if os.Getenv("XRAY_LOCATION_ASSET") == "" && os.Getenv("xray.location.asset") == "" {
-		os.Setenv("XRAY_LOCATION_ASSET", filepath.Dir(path))
-	}
+	setAssetLocation(path)
 	cfg, err := panel.LoadConfig(path)
 	if err != nil {
 		return err

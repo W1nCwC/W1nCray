@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"w1ncray/api/xboard"
-	"w1ncray/core"
+	"github.com/W1nCwC/W1nCray/api/xboard"
+	"github.com/W1nCwC/W1nCray/core"
 )
 
 // privateCIDRs are blocked by default so users cannot reach the node's own

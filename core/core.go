@@ -20,8 +20,8 @@ import (
 	// Register every Xray protocol, transport and app.
 	_ "github.com/xtls/xray-core/main/distro/all"
 
-	"w1ncray/app/dispatcher"
-	"w1ncray/common/limiter"
+	"github.com/W1nCwC/W1nCray/app/dispatcher"
+	"github.com/W1nCwC/W1nCray/common/limiter"
 )
 
 // BlockTag is the tag of the blackhole outbound used by block rules.

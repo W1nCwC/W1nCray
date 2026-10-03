@@ -20,7 +20,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 
-	"w1ncray/common/limiter"
+	"github.com/W1nCwC/W1nCray/common/limiter"
 )
 
 // spliceForbidden is session.Inbound.CanSpliceCopy's "cannot" value. Splice

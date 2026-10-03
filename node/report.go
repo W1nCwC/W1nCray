@@ -8,8 +8,8 @@ import (
 
 	"github.com/xtls/xray-core/features/stats"
 
-	"w1ncray/api/xboard"
-	"w1ncray/common/serverstatus"
+	"github.com/W1nCwC/W1nCray/api/xboard"
+	"github.com/W1nCwC/W1nCray/common/serverstatus"
 )
 
 func (c *Controller) push() {

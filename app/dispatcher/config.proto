@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 package w1ncray.app.dispatcher;
-option go_package = "w1ncray/app/dispatcher";
+option go_package = "github.com/W1nCwC/W1nCray/app/dispatcher";
 
 // Config selects the W1nCray dispatcher, which wraps Xray's DefaultDispatcher
 // with per-user device limiting and rate limiting. It carries no fields: the

@@ -13,8 +13,8 @@ import (
 
 	_ "github.com/xtls/xray-core/main/distro/all"
 
-	"w1ncray/api/xboard"
-	"w1ncray/common/cert"
+	"github.com/W1nCwC/W1nCray/api/xboard"
+	"github.com/W1nCwC/W1nCray/common/cert"
 )
 
 func testCert(t *testing.T) *certPaths {

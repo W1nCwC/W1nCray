@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v0.0.0
-// source: w1ncray/app/dispatcher/config.proto
+// source: github.com/W1nCwC/W1nCray/app/dispatcher/config.proto
 
 package dispatcher
 
@@ -29,7 +29,7 @@ type Config struct {
 
 func (x *Config) Reset() {
 	*x = Config{}
-	mi := &file_w1ncray_app_dispatcher_config_proto_msgTypes[0]
+	mi := &file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -41,7 +41,7 @@ func (x *Config) String() string {
 func (*Config) ProtoMessage() {}
 
 func (x *Config) ProtoReflect() protoreflect.Message {
-	mi := &file_w1ncray_app_dispatcher_config_proto_msgTypes[0]
+	mi := &file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -54,33 +54,33 @@ func (x *Config) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Config.ProtoReflect.Descriptor instead.
 func (*Config) Descriptor() ([]byte, []int) {
-	return file_w1ncray_app_dispatcher_config_proto_rawDescGZIP(), []int{0}
+	return file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDescGZIP(), []int{0}
 }
 
-var File_w1ncray_app_dispatcher_config_proto protoreflect.FileDescriptor
+var File_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto protoreflect.FileDescriptor
 
-const file_w1ncray_app_dispatcher_config_proto_rawDesc = "" +
+const file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDesc = "" +
 	"\n" +
-	"#w1ncray/app/dispatcher/config.proto\x12\x16w1ncray.app.dispatcher\"\b\n" +
-	"\x06ConfigB\x18Z\x16w1ncray/app/dispatcherb\x06proto3"
+	"5github.com/W1nCwC/W1nCray/app/dispatcher/config.proto\x12\x16w1ncray.app.dispatcher\"\b\n" +
+	"\x06ConfigB*Z(github.com/W1nCwC/W1nCray/app/dispatcherb\x06proto3"
 
 var (
-	file_w1ncray_app_dispatcher_config_proto_rawDescOnce sync.Once
-	file_w1ncray_app_dispatcher_config_proto_rawDescData []byte
+	file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDescOnce sync.Once
+	file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDescData []byte
 )
 
-func file_w1ncray_app_dispatcher_config_proto_rawDescGZIP() []byte {
-	file_w1ncray_app_dispatcher_config_proto_rawDescOnce.Do(func() {
-		file_w1ncray_app_dispatcher_config_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_w1ncray_app_dispatcher_config_proto_rawDesc), len(file_w1ncray_app_dispatcher_config_proto_rawDesc)))
+func file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDescGZIP() []byte {
+	file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDescOnce.Do(func() {
+		file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDesc), len(file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDesc)))
 	})
-	return file_w1ncray_app_dispatcher_config_proto_rawDescData
+	return file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDescData
 }
 
-var file_w1ncray_app_dispatcher_config_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
-var file_w1ncray_app_dispatcher_config_proto_goTypes = []any{
+var file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_goTypes = []any{
 	(*Config)(nil), // 0: w1ncray.app.dispatcher.Config
 }
-var file_w1ncray_app_dispatcher_config_proto_depIdxs = []int32{
+var file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
 	0, // [0:0] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
@@ -88,26 +88,26 @@ var file_w1ncray_app_dispatcher_config_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_w1ncray_app_dispatcher_config_proto_init() }
-func file_w1ncray_app_dispatcher_config_proto_init() {
-	if File_w1ncray_app_dispatcher_config_proto != nil {
+func init() { file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_init() }
+func file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_init() {
+	if File_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_w1ncray_app_dispatcher_config_proto_rawDesc), len(file_w1ncray_app_dispatcher_config_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDesc), len(file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_w1ncray_app_dispatcher_config_proto_goTypes,
-		DependencyIndexes: file_w1ncray_app_dispatcher_config_proto_depIdxs,
-		MessageInfos:      file_w1ncray_app_dispatcher_config_proto_msgTypes,
+		GoTypes:           file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_goTypes,
+		DependencyIndexes: file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_depIdxs,
+		MessageInfos:      file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_msgTypes,
 	}.Build()
-	File_w1ncray_app_dispatcher_config_proto = out.File
-	file_w1ncray_app_dispatcher_config_proto_goTypes = nil
-	file_w1ncray_app_dispatcher_config_proto_depIdxs = nil
+	File_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto = out.File
+	file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_goTypes = nil
+	file_github_com_W1nCwC_W1nCray_app_dispatcher_config_proto_depIdxs = nil
 }

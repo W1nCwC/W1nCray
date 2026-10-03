@@ -14,7 +14,7 @@ import (
 	"github.com/xtls/xray-core/infra/conf"
 	"google.golang.org/protobuf/proto"
 
-	"w1ncray/api/xboard"
+	"github.com/W1nCwC/W1nCray/api/xboard"
 )
 
 // Xboard node types handled by the official Xray kernel.

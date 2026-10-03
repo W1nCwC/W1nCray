@@ -4,7 +4,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X w1ncray/cmd.version=${VERSION}" -o /out/W1nCray .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/W1nCwC/W1nCray/cmd.version=${VERSION}" -o /out/W1nCray .
 
 FROM alpine:3
 RUN apk add --no-cache ca-certificates tzdata && mkdir -p /etc/W1nCray

@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/viper"
 
-	"w1ncray/node"
+	"github.com/W1nCwC/W1nCray/node"
 )
 
 // Config is the root of config.yml (XrayR compatible layout).

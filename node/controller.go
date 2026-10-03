@@ -15,10 +15,10 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/infra/conf"
 
-	"w1ncray/api/xboard"
-	"w1ncray/common/cert"
-	"w1ncray/common/limiter"
-	"w1ncray/core"
+	"github.com/W1nCwC/W1nCray/api/xboard"
+	"github.com/W1nCwC/W1nCray/common/cert"
+	"github.com/W1nCwC/W1nCray/common/limiter"
+	"github.com/W1nCwC/W1nCray/core"
 )
 
 // Options configures a Controller.

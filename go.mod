@@ -1,4 +1,4 @@
-module w1ncray
+module github.com/W1nCwC/W1nCray
 
 go 1.26.0
 

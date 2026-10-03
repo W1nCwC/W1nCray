@@ -7,7 +7,7 @@ import (
 	xcore "github.com/xtls/xray-core/core"
 )
 
-// Set at build time with -ldflags "-X w1ncray/cmd.version=...".
+// Set at build time with -ldflags "-X github.com/W1nCwC/W1nCray/cmd.version=...".
 var version = "dev"
 
 func init() {

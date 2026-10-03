@@ -97,3 +97,30 @@ install.sh uninstall [--purge]
 | B5 | dry-run 不写任何文件；目标已存在且无 --force 时拒绝 | 单测 |
 | B6 | `install.sh` 语法正确 | `bash -n` |
 | B7 | `install.sh install/migrate/check` 在真实 Linux（用户 VPS，经授权）上运行，不影响运行中的 XrayR | 待用户提供 SSH 密钥访问 |
+
+---
+
+## 6. 实施记录（2026-10-04）
+
+### 6.1 偏差
+
+| # | 偏差 | 原因 |
+|---|---|---|
+| V1 | 新增 `W1nCray init`（默认配置以 go:embed 打包进二进制） | 单独下载的 install.sh 拿不到仓库中的示例配置 |
+| V2 | 模块路径改为 `github.com/W1nCwC/W1nCray`，install.sh 默认仓库 `W1nCwC/W1nCray` | 用户提供 GitHub 用户名 |
+| V3 | 新增 `release/build.sh` | 产出 install.sh 期望的 `W1nCray-linux-<arch>` 文件名 |
+| V4 | `core.CheckFiles` 逐文件、逐条构建 | 整体构建的错误不含文件名，无法定位 |
+| V5 | ACME 模式下不对 CertFile/KeyFile 报"文件不存在" | XrayR 在 ACME 模式忽略这两个字段（M4），报错会误导 |
+
+### 6.2 验收结果
+
+| # | 结果 | 证据 |
+|---|---|---|
+| B1 | ✅ | `TestMigrate`：路径、PanelType、NodeType(V2ray+EnableVless→vless 等)、REALITY、废弃键转换正确；注释保留；迁移前后 XrayR 目录所有文件 SHA-256 一致 |
+| B2 | ✅ | SSpanel 节点被移除并告警；`TestMigrateXrayRExampleOnlySSpanel`：XrayR 原版示例（仅 SSpanel）迁移失败并说明原因，改为 NewV2board 后可迁移并加载 |
+| B3 | ✅ | XrayR lego 证书复制到 `cert.TargetPaths`，`cert.Manager.Ensure` 返回 renewed=false（不重新签发）；file 模式证书一并复制 |
+| B4 | ✅ | 迁移结果被 `panel.LoadConfig` 加载、`core.CheckFiles` 通过；`TestCheckNamesBrokenFile` 精确报告 `route.json rules[2] ... no effective fields` |
+| B5 | ✅ | dry-run 不创建目标目录；目标已存在且无 --force 拒绝；源=目标拒绝 |
+| B6 | ✅ | `bash -n install.sh`、`bash -n release/build.sh` 通过；文件为 LF |
+| B7 | ⏳ | 等待用户提供 VPS 的 SSH 密钥访问 |
+| — | ✅ | 全量回归 `go test ./...` 通过；CLI 实测 `migrate --dry-run` / `migrate` / `check` 输出与退出码符合预期 |

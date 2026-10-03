@@ -11,9 +11,9 @@ import (
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
 
-	"w1ncray/common/cert"
-	"w1ncray/core"
-	"w1ncray/node"
+	"github.com/W1nCwC/W1nCray/common/cert"
+	"github.com/W1nCwC/W1nCray/core"
+	"github.com/W1nCwC/W1nCray/node"
 )
 
 // Panel owns the Xray instance and the node controllers.
@@ -65,11 +65,7 @@ func (p *Panel) start() error {
 	cfg := p.cfg
 	setLogLevel(cfg.LogConfig.Level)
 
-	certDir := cfg.CertDir
-	if certDir == "" {
-		certDir = filepath.Join(filepath.Dir(p.path), "cert")
-	}
-	certs := cert.NewManager(certDir)
+	certs := cert.NewManager(certDir(p.path, cfg))
 
 	nodes := make([]*node.Controller, 0, len(cfg.NodesConfig))
 	for _, nc := range cfg.NodesConfig {
@@ -102,24 +98,7 @@ func (p *Panel) start() error {
 		ns = append(ns, n.NameServers()...)
 	}
 
-	cc := cfg.ConnectionConfig
-	cr, err := core.New(core.Options{
-		LogLevel:           xrayLogLevel(cfg.LogConfig.Level),
-		AccessPath:         cfg.LogConfig.AccessPath,
-		ErrorPath:          cfg.LogConfig.ErrorPath,
-		DNSConfigPath:      cfg.DnsConfigPath,
-		RouteConfigPath:    cfg.RouteConfigPath,
-		InboundConfigPath:  cfg.InboundConfigPath,
-		OutboundConfigPath: cfg.OutboundConfigPath,
-		Connection: core.ConnectionPolicy{
-			Handshake:    cc.Handshake,
-			ConnIdle:     cc.ConnIdle,
-			UplinkOnly:   cc.UplinkOnly,
-			DownlinkOnly: cc.DownlinkOnly,
-			BufferSize:   cc.BufferSize,
-		},
-		NameServers: ns,
-	})
+	cr, err := core.New(coreOptions(cfg, ns))
 	if err != nil {
 		return err
 	}
@@ -254,6 +233,34 @@ func (p *Panel) watchedFiles() []string {
 		}
 	}
 	return files
+}
+
+func certDir(path string, cfg *Config) string {
+	if cfg.CertDir != "" {
+		return cfg.CertDir
+	}
+	return filepath.Join(filepath.Dir(path), "cert")
+}
+
+func coreOptions(cfg *Config, ns []core.NameServer) core.Options {
+	cc := cfg.ConnectionConfig
+	return core.Options{
+		LogLevel:           xrayLogLevel(cfg.LogConfig.Level),
+		AccessPath:         cfg.LogConfig.AccessPath,
+		ErrorPath:          cfg.LogConfig.ErrorPath,
+		DNSConfigPath:      cfg.DnsConfigPath,
+		RouteConfigPath:    cfg.RouteConfigPath,
+		InboundConfigPath:  cfg.InboundConfigPath,
+		OutboundConfigPath: cfg.OutboundConfigPath,
+		Connection: core.ConnectionPolicy{
+			Handshake:    cc.Handshake,
+			ConnIdle:     cc.ConnIdle,
+			UplinkOnly:   cc.UplinkOnly,
+			DownlinkOnly: cc.DownlinkOnly,
+			BufferSize:   cc.BufferSize,
+		},
+		NameServers: ns,
+	}
 }
 
 func xrayLogLevel(l string) string {

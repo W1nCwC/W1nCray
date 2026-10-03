@@ -39,28 +39,47 @@
 ## 安装（Linux）
 
 ```bash
-mkdir -p /usr/local/W1nCray /etc/W1nCray
-cp W1nCray /usr/local/W1nCray/ && chmod +x /usr/local/W1nCray/W1nCray
-cp release/config/* /etc/W1nCray/ && cp /etc/W1nCray/config.yml.example /etc/W1nCray/config.yml
-cp release/W1nCray.service /etc/systemd/system/ && systemctl daemon-reload
-systemctl enable --now W1nCray
+# 已发布 Release 时（从 github.com/W1nCwC/W1nCray 下载对应架构）
+bash install.sh install
+# 或使用本地编译的二进制
+bash install.sh install --binary ./W1nCray-linux-amd64
 ```
 
-面板路由中使用 `geosite:` / `geoip:` 时，需要把 `geosite.dat`、`geoip.dat` 放到 `/etc/W1nCray/`（默认从配置文件所在目录查找，也可用环境变量 `XRAY_LOCATION_ASSET` 指定）。
+安装脚本会：
 
-### 编译
+1. 安装到 `/usr/local/W1nCray/W1nCray`，配置目录 `/etc/W1nCray`，注册 systemd 服务 `W1nCray`；
+2. **检测到 `/etc/XrayR/config.yml` 时自动迁移**（`config.yml` 以及 dns/route/出入站/规则列表、geo 文件、XrayR 已签发的证书），XrayR 的文件只读、不会被修改；没有 XrayR 时生成默认配置；
+3. 缺少 `geoip.dat` / `geosite.dat` 时自动下载；
+4. 运行 `W1nCray check --online`：向面板拉取每个节点并实际构建入站，不监听端口；
+5. **XrayR 仍在运行时不会启动 W1nCray**（端口冲突），确认后再切换。
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X w1ncray/cmd.version=v1.0.0" -o W1nCray .
+bash install.sh switch     # 停用 XrayR、启用 W1nCray；5 秒内未正常运行会自动回滚
+bash install.sh rollback   # 随时回到 XrayR
+bash install.sh migrate    # 重新迁移（先把现有 /etc/W1nCray 备份为 /etc/W1nCray.bak.<时间>）
+bash install.sh check | status | log | uninstall [--purge]
 ```
 
 ### 命令
 
 ```bash
-W1nCray -c /etc/W1nCray/config.yml   # 运行
-W1nCray version                      # 版本与内核版本
-W1nCray x25519                       # 生成 REALITY 密钥对
+W1nCray -c /etc/W1nCray/config.yml                     # 运行
+W1nCray migrate --from /etc/XrayR --to /etc/W1nCray    # 迁移 XrayR（--dry-run 只预览，--force 覆盖）
+W1nCray check -c /etc/W1nCray/config.yml [--online]    # 检查配置（--online 同时向面板验证节点）
+W1nCray init --dir /etc/W1nCray                        # 写入默认配置
+W1nCray version                                        # 版本与内核版本
+W1nCray x25519                                         # 生成 REALITY 密钥对
 ```
+
+面板路由中使用 `geosite:` / `geoip:` 时需要 `geosite.dat`、`geoip.dat`（默认从配置文件所在目录查找，也可用环境变量 `XRAY_LOCATION_ASSET` 指定）。
+
+### 编译与发布
+
+```bash
+bash release/build.sh v1.0.0   # 产出 dist/W1nCray-linux-amd64、W1nCray-linux-arm64 与 SHA256SUMS
+```
+
+把 `dist/` 里的文件上传到 GitHub Release，`install.sh install` 即可直接下载。
 
 ## 配置
 
@@ -81,12 +100,23 @@ Nodes:
 
 ### 从 XrayR 迁移
 
-1. `PanelType` 可保留 `NewV2board`，或改为 `Xboard`。
-2. 协议、flow、传输、TLS/REALITY 均以面板为准；`NodeType`、`EnableVless`、`VlessFlow` 不再需要（保留也不报错）。
-3. `GlobalDeviceLimitConfig`（Redis）已移除，改用 Xboard 自带的跨节点设备统计，无需 Redis。
-4. `DisableIVCheck` 已随 Xray 移除，忽略。
-5. 新增 `BlockPrivateIP`（默认开启）、`CertConfig.HTTPPort`、`CertDir`。
-6. `SendIP: 0.0.0.0` 现在表示由系统选择出口地址（XrayR 会绑定 IPv4 导致 IPv6 目标不可达）。
+推荐用安装脚本或 `W1nCray migrate` 自动迁移，它会逐项打印做了什么。转换规则：
+
+| XrayR | W1nCray |
+|---|---|
+| `/etc/XrayR/...` 路径（含注释中的路径） | `/etc/W1nCray/...`，被引用的文件一并复制；XrayR 目录外的路径保留并提示 |
+| `PanelType: NewV2board / V2board` | `Xboard`；SSpanel 等其他面板的节点会被移除并提示 |
+| `NodeType: V2ray` + `EnableVless: true` | `NodeType: vless`（与 XrayR 发给面板的 node_type 一致），删除 EnableVless/VlessFlow |
+| `DisableLocalREALITYConfig: true` | `EnableREALITY: false`（即使用面板 REALITY） |
+| `DisableIVCheck`、`GlobalDeviceLimitConfig` | 删除（后者改用 Xboard 自带的跨节点设备统计，无需 Redis） |
+| XrayR 申请的 ACME 证书（`cert/certificates/<域名>.crt`） | 复制到 W1nCray 证书路径，不重新签发 |
+| dns.json / route.json / custom_*.json / rulelist | 原样复制，再用新内核逐条检查，不兼容项会指出文件和第几条 |
+
+迁移后需注意：
+
+- XrayR 的 REALITY 只在 `DisableLocalREALITYConfig: true` 时使用面板配置；W1nCray 在面板节点 `tls=2` 时直接使用面板 REALITY。
+- `SendIP: 0.0.0.0` 现在表示由系统选择出口地址（XrayR 会绑定 IPv4，导致无法访问 IPv6 目标）。
+- 自定义出站中的 `allowInsecure` 已被 Xray v26 移除，`check` 会提示改用 `pinnedPeerCertSha256`。
 
 ### 规则与行为说明
 
@@ -113,7 +143,7 @@ go test ./...            # 单元测试 + 端到端测试（真实 Xray 客户�
 go run ./tools/protogen  # 重新生成 app/dispatcher/config.pb.go（无需 protoc）
 ```
 
-设计与验证记录见 [docs/PLAN.md](docs/PLAN.md)。
+设计与验证记录见 [docs/PLAN.md](docs/PLAN.md)、[docs/PLAN-v2-migration.md](docs/PLAN-v2-migration.md)。
 
 ## 许可
 

@@ -1,0 +1,1 @@
+Files copied verbatim from XrayR v0.9.4 release/config (proxy.golang.org/github.com/xrayr-project/xrayr/@v/v0.9.4.zip, MPL-2.0) as migration test samples.

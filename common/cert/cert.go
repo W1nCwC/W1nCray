@@ -84,6 +84,21 @@ func (m *Manager) paths(domain string) (string, string) {
 	return filepath.Join(m.Dir, name+".crt"), filepath.Join(m.Dir, name+".key")
 }
 
+// TargetPaths returns where Ensure stores the certificate of cfg: CertFile and
+// KeyFile when both are set, otherwise <dir>/<domain>.crt|.key.
+func TargetPaths(dir string, cfg *Config) (certFile, keyFile string) {
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		return cfg.CertFile, cfg.KeyFile
+	}
+	return (&Manager{Dir: dir}).paths(cfg.CertDomain)
+}
+
+// Valid reports whether the pair exists, covers domain and does not expire
+// within the renewal window.
+func Valid(certFile, keyFile, domain string) bool {
+	return valid(certFile, keyFile, domain)
+}
+
 // Ensure returns the certificate and key file paths for cfg, creating,
 // writing or renewing them when needed. renewed reports whether new files
 // were written.
@@ -115,10 +130,7 @@ func (m *Manager) target(cfg *Config) (string, string, error) {
 	if cfg.CertDomain == "" {
 		return "", "", fmt.Errorf("%s mode requires a domain", cfg.CertMode)
 	}
-	certFile, keyFile := m.paths(cfg.CertDomain)
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		certFile, keyFile = cfg.CertFile, cfg.KeyFile
-	}
+	certFile, keyFile := TargetPaths(m.Dir, cfg)
 	if err := os.MkdirAll(filepath.Dir(certFile), 0o700); err != nil {
 		return "", "", err
 	}
