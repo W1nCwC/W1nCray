@@ -79,19 +79,47 @@ EOF
 	systemctl daemon-reload
 }
 
-fetch_binary() { # source args -> path of a verified binary
-	local src="$1" url tmp
+# latest_tag prints the newest release tag, pre-releases included
+# (releases/latest skips them).
+latest_tag() {
+	local tmp tag
+	tmp="$(mktemp)"
+	download "https://api.github.com/repos/$REPO/releases?per_page=1" "$tmp" >/dev/null 2>&1 || true
+	tag="$(grep -m1 '"tag_name"' "$tmp" | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+	rm -f "$tmp"
+	[ -n "$tag" ] || die "无法获取 $REPO 的发布版本（可用 --binary 指定本地文件）"
+	echo "$tag"
+}
+
+# verify_sha256 checks file against SHA256SUMS of the release tag.
+verify_sha256() { # file tag
+	command -v sha256sum >/dev/null 2>&1 || { yellow "未找到 sha256sum，跳过校验"; return 0; }
+	local sums want got
+	sums="$(mktemp)"
+	if ! download "https://github.com/$REPO/releases/download/$2/SHA256SUMS" "$sums" >/dev/null 2>&1; then
+		rm -f "$sums"
+		yellow "该版本没有 SHA256SUMS，跳过校验"
+		return 0
+	fi
+	want="$(grep "W1nCray-linux-$(arch)\$" "$sums" | awk '{print $1}')"
+	rm -f "$sums"
+	got="$(sha256sum "$1" | awk '{print $1}')"
+	[ -n "$want" ] && [ "$want" = "$got" ] || die "SHA256 校验失败（期望 $want，实际 $got）"
+	green "SHA256 校验通过"
+}
+
+fetch_binary() { # source -> path of a verified binary
+	local src="$1" tag tmp
 	tmp="$(mktemp)"
 	case "$src" in
 	file:*) cp "${src#file:}" "$tmp" ;;
-	url:*) download "${src#url:}" "$tmp" ;;
-	version:*)
-		url="https://github.com/$REPO/releases/download/${src#version:}/W1nCray-linux-$(arch)"
-		download "$url" "$tmp" || die "下载失败: $url"
-		;;
-	latest)
-		url="https://github.com/$REPO/releases/latest/download/W1nCray-linux-$(arch)"
-		download "$url" "$tmp" || die "下载失败: $url（尚未发布 Release 时请用 --binary 指定本地文件）"
+	url:*) download "${src#url:}" "$tmp" || die "下载失败: ${src#url:}" ;;
+	version:* | latest)
+		if [ "$src" = latest ]; then tag="$(latest_tag)"; else tag="${src#version:}"; fi
+		yellow "下载 W1nCray $tag ($(arch)) ..." >&2
+		download "https://github.com/$REPO/releases/download/$tag/W1nCray-linux-$(arch)" "$tmp" ||
+			die "下载失败: $REPO $tag"
+		verify_sha256 "$tmp" "$tag" >&2
 		;;
 	esac
 	chmod +x "$tmp"
