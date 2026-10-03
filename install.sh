@@ -23,6 +23,7 @@ UNIT="/etc/systemd/system/W1nCray.service"
 XRAYR_DIR="${XRAYR_DIR:-/etc/XrayR}"
 XRAYR_UNIT="XrayR"
 GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+SELF="$BIN_DIR/install.sh"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -98,6 +99,17 @@ fetch_binary() { # source args -> path of a verified binary
 	echo "$tmp"
 }
 
+# save_self keeps a copy of this script for later commands; when it runs from
+# a pipe (bash <(curl ...)) it is fetched from the repository instead.
+save_self() {
+	if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$SELF" ]; then
+		install -m 0755 "$0" "$SELF"
+	elif [ ! -f "$SELF" ]; then
+		download "https://raw.githubusercontent.com/$REPO/main/install.sh" "$SELF" && chmod 0755 "$SELF" ||
+			yellow "未能保存安装脚本副本，后续命令请重新下载 install.sh 执行"
+	fi
+}
+
 ensure_geo() {
 	local f
 	for f in geoip.dat geosite.dat; do
@@ -127,7 +139,7 @@ run_check() {
 	if "$BIN" check -c "$CONF" --online; then
 		return 0
 	fi
-	red "配置检查未通过，请根据上面的提示修改 $CONF 后执行: bash $0 check"
+	red "配置检查未通过，请根据上面的提示修改 $CONF 后执行: bash $SELF check"
 	return 1
 }
 
@@ -151,6 +163,7 @@ cmd_install() {
 	install -m 0755 "$tmp" "$BIN"
 	rm -f "$tmp"
 	ln -sf "$BIN" "$LINK"
+	save_self
 	green "已安装 $("$BIN" version)"
 
 	mkdir -p "$CONF_DIR"
@@ -163,7 +176,7 @@ cmd_install() {
 			yellow "已生成默认配置，请编辑 $CONF 填写 ApiHost / ApiKey / NodeID"
 		fi
 	else
-		yellow "保留现有配置 $CONF（重新迁移请执行: bash $0 migrate）"
+		yellow "保留现有配置 $CONF（重新迁移请执行: bash $SELF migrate）"
 	fi
 	ensure_geo
 	write_unit
@@ -177,7 +190,7 @@ cmd_install() {
 	run_check || check_failed=1
 	if xrayr_present && { unit_active "$XRAYR_UNIT" || unit_enabled "$XRAYR_UNIT"; }; then
 		yellow "XrayR 仍在运行/开机自启，为避免端口冲突，W1nCray 暂未启动。"
-		yellow "确认无误后执行: bash $0 switch   （失败会自动回滚到 XrayR）"
+		yellow "确认无误后执行: bash $SELF switch   （失败会自动回滚到 XrayR）"
 	elif [ "$check_failed" -eq 0 ]; then
 		systemctl enable --now W1nCray
 		green "W1nCray 已启动并设为开机自启"
@@ -215,7 +228,7 @@ cmd_switch() {
 	systemctl enable --now W1nCray
 	sleep 5
 	if unit_active W1nCray; then
-		green "切换完成，W1nCray 运行中。回滚: bash $0 rollback"
+		green "切换完成，W1nCray 运行中。回滚: bash $SELF rollback"
 		journalctl -u W1nCray -n 20 --no-pager || true
 	else
 		red "W1nCray 启动失败，自动回滚到 XrayR"

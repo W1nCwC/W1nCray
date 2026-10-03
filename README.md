@@ -39,11 +39,13 @@
 ## 安装（Linux）
 
 ```bash
-# 已发布 Release 时（从 github.com/W1nCwC/W1nCray 下载对应架构）
-bash install.sh install
+# 一键安装（从 GitHub Releases 下载对应架构的二进制）
+bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.sh) install
 # 或使用本地编译的二进制
 bash install.sh install --binary ./W1nCray-linux-amd64
 ```
+
+安装后脚本保存在 `/usr/local/W1nCray/install.sh`，之后的命令都用它执行。
 
 安装脚本会：
 
@@ -54,10 +56,10 @@ bash install.sh install --binary ./W1nCray-linux-amd64
 5. **XrayR 仍在运行时不会启动 W1nCray**（端口冲突），确认后再切换。
 
 ```bash
-bash install.sh switch     # 停用 XrayR、启用 W1nCray；5 秒内未正常运行会自动回滚
-bash install.sh rollback   # 随时回到 XrayR
-bash install.sh migrate    # 重新迁移（先把现有 /etc/W1nCray 备份为 /etc/W1nCray.bak.<时间>）
-bash install.sh check | status | log | uninstall [--purge]
+bash /usr/local/W1nCray/install.sh switch     # 停用 XrayR、启用 W1nCray；5 秒内未正常运行会自动回滚
+bash /usr/local/W1nCray/install.sh rollback   # 随时回到 XrayR
+bash /usr/local/W1nCray/install.sh migrate    # 重新迁移（先把现有 /etc/W1nCray 备份为 /etc/W1nCray.bak.<时间>）
+bash /usr/local/W1nCray/install.sh check | status | log | uninstall [--purge]
 ```
 
 ### 命令
@@ -147,4 +149,4 @@ go run ./tools/protogen  # 重新生成 app/dispatcher/config.pb.go（无需 pro
 
 ## 许可
 
-本项目参考了 XrayR（MPL-2.0）的设计与配置格式，基于 Xray-core（MPL-2.0）构建。发布前请补充 LICENSE 文件。
+[MPL-2.0](LICENSE)。本项目参考了 XrayR（MPL-2.0）的设计与配置格式，基于 Xray-core（MPL-2.0）构建；`migrate/testdata/xrayr-v0.9.4/` 为 XrayR 原版示例文件，仅作迁移测试样本。
