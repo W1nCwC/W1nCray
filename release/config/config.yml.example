@@ -1,0 +1,83 @@
+# W1nCray 配置文件（结构与 XrayR 兼容，可直接迁移）
+Log:
+  Level: warning # 日志级别：none, error, warning, info, debug
+  AccessPath: # /etc/W1nCray/access.log
+  ErrorPath: # /etc/W1nCray/error.log
+DnsConfigPath: # /etc/W1nCray/dns.json  Xray DNS 配置，见 https://xtls.github.io/config/dns.html
+RouteConfigPath: # /etc/W1nCray/route.json  全局路由，见 https://xtls.github.io/config/routing.html
+InboundConfigPath: # /etc/W1nCray/custom_inbound.json  自定义入站（JSON 数组）
+OutboundConfigPath: # /etc/W1nCray/custom_outbound.json  自定义出站（JSON 数组，第一个为默认出站）
+CertDir: # 证书存储目录，默认为配置文件所在目录下的 cert/
+ConnectionConfig:
+  Handshake: 4 # 握手超时（秒）
+  ConnIdle: 30 # 连接空闲超时（秒）
+  UplinkOnly: 2 # 下行关闭后上行的超时（秒）
+  DownlinkOnly: 4 # 上行关闭后下行的超时（秒）
+  BufferSize: 64 # 每个连接的内部缓冲（kB）
+Nodes:
+  - PanelType: "Xboard" # 面板类型：Xboard（NewV2board / V2board 亦按 Xboard 处理）
+    ApiConfig:
+      ApiHost: "https://xboard.example.com"
+      ApiKey: "Xboard 后台 系统配置 -> 节点 -> 通讯密钥"
+      NodeID: 1
+      NodeType: # 可选：vmess, vless, trojan, shadowsocks, hysteria, socks, http；留空则以面板为准
+      Timeout: 30 # API 请求超时（秒）
+      SpeedLimit: 0 # 本地限速（Mbps），>0 时覆盖面板用户限速
+      DeviceLimit: 0 # 本地设备数限制，>0 时覆盖面板用户设备数
+      RuleListPath: # /etc/W1nCray/rulelist  本地审计规则：每行一个正则，匹配的域名将被阻断
+    ControllerConfig:
+      ListenIP: 0.0.0.0 # 监听地址；使用 "::" 可同时监听 IPv4/IPv6
+      SendIP: 0.0.0.0 # 出口地址；0.0.0.0 / :: 表示由系统选择
+      UpdatePeriodic: 0 # 拉取间隔（秒）；0 表示使用面板的 pull_interval
+      EnableDNS: false # 出站使用 Xray DNS 解析（配合 DnsConfigPath）
+      DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6
+      DisableUploadTraffic: false # 不上报流量
+      DisableGetRule: false # 不使用面板下发的路由规则
+      EnableProxyProtocol: false # 入站接受 PROXY protocol（TCP/WS/HTTPUpgrade/XHTTP/gRPC）
+      DisableSniffing: false # 关闭流量嗅探
+      BlockPrivateIP: true # 阻止用户访问内网/保留地址（推荐开启）
+      AutoSpeedLimitConfig:
+        Limit: 0 # 触发阈值（Mbps），0 为关闭
+        WarnTimes: 0 # 连续超过阈值多少个上报周期后限速，0 为立即
+        LimitSpeed: 0 # 限速值（Mbps）
+        LimitDuration: 0 # 限速时长（分钟）
+      EnableFallback: false # 仅 VLESS / Trojan（TCP）
+      FallBackConfigs:
+        - SNI: # TLS SNI，留空匹配任意
+          Alpn: # 留空匹配任意
+          Path: # HTTP 路径，留空匹配任意
+          Dest: 80 # 必填，回落目标，见 https://xtls.github.io/config/features/fallback.html
+          ProxyProtocolVer: 0 # 发送 PROXY protocol 版本，0 为不发送
+      EnableREALITY: false # 使用下方本地 REALITY 配置覆盖面板（仅 VLESS / Trojan）
+      REALITYConfigs:
+        Show: false
+        Dest: www.example.com:443 # 必填，REALITY 目标
+        ProxyProtocolVer: 0
+        ServerNames: # 必填
+          - www.example.com
+        PrivateKey: YOUR_PRIVATE_KEY # 必填，执行 `W1nCray x25519` 生成
+        MinClientVer:
+        MaxClientVer:
+        MaxTimeDiff: 0
+        ShortIds:
+          - ""
+      # 面板节点下发 cert_config 时以面板为准，否则使用此处配置
+      CertConfig:
+        CertMode: none # none, file, self, http, tls, dns
+        CertDomain: "node1.example.com"
+        CertFile: /etc/W1nCray/cert/node1.example.com.crt # file 模式使用
+        KeyFile: /etc/W1nCray/cert/node1.example.com.key
+        Provider: cloudflare # dns 模式的 DNS 服务商，完整列表：https://go-acme.github.io/lego/dns/
+        Email: admin@example.com
+        HTTPPort: 80 # http 模式 ACME 验证端口
+        RejectUnknownSni: false
+        DNSEnv: # dns 模式所需的环境变量
+          CF_DNS_API_TOKEN: xxxxxxxx
+
+#  - PanelType: "Xboard"
+#    ApiConfig:
+#      ApiHost: "https://xboard.example.com"
+#      ApiKey: "..."
+#      NodeID: 2
+#    ControllerConfig:
+#      ListenIP: 0.0.0.0

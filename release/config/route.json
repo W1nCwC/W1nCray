@@ -1,0 +1,9 @@
+{
+  "domainStrategy": "AsIs",
+  "rules": [
+    {
+      "outboundTag": "w1ncray-block",
+      "protocol": ["bittorrent"]
+    }
+  ]
+}

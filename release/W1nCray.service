@@ -1,0 +1,18 @@
+[Unit]
+Description=W1nCray Xboard node backend
+Documentation=https://xtls.github.io/
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/W1nCray
+ExecStart=/usr/local/W1nCray/W1nCray -c /etc/W1nCray/config.yml
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=1048576
+Environment=XRAY_LOCATION_ASSET=/etc/W1nCray
+
+[Install]
+WantedBy=multi-user.target

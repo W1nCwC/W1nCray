@@ -1,0 +1,2 @@
+# 每行一个正则表达式，匹配的域名将被阻断（与 XrayR RuleListPath 相同）
+# (.*\.|)example-blocked\.com
