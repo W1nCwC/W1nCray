@@ -401,7 +401,7 @@ func (m *migration) planACMECert(label string, c *yaml.Node) {
 			return
 		}
 	}
-	m.report.warn("%s: 未找到 XrayR 为 %s 签发的有效证书，W1nCray 启动时将重新申请", label, domain)
+	m.report.warn("%s: 未找到 XrayR 为 %s 签发的有效证书；仅当该节点在面板启用 TLS 时需要，届时 W1nCray 会自动申请", label, domain)
 }
 
 func (m *migration) planKnownFiles() {

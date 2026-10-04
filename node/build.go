@@ -80,6 +80,14 @@ func userEmail(p, tag string, uid int, uuid string) string {
 	return tag + "|" + strconv.Itoa(uid)
 }
 
+// ssPluginEnabled mirrors the Xboard subscription (Protocols/Clash.php),
+// which only hands a plugin to clients when both plugin and plugin_opts are
+// set. The admin UI stores "no plugin" as "none".
+func ssPluginEnabled(plugin, opts string) bool {
+	p := strings.ToLower(strings.TrimSpace(plugin))
+	return p != "" && p != "none" && strings.TrimSpace(opts) != ""
+}
+
 // ss2022KeySize returns the user key size of a Shadowsocks 2022 cipher, or 0.
 func ss2022KeySize(cipher string) int {
 	switch cipher {
@@ -227,8 +235,8 @@ func (s *inboundSpec) settings(users []nodeUser) (map[string]any, error) {
 
 	case protoShadowsocks:
 		cipher := strings.ToLower(string(s.node.Cipher))
-		if s.node.Plugin != "" {
-			return nil, fmt.Errorf("shadowsocks plugin %q is not supported by Xray", s.node.Plugin)
+		if ssPluginEnabled(string(s.node.Plugin), string(s.node.PluginOpts)) {
+			return nil, fmt.Errorf("shadowsocks plugin %q is not supported by Xray; set the node plugin to None", s.node.Plugin)
 		}
 		if size := ss2022KeySize(cipher); size > 0 {
 			if !strings.Contains(cipher, "aes") {

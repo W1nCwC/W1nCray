@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 type recorded struct {
@@ -160,5 +162,51 @@ func TestStatusError(t *testing.T) {
 	var se *StatusError
 	if !errors.As(err, &se) || se.Code != 422 {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTokenRedacted(t *testing.T) {
+	// Unreachable host: the transport error embeds the request URL.
+	c := New(Config{APIHost: "http://127.0.0.1:1", Key: "s3cr3t+tok/en", NodeID: 1, Timeout: time.Second})
+	retryDelay = time.Millisecond
+	_, err := c.GetUsers(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "s3cr3t") || strings.Contains(err.Error(), "tok%2Fen") {
+		t.Fatalf("token leaked: %v", err)
+	}
+	if !strings.Contains(err.Error(), "token=***") {
+		t.Fatalf("redaction marker missing: %v", err)
+	}
+}
+
+func TestRetryGETOnly(t *testing.T) {
+	retryDelay = time.Millisecond
+	var gets, posts int
+	c, _ := newServer(t, func(r *recorded, w http.ResponseWriter) {
+		if r.method == http.MethodGet {
+			gets++
+			if gets < 3 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			io.WriteString(w, `{"users":[]}`)
+			return
+		}
+		posts++
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	if _, err := c.GetUsers(context.Background()); err != nil {
+		t.Fatalf("GET not retried: %v", err)
+	}
+	if gets != 3 {
+		t.Fatalf("gets = %d", gets)
+	}
+	if err := c.PushTraffic(context.Background(), map[int][2]int64{1: {1, 1}}); err == nil {
+		t.Fatal("expected push error")
+	}
+	if posts != 1 {
+		t.Fatalf("POST sent %d times, must not be retried", posts)
 	}
 }

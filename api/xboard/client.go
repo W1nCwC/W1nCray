@@ -96,7 +96,47 @@ func (c *Client) ResetETags() {
 	c.mu.Unlock()
 }
 
+// retryDelay is the base backoff between GET attempts (variable for tests).
+var retryDelay = time.Second
+
+// do sends a request. GET requests are idempotent and are retried up to three
+// times on network errors and 5xx answers, like XrayR's resty client; POST
+// requests (traffic reports) are sent once so traffic cannot be counted twice.
 func (c *Client) do(ctx context.Context, method, name string, body any, etag string) (*http.Response, error) {
+	attempts := 1
+	if method == http.MethodGet {
+		attempts = 3
+	}
+	var resp *http.Response
+	var err error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, err
+			case <-time.After(retryDelay * time.Duration(i)):
+			}
+		}
+		resp, err = c.attempt(ctx, method, name, body, etag)
+		if !retryable(err) {
+			break
+		}
+	}
+	return resp, err
+}
+
+func retryable(err error) bool {
+	if err == nil || errors.Is(err, ErrNotModified) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code >= 500
+	}
+	return true
+}
+
+func (c *Client) attempt(ctx context.Context, method, name string, body any, etag string) (*http.Response, error) {
 	u := c.base + basePath + name + "?" + c.query.Encode()
 	var rd io.Reader
 	if body != nil {
@@ -108,7 +148,7 @@ func (c *Client) do(ctx context.Context, method, name string, body any, etag str
 	}
 	req, err := http.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
-		return nil, err
+		return nil, c.redact(err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "W1nCray")
@@ -120,7 +160,7 @@ func (c *Client) do(ctx context.Context, method, name string, body any, etag str
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request %s: %w", name, err)
+		return nil, fmt.Errorf("request %s: %w", name, c.redact(err))
 	}
 	if resp.StatusCode == http.StatusNotModified {
 		resp.Body.Close()
@@ -129,9 +169,27 @@ func (c *Client) do(ctx context.Context, method, name string, body any, etag str
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
-		return nil, &StatusError{Path: name, Code: resp.StatusCode, Body: strings.TrimSpace(string(b))}
+		return nil, &StatusError{Path: name, Code: resp.StatusCode, Body: c.redactString(strings.TrimSpace(string(b)))}
 	}
 	return resp, nil
+}
+
+// redact removes the node token from errors: *url.Error embeds the full
+// request URL, whose query carries the token, and errors end up in logs.
+func (c *Client) redact(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL = c.redactString(ue.URL)
+	}
+	return err
+}
+
+func (c *Client) redactString(s string) string {
+	if c.cfg.Key == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, url.QueryEscape(c.cfg.Key), "***")
+	return strings.ReplaceAll(s, c.cfg.Key, "***")
 }
 
 // GetNodeConfig fetches the node config. It returns ErrNotModified when the

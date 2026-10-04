@@ -7,6 +7,8 @@ import (
 	"io"
 	"time"
 
+	xlog "github.com/xtls/xray-core/common/log"
+
 	"github.com/W1nCwC/W1nCray/common/cert"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/node"
@@ -22,6 +24,7 @@ func Check(path string, online bool, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "配置文件: %s（%d 个节点）\n", path, len(cfg.NodesConfig))
 	failed := false
+	quietKernelLog()
 
 	var ns []core.NameServer
 	if online {
@@ -42,6 +45,11 @@ func Check(path string, online bool, w io.Writer) error {
 	}
 
 	opts := coreOptions(cfg, ns)
+	// Keep the kernel's debug/info output out of the check report.
+	if opts.LogLevel == "debug" || opts.LogLevel == "info" {
+		opts.LogLevel = "warning"
+	}
+	opts.AccessPath, opts.ErrorPath = "", ""
 	if errs := core.CheckFiles(opts); len(errs) > 0 {
 		failed = true
 		for _, e := range errs {
@@ -60,4 +68,20 @@ func Check(path string, online bool, w io.Writer) error {
 	}
 	fmt.Fprintln(w, "检查通过")
 	return nil
+}
+
+// quietKernelLog drops kernel messages below warning. Building configs before
+// an instance exists logs through Xray's default handler, which does not
+// filter by level (e.g. router debug lines).
+func quietKernelLog() {
+	xlog.RegisterHandler(warningFilter{next: xlog.NewLogger(xlog.CreateStdoutLogWriter())})
+}
+
+type warningFilter struct{ next xlog.Handler }
+
+func (f warningFilter) Handle(msg xlog.Message) {
+	if gm, ok := msg.(*xlog.GeneralMessage); ok && gm.Severity > xlog.Severity_Warning {
+		return
+	}
+	f.next.Handle(msg)
 }
