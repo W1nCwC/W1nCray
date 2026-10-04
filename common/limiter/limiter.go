@@ -96,6 +96,9 @@ type userState struct {
 	// contributed to that count in its last report.
 	globalAlive  int
 	lastReported int
+	// globalIPs are the user's IPs on all nodes from the panel's
+	// sync.devices push (WebSocket); nil when not available.
+	globalIPs map[string]struct{}
 }
 
 // SetUsers replaces the user table. State (online IPs, buckets) of users that
@@ -137,6 +140,34 @@ func (in *Inbound) SetGlobalAlive(alive map[int]int) {
 	}
 }
 
+// SetGlobalDevices stores the panel-wide IPs of every user (uid -> IPs), as
+// pushed by sync.devices. Users missing from the map have no devices.
+func (in *Inbound) SetGlobalDevices(devices map[int][]string) {
+	in.mu.RLock()
+	defer in.mu.RUnlock()
+	for _, st := range in.users {
+		set := make(map[string]struct{}, len(devices[st.uid]))
+		for _, ip := range devices[st.uid] {
+			set[ip] = struct{}{}
+		}
+		st.mu.Lock()
+		st.globalIPs = set
+		st.mu.Unlock()
+	}
+}
+
+// ClearGlobalDevices drops the panel-wide IPs (WebSocket disconnected), so
+// device checks fall back to the alive list counts.
+func (in *Inbound) ClearGlobalDevices() {
+	in.mu.RLock()
+	defer in.mu.RUnlock()
+	for _, st := range in.users {
+		st.mu.Lock()
+		st.globalIPs = nil
+		st.mu.Unlock()
+	}
+}
+
 func (st *userState) setLimits(speed uint64, deviceLimit int) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -174,11 +205,8 @@ func (in *Inbound) Acquire(email, ip string) (*Session, error) {
 		s.refs++
 		s.lastSeen = time.Now()
 	} else {
-		if st.deviceLimit > 0 {
-			other := max(st.globalAlive-st.lastReported, 0)
-			if len(st.ips)+other+1 > st.deviceLimit {
-				return nil, ErrDeviceLimit
-			}
+		if st.deviceLimit > 0 && st.devicesWith(ip) > st.deviceLimit {
+			return nil, ErrDeviceLimit
 		}
 		st.ips[ip] = &ipState{refs: 1, lastSeen: time.Now()}
 	}
@@ -193,6 +221,23 @@ func (in *Inbound) Acquire(email, ip string) (*Session, error) {
 		sess.Up, sess.Down = st.up, st.down
 	}
 	return sess, nil
+}
+
+// devicesWith returns the panel-wide device count if ip (not yet connected
+// here) is admitted. With sync.devices data it is the exact number of unique
+// IPs across all nodes, as Xboard counts them; otherwise it estimates the
+// other nodes' share from the alive list. Caller holds st.mu.
+func (st *userState) devicesWith(ip string) int {
+	if st.globalIPs != nil {
+		n := len(st.ips) + 1
+		for g := range st.globalIPs {
+			if _, local := st.ips[g]; !local && g != ip {
+				n++
+			}
+		}
+		return n
+	}
+	return len(st.ips) + max(st.globalAlive-st.lastReported, 0) + 1
 }
 
 // AliveIPs returns, per uid, the IPs that are connected now or were seen

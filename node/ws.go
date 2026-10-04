@@ -1,0 +1,208 @@
+package node
+
+import (
+	"context"
+	"encoding/json"
+	"runtime"
+	"time"
+
+	"github.com/W1nCwC/W1nCray/api/xboard"
+)
+
+// wsReportInterval is how often devices and status go over the WebSocket.
+// It stays well below the panel's 300 s device TTL (DeviceStateService::TTL).
+var wsReportInterval = 60 * time.Second
+
+// wsLoop discovers the panel WebSocket through the handshake and keeps it
+// connected. HTTP polling continues meanwhile as a safety net.
+func (c *Controller) wsLoop() {
+	defer c.wg.Done()
+	for c.ctx.Err() == nil {
+		ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+		hs, err := c.api.Handshake(ctx)
+		cancel()
+		switch {
+		case err != nil:
+			c.log.Debugf("websocket handshake: %v", err)
+		case !hs.WebSocket.Enabled || hs.WebSocket.URL == "":
+			c.log.Debug("panel websocket disabled, using HTTP polling")
+		default:
+			wc, err := c.api.NewWSClient(hs.WebSocket.URL, &wsHandler{c: c})
+			if err != nil {
+				c.log.Warnf("websocket: %v", err)
+				break
+			}
+			c.log.Infof("panel websocket enabled: %s", hs.WebSocket.URL)
+			c.ws.Store(wc)
+			go c.wsReporter(wc)
+			wc.Run(c.ctx) // reconnects until the controller stops
+			c.ws.Store(nil)
+			return
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(c.interval(true)):
+		}
+	}
+}
+
+// wsConnected reports whether pushes currently arrive over the WebSocket.
+func (c *Controller) wsConnected() bool {
+	wc := c.ws.Load()
+	return wc != nil && wc.Connected()
+}
+
+func (c *Controller) wsReporter(wc *xboard.WSClient) {
+	t := time.NewTicker(wsReportInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			if wc.Connected() {
+				c.wsSendDevices(wc)
+				c.wsSendStatus(wc)
+			}
+		}
+	}
+}
+
+// wsSendDevices sends this node's complete device snapshot: the panel drops
+// users missing from it (NodeEventHandlers::handleDeviceReport).
+func (c *Controller) wsSendDevices(wc *xboard.WSClient) {
+	if c.limiterIn == nil {
+		return
+	}
+	alive := c.limiterIn.AliveIPs(wsReportInterval)
+	wc.Send(xboard.EventReportDevices, xboard.DevicesPayload(alive))
+}
+
+func (c *Controller) wsSendStatus(wc *xboard.WSClient) {
+	c.mu.Lock()
+	total := len(c.users)
+	c.mu.Unlock()
+	wc.Send(xboard.EventNodeStatus, map[string]any{
+		"uptime":        int64(time.Since(c.started).Seconds()),
+		"goroutines":    runtime.NumGoroutine(),
+		"total_users":   total,
+		"kernel_status": true,
+	})
+}
+
+// wsHandler applies panel pushes through the same paths as HTTP polling.
+type wsHandler struct{ c *Controller }
+
+func (h *wsHandler) OnConnected() {
+	c := h.c
+	c.log.Info("panel websocket connected")
+	// The panel cleared this node's devices on connect: report them now.
+	if wc := c.ws.Load(); wc != nil {
+		c.wsSendDevices(wc)
+		c.wsSendStatus(wc)
+	}
+}
+
+func (h *wsHandler) OnDisconnected(err error) {
+	c := h.c
+	if c.ctx.Err() != nil {
+		return
+	}
+	if err != nil {
+		c.log.Warnf("panel websocket disconnected: %v (HTTP polling continues)", err)
+	}
+	c.limiterIn.ClearGlobalDevices()
+	// The panel dropped this node's devices on disconnect; restore them
+	// over HTTP instead of waiting for the next push interval.
+	go func() {
+		ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+		defer cancel()
+		c.reportAlive(ctx)
+	}()
+}
+
+func (h *wsHandler) OnConfig(nc *xboard.NodeConfig) {
+	c := h.c
+	// sync.config carries no base_config (NodeSyncService::notifyConfigUpdated);
+	// keep the intervals from the last HTTP config.
+	c.mu.Lock()
+	if nc.BaseConfig == nil && c.node != nil {
+		nc.BaseConfig = c.node.BaseConfig
+	}
+	c.mu.Unlock()
+	if err := c.applyNode(nc, nil); err != nil {
+		c.log.Errorf("apply pushed node config: %v", err)
+		c.api.ResetETags()
+	}
+}
+
+func (h *wsHandler) OnUsers(users []xboard.User) {
+	if err := h.c.applyUsers(users); err != nil {
+		h.c.log.Errorf("apply pushed users: %v", err)
+		h.c.api.ResetETags()
+	}
+}
+
+func (h *wsHandler) OnUserDelta(d *xboard.UserDelta) {
+	if err := h.c.applyUserDelta(string(d.Action), d.Users); err != nil {
+		h.c.log.Errorf("apply pushed user change: %v", err)
+		h.c.api.ResetETags()
+	}
+}
+
+func (h *wsHandler) OnDevices(devices map[int][]string) {
+	h.c.limiterIn.SetGlobalDevices(devices)
+}
+
+// applyUserDelta adds/updates or removes users from the current panel list.
+func (c *Controller) applyUserDelta(action string, delta []xboard.User) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	byID := make(map[xboard.Int]int, len(c.panelUsers))
+	next := make([]xboard.User, 0, len(c.panelUsers)+len(delta))
+	for _, u := range c.panelUsers {
+		byID[u.ID] = len(next)
+		next = append(next, u)
+	}
+	switch action {
+	case "add":
+		for _, u := range delta {
+			if i, ok := byID[u.ID]; ok {
+				next[i] = u
+			} else {
+				byID[u.ID] = len(next)
+				next = append(next, u)
+			}
+		}
+	case "remove":
+		drop := make(map[xboard.Int]bool, len(delta))
+		for _, u := range delta {
+			drop[u.ID] = true
+		}
+		kept := next[:0]
+		for _, u := range next {
+			if !drop[u.ID] {
+				kept = append(kept, u)
+			}
+		}
+		next = kept
+	default:
+		c.log.Warnf("unknown user delta action %q", action)
+		return nil
+	}
+	return c.applyUsersLocked(next)
+}
+
+// configKey identifies a node config for change detection. base_config is
+// left out: HTTP configs carry it and WebSocket pushes do not, and only the
+// intervals depend on it.
+func configKey(nc *xboard.NodeConfig) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(nc.Raw, &m) != nil {
+		return string(nc.Raw)
+	}
+	delete(m, "base_config")
+	b, _ := json.Marshal(m) // map keys are sorted
+	return string(b)
+}

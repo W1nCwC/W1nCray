@@ -40,6 +40,8 @@ type fakePanel struct {
 	traffic []map[string][2]int64
 	alive   []map[string][]string
 	status  int
+	// hook serves extra endpoints (WebSocket tests); true = handled.
+	hook func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func newFakePanel(t *testing.T, node string, users []map[string]any) *fakePanel {
@@ -55,6 +57,9 @@ func etag(b []byte) string {
 }
 
 func (fp *fakePanel) handle(w http.ResponseWriter, r *http.Request) {
+	if fp.hook != nil && fp.hook(w, r) {
+		return
+	}
 	q := r.URL.Query()
 	if q.Get("token") != "secret" || q.Get("node_id") != "1" {
 		w.WriteHeader(http.StatusForbidden)
@@ -197,7 +202,11 @@ type server struct {
 
 func startServer(t *testing.T, nodeJSON string, users []map[string]any, mutate func(*Config)) *server {
 	t.Helper()
-	fp := newFakePanel(t, nodeJSON, users)
+	return startServerOn(t, newFakePanel(t, nodeJSON, users), mutate)
+}
+
+func startServerOn(t *testing.T, fp *fakePanel, mutate func(*Config)) *server {
+	t.Helper()
 	cfg := DefaultConfig()
 	cfg.ListenIP = "127.0.0.1"
 	off := false

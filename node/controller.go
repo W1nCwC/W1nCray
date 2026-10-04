@@ -1,7 +1,6 @@
 package node
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -64,6 +64,9 @@ type Controller struct {
 	pushEvery    time.Duration
 	statusOff    bool
 	auto         *autoLimit
+
+	ws      atomic.Pointer[xboard.WSClient]
+	started time.Time
 }
 
 // New creates a controller.
@@ -207,10 +210,15 @@ func (c *Controller) Start(cr *core.Core) error {
 		}
 	}
 
+	c.started = time.Now()
 	c.wg.Add(3)
 	go c.loop("pull", func() time.Duration { return c.interval(true) }, c.pull)
 	go c.loop("push", func() time.Duration { return c.interval(false) }, c.push)
 	go c.loop("cert", func() time.Duration { return 12 * time.Hour }, c.renewCert)
+	if !c.cfg.DisableWebSocket {
+		c.wg.Add(1)
+		go c.wsLoop()
+	}
 	return nil
 }
 
@@ -319,6 +327,9 @@ func (c *Controller) pull() {
 
 // syncAliveList fetches panel-wide device counts when some user has a limit.
 func (c *Controller) syncAliveList(ctx context.Context) {
+	if c.wsConnected() {
+		return // exact device data arrives through sync.devices
+	}
 	c.mu.Lock()
 	need := false
 	for _, u := range c.users {
@@ -403,7 +414,12 @@ func (c *Controller) applyNode(nc *xboard.NodeConfig, users []xboard.User) error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.node != nil && bytes.Equal(c.node.Raw, nc.Raw) {
+	if c.node != nil && configKey(c.node) == configKey(nc) {
+		// Same node; intervals may still differ (base_config).
+		if nc.BaseConfig != nil {
+			c.setIntervals(nc)
+			c.node = nc
+		}
 		if users != nil {
 			return c.applyUsersLocked(users)
 		}
