@@ -92,3 +92,9 @@
 - D12 ✅ 快照不变时不重复上报；下线后不重复上报空快照。
 - 限制：Xboard HTTP `alive` 只更新所列用户，HTTP 模式无法上报"下线"，需等面板 TTL 300s；WS 模式无此限制。
 - 全量回归通过；WS/实时用例连跑 3 次通过。
+
+## 7. 真机验收（2026-10-04，用户 VPS + 用户面板）
+
+- 21:13 部署 `v0.2.0-dev+030fcb5`（经用户同意），重启后 2s 内 3 个节点全部 `panel websocket connected`；面板日志 `[WS] Node#138 connected {"total":3}`、`Full sync pushed to node#119/#138`、`status updated`。
+- 在线 IP 实时：面板 `Node#173 synced 1 users`（21:13:16）→ `synced 2 users`（21:13:21）；之后每 ~60s 刷新，面板 ≤8s 回推 `sync.devices`；5 分钟内无断线、无错误。
+- D9 ✅ 用户在后台封禁/解封测试用户：面板 22:26:58 `Pushed sync.user.delta to node#173` → 节点同一秒 `users: 1 removed`；22:27:28 解封 → 同一秒 `users: 1 added`（热更新，未重建入站）。
