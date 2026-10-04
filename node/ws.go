@@ -9,8 +9,7 @@ import (
 	"github.com/W1nCwC/W1nCray/api/xboard"
 )
 
-// wsReportInterval is how often devices and status go over the WebSocket.
-// It stays well below the panel's 300 s device TTL (DeviceStateService::TTL).
+// wsReportInterval is how often node.status goes over the WebSocket.
 var wsReportInterval = 60 * time.Second
 
 // wsLoop discovers the panel WebSocket through the handshake and keeps it
@@ -62,21 +61,10 @@ func (c *Controller) wsReporter(wc *xboard.WSClient) {
 			return
 		case <-t.C:
 			if wc.Connected() {
-				c.wsSendDevices(wc)
 				c.wsSendStatus(wc)
 			}
 		}
 	}
-}
-
-// wsSendDevices sends this node's complete device snapshot: the panel drops
-// users missing from it (NodeEventHandlers::handleDeviceReport).
-func (c *Controller) wsSendDevices(wc *xboard.WSClient) {
-	if c.limiterIn == nil {
-		return
-	}
-	alive := c.limiterIn.AliveIPs(wsReportInterval)
-	wc.Send(xboard.EventReportDevices, xboard.DevicesPayload(alive))
 }
 
 func (c *Controller) wsSendStatus(wc *xboard.WSClient) {
@@ -98,8 +86,8 @@ func (h *wsHandler) OnConnected() {
 	c := h.c
 	c.log.Info("panel websocket connected")
 	// The panel cleared this node's devices on connect: report them now.
+	c.devices.notify(true)
 	if wc := c.ws.Load(); wc != nil {
-		c.wsSendDevices(wc)
 		c.wsSendStatus(wc)
 	}
 }
@@ -114,12 +102,8 @@ func (h *wsHandler) OnDisconnected(err error) {
 	}
 	c.limiterIn.ClearGlobalDevices()
 	// The panel dropped this node's devices on disconnect; restore them
-	// over HTTP instead of waiting for the next push interval.
-	go func() {
-		ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
-		defer cancel()
-		c.reportAlive(ctx)
-	}()
+	// over HTTP right away.
+	c.devices.notify(true)
 }
 
 func (h *wsHandler) OnConfig(nc *xboard.NodeConfig) {

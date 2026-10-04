@@ -241,8 +241,64 @@ func TestE2EWebSocketDisabled(t *testing.T) {
 	if _, err := c.get(tgt.URL+"/bytes?n=100", 10*time.Second); err != nil {
 		t.Fatalf("HTTP-only node: %v", err)
 	}
-	s.ctl.push()
-	if len(fp.aliveIPs(1)) == 0 {
-		t.Fatal("HTTP alive not reported in HTTP-only mode")
+	eventually(t, "HTTP alive in HTTP-only mode", 10*time.Second, func() bool { return len(fp.aliveIPs(1)) > 0 })
+}
+
+// lastDevices returns the latest report.devices payload and the report count.
+func (fw *fakeWSPanel) lastDevices() (map[string][]string, int) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	var last map[string][]string
+	n := 0
+	for _, m := range fw.got {
+		if m.Event == xboard.EventReportDevices {
+			n++
+			last = nil
+			json.Unmarshal(m.Data, &last)
+		}
+	}
+	return last, n
+}
+
+func TestE2EDevicesRealtime(t *testing.T) {
+	grace, tick, refresh := devicesGrace, devicesTick, devicesRefresh
+	devicesGrace, devicesTick, devicesRefresh = 2*time.Second, 300*time.Millisecond, time.Hour
+	t.Cleanup(func() { devicesGrace, devicesTick, devicesRefresh = grace, tick, refresh })
+
+	tgt := target(t)
+	port := freePort(t, "tcp")
+	fw := newFakeWSPanel(t, vmessNode(port, "[]"), panelUsers(0, 0))
+	s := startServerOn(t, fw.fp, nil)
+	eventually(t, "websocket connected", 10*time.Second, func() bool { return s.ctl.wsConnected() })
+	eventually(t, "snapshot on connect", 5*time.Second, func() bool { _, n := fw.lastDevices(); return n >= 1 })
+
+	c := startClient(t, protoCases[0].client(port, uuid1))
+	start := time.Now()
+	if _, err := c.get(tgt.URL+"/bytes?n=10", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "new IP reported", 3*time.Second, func() bool {
+		d, _ := fw.lastDevices()
+		return len(d["1"]) == 1 && d["1"][0] == "127.0.0.1"
+	})
+	t.Logf("new IP reported %v after connecting", time.Since(start))
+
+	// Unchanged snapshot: no further reports during the grace period.
+	_, n := fw.lastDevices()
+	time.Sleep(time.Second)
+	if _, n2 := fw.lastDevices(); n2 != n {
+		t.Fatalf("unchanged snapshot reported again: %d -> %d", n, n2)
+	}
+
+	// After the grace period the IP is reported as gone.
+	took := eventually(t, "IP removal reported", 6*time.Second, func() bool {
+		d, _ := fw.lastDevices()
+		return len(d["1"]) == 0
+	})
+	t.Logf("IP removal reported %v after the check above", took)
+	_, n = fw.lastDevices()
+	time.Sleep(time.Second)
+	if _, n2 := fw.lastDevices(); n2 != n {
+		t.Fatalf("empty snapshot reported repeatedly: %d -> %d", n, n2)
 	}
 }

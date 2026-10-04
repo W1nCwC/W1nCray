@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -76,6 +77,14 @@ type Inbound struct {
 
 	mu    sync.RWMutex
 	users map[string]*userState // email -> state
+
+	onChange atomic.Pointer[func()]
+}
+
+// SetOnChange registers f to be called when a user connects from a new IP.
+// f runs on the connection path and must not block.
+func (in *Inbound) SetOnChange(f func()) {
+	in.onChange.Store(&f)
 }
 
 type ipState struct {
@@ -209,6 +218,9 @@ func (in *Inbound) Acquire(email, ip string) (*Session, error) {
 			return nil, ErrDeviceLimit
 		}
 		st.ips[ip] = &ipState{refs: 1, lastSeen: time.Now()}
+		if f := in.onChange.Load(); f != nil {
+			(*f)()
+		}
 	}
 
 	sess := &Session{st: st, ip: ip}
