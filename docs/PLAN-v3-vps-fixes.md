@@ -32,3 +32,14 @@
 | C3 | Xboard 样例 `plugin:"none"`、`plugin:"obfs"`+空 opts 可构建；`plugin:"obfs"`+opts 明确报错（单测） |
 | C4 | 全量回归通过 |
 | C5 | 用户 VPS 上重新 check（需用户升级后执行） |
+
+## 4. 实施与真机结果（2026-10-04）
+
+- 修复提交 `538bce5`，已推送并发布 v0.1.1（预发布）。
+- 用户 VPS（Debian 12 / x86_64，XrayR 0.9.4 + xray-core 24.12.18，3 个 Xboard 节点）：
+  - 16:21 升级至修复版并 `check --online`：173 vmess(22 用户)、119 shadowsocks(3 用户，plugin "none" 已通过)、138 vless+REALITY(3 用户) 全部 ✓，C5 通过；
+  - 138 节点用户接口复测 0.17s（Timeout 10s），先前超时未复现 → 判定为偶发【高度可能】；
+  - 16:23 经用户同意执行 `install.sh switch`：XrayR 停止并禁用，W1nCray 启用；监听端口与 XrayR 一致（65535、65533 tcp/udp、2083、127.0.0.1:62788）；切换后 2 分钟内已有用户连接；
+  - 日志中的批量 `shadowsocks: failed to read 50 bytes > EOF` 来自同一秒内数十个 IP 的空连接，为外部 TCP 探测，非故障。
+- 面板 `push_interval`/`pull_interval` 为 600s，首次上报验证见下。
+- 16:34 首次上报周期（16:33:18）后检查：W1nCray active、重启 0 次；日志无任何上报错误（流量/在线 IP/状态失败均会记 level=error）→ 上报被面板接受【高度可能，待用户在 Xboard 后台确认】；node173 已接受 27 个连接；node119、node138 暂无用户连接，真实流量待验证。
