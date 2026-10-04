@@ -24,7 +24,6 @@ func (c *Controller) push() {
 		}
 		c.mu.Unlock()
 	}
-	c.reportAlive(ctx)
 	c.reportStatus(ctx)
 }
 
@@ -104,21 +103,6 @@ func (c *Controller) reportTraffic(ctx context.Context) map[int][2]int64 {
 	}
 	c.mu.Unlock()
 	return traffic
-}
-
-func (c *Controller) reportAlive(ctx context.Context) {
-	if c.limiterIn == nil || c.wsConnected() {
-		return // devices go over the WebSocket while it is up
-	}
-	alive := c.limiterIn.AliveIPs(c.interval(false))
-	if len(alive) == 0 {
-		return
-	}
-	if err := c.api.PushAlive(ctx, alive); err != nil {
-		c.log.Errorf("report online IPs: %v", err)
-		return
-	}
-	c.log.Debugf("reported online IPs of %d users", len(alive))
 }
 
 func (c *Controller) reportStatus(ctx context.Context) {

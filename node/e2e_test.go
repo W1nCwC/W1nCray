@@ -453,10 +453,11 @@ func TestE2EProtocols(t *testing.T) {
 			if u2, d2 := s.panel.totals(2); u2 != 0 || d2 != 0 {
 				t.Fatalf("user 2 has traffic %d/%d", u2, d2)
 			}
-			ips := s.panel.aliveIPs(1)
-			if len(ips) == 0 || ips[0] != "127.0.0.1" {
-				t.Fatalf("alive IPs = %v", ips)
-			}
+			// Online IPs are reported as they appear (devices.go).
+			eventually(t, "online IP reported", 10*time.Second, func() bool {
+				ips := s.panel.aliveIPs(1)
+				return len(ips) > 0 && ips[0] == "127.0.0.1"
+			})
 			if s.panel.status == 0 {
 				t.Fatal("status not reported")
 			}

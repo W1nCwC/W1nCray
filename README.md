@@ -125,7 +125,8 @@ Nodes:
 Xboard 开启节点 WebSocket 后（后台开关 + 运行 `ws-server`），W1nCray 会通过 `/api/v2/server/handshake` 自动发现并连接，无需配置：
 
 - 用户新增/封禁/超流量/到期、节点配置修改：**秒级生效**（不再等待 `pull_interval`）；
-- 在线 IP 每 60 秒经 WebSocket 上报（低于面板 300 秒的设备过期时间），并接收面板下发的全网设备 IP，跨节点设备限制更精确；
+- 在线 IP **实时上报**：新 IP 接入后约 1 秒内上报，断开 30 秒（宽限期，避免短连接导致在线数抖动）后上报下线，未变化时每 60 秒刷新；并接收面板下发的全网设备 IP，跨节点设备限制与 Xboard 的计数方式一致；
+- 未使用 WebSocket 时在线 IP 同样实时经 HTTP 上报（间隔 ≥5 秒）；但 Xboard 的 HTTP 接口无法表示"下线"，下线的 IP 要等面板 300 秒过期；
 - 流量与负载仍走 HTTP；HTTP 轮询始终保留，WebSocket 断开时自动重连并回退，不影响节点工作；
 - 不想使用时设置 `ControllerConfig.DisableWebSocket: true`。
 

@@ -66,6 +66,7 @@ type Controller struct {
 	auto         *autoLimit
 
 	ws      atomic.Pointer[xboard.WSClient]
+	devices *deviceSignal
 	started time.Time
 }
 
@@ -211,7 +212,10 @@ func (c *Controller) Start(cr *core.Core) error {
 	}
 
 	c.started = time.Now()
-	c.wg.Add(3)
+	c.devices = newDeviceSignal()
+	c.limiterIn.SetOnChange(func() { c.devices.notify(false) })
+	c.wg.Add(4)
+	go c.deviceReporter()
 	go c.loop("pull", func() time.Duration { return c.interval(true) }, c.pull)
 	go c.loop("push", func() time.Duration { return c.interval(false) }, c.push)
 	go c.loop("cert", func() time.Duration { return 12 * time.Hour }, c.renewCert)
