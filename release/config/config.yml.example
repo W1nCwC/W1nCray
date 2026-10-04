@@ -35,6 +35,7 @@ Nodes:
       DisableGetRule: false # 不使用面板下发的路由规则
       EnableProxyProtocol: false # 入站接受 PROXY protocol（TCP/WS/HTTPUpgrade/XHTTP/gRPC）
       DisableSniffing: false # 关闭流量嗅探
+      DisableWebSocket: false # 不使用面板 WebSocket（面板开启时，用户/配置变更秒级生效；HTTP 轮询始终作为兜底）
       BlockPrivateIP: true # 阻止用户访问内网/保留地址（推荐开启）
       AutoSpeedLimitConfig:
         Limit: 0 # 触发阈值（Mbps），0 为关闭

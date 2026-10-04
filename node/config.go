@@ -36,6 +36,7 @@ type Config struct {
 	DisableGetRule       bool                  `mapstructure:"DisableGetRule"`
 	EnableProxyProtocol  bool                  `mapstructure:"EnableProxyProtocol"`
 	DisableSniffing      bool                  `mapstructure:"DisableSniffing"`
+	DisableWebSocket     bool                  `mapstructure:"DisableWebSocket"`
 	BlockPrivateIP       *bool                 `mapstructure:"BlockPrivateIP"`
 	AutoSpeedLimitConfig *AutoSpeedLimitConfig `mapstructure:"AutoSpeedLimitConfig"`
 	EnableFallback       bool                  `mapstructure:"EnableFallback"`

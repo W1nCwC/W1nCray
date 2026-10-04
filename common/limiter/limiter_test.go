@@ -158,3 +158,33 @@ func (c *countWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	buf.ReleaseMulti(mb)
 	return nil
 }
+
+// sync.devices gives the user's IPs on all nodes; the check counts unique IPs
+// exactly like Xboard (DeviceStateService::getDeviceCount).
+func TestDeviceLimitGlobalIPs(t *testing.T) {
+	l := New()
+	in := l.AddInbound("n", false)
+	in.SetUsers([]User{{UID: 1, Email: "a", DeviceLimit: 2}, {UID: 2, Email: "b", DeviceLimit: 1}})
+
+	in.SetGlobalDevices(map[int][]string{1: {"9.9.9.9"}, 2: {"1.1.1.1"}})
+	if _, err := l.Acquire("n", "a", "1.1.1.1"); err != nil {
+		t.Fatalf("1 elsewhere + 1 here must fit a limit of 2: %v", err)
+	}
+	if _, err := l.Acquire("n", "a", "2.2.2.2"); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("third unique IP: %v", err)
+	}
+	// The same IP on another node is one device, not two.
+	if _, err := l.Acquire("n", "b", "1.1.1.1"); err != nil {
+		t.Fatalf("same IP as on another node: %v", err)
+	}
+
+	// Without WebSocket data only the local IPs (and the alive list
+	// estimate, 0 here) count: 9.9.9.9 elsewhere is no longer known.
+	in.ClearGlobalDevices()
+	if _, err := l.Acquire("n", "a", "2.2.2.2"); err != nil {
+		t.Fatalf("second local IP with limit 2: %v", err)
+	}
+	if _, err := l.Acquire("n", "a", "3.3.3.3"); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("third local IP: %v", err)
+	}
+}

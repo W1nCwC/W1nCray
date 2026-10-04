@@ -137,7 +137,11 @@ func retryable(err error) bool {
 }
 
 func (c *Client) attempt(ctx context.Context, method, name string, body any, etag string) (*http.Response, error) {
-	u := c.base + basePath + name + "?" + c.query.Encode()
+	path := basePath + name
+	if strings.HasPrefix(name, "/") {
+		path = name // absolute API path, e.g. the V2 handshake
+	}
+	u := c.base + path + "?" + c.query.Encode()
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)

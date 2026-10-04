@@ -120,6 +120,17 @@ Nodes:
 - `SendIP: 0.0.0.0` 现在表示由系统选择出口地址（XrayR 会绑定 IPv4，导致无法访问 IPv6 目标）。
 - 自定义出站中的 `allowInsecure` 已被 Xray v26 移除，`check` 会提示改用 `pinnedPeerCertSha256`。
 
+### 面板 WebSocket（实时同步）
+
+Xboard 开启节点 WebSocket 后（后台开关 + 运行 `ws-server`），W1nCray 会通过 `/api/v2/server/handshake` 自动发现并连接，无需配置：
+
+- 用户新增/封禁/超流量/到期、节点配置修改：**秒级生效**（不再等待 `pull_interval`）；
+- 在线 IP 每 60 秒经 WebSocket 上报（低于面板 300 秒的设备过期时间），并接收面板下发的全网设备 IP，跨节点设备限制更精确；
+- 流量与负载仍走 HTTP；HTTP 轮询始终保留，WebSocket 断开时自动重连并回退，不影响节点工作；
+- 不想使用时设置 `ControllerConfig.DisableWebSocket: true`。
+
+面板侧要点：若 Xboard 用自定义 compose 以 `octane:start` 覆盖了启动命令，内置的 Caddy 与 ws-server 不会启动，需要单独运行 `php artisan ws-server start` 并在 Nginx 中把 `/ws` 反代到它（`proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`）。
+
 ### 规则与行为说明
 
 - **路由顺序**：节点安全规则（内网屏蔽）→ 面板路由 / 自定义路由 / 本地 RuleList → 全局 `route.json` → 节点兜底出站。所有节点规则都限定在本节点入站上，互不影响。

@@ -107,8 +107,8 @@ func (c *Controller) reportTraffic(ctx context.Context) map[int][2]int64 {
 }
 
 func (c *Controller) reportAlive(ctx context.Context) {
-	if c.limiterIn == nil {
-		return
+	if c.limiterIn == nil || c.wsConnected() {
+		return // devices go over the WebSocket while it is up
 	}
 	alive := c.limiterIn.AliveIPs(c.interval(false))
 	if len(alive) == 0 {
