@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/viper"
 
+	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/node"
 )
 
@@ -22,6 +23,49 @@ type Config struct {
 	ConnectionConfig   *ConnectionConfig `mapstructure:"ConnectionConfig"`
 	CertDir            string            `mapstructure:"CertDir"`
 	NodesConfig        []*NodesConfig    `mapstructure:"Nodes"`
+	Agent              *AgentConfig      `mapstructure:"Agent"`
+}
+
+// AgentConfig configures the in-process agent: a declarative kernel manager
+// that applies a desired state (from Agent.DesiredPath) to the configured
+// engines. It is independent of the Xboard Nodes; either may be configured.
+type AgentConfig struct {
+	Enabled bool `mapstructure:"Enabled"`
+	// StateDir holds the agent's state files and per-driver directories.
+	// Default: a "state" directory next to the config file.
+	StateDir string `mapstructure:"StateDir"`
+	// ManifestPath is the signed kernel manifest. Empty: only the builtin xray
+	// engine is available (no external kernel can be installed).
+	ManifestPath string `mapstructure:"ManifestPath"`
+	// ManifestKeysPath is an optional file of extra trusted ed25519 public
+	// keys (hex, one per line), added to the keys compiled into the binary.
+	// For local/self-hosted use; production should inject keys with ldflags.
+	ManifestKeysPath string `mapstructure:"ManifestKeysPath"`
+	// KernelsDir is where external kernels are installed.
+	// Default: StateDir/kernels.
+	KernelsDir string `mapstructure:"KernelsDir"`
+	// DesiredPath is a JSON file holding a spec.Desired. When set, the agent
+	// applies it at start-up and re-applies it (debounced) on every change.
+	DesiredPath string `mapstructure:"DesiredPath"`
+	// Policy is the local root-of-trust policy; remote desired state can never
+	// relax it.
+	Policy *AgentPolicy `mapstructure:"Policy"`
+}
+
+// AgentPolicy maps agent/spec.Policy fields onto the config file. A zero value
+// keeps the agent defaults (loopback-only listeners, ports >= 1024, ...).
+type AgentPolicy struct {
+	MaxInstances             int      `mapstructure:"MaxInstances"`
+	MaxPortsPerInstance      int      `mapstructure:"MaxPortsPerInstance"`
+	AllowListen              []string `mapstructure:"AllowListen"`
+	PrivilegedPorts          bool     `mapstructure:"PrivilegedPorts"`
+	PortRange                []int    `mapstructure:"PortRange"` // [lo, hi]
+	DenyPorts                []int    `mapstructure:"DenyPorts"`
+	DenyCIDRs                []string `mapstructure:"DenyCIDRs"`
+	AllowPrivate             bool     `mapstructure:"AllowPrivate"`
+	AllowAnyTarget           bool     `mapstructure:"AllowAnyTarget"`
+	AllowAcceptProxyOnPublic bool     `mapstructure:"AllowAcceptProxyOnPublic"`
+	AllowEngines             []string `mapstructure:"AllowEngines"`
 }
 
 // NodesConfig is one entry of Nodes.
@@ -73,7 +117,23 @@ func LoadConfig(path string) (*Config, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	cfg.resolvePaths(path)
 	return cfg, nil
+}
+
+// resolvePaths fills the agent's path defaults relative to the config file.
+// It runs after validate so it never hides a config error.
+func (c *Config) resolvePaths(configPath string) {
+	if c.Agent == nil {
+		return
+	}
+	base := filepath.Dir(configPath)
+	if c.Agent.StateDir == "" {
+		c.Agent.StateDir = filepath.Join(base, "state")
+	}
+	if c.Agent.KernelsDir == "" {
+		c.Agent.KernelsDir = filepath.Join(c.Agent.StateDir, "kernels")
+	}
 }
 
 func (c *Config) validate() error {
@@ -83,8 +143,15 @@ func (c *Config) validate() error {
 	if c.ConnectionConfig == nil {
 		c.ConnectionConfig = &ConnectionConfig{Handshake: 4, ConnIdle: 30, UplinkOnly: 2, DownlinkOnly: 4, BufferSize: 64}
 	}
-	if len(c.NodesConfig) == 0 {
-		return fmt.Errorf("config: no Nodes configured")
+	// D-F: a machine may run the agent without any Xboard node, so an empty
+	// Nodes list is only an error when neither Nodes nor the agent is enabled.
+	if len(c.NodesConfig) == 0 && (c.Agent == nil || !c.Agent.Enabled) {
+		return fmt.Errorf("config: no Nodes configured and Agent.Enabled is not set (configure Nodes, or an Agent)")
+	}
+	if c.Agent != nil {
+		if err := c.Agent.validate(); err != nil {
+			return err
+		}
 	}
 	seen := make(map[string]bool)
 	for i, n := range c.NodesConfig {
@@ -128,4 +195,50 @@ func merge(dst, src *node.Config) {
 	if dst.DNSType == "" {
 		dst.DNSType = defaults.DNSType
 	}
+}
+
+// validate checks the agent section. It is deliberately shallow: the policy is
+// parsed in full by the agent core when a desired state is applied.
+func (a *AgentConfig) validate() error {
+	if !a.Enabled {
+		return nil
+	}
+	if a.Policy != nil {
+		if n := len(a.Policy.PortRange); n != 0 && n != 2 {
+			return fmt.Errorf("config: Agent.Policy.PortRange must have two elements [lo, hi], got %d", n)
+		}
+		for _, e := range a.Policy.AllowEngines {
+			switch e {
+			case spec.EngineAuto, spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm:
+			default:
+				return fmt.Errorf("config: Agent.Policy.AllowEngines: unknown engine %q", e)
+			}
+		}
+	}
+	return nil
+}
+
+// PolicySpec maps the config policy onto the agent core's policy. A nil policy
+// yields the zero spec.Policy, which the core normalises to safe defaults.
+func (a *AgentConfig) PolicySpec() spec.Policy {
+	if a == nil || a.Policy == nil {
+		return spec.Policy{}
+	}
+	p := a.Policy
+	out := spec.Policy{
+		MaxInstances:             p.MaxInstances,
+		MaxPortsPerInstance:      p.MaxPortsPerInstance,
+		AllowListen:              append([]string(nil), p.AllowListen...),
+		PrivilegedPorts:          p.PrivilegedPorts,
+		DenyPorts:                append([]int(nil), p.DenyPorts...),
+		DenyCIDRs:                append([]string(nil), p.DenyCIDRs...),
+		AllowPrivate:             p.AllowPrivate,
+		AllowAnyTarget:           p.AllowAnyTarget,
+		AllowAcceptProxyOnPublic: p.AllowAcceptProxyOnPublic,
+		AllowEngines:             append([]string(nil), p.AllowEngines...),
+	}
+	if len(p.PortRange) == 2 {
+		out.PortRange = [2]int{p.PortRange[0], p.PortRange[1]}
+	}
+	return out
 }

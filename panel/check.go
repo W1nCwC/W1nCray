@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	xlog "github.com/xtls/xray-core/common/log"
@@ -24,6 +25,11 @@ func Check(path string, online bool, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "配置文件: %s（%d 个节点）\n", path, len(cfg.NodesConfig))
 	failed := false
+	if cfg.Agent != nil && cfg.Agent.Enabled {
+		if err := checkAgent(w, cfg); err != nil {
+			failed = true
+		}
+	}
 	quietKernelLog()
 
 	var ns []core.NameServer
@@ -74,6 +80,37 @@ func Check(path string, online bool, w io.Writer) error {
 		return errors.New("检查未通过")
 	}
 	fmt.Fprintln(w, "检查通过")
+	return nil
+}
+
+// checkAgent reports the agent section and verifies the files it references.
+// A missing manifest is not fatal (only the builtin xray engine runs then),
+// but a configured path that does not exist is.
+func checkAgent(w io.Writer, cfg *Config) error {
+	a := cfg.Agent
+	fmt.Fprintf(w, "  Agent: 已启用（状态目录 %s，内核目录 %s）\n", a.StateDir, a.KernelsDir)
+	if a.ManifestPath == "" {
+		fmt.Fprintln(w, "  ! Agent.ManifestPath 未设置：仅内嵌 xray 引擎可用")
+	} else if _, err := os.Stat(a.ManifestPath); err != nil {
+		fmt.Fprintf(w, "  ✗ Agent.ManifestPath: %v\n", err)
+		return err
+	} else {
+		fmt.Fprintf(w, "  ✓ Agent.ManifestPath: %s\n", a.ManifestPath)
+	}
+	if a.ManifestKeysPath != "" {
+		if _, err := os.Stat(a.ManifestKeysPath); err != nil {
+			fmt.Fprintf(w, "  ✗ Agent.ManifestKeysPath: %v\n", err)
+			return err
+		}
+		fmt.Fprintf(w, "  ✓ Agent.ManifestKeysPath: %s\n", a.ManifestKeysPath)
+	}
+	if a.DesiredPath != "" {
+		if _, err := os.Stat(a.DesiredPath); err != nil {
+			fmt.Fprintf(w, "  ! Agent.DesiredPath 不存在（启动时不会应用）: %v\n", err)
+		} else {
+			fmt.Fprintf(w, "  ✓ Agent.DesiredPath: %s\n", a.DesiredPath)
+		}
+	}
 	return nil
 }
 

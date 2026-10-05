@@ -11,6 +11,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/W1nCwC/W1nCray/agent/bootstrap"
 	"github.com/W1nCwC/W1nCray/common/cert"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/node"
@@ -24,6 +25,7 @@ type Panel struct {
 	cfg     *Config
 	core    *core.Core
 	nodes   []*node.Controller
+	agent   *bootstrap.Runtime
 	running bool
 
 	reloadCh chan string
@@ -111,9 +113,40 @@ func (p *Panel) start() error {
 			log.WithField("node", n.Tag()).Errorf("start: %v", err)
 		}
 	}
+	// The agent runs on top of the same Xray instance. A boot failure is
+	// logged, not fatal: the panel nodes keep serving.
+	if cfg.Agent != nil && cfg.Agent.Enabled {
+		rt, err := bootstrap.Boot(bootstrap.Options{
+			StateDir:         cfg.Agent.StateDir,
+			KernelsDir:       cfg.Agent.KernelsDir,
+			ManifestPath:     cfg.Agent.ManifestPath,
+			ManifestKeysPath: cfg.Agent.ManifestKeysPath,
+			Policy:           cfg.Agent.PolicySpec(),
+			Log:              log.StandardLogger(),
+		}, cr)
+		if err != nil {
+			log.Errorf("agent: boot: %v", err)
+		} else {
+			p.agent = rt
+			if cfg.Agent.DesiredPath != "" {
+				p.applyAgentDesiredLocked(cfg.Agent.DesiredPath, rt)
+			}
+		}
+	}
 	p.core, p.nodes, p.running = cr, nodes, true
 	log.Infof("W1nCray started with %d node(s)", len(nodes))
 	return nil
+}
+
+// applyAgentDesiredLocked applies a desired-state file and logs the outcome.
+// The caller must hold p.mu.
+func (p *Panel) applyAgentDesiredLocked(path string, rt *bootstrap.Runtime) {
+	rep, err := rt.ApplyFile(path)
+	if err != nil {
+		log.Errorf("agent: apply %s: %v", path, err)
+		return
+	}
+	log.Infof("agent: %s: %s (%d instance(s))", path, rep.Status, len(rep.Instances))
 }
 
 func (p *Panel) shutdown() {
@@ -131,6 +164,16 @@ func (p *Panel) shutdown() {
 		}(n)
 	}
 	wg.Wait()
+	// The agent's kernels may live in the Xray instance, so stop them before
+	// closing it.
+	if p.agent != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := p.agent.Shutdown(ctx); err != nil {
+			log.Errorf("agent: shutdown: %v", err)
+		}
+		cancel()
+		p.agent = nil
+	}
 	// Closing the instance does not end accepted connections; abort the
 	// tracked ones (none unless a tag prefix is watched) so that a reload does
 	// not leave sessions of the old instance behind.
@@ -202,8 +245,15 @@ func (p *Panel) watch() {
 	if w != nil {
 		events, errs = w.Events, w.Errors
 	}
+	// The desired-state file is watched too, but a change applies the agent
+	// state instead of reloading the panel. Debounce both.
+	desiredAbs := ""
+	if dp := p.agentDesiredPath(); dp != "" {
+		desiredAbs, _ = filepath.Abs(dp)
+	}
 
 	var debounce <-chan time.Time
+	var desiredDebounce <-chan time.Time
 	for {
 		select {
 		case <-p.stop:
@@ -212,16 +262,44 @@ func (p *Panel) watch() {
 			p.reload(reason)
 		case ev := <-events:
 			abs, _ := filepath.Abs(ev.Name)
-			if watched[abs] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+			if desiredAbs != "" && abs == desiredAbs {
+				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+					desiredDebounce = time.After(500 * time.Millisecond)
+				}
+			} else if watched[abs] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
 				debounce = time.After(2 * time.Second)
 			}
 		case err := <-errs:
 			log.Warnf("config watcher: %v", err)
+		case <-desiredDebounce:
+			desiredDebounce = nil
+			p.applyAgentDesired()
 		case <-debounce:
 			debounce = nil
 			p.reload("config file changed")
 		}
 	}
+}
+
+// applyAgentDesired applies the current desired-state file, if the agent is
+// running. It is called from the watcher goroutine.
+func (p *Panel) applyAgentDesired() {
+	p.mu.Lock()
+	rt := p.agent
+	var path string
+	if p.cfg.Agent != nil {
+		path = p.cfg.Agent.DesiredPath
+	}
+	p.mu.Unlock()
+	if rt == nil || path == "" {
+		return
+	}
+	rep, err := rt.ApplyFile(path)
+	if err != nil {
+		log.Errorf("agent: apply %s: %v", path, err)
+		return
+	}
+	log.Infof("agent: %s: %s", path, rep.Status)
 }
 
 func (p *Panel) watchedFiles() []string {
@@ -238,7 +316,20 @@ func (p *Panel) watchedFiles() []string {
 			files = append(files, n.ApiConfig.RuleListPath)
 		}
 	}
+	if p.cfg.Agent != nil && p.cfg.Agent.DesiredPath != "" {
+		files = append(files, p.cfg.Agent.DesiredPath)
+	}
 	return files
+}
+
+// agentDesiredPath returns the configured desired-state file ("" if none).
+func (p *Panel) agentDesiredPath() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cfg.Agent == nil {
+		return ""
+	}
+	return p.cfg.Agent.DesiredPath
 }
 
 func certDir(path string, cfg *Config) string {

@@ -159,6 +159,36 @@ Xboard 开启节点 WebSocket 后（后台开关 + 运行 `ws-server`），W1nCr
 
 面板侧要点：若 Xboard 用自定义 compose 以 `octane:start` 覆盖了启动命令，内置的 Caddy 与 ws-server 不会启动，需要单独运行 `php artisan ws-server start` 并在 Nginx 中把 `/ws` 反代到它（`proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`）。
 
+### Agent（内置内核管理）
+
+除了 Xboard 节点，W1nCray 还能以“Agent”方式运行：读取一个声明式的期望状态（`spec.Desired` JSON），在本机把转发实例落到内嵌的 xray 引擎或外部内核（gost / frp / realm）上。它与 `Nodes` 相互独立，可以只配 Agent 不配 Nodes。
+
+```yaml
+Agent:
+  Enabled: true
+  # 期望状态文件；修改后自动（去抖 500ms）重新应用，无需整机重载
+  DesiredPath: /etc/W1nCray/desired.json
+  # 已签名的内核清单；不设置时只有内嵌 xray 引擎可用
+  ManifestPath: /etc/W1nCray/manifest.json
+  # 额外信任的 ed25519 公钥（每行一个 hex），叠加在内嵌密钥之上；本地/自托管用
+  ManifestKeysPath: /etc/W1nCray/keys.txt
+  # 默认：StateDir=配置目录/state，KernelsDir=StateDir/kernels
+  StateDir: /etc/W1nCray/state
+  KernelsDir: /etc/W1nCray/state/kernels
+  # 本地根信任策略，远端下发的期望状态永远无法放宽它
+  Policy:
+    AllowListen: ["0.0.0.0"]      # 允许监听的地址，默认 ["127.0.0.1"]
+    PrivilegedPorts: false         # 是否允许 <1024 端口
+    PortRange: [20000, 40000]      # 允许的监听端口区间，0 表示不限
+    AllowPrivate: false            # 是否允许转发到私网目标
+    AllowEngines: []               # 允许的引擎，空=全部已安装
+```
+
+- **引擎**：`xray` 是内嵌内核（无需安装，`External: false`）；`gost`、`frp`、`realm` 需要从签名清单安装二进制。清单里的版本、URL、哈希都以清单为准，期望状态只能指定版本号。
+- **信任根**：内嵌公钥（`kernel/manifest/trusted_keys.txt`）是生产信任根，发布时用 `-ldflags "-X github.com/W1nCwC/W1nCray/kernel/manifest.ExtraKeys=<hex>,<hex>"` 注入。`ManifestKeysPath` 用于本地/自托管阶段补充密钥；两者都没有时，任何清单都会被拒绝（fail-closed，这是预期行为）。
+- **热载**：`DesiredPath` 变更（含 `W1nCray` 自身的重载）触发一次应用；失败会回滚到上一个可用状态，并把失败的期望状态“冻结”，直到内容变化。
+- **手动应用**：`W1nCray agent-apply -f desired.json` 应用一次并打印 JSON 报告（报告不含任何 secret）。它不注册内嵌 xray 引擎，只用于外部内核；已启动的内核在命令退出后继续运行。
+
 ### 规则与行为说明
 
 - **路由顺序**：节点安全规则（内网屏蔽）→ 面板路由 / 自定义路由 / 本地 RuleList → 全局 `route.json` → 节点兜底出站。所有节点规则都限定在本节点入站上，互不影响。
