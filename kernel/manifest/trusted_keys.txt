@@ -1,0 +1,9 @@
+# W1nCray kernel-manifest trust root: ed25519 public keys, one 64-hex-digit key
+# per line ("<hex> # comment"). The matching private keys are held offline by
+# the release owner and are NOT in this repository.
+#
+# PLACEHOLDER: no production key has been generated yet, so a binary built from
+# this tree rejects every manifest (kernel.ErrNoTrustedKeys, fail-closed).
+# Generate two with:   go run ./tools/manifestgen keygen -out <file>
+# and list both here (primary + rotation spare) before cutting a release, or
+# inject them at link time through manifest.ExtraKeys.
