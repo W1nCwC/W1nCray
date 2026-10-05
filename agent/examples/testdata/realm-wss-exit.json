@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "realm-tun",
+      "name": "realm隧道出口（机器B）：需公共CA签发的证书文件，与entry文件成对",
+      "enabled": true,
+      "engine": "realm",
+      "kind": "tunnel_exit",
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.90", "ports": "443" }],
+      "tunnel": {
+        "type": "wss",
+        "listen": "0.0.0.0:21101",
+        "host": "relay.example.com",
+        "path": "/realm",
+        "cert": {
+          "mode": "file",
+          "cert_file": "/etc/ssl/relay/fullchain.pem",
+          "key_file": "/etc/ssl/relay/privkey.pem"
+        }
+      },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

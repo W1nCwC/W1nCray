@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "range-1to1",
+      "name": "端口范围一一映射：20100-20109对应30100-30109",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "20100-20109" },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.20", "ports": "30100-30109" }]
+    }
+  ]
+}

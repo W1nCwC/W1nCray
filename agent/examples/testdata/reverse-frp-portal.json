@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "frp-nas",
+      "name": "frp反向代理公网端（portal）：与bridge文件成对",
+      "enabled": true,
+      "engine": "frp",
+      "kind": "reverse_portal",
+      "listen": { "addr": "0.0.0.0", "ports": "20950-20951" },
+      "network": ["tcp"],
+      "tunnel": {
+        "type": "tls",
+        "listen": "0.0.0.0:20959",
+        "security": "tls",
+        "cert": { "mode": "self" }
+      },
+      "reverse": { "link": "frp-nas" },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

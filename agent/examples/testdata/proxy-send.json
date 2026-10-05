@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "proxy-send",
+      "name": "发送PROXY协议v2：目标服务据此看到真实客户端IP",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "20600" },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.60", "ports": "443" }],
+      "proxy_protocol_out": 2
+    }
+  ]
+}

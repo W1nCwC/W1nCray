@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "tun-pin",
+      "name": "隧道出口（机器B）：自签证书，入口按指纹校验，与entry文件成对",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "tunnel_exit",
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.71", "ports": "443" }],
+      "tunnel": {
+        "type": "wss",
+        "listen": "0.0.0.0:20711",
+        "host": "relay.example.com",
+        "sni": "relay.example.com",
+        "path": "/w1n",
+        "security": "tls_pin",
+        "pin_sha256": "aff01cb372788295283a4aa4c92f8c6a6855f412b1974fb93c0fa51374620116",
+        "cert": { "mode": "self" }
+      },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

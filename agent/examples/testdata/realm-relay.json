@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "realm-tcpudp",
+      "name": "realm小设备纯中继：TCP加UDP单目标",
+      "enabled": true,
+      "engine": "realm",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "21000" },
+      "network": ["tcp", "udp"],
+      "targets": [{ "host": "203.0.113.80", "ports": "443" }],
+      "idle_profile": "udp_long"
+    },
+    {
+      "id": "realm-rr",
+      "name": "realm轮询（权重2比1）加发送PROXY v1，无健康检查",
+      "enabled": true,
+      "engine": "realm",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "21001" },
+      "network": ["tcp"],
+      "targets": [
+        { "host": "203.0.113.81", "ports": "8080", "weight": 2 },
+        { "host": "203.0.113.82", "ports": "8080", "weight": 1 }
+      ],
+      "balance": { "strategy": "round_robin" },
+      "proxy_protocol_out": 1
+    }
+  ]
+}
