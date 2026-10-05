@@ -85,6 +85,12 @@ func (c *Core) Conns() *dispatcher.ConnTracker {
 	return c.conns
 }
 
+// Stats returns the stats manager of the instance. It is the manager of the
+// "stats": {} section of the generated config, so it is never nil after New.
+func (c *Core) Stats() stats.Manager {
+	return c.stats
+}
+
 // New builds (but does not start) the Xray instance.
 func New(opts Options) (*Core, error) {
 	cfgJSON, rm, err := buildConfig(opts)
