@@ -45,6 +45,13 @@ func init() {
 type Dispatcher struct {
 	inner   routing.Dispatcher
 	limiter atomic.Pointer[limiter.Limiter]
+	tracker ConnTracker
+}
+
+// Tracker returns the connection tracker of this dispatcher. Nothing is
+// tracked until a tag prefix is passed to its Watch method.
+func (d *Dispatcher) Tracker() *ConnTracker {
+	return &d.tracker
 }
 
 // SetLimiter attaches the limiter. Until it is set, connections pass through.
@@ -103,9 +110,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dest net.Destination) (*trans
 	if err != nil {
 		return nil, err
 	}
+	ctx, untrack := d.tracker.track(ctx)
 	link, err := d.inner.Dispatch(ctx, dest)
 	if err != nil {
 		sess.Release()
+		if untrack != nil {
+			untrack()
+		}
 		return nil, err
 	}
 	if sess == nil {
@@ -143,6 +154,11 @@ func (d *Dispatcher) DispatchLink(ctx context.Context, dest net.Destination, lin
 	sess, err := d.admit(ctx)
 	if err != nil {
 		return err
+	}
+	// DispatchLink returns when the session is over.
+	ctx, untrack := d.tracker.track(ctx)
+	if untrack != nil {
+		defer untrack()
 	}
 	if sess != nil {
 		context.AfterFunc(ctx, sess.Release)

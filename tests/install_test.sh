@@ -264,8 +264,49 @@ t_verify() {
 	echo tampered >>"$W1NCRAY_ROOT/f.gz"
 	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >/dev/null 2>&1 && fail "tampered file accepted" || pass "tampered file is rejected"
 	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-nothere.gz v1 ) >/dev/null 2>&1 && fail "missing entry accepted" || pass "missing checksum entry is rejected"
+	# Fail closed: anything that prevents a real check is a refusal.
+	printf '%s *short.gz\n%s *bad.gz\n%s *empty.gz\n' abc zzzz "" >"$W1NCRAY_ROOT/release/SHA256SUMS"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" short.gz v1 ) >/dev/null 2>&1 && fail "truncated checksum accepted" || pass "truncated checksum value is rejected"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" bad.gz v1 ) >/dev/null 2>&1 && fail "non-hex checksum accepted" || pass "non-hex checksum value is rejected"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" empty.gz v1 ) >/dev/null 2>&1 && fail "empty checksum accepted" || pass "empty checksum value is rejected"
 	rm -f "$W1NCRAY_ROOT/release/SHA256SUMS"
-	check "a release without SHA256SUMS is let through with a notice" verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "missing SHA256SUMS accepted" || pass "a release without SHA256SUMS is refused"
+	has "the refusal names the opt-out" "$(cat "$W1NCRAY_ROOT/out")" "--insecure-skip-verify"
+	h="$(sha256sum "$W1NCRAY_ROOT/f.gz" | awk '{print $1}')"
+	printf '%s *W1nCray-linux-amd64.gz\n' "$h" >"$W1NCRAY_ROOT/release/SHA256SUMS"
+	( have_sha256sum() { return 1; }; verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "missing sha256sum accepted" || pass "a missing sha256sum is refused"
+	has "the refusal names sha256sum" "$(cat "$W1NCRAY_ROOT/out")" "sha256sum"
+	# Upper-case hex digests are accepted when they match.
+	printf '%s *W1nCray-linux-amd64.gz\n' "$(printf '%s' "$h" | tr 'a-f' 'A-F')" >"$W1NCRAY_ROOT/release/SHA256SUMS"
+	check "an upper-case digest that matches passes" verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1
+}
+
+t_verify_opt_out() {
+	mock_downloads
+	echo "payload" >"$W1NCRAY_ROOT/f.gz"
+	# No SHA256SUMS at all, and the file would not match anyway.
+	INSECURE_SKIP_VERIFY=1
+	out="$(verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 2>&1)"
+	eq "--insecure-skip-verify skips the check" "$?" 0
+	has "the skip is announced as a warning" "$out" "警告"
+	has "the warning names the flag" "$out" "--insecure-skip-verify"
+	hasnt "nothing is downloaded when skipping" "$(cat "$DL_LOG")" "SHA256SUMS"
+	mkdir -p "$W1NCRAY_ROOT/release"
+	printf '%s *W1nCray-linux-amd64.gz\n' 0000000000000000000000000000000000000000000000000000000000000000 >"$W1NCRAY_ROOT/release/SHA256SUMS"
+	check "a mismatching file passes only with the opt-out" verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1
+	INSECURE_SKIP_VERIFY=0
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >/dev/null 2>&1 && fail "mismatch accepted without the opt-out" || pass "the same file is refused without the opt-out"
+	# The environment variable is read when the script is sourced.
+	env_opt_out() { # value of W1NCRAY_INSECURE_SKIP_VERIFY ("-" = unset)
+		if [ "$1" = - ]; then
+			( unset W1NCRAY_INSECURE_SKIP_VERIFY; . "$SCRIPT"; echo "$INSECURE_SKIP_VERIFY" )
+		else
+			( W1NCRAY_INSECURE_SKIP_VERIFY="$1"; . "$SCRIPT"; echo "$INSECURE_SKIP_VERIFY" )
+		fi
+	}
+	eq "env opt-out is off by default" "$(env_opt_out -)" 0
+	eq "W1NCRAY_INSECURE_SKIP_VERIFY=1 opts out" "$(env_opt_out 1)" 1
+	eq "any other value does not opt out" "$(env_opt_out yes)" 0
 }
 
 t_generated_scripts() {
@@ -448,6 +489,45 @@ t_install_from_release() {
 	( cmd_install --version v1.2.3 --lite --no-geo ) >/dev/null 2>&1 && fail "tampered release installed" || pass "tampered release is refused"
 	eq "binary unchanged after a refused install" "$(cat "$BIN")" "$before"
 	hasnt "no temp download dir left after a failure" "$(ls -a "$BIN_DIR")" ".dl."
+}
+
+t_install_verify_policy() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	before="$(cat "$BIN")"
+	# The release has the asset but no SHA256SUMS.
+	mkdir -p "$W1NCRAY_ROOT/release"
+	printf '#!/bin/sh\necho "W1nCray vNEW"\n' >"$W1NCRAY_ROOT/newbin"
+	gzip -c "$W1NCRAY_ROOT/newbin" >"$W1NCRAY_ROOT/release/W1nCray-linux-amd64.gz"
+
+	( cmd_install --version v1.2.3 --no-geo ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "unverifiable release installed" || pass "a release without SHA256SUMS is refused"
+	has "the refusal names the opt-out" "$(cat "$W1NCRAY_ROOT/out")" "--insecure-skip-verify"
+	eq "binary unchanged after the refusal" "$(cat "$BIN")" "$before"
+	hasnt "no temp download dir left after the refusal" "$(ls -a "$BIN_DIR")" ".dl."
+
+	( cmd_update --version v1.2.3 --no-geo ) >/dev/null 2>&1 && fail "update installed an unverifiable release" || pass "update refuses it as well"
+	eq "binary unchanged after the refused update" "$(cat "$BIN")" "$before"
+
+	( cmd_install --version v1.2.3 --no-geo --insecure-skip-verify ) >"$W1NCRAY_ROOT/out" 2>&1
+	eq "--insecure-skip-verify installs it" "$?" 0
+	has "and warns loudly" "$(cat "$W1NCRAY_ROOT/out")" "警告"
+	eq "the new binary is in place" "$("$BIN" version)" "W1nCray vNEW"
+
+	# The opt-out can also come from the environment.
+	printf '%s' "$before" >"$BIN"
+	( INSECURE_SKIP_VERIFY=1; cmd_install --version v1.2.3 --no-geo ) >/dev/null 2>&1
+	eq "the environment opt-out installs it" "$("$BIN" version)" "W1nCray vNEW"
+
+	# Files given by the user (--binary) were never checked and still work.
+	printf '%s' "$before" >"$BIN"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	eq "--binary needs no checksum" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
+	has "help documents the flag" "$(usage)" "--insecure-skip-verify"
 }
 
 t_update_version_shorthand() {
@@ -652,9 +732,9 @@ run() { # name
 	)
 }
 
-for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_generated_scripts \
+for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_verify_opt_out t_generated_scripts \
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
-	t_install_flavor_prefix_upgrade t_install_from_release t_update_version_shorthand t_space_check t_switch_rollback \
+	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
 	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend; do
 	run "$t"
 done

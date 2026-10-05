@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/xtls/xray-core/infra/conf"
 
 	"github.com/W1nCwC/W1nCray/node"
 )
@@ -192,4 +195,93 @@ Nodes:
 	}
 	listening()
 	_ = node.DefaultConfig
+}
+
+// D-C: closing the instance (shutdown, and with it every reload) must abort
+// the tracked connections; Xray itself leaves accepted connections running.
+func TestPanelShutdownAbortsTrackedConns(t *testing.T) {
+	nodePort := freePort(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			fmt.Fprintf(w, `{"protocol":"vmess","server_port":%d,"network":"tcp","tls":0,"routes":[],"base_config":{"push_interval":60,"pull_interval":60}}`, nodePort)
+		case strings.HasSuffix(r.URL.Path, "/user"):
+			io.WriteString(w, `{"users":[{"id":1,"uuid":"7f6fd2d2-9a3d-4a8e-9f5b-1c2d3e4f5a6b"}]}`)
+		default:
+			io.WriteString(w, `{"data":true}`)
+		}
+	}))
+	defer srv.Close()
+	path := filepath.Join(t.TempDir(), "config.yml")
+	os.WriteFile(path, []byte(fmt.Sprintf(`
+Nodes:
+  - PanelType: Xboard
+    ApiConfig: {ApiHost: "%s", ApiKey: k, NodeID: 1}
+    ControllerConfig: {ListenIP: 127.0.0.1}
+`, srv.URL)), 0o600)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New(path, cfg)
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+
+	p.mu.Lock()
+	cr := p.core
+	p.mu.Unlock()
+	cr.Conns().Watch("fwd-")
+	fwd := freePort(t)
+	var ic conf.InboundDetourConfig
+	if err := json.Unmarshal([]byte(fmt.Sprintf(`{"tag":"fwd-1","listen":"127.0.0.1","port":%d,"protocol":"dokodemo-door",
+		"settings":{"address":"127.0.0.1","port":%d,"network":"tcp"}}`, fwd, echo.Addr().(*net.TCPAddr).Port)), &ic); err != nil {
+		t.Fatal(err)
+	}
+	hc, err := ic.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cr.AddInbound(hc); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", fwd), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	conn.Write([]byte("ping"))
+	if _, err := io.ReadFull(conn, make([]byte, 4)); err != nil {
+		t.Fatalf("echo: %v", err)
+	}
+	if cr.Conns().Active("fwd-1") != 1 {
+		t.Fatalf("Active = %d, want 1", cr.Conns().Active("fwd-1"))
+	}
+
+	p.shutdown()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("unexpected data after shutdown")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("tracked connection survived shutdown")
+	}
 }
