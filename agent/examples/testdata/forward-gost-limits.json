@@ -14,7 +14,10 @@
         { "host": "203.0.113.14", "ports": "443" },
         { "host": "203.0.113.15", "ports": "443" }
       ],
-      "balance": { "strategy": "failover" },
+      "balance": {
+        "strategy": "failover",
+        "health": { "type": "tcp", "interval_s": 30, "max_fails": 3 }
+      },
       "limits": { "max_conns": 200, "rate_up_bps": 8000000, "rate_down_bps": 8000000 }
     }
   ]

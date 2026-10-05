@@ -65,8 +65,13 @@ func capsReason(c driver.Caps, in spec.Instance, requireStats bool) string {
 		if !hasString(c.Balance, b.Strategy) {
 			return fmt.Sprintf("balance strategy %q is not supported", b.Strategy)
 		}
-		if b.Health != nil && c.HealthCheck != "active" {
-			return "active health checks are not supported"
+		// An engine with passive ejection (gost) honours a health section
+		// in its own way and its driver accepts it, so it is not refused
+		// here; selectEngine prefers an active engine in "auto" mode and
+		// reports when it had to settle for a passive one. Only an engine
+		// without any failure detection refuses.
+		if b.Health != nil && c.HealthCheck != "active" && c.HealthCheck != "passive" {
+			return "health checks are not supported (the engine has no failure detection)"
 		}
 	}
 	if requireStats && (c.Stats == "" || c.Stats == "none") {
@@ -167,16 +172,34 @@ func (r *Reconciler) selectEngine(in spec.Instance, pol spec.Policy) (selection,
 		sel.considered = nil
 		return sel, nil
 	}
+	wantHealth := in.Balance != nil && in.Balance.Health != nil
+	passive := "" // first engine that could run it with passive health only
 	for _, name := range r.engineOrder() {
 		why := r.evaluate(name, in, pol)
-		if why == "" {
-			sel.engine = name
-			if len(sel.considered) == 0 {
-				sel.considered = nil
-			}
-			return sel, nil
+		if why != "" {
+			sel.considered[name] = why
+			continue
 		}
-		sel.considered[name] = why
+		if wantHealth && r.Drivers[name].Caps().HealthCheck != "active" {
+			// Capable, but it only ejects failing targets from the traffic
+			// it sees. Keep looking for active probing; settle for this
+			// engine (loudly) only if nothing better exists.
+			sel.considered[name] = "only passive health checks (no active probing); an engine with active checks is preferred"
+			if passive == "" {
+				passive = name
+			}
+			continue
+		}
+		sel.engine = name
+		if len(sel.considered) == 0 {
+			sel.considered = nil
+		}
+		return sel, nil
+	}
+	if passive != "" {
+		sel.engine = passive
+		sel.considered[passive] = "selected with passive health checks only: failing targets are ejected by observed traffic errors, no engine with active probing can run this instance"
+		return sel, nil
 	}
 	if len(sel.considered) == 0 {
 		return sel, fmt.Errorf("no engine is available to run this instance")

@@ -315,7 +315,7 @@ func TestExplicitEngineCapabilityRefusals(t *testing.T) {
 			in.Targets = append(in.Targets, spec.Target{Host: "198.51.100.11", Ports: "443"})
 			in.Balance = &spec.Balance{Strategy: "round_robin", Health: &spec.Health{Type: "tcp"}}
 			return in
-		}, nil, "active health checks are not supported"},
+		}, nil, "health checks are not supported"},
 		{"strategy", func(t *testing.T) spec.Instance {
 			in := realmFwd(t)
 			in.Balance = &spec.Balance{Strategy: "failover"}

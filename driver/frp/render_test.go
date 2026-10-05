@@ -291,6 +291,43 @@ func TestCapsAreConsistent(t *testing.T) {
 	}
 }
 
+// TestCapsBalanceMatchesValidate keeps Caps.Balance/HealthCheck honest: the
+// agent decides "greyed out" features from Caps alone, so a strategy is
+// declared exactly when a bridge accepts it, and the declared active health
+// check is the frpc healthCheck the e2e suite exercises.
+func TestCapsBalanceMatchesValidate(t *testing.T) {
+	c := New().Caps()
+	if c.HealthCheck != "active" {
+		t.Fatalf("HealthCheck = %q", c.HealthCheck)
+	}
+	for _, s := range []string{"round_robin", "random", "iphash", "failover", "least_ping"} {
+		in := bridgeInst()
+		in.Network = []string{"tcp"}
+		in.Balance = &spec.Balance{Strategy: s}
+		declared := false
+		for _, d := range c.Balance {
+			declared = declared || d == s
+		}
+		err := New().Validate(in)
+		if declared && err != nil {
+			t.Fatalf("declared strategy %s rejected: %v", s, err)
+		}
+		if !declared && err == nil {
+			t.Fatalf("undeclared strategy %s accepted", s)
+		}
+	}
+	if len(c.Balance) != 1 || c.Balance[0] != "failover" {
+		t.Fatalf("Balance = %v, want [failover]", c.Balance)
+	}
+	// failover + active health check, the combination the e2e test runs.
+	in := bridgeInst()
+	in.Network = []string{"tcp"}
+	in.Balance = &spec.Balance{Strategy: "failover", Health: &spec.Health{Type: "tcp", IntervalS: 1, TimeoutS: 1, MaxFails: 1}}
+	if err := New().Validate(in); err != nil {
+		t.Fatalf("failover + health rejected: %v", err)
+	}
+}
+
 func TestBinaries(t *testing.T) {
 	frps, frpc, err := Binaries(filepath.Join("opt", "frp", "0.71.0", "frps"))
 	if err != nil || filepath.Base(frps) != "frps" || filepath.Base(frpc) != "frpc" || filepath.Dir(frps) != filepath.Dir(frpc) {

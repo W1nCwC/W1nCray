@@ -194,7 +194,7 @@ type Policy struct {
 	PrivilegedPorts     bool     `json:"privileged_ports"`
 	PortRange           [2]int   `json:"port_range"` // permitted listen ports, 0 = any
 	DenyPorts           []int    `json:"deny_ports"`
-	DenyCIDRs           []string `json:"deny_cidrs"` // targets, default loopback/link-local/metadata
+	DenyCIDRs           []string `json:"deny_cidrs"` // extra target CIDRs; loopback/link-local/metadata are always denied anyway
 	AllowPrivate        bool     `json:"allow_private"`
 	AllowAnyTarget      bool     `json:"allow_any_target"`
 	// AllowAcceptProxyOnPublic permits accept_proxy_protocol on a

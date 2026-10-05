@@ -56,20 +56,20 @@
 | 反向代理 | 是（但见 §10 的阻塞项） | 是 | 是 | 否 |
 | 接收 PROXY（`accept_proxy_protocol`） | 是 | 是 | **否** | 是 |
 | 发送 PROXY（`proxy_protocol_out`，仅 TCP） | 是 | 是 | 是（仅 bridge） | 是 |
-| 负载均衡策略 | round_robin、random、failover | round_robin、random、iphash、failover | **无**（bridge 每端口一个目标） | round_robin、iphash |
+| 负载均衡策略 | round_robin、random、failover | round_robin、random、iphash、failover | 仅 failover（bridge 每端口一个目标；portal 不接受 `balance`） | round_robin、iphash |
 | 健康检查（`Caps`） | active（仅 tcp） | passive | active（仅 bridge） | none |
 | 统计 | counters | api | api（仅 portal） | **none（不可计量）** |
 | 重载方式 | hot（增删入站，不重启内核） | api（REST 增删 service，不用整体重载） | api（frpc 仅改代理时）；**frps 改动即重启该 portal** | none（**改一个实例即重启该实例的进程，断开它的连接**） |
 | 改动一个实例是否牵连其他实例 | 否 | 否 | 否（一实例一进程） | 否（一实例一进程） |
 | 外部内核 / 安装体积 | 否 / 0 | 是 / ≈50 MB | 是 / ≈36 MB | 是 / ≈6.9 MB |
 
-**`engine: auto`** 在能胜任的引擎里选：内嵌引擎优先，然后按安装体积从小到大，再按名字，即 **xray → realm → frp → gost**。选择结果和被淘汰引擎的原因写在报告的 `engine` / `considered` 里；没有任何引擎能跑时**拒绝**并列出每个引擎的原因，不会降级。注意 `W1nCray agent-apply` 不注册 xray（§7），此时 auto 会落到 realm 等外部引擎。
+**`engine: auto`** 在能胜任的引擎里选：内嵌引擎优先，然后按安装体积从小到大，再按名字，即 **xray → realm → frp → gost**。选择结果和被淘汰引擎的原因写在报告的 `engine` / `considered` 里；没有任何引擎能跑时**拒绝**并列出每个引擎的原因，不会降级。写了 `balance.health` 时，`auto` 优先选主动探测（active）的引擎；只有被动摘除（passive，gost）的引擎能跑时才选它，并在 `considered` 里注明「selected with passive health checks only」；没有故障检测能力（none，realm）的引擎会被拒绝，原因为 `health checks are not supported`。注意 `W1nCray agent-apply` 不注册 xray（§7），此时 auto 会落到 realm 等外部引擎。
 
 各引擎还有这些「表里装不下」的约束（来自驱动的校验代码与文档，`engine` 写错时会收到对应拒绝信息，见 §8）：
 
 - **xray**：不支持 `limits`；`balance.health` 只支持 `type: tcp` 且至少两个目标，`failover` 必须带 `health`；目标权重之和 ≤ 64；多目标只能配单个监听端口；`tunnel.security` 省略时 tls/wss 用 TLS，其余用 VLESS 加密（`vless_enc`），**不接受不加密的 raw 隧道**；自签证书（`cert.mode: self`）必须配 `tls_pin`；`cert.mode` 为 `file` / `panel` 在当前内置装配里不可用（`bootstrap.buildDrivers` 没给 xray 配证书目录和面板证书源）。收 PROXY 头时按实测记录（PLAN-v6 §2.3）无头即断连。
-- **gost**：不支持 `tls_pin`、`vless_enc`、`tunnel.alpn`；权重只对 `random` 策略生效（其他策略写了非 1 的权重会被拒）；`tunnel_exit` / `reverse_portal` 不支持 `proxy_protocol_out` 与 `limits`，portal 不支持 `acl`；`accept_proxy_protocol` 仅限 forward / tunnel_entry；`tunnel_exit` 的目标不能用端口范围；入口方（entry / bridge）不带 `cert` 时用系统根证书严格校验出口，所以出口应使用公共 CA 签发的证书。
-- **frp**：每个 portal 一个 `frps`、每个 bridge 一个 `frpc` 进程；不支持 `acl`、`limits`、`idle_profile`、`allow_any_target`；bridge 只能有一个 target（端口范围须与 `listen.ports` 等长）或用 `port_map`；公共端口不能等于控制端口。**bridge 不校验 portal 的证书**（`validate` 不允许 bridge 带 `tunnel.cert`），TLS 只防窃听、不防中间人；`secret` 即 frp token。
+- **gost**：不支持 `tls_pin`、`vless_enc`、`tunnel.alpn`；权重只对 `random` 策略生效（其他策略写了非 1 的权重会被拒）；`tunnel_exit` / `reverse_portal` 不支持 `proxy_protocol_out` 与 `limits`，portal 不支持 `acl`；`accept_proxy_protocol` 仅限 forward / tunnel_entry；`tunnel_exit` 的目标不能用端口范围；入口方（entry / bridge）不带 `cert` 时用系统根证书严格校验出口，所以出口应使用公共 CA 签发的证书；出口用私有 CA / 自签证书时，入口方写 `tunnel.cert: {mode: "file", cert_file: "<CA 绝对路径>"}` 把它作为信任锚（不能带 `key_file`）。`balance.health` 只支持 `type: tcp`，不接受 `timeout_s` / `probe_url`；这是被动摘除：`max_fails` 次失败后该目标暂时退出轮转，`interval_s` 是它被摘除的时长。
+- **frp**：每个 portal 一个 `frps`、每个 bridge 一个 `frpc` 进程；不支持 `acl`、`limits`、`idle_profile`、`allow_any_target`；bridge 只能有一个 target（端口范围须与 `listen.ports` 等长）或用 `port_map`；公共端口不能等于控制端口。**bridge 默认不校验 portal 的证书**（frp 的默认行为），TLS 只防窃听、不防中间人；要校验就在 bridge 写 `tunnel.cert: {mode: "file", cert_file: "<CA 或 portal 证书的绝对路径>"}` 作信任锚（不能带 `key_file`，不支持客户端证书）；`balance` 只能用在 bridge 上，且只接受 `failover`（单目标），`health` 可用 `tcp` / `http`，不能与 `network` 含 udp 同用；`secret` 即 frp token（还要避开 `: @`，见 §5）。
 - **realm**：无 ACL、无 limits、无健康检查（挂掉的目标仍会分到流量）；UDP 只能单目标；**隧道只支持 TCP，且只能 realm ↔ realm**；`tcp` / `tls` 隧道没有任何应用层认证（配 `secret` 会被拒），`ws` / `wss` 靠由 `secret` 派生的 path 令牌认证；只信任公共 CA 证书，不能固定指纹；entry 只能一个监听端口、不能 `port_map`；**出口不是守门员**——任何能连到出口端口的主机都能让它向目标建连，务必用防火墙把来源限制为入口机。
 
 `idle_profile`（空闲超时预设）在各引擎的实际取值：
@@ -168,7 +168,7 @@ Agent:
 | `limits` | `{max_conns, rate_up_bps, rate_down_bps}`，0 不限；速率单位为 **bit/s**（`8000000` = 8 Mbit/s）；xray / realm / frp 不支持 |
 | `acl` | `{allow, deny}`，来源 IP 或 CIDR；`allow` 非空时只放行列表内来源（xray 中 `deny` 先判）。对 `tunnel_exit` 来说「来源」是入口机的地址，可用它把出口限制为只有入口机能连（realm / frp 不支持 ACL） |
 | `allow_any_target` | 仅 `tunnel_exit`，与 `targets` 互斥，且需要策略 `AllowAnyTarget` |
-| `secret` | 隧道/反向链路的共享密钥，两端必须相同。16–256 字符，`[A-Za-z0-9_.~+/=-]`。各引擎的实际字符集更窄（xray 不收 `~`，frp 不收 `:` `@`），**建议只用字母数字和 `- _ . + / =`** |
+| `secret` | 隧道/反向链路的共享密钥，两端必须相同。16–256 字符，只允许 `[A-Za-z0-9_.+/=-]`——这是四个引擎都接受的交集（xray 不收 `~`，frp 不收 `: @`，gost 只收可打印 ASCII）；含其他字符在校验阶段就被拒绝 |
 
 各 `kind` 要填什么：
 
@@ -180,7 +180,7 @@ Agent:
 | `reverse_portal` | 必填（公网侧用户口） | 必填，写 `listen`（控制链路） | 必填 | 不允许（见 §10） |
 | `reverse_bridge` | 只写 `ports` = portal 侧公网端口（`addr` 不用） | 必填，写 `server`（portal 的 `host:port`） | 必填 | 必填（内网目标，端口一一对应 `listen.ports`） |
 
-`tunnel` 字段：`type` ∈ tcp / tls / ws / wss / grpc / xhttp / kcp / quic（引擎支持子集见 §2）；`security` ∈ `none` / `tls` / `tls_pin` / `vless_enc`（`vless_enc` 仅 xray；`tls_pin` 需要 `pin_sha256` = 出口叶子证书 DER 的 SHA-256，64 位十六进制；`tls`/`wss` 类型再写 `none` 或 `vless_enc` 自相矛盾会被拒）；`host`（Host 头）、`path`、`sni`（须为域名）、`alpn`（≤8 项）；`cert` 仅出口/portal 侧：`{mode: self|file|panel, cert_file, key_file}`，`file` 模式路径须为绝对路径（只含字母数字和 `. _ / -`，不含 `..`）。
+`tunnel` 字段：`type` ∈ tcp / tls / ws / wss / grpc / xhttp / kcp / quic（引擎支持子集见 §2）；`security` ∈ `none` / `tls` / `tls_pin` / `vless_enc`（`vless_enc` 仅 xray；`tls_pin` 需要 `pin_sha256` = 出口叶子证书 DER 的 SHA-256，64 位十六进制；`tls`/`wss` 类型再写 `none` 或 `vless_enc` 自相矛盾会被拒）；`host`（Host 头）、`path`、`sni`（须为域名）、`alpn`（≤8 项）；`cert`：出口/portal 侧是要出示的证书 `{mode: self|file|panel, cert_file, key_file}`（`file` 模式两个文件都要）；入口/bridge 侧只能是信任锚 `{mode: "file", cert_file}`（用来校验对端，不能带 `key_file`，`self` / `panel` 被拒；哪个引擎真正采用它由驱动决定：gost、frp 采用，xray 会以 `tunnel.cert is only valid on the accepting side` 拒绝，realm 以 `a certificate belongs to the tunnel exit` 拒绝）。路径须为绝对路径（只含字母数字和 `. _ / -`，不含 `..`）。
 
 ## 6 样例索引
 
@@ -199,13 +199,13 @@ Agent:
 | [forward-port-map](../agent/examples/testdata/forward-port-map.json) | xray | `port_map`：①逐端口指定、不写 targets；②覆盖范围里的一个端口 | listen | ① 的 `port_map` 必须覆盖每个监听端口；② 的 20301 去 `port_map` 指定处，其余按 targets |
 | [forward-balance](../agent/examples/testdata/forward-balance.json) | xray | 负载均衡：round_robin（权重 3:1）、random、failover | listen | failover 必须带 `health`（仅 `tcp`）；多目标只能配单个监听端口；权重和 ≤ 64 |
 | [forward-acl](../agent/examples/testdata/forward-acl.json) | xray | 来源 ACL（allow 网段 + deny 单个地址） | listen | `deny` 先判；`allow` 非空即白名单；realm / frp 不支持 ACL |
-| [forward-gost-limits](../agent/examples/testdata/forward-gost-limits.json) | gost | 连接数 / 带宽限制 + 被动摘除的主备 | listen | 速率单位 bit/s。**不要写 `balance.health`**：Reconciler 会以「active health checks are not supported」拒绝 gost（见 §10） |
+| [forward-gost-limits](../agent/examples/testdata/forward-gost-limits.json) | gost | 连接数 / 带宽限制 + 被动摘除的主备 | listen | 速率单位 bit/s。`health` 是 gost 的**被动摘除**（只支持 `type: tcp`，`max_fails` 次失败后摘除 `interval_s` 秒），不是主动探测；要主动探测请用 xray |
 | [proxy-send](../agent/examples/testdata/proxy-send.json) | xray | 向目标发送 PROXY v2 | listen | 目标服务必须开启接收 PROXY，否则会把头当作数据；仅 TCP |
 | [proxy-accept](../agent/examples/testdata/proxy-accept.json) | xray | 接收 PROXY（前置 nginx / haproxy 送入） | **默认** | 只监听 `127.0.0.1`。PROXY 头可伪造，改成公网监听会被拒（需 `AllowAcceptProxyOnPublic`，不建议） |
 | [proxy-passthrough](../agent/examples/testdata/proxy-passthrough.json) | xray | PROXY 透传：收头再发头，保留真实来源 | **默认** | 同上；上游必须真的发 PROXY 头，否则连接被断 |
 | [tunnel-vless-enc-entry](../agent/examples/testdata/tunnel-vless-enc-entry.json) / [exit](../agent/examples/testdata/tunnel-vless-enc-exit.json) | xray | 隧道：raw + VLESS 加密（无需证书，最简单） | listen | 出口只放行声明的目标；入口 `targets` 必须与出口一致；两端 `secret` 相同 |
 | [tunnel-tls-pin-entry](../agent/examples/testdata/tunnel-tls-pin-entry.json) / [exit](../agent/examples/testdata/tunnel-tls-pin-exit.json) | xray | 隧道：wss + 自签证书 + 指纹固定 | listen | **`pin_sha256` 由 `secret` 和 `sni` 决定**：样例里的指纹对应占位 secret + `relay.example.com`，换 secret 或 sni 后必须重算（见下） |
-| [reverse-frp-portal](../agent/examples/testdata/reverse-frp-portal.json) / [bridge](../agent/examples/testdata/reverse-frp-bridge.json) | frp | 反向代理：bridge 在内网主动连出，portal 在公网开口 | portal：listen；bridge：private | bridge 的 `listen.ports` 要与 portal 的公网端口一致；bridge 不校验 portal 证书；`secret` 就是 frp token |
+| [reverse-frp-portal](../agent/examples/testdata/reverse-frp-portal.json) / [bridge](../agent/examples/testdata/reverse-frp-bridge.json) | frp | 反向代理：bridge 在内网主动连出，portal 在公网开口 | portal：listen；bridge：private | bridge 的 `listen.ports` 要与 portal 的公网端口一致；bridge 默认不校验 portal 证书（可用 `tunnel.cert.cert_file` 指定信任锚）；样例带 `failover` + TCP 主动健康检查，目标挂掉时 frpc 撤下该公网端口；`secret` 就是 frp token |
 | [reverse-gost-portal](../agent/examples/testdata/reverse-gost-portal.json) / [bridge](../agent/examples/testdata/reverse-gost-bridge.json) | gost | 反向代理：wss 控制链路 | portal：listen；bridge：private | portal 需公共 CA 证书文件（`cert.mode: file`）；bridge 严格校验域名，`sni` 必须对得上 |
 | [realm-relay](../agent/examples/testdata/realm-relay.json) | realm | 小设备纯中继：①TCP+UDP 单目标 ②TCP 轮询（权重 2:1）+ 发送 PROXY v1 | listen | 无统计、无健康检查、无 ACL；改配置会重启该实例并断连；UDP 只能单目标 |
 | [realm-wss-entry](../agent/examples/testdata/realm-wss-entry.json) / [exit](../agent/examples/testdata/realm-wss-exit.json) | realm | realm ↔ realm 的 wss 隧道 | listen | 隧道只支持 TCP；出口需**公共 CA** 签发的证书文件；认证靠 `secret` 派生的 path 令牌；务必用防火墙限制只有入口机能连出口 |
@@ -258,7 +258,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `tunnel_exit needs fixed targets or allow_any_target` | 出口既没目标也没放开 | 给出口写 `targets` |
 | `PROXY headers are forgeable there and the local policy does not allow it` | 在公网地址上收 PROXY 头 | 改监听 `127.0.0.1`（或私网地址），由本机前置代理送入 |
 | `PROXY protocol is TCP only and cannot be combined with network udp` | `proxy_protocol_out`/`accept_proxy_protocol` 与 udp 同用 | 拆成 TCP、UDP 两个实例 |
-| `secret: must be 16-256 characters of [A-Za-z0-9_.~+/=-]` / `secret: required for kind "tunnel_entry" …` | 密钥缺失、过短或含非法字符（如 `!`）。报错**不会回显密钥** | 换成 16 位以上、只含允许字符的随机串 |
+| `secret: must be 16-256 characters of [A-Za-z0-9_.+/=-] (the set every engine accepts)` / `secret: required for kind "tunnel_entry" …` | 密钥缺失、过短或含非法字符（如 `!`、`~`、`:`、`@`）。报错**不会回显密钥** | 换成 16 位以上、只含字母数字和 `- _ . + / =` 的随机串 |
 | `targets[0].ports: has 3 port(s) but listen.ports has 10; ranges must be the same length` | 范围长度不一致 | 让目标范围与监听范围等长 |
 | `tcp port(s) 20080 on 0.0.0.0 collide with instances[0] (listen)` | 两个实例声明了重叠的监听端口 | 改端口；`0.0.0.0` 与具体地址同端口也算冲突 |
 | `duplicate id (also used by instances[0])` | id 重复 | 改 id |
@@ -266,7 +266,10 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `engine "realm" cannot run this instance: kind "reverse_portal" is not supported` | 引擎不具备该能力（kind、网络、隧道类型、PROXY、策略等） | 看 §2 换引擎，或用 `engine: auto` |
 | `engine "xray" cannot run this instance: no driver for this engine` | 在 `agent-apply` 里用了 xray | 改由常驻服务（`DesiredPath`）应用，或换外部引擎 |
 | `engine "xray" cannot run this instance: balance strategy "iphash" is not supported` | 策略该引擎没有 | 换 gost / realm，或改策略 |
-| `engine "gost" cannot run this instance: active health checks are not supported` | 写了 `balance.health`；只有 xray 被判定支持 | 去掉 `health`（gost 本身是被动摘除），或换 xray |
+| `engine "realm" cannot run this instance: health checks are not supported (the engine has no failure detection)` | 写了 `balance.health`，而该引擎没有任何故障检测（realm）。xray / frp 是主动探测，gost 是被动摘除，都放行 | 去掉 `health`，或换 xray / gost / frp |
+| `driver validation: gost: … active health checks are not implemented` | gost 只做被动摘除，不接受 `type: http`、`probe_url`、`timeout_s` | 只写 `{type: tcp, interval_s, max_fails}`，或换 xray |
+| `engine "frp" cannot run this instance: balance strategy "round_robin" is not supported` | frp bridge 每端口只有一个目标，只接受 `failover` | 策略改 `failover`（可带 `health`），或换别的引擎 |
+| `tunnel.cert.key_file: not used by kind "reverse_bridge" …` / `tunnel.cert.mode: kind "tunnel_entry" only supports mode "file" …` | 入口 / bridge 侧的 `cert` 只能是信任锚：`mode: file` + `cert_file`，不能带 `key_file`，不能用 `self` / `panel` | 去掉 `key_file`，`mode` 改 `file` |
 | `driver validation: realm: acl: realm has no access control …` | 引擎的专属限制（ACL / limits / 证书 / UDP 隧道…），冒号后是驱动给出的原因 | 按原因换引擎或去掉该字段 |
 | `driver validation: xray: … limits (max_conns, rate_up_bps, rate_down_bps) are not supported by the xray driver` | xray 不支持限速/限连接 | 换 gost |
 | `tunnel.security: vless_enc is only supported by the xray engine` | VLESS 加密只有 xray | 引擎改 xray，或换 `tls` + 证书 |
@@ -288,7 +291,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 4. **隧道出口默认只放行声明的目标**：`tunnel_exit` 必须写固定 `targets`，`allow_any_target` 需要本地 `AllowAnyTarget`；反向代理的 bridge 只服务 `targets` / `bridge_allow` 声明的目的地。realm 出口不是守门员，务必用防火墙限制来源；xray / gost 的出口还可以用 `acl.allow` 只放行入口机的地址。
 5. **本地策略是根信任**，期望状态无法放宽它；默认拒绝公网监听、私网目标、任意目标、公网收 PROXY。`AllowPrivate` 打开后仍拒绝环回、链路本地、云元数据地址。
 6. **优先用字面 IP 作目标**：域名只在校验时解析一次，存在 DNS 重绑定的时间窗。
-7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书。frp 的 bridge 不校验 portal 证书，对抗主动中间人的场景请用 xray / gost。
+7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
 8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。Agent 没有终端、脚本执行或任意命令通道，外部命令一律用参数数组启动。
 
 ## 10 已知限制与未决事项
@@ -296,9 +299,9 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 以下是写样例和本手册时发现的、**需要代码侧决定**的不一致，均有测试或命令输出佐证；它们不影响上面样例的有效性，但会限制能写出什么：
 
 1. **xray 反向代理目前无法通过 Agent 表达**【已验证】：`agent/validate` 对 `reverse_portal` 拒绝 `targets`（`not used by reverse_portal …`），而 xray 驱动要求 portal 必须有 `targets` 或 `port_map`（`listen port … has no target`）。两侧互相矛盾，所以 xray 的 portal / bridge 样例暂存在 `agent/examples/testdata/pending/`，不在索引里，由 `TestPendingXrayReverse` 盯着；冲突消除后该测试会失败并提示晋升样例。需要反向代理请用上面的 frp 或 gost 样例。
-2. **`balance.health` 被过严拒绝**【已验证】：`reconcile/select.go` 对任何 `balance.health` 要求引擎 `HealthCheck == "active"`，于是 gost（被动摘除，驱动自身接受 `health`）与 frp（驱动支持 bridge 的 TCP/HTTP 健康检查，但 `Caps.Balance` 为空，连 `balance` 本身都被拒）都无法使用其健康检查能力。
-3. **私有 CA / 自签证书无法在 gost、frp 上被校验**：驱动约定入口/桥端用 `tunnel.cert.cert_file` 作信任锚，但 `agent/validate` 不允许客户端类 kind（entry、bridge）带 `cert`。因此 gost 隧道的出口须用公共 CA 证书；frp 的 bridge 不校验 portal。
-4. **`secret` 字符集不一致**：`validate` 接受 `~`，xray 不接受；frp 不接受 `:` `@`。本手册建议只用字母数字和 `- _ . + / =`。
+2. **`balance.health`（已解决）**：`reconcile/select.go` 现在按驱动实际接受什么来判断：主动（xray、frp）与被动摘除（gost）都放行，没有故障检测的引擎（realm）才拒绝；frp 的 `Caps` 如实声明 bridge 支持 `failover` + 主动健康检查。`auto` 优先主动探测，只能用被动时在 `considered` 里注明。`forward-gost-limits` 与 `reverse-frp-bridge` 样例已带上 `health`。
+3. **私有 CA / 自签证书（已解决）**：入口 / bridge 现在可以带 `tunnel.cert: {mode: "file", cert_file}` 作信任锚（gost 作 CA 文件，frp 作 `trustedCaFile`），`key_file` 与非 `file` 模式被拒；出口 / portal 侧规则不变。xray 驱动自己的校验仍会拒绝客户端侧的 `cert`（`tunnel.cert is only valid on the accepting side`），xray 入口请用 `tls_pin` 或 `vless_enc`，realm 入口只信公共 CA。
+4. **`secret` 字符集（已解决）**：`validate` 收紧到四个引擎的交集 `[A-Za-z0-9_.+/=-]`，`~` `:` `@` 等在校验阶段就被拒。
 5. **xray 的 `cert.mode: file` / `panel` 在内置装配里不可用**（`bootstrap.buildDrivers` 没配证书目录和面板证书源），xray TLS 隧道目前只能 `self` + `tls_pin`。
 6. `W1nCray check` 不校验 `desired.json` 内容，也没有 dry-run 命令。
 7. 面板下发、多机批量配置属 v7 阶段，未实现。

@@ -173,7 +173,7 @@ func TestInstanceRules(t *testing.T) {
 		{"entry no server", entry, func(i *spec.Instance) { i.Tunnel.Server = "" }, "tunnel.server", "required"},
 		{"entry with tunnel listen", entry, func(i *spec.Instance) { i.Tunnel.Listen = "127.0.0.1:1" }, "tunnel.listen", "not used"},
 		{"entry no tunnel", entry, func(i *spec.Instance) { i.Tunnel = nil }, "tunnel", "required"},
-		{"entry cert", entry, func(i *spec.Instance) { i.Tunnel.Cert = &spec.Cert{Mode: "self"} }, "tunnel.cert", "not used"},
+		{"entry cert", entry, func(i *spec.Instance) { i.Tunnel.Cert = &spec.Cert{Mode: "self"} }, "tunnel.cert.mode", "only supports mode"},
 		{"exit no tunnel listen", exit, func(i *spec.Instance) { i.Tunnel.Listen = "" }, "tunnel.listen", "required"},
 		{"exit server set", exit, func(i *spec.Instance) { i.Tunnel.Server = "198.51.100.1:1" }, "tunnel.server", "not used"},
 		{"exit no targets", exit, func(i *spec.Instance) { i.Targets = nil }, "targets", "fixed targets or allow_any_target"},
