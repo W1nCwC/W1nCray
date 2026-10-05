@@ -29,12 +29,14 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/app/dispatcher"
+	"github.com/W1nCwC/W1nCray/app/routeguard"
 )
 
 // testHost is a minimal real Host over an in-process Xray instance (the
-// upstream dispatcher, no W1nCray extensions): what core.Core + RuleManager
-// provide once WP0 is merged. Kill is recorded but cannot close connections
-// (there is no connection tracker without the W1nCray dispatcher).
+// W1nCray dispatcher for its route guard, but no limiter or tracker watch):
+// what core.Core + RuleManager provide once WP0 is merged. Kill is recorded
+// but cannot close connections (no tracker prefix is watched).
 type testHost struct {
 	t     testing.TB
 	inst  *xcore.Instance
@@ -78,6 +80,18 @@ func newTestHost(t testing.TB) *testHost {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Use the W1nCray dispatcher, as core.New does: its route selection runs
+	// under the routeguard lock, which the run-time mutators below take.
+	swapped := false
+	for i, app := range pb.App {
+		if app.Type == "xray.app.dispatcher.Config" {
+			pb.App[i] = serial.ToTypedMessage(&dispatcher.Config{})
+			swapped = true
+		}
+	}
+	if !swapped {
+		t.Fatal("upstream dispatcher config not found in app list")
+	}
 	inst, err := xcore.New(pb)
 	if err != nil {
 		t.Fatal(err)
@@ -88,8 +102,8 @@ func newTestHost(t testing.TB) *testHost {
 	h := &testHost{
 		t: t, inst: inst, rules: map[string][]json.RawMessage{}, bals: map[string]json.RawMessage{},
 		ibm:   inst.GetFeature(inbound.ManagerType()).(inbound.Manager),
-		obm:   inst.GetFeature(outbound.ManagerType()).(outbound.Manager),
-		rt:    inst.GetFeature(routing.RouterType()).(routing.Router),
+		obm:   routeguard.OutboundManager(inst.GetFeature(outbound.ManagerType()).(outbound.Manager)),
+		rt:    routeguard.Router(inst.GetFeature(routing.RouterType()).(routing.Router)),
 		stats: inst.GetFeature(stats.ManagerType()).(stats.Manager),
 	}
 	t.Cleanup(func() { h.Close() })
@@ -116,11 +130,22 @@ func (h *testHost) RemoveInbound(tag string) error {
 	return h.ibm.RemoveHandler(context.Background(), tag)
 }
 
+// AddOutbound builds the handler and registers it under the routeguard write
+// lock (what core.Core.AddOutbound does).
 func (h *testHost) AddOutbound(cfg *xcore.OutboundHandlerConfig) error {
-	return xcore.AddOutboundHandler(h.inst, cfg)
+	raw, err := xcore.CreateObject(h.inst, cfg)
+	if err != nil {
+		return err
+	}
+	oh, ok := raw.(outbound.Handler)
+	if !ok {
+		return fmt.Errorf("not an OutboundHandler")
+	}
+	return h.obm.AddHandler(context.Background(), oh)
 }
 
-// RemoveOutbound closes the handler first (WP0 D-A).
+// RemoveOutbound closes the handler first (WP0 D-A), outside the lock that
+// the guarded manager takes for the removal.
 func (h *testHost) RemoveOutbound(tag string) error {
 	o := h.obm.GetHandler(tag)
 	if o == nil {

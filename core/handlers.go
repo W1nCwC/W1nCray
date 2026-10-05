@@ -2,13 +2,17 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/protocol"
 	xcore "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+
+	"github.com/W1nCwC/W1nCray/app/routeguard"
 )
 
 // AddInbound adds an inbound handler.
@@ -32,9 +36,22 @@ func (c *Core) RemoveInboundAndKill(tag string) (int, error) {
 	return c.conns.Kill(tag), err
 }
 
-// AddOutbound adds an outbound handler.
+// AddOutbound adds an outbound handler. It is xcore.AddOutboundHandler split
+// in two: the handler is built outside the routeguard lock (construction may
+// be slow) and only its registration, which route selection must not overlap,
+// runs under the write lock.
 func (c *Core) AddOutbound(cfg *xcore.OutboundHandlerConfig) error {
-	return xcore.AddOutboundHandler(c.Instance, cfg)
+	raw, err := xcore.CreateObject(c.Instance, cfg)
+	if err != nil {
+		return err
+	}
+	h, ok := raw.(outbound.Handler)
+	if !ok {
+		return errors.New("not an OutboundHandler")
+	}
+	return routeguard.Mutate(func() error {
+		return c.obm.AddHandler(context.Background(), h)
+	})
 }
 
 // RemoveOutbound closes and removes an outbound handler; a missing tag is not
@@ -46,8 +63,13 @@ func (c *Core) RemoveOutbound(tag string) error {
 	if h == nil {
 		return nil
 	}
+	// Close may block, so it stays outside the routeguard write lock; only the
+	// removal from the manager is a change that route selection must not
+	// overlap.
 	closeErr := common.Close(h)
-	if err := c.obm.RemoveHandler(context.Background(), tag); err != nil {
+	if err := routeguard.Mutate(func() error {
+		return c.obm.RemoveHandler(context.Background(), tag)
+	}); err != nil {
 		return err
 	}
 	return closeErr

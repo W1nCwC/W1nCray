@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 
+	"github.com/W1nCwC/W1nCray/app/routeguard"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/driver/xray"
 )
@@ -103,7 +104,9 @@ func (h *Host) Dispatcher() routing.Dispatcher {
 }
 
 // OutboundManager returns the outbound manager feature, used by the reverse
-// portal.
+// portal. AddHandler and RemoveHandler of the returned manager run under the
+// routeguard write lock, so route selection never overlaps them; the caller
+// must not call them from code that already holds that lock.
 func (h *Host) OutboundManager() outbound.Manager {
-	return h.c.Instance.GetFeature(outbound.ManagerType()).(outbound.Manager)
+	return routeguard.OutboundManager(h.c.Instance.GetFeature(outbound.ManagerType()).(outbound.Manager))
 }
