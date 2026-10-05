@@ -53,7 +53,7 @@
 | 实例类型 `kind` | forward、tunnel_entry、tunnel_exit、reverse_portal、reverse_bridge | 同 xray（全部 5 种） | **仅** reverse_portal、reverse_bridge | forward、tunnel_entry、tunnel_exit（**无反向代理**） |
 | 网络 | tcp、udp | tcp、udp | tcp、udp | tcp、udp |
 | 隧道载体 `tunnel.type` | tcp、tls、ws、wss、grpc、xhttp | tcp、tls、ws、wss、grpc | tcp、tls、ws、kcp、quic（**不支持 wss**） | tcp、tls、ws、wss |
-| 反向代理 | 是（但见 §10 的阻塞项） | 是 | 是 | 否 |
+| 反向代理 | 是（bridge 决定目的地；portal 不带 `targets`） | 是 | 是 | 否 |
 | 接收 PROXY（`accept_proxy_protocol`） | 是 | 是 | **否** | 是 |
 | 发送 PROXY（`proxy_protocol_out`，仅 TCP） | 是 | 是 | 是（仅 bridge） | 是 |
 | 负载均衡策略 | round_robin、random、failover | round_robin、random、iphash、failover | 仅 failover（bridge 每端口一个目标；portal 不接受 `balance`） | round_robin、iphash |
@@ -163,7 +163,7 @@ Agent:
 | `proxy_protocol_out` | 0 / 1 / 2，向目标发送 PROXY 头；**仅 TCP**，不能与 `network` 含 udp 组合 |
 | `accept_proxy_protocol` | 监听口要求 PROXY 头；**仅 TCP**，仅 forward / tunnel_entry / reverse_portal；公网监听需要策略放开 |
 | `tunnel` | `{type, server, listen, host, path, sni, alpn, security, pin_sha256, cert}`，见下 |
-| `reverse` | `{link, domain, bridge_allow}`，仅 reverse_*；`link` 只是配对标记；`domain` 是反向代理的会合名，须随机（十六进制 ≥32 字符或 base64url ≥22 字符，且字符种类 ≥8；xray 另要求 26–64 位小写字母数字）；`bridge_allow:[{host,ports}]` 限制桥端可被请求的目的地 |
+| `reverse` | `{link, domain, bridge_allow}`，仅 reverse_*；`link` 只是配对标记；`domain` 是反向代理的会合名，须随机（十六进制 ≥32 字符或 base64url ≥22 字符，且字符种类 ≥8；xray 另要求 26–64 位小写字母数字）；`bridge_allow` 已废弃（反向代理由 bridge 的 `targets` 决定目的地，写了会被拒） |
 | `idle_profile` | `tcp_long` / `tcp_default` / `udp_short` / `udp_long`；`tcp_*` 需要 network 含 tcp，`udp_*` 需要含 udp |
 | `limits` | `{max_conns, rate_up_bps, rate_down_bps}`，0 不限；速率单位为 **bit/s**（`8000000` = 8 Mbit/s）；xray / realm / frp 不支持 |
 | `acl` | `{allow, deny}`，来源 IP 或 CIDR；`allow` 非空时只放行列表内来源（xray 中 `deny` 先判）。对 `tunnel_exit` 来说「来源」是入口机的地址，可用它把出口限制为只有入口机能连（realm / frp 不支持 ACL） |
@@ -177,7 +177,7 @@ Agent:
 | `forward` | 必填 | 不允许 | 不允许 | 必填（或 `port_map` 覆盖每个监听端口） |
 | `tunnel_entry` | 必填（用户连入的口） | 必填，写 `server`（出口的 `host:port`） | 必填 | 可选；xray 以它作为要去的目的地，须与出口声明的一致 |
 | `tunnel_exit` | **不允许**（监听在 `tunnel.listen`） | 必填，写 `listen`（`ip:port`） | 必填 | 固定目标，或 `allow_any_target` 二选一 |
-| `reverse_portal` | 必填（公网侧用户口） | 必填，写 `listen`（控制链路） | 必填 | 不允许（见 §10） |
+| `reverse_portal` | 必填（公网侧用户口） | 必填，写 `listen`（控制链路） | 必填 | 不允许（目的地由 bridge 的 targets 决定） |
 | `reverse_bridge` | 只写 `ports` = portal 侧公网端口（`addr` 不用） | 必填，写 `server`（portal 的 `host:port`） | 必填 | 必填（内网目标，端口一一对应 `listen.ports`） |
 
 `tunnel` 字段：`type` ∈ tcp / tls / ws / wss / grpc / xhttp / kcp / quic（引擎支持子集见 §2）；`security` ∈ `none` / `tls` / `tls_pin` / `vless_enc`（`vless_enc` 仅 xray；`tls_pin` 需要 `pin_sha256` = 出口叶子证书 DER 的 SHA-256，64 位十六进制；`tls`/`wss` 类型再写 `none` 或 `vless_enc` 自相矛盾会被拒）；`host`（Host 头）、`path`、`sni`（须为域名）、`alpn`（≤8 项）；`cert`：出口/portal 侧是要出示的证书 `{mode: self|file|panel, cert_file, key_file}`（`file` 模式两个文件都要）；入口/bridge 侧只能是信任锚 `{mode: "file", cert_file}`（用来校验对端，不能带 `key_file`，`self` / `panel` 被拒；哪个引擎真正采用它由驱动决定：gost、frp 采用，xray 会以 `tunnel.cert is only valid on the accepting side` 拒绝，realm 以 `a certificate belongs to the tunnel exit` 拒绝）。路径须为绝对路径（只含字母数字和 `. _ / -`，不含 `..`）。
@@ -288,7 +288,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 1. **`secret` 只应存在于本机 0600 文件里**：你写的 `desired.json`（请 `chmod 600`、属主 root）、Agent 状态目录（`StateDir`，文件 0600）、各驱动的私有配置（0600）。Report、日志、报错信息都经过清洗，不含 `secret`；但 `reverse.domain`（反向代理会合名，≥128 位随机）同样应当当作机密对待，清洗**不覆盖**它。
 2. **不要公开粘贴 `desired.json`**。求助时请先把所有 `secret`、`reverse.domain` 和真实 IP 换成占位值。样例中的占位 secret 只用于演示，**绝不能**直接上线；多个隧道不要共用同一个 secret。
 3. **PROXY 头可被伪造**，因此 `accept_proxy_protocol` 默认只允许在回环/私网地址上监听，公网监听要靠 `AllowAcceptProxyOnPublic` 本地放开（不建议）。真实来源 IP 只应来自你自己控制的前置代理。
-4. **隧道出口默认只放行声明的目标**：`tunnel_exit` 必须写固定 `targets`，`allow_any_target` 需要本地 `AllowAnyTarget`；反向代理的 bridge 只服务 `targets` / `bridge_allow` 声明的目的地。realm 出口不是守门员，务必用防火墙限制来源；xray / gost 的出口还可以用 `acl.allow` 只放行入口机的地址。
+4. **隧道出口默认只放行声明的目标**：`tunnel_exit` 必须写固定 `targets`，`allow_any_target` 需要本地 `AllowAnyTarget`；反向代理的 bridge 只服务 `targets` 声明的目的地。realm 出口不是守门员，务必用防火墙限制来源；xray / gost 的出口还可以用 `acl.allow` 只放行入口机的地址。
 5. **本地策略是根信任**，期望状态无法放宽它；默认拒绝公网监听、私网目标、任意目标、公网收 PROXY。`AllowPrivate` 打开后仍拒绝环回、链路本地、云元数据地址。
 6. **优先用字面 IP 作目标**：域名只在校验时解析一次，存在 DNS 重绑定的时间窗。
 7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
@@ -298,7 +298,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 以下是写样例和本手册时发现的、**需要代码侧决定**的不一致，均有测试或命令输出佐证；它们不影响上面样例的有效性，但会限制能写出什么：
 
-1. **xray 反向代理目前无法通过 Agent 表达**【已验证】：`agent/validate` 对 `reverse_portal` 拒绝 `targets`（`not used by reverse_portal …`），而 xray 驱动要求 portal 必须有 `targets` 或 `port_map`（`listen port … has no target`）。两侧互相矛盾，所以 xray 的 portal / bridge 样例暂存在 `agent/examples/testdata/pending/`，不在索引里，由 `TestPendingXrayReverse` 盯着；冲突消除后该测试会失败并提示晋升样例。需要反向代理请用上面的 frp 或 gost 样例。
+1. **xray 反向代理（已解决）**：语义已统一为「bridge 决定目的地」——portal 不带 `targets`（它给用户连接盖一个 TEST-NET-1 占位目的地），bridge 用自己的 `targets`（或 `allow_any_target` + 本地策略）改写每个被转发的连接；portal / 它的用户都选不了目的地。`reverse.bridge_allow` 在此语义下已无意义，写了会被拒（改用 bridge 的 `targets`）。xray 反向样例已晋升为正式样例。
 2. **`balance.health`（已解决）**：`reconcile/select.go` 现在按驱动实际接受什么来判断：主动（xray、frp）与被动摘除（gost）都放行，没有故障检测的引擎（realm）才拒绝；frp 的 `Caps` 如实声明 bridge 支持 `failover` + 主动健康检查。`auto` 优先主动探测，只能用被动时在 `considered` 里注明。`forward-gost-limits` 与 `reverse-frp-bridge` 样例已带上 `health`。
 3. **私有 CA / 自签证书（已解决）**：入口 / bridge 现在可以带 `tunnel.cert: {mode: "file", cert_file}` 作信任锚（gost 作 CA 文件，frp 作 `trustedCaFile`），`key_file` 与非 `file` 模式被拒；出口 / portal 侧规则不变。xray 驱动自己的校验仍会拒绝客户端侧的 `cert`（`tunnel.cert is only valid on the accepting side`），xray 入口请用 `tls_pin` 或 `vless_enc`，realm 入口只信公共 CA。
 4. **`secret` 字符集（已解决）**：`validate` 收紧到四个引擎的交集 `[A-Za-z0-9_.+/=-]`，`~` `:` `@` 等在校验阶段就被拒。
