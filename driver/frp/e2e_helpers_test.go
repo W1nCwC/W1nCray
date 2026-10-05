@@ -105,8 +105,11 @@ func (s *testSup) launch(p *tproc) error {
 		}
 		return err
 	}
+	// Status/Signal read these under s.mu; publish them under it too.
+	s.mu.Lock()
 	p.cmd = cmd
 	p.done = make(chan struct{})
+	s.mu.Unlock()
 	s.wg.Add(1)
 	go func(cmd *exec.Cmd, done chan struct{}) {
 		defer s.wg.Done()
@@ -191,11 +194,16 @@ func (s *testSup) Stop(ctx context.Context, id string) error {
 
 func (s *testSup) Signal(id string, sig os.Signal) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p, ok := s.procs[id]; ok && p.cmd != nil && p.cmd.Process != nil {
-		return p.cmd.Process.Signal(sig)
+	p, ok := s.procs[id]
+	var cmd *exec.Cmd
+	if ok {
+		cmd = p.cmd
 	}
-	return errors.New("no such process")
+	s.mu.Unlock()
+	if !ok || cmd == nil || cmd.Process == nil {
+		return errors.New("no such process")
+	}
+	return cmd.Process.Signal(sig)
 }
 
 func (s *testSup) Status(id string) driver.ProcStatus {

@@ -349,7 +349,9 @@ func randBytes(n int) []byte {
 // waitCounters polls until every named counter has exactly the wanted value.
 func waitCounters(t *testing.T, h xray.Host, want map[string]uint64) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Generous: under -race the whole pipeline is several times slower and
+	// the counters update as connections tear down.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ok := true
 		for name, w := range want {
@@ -524,8 +526,18 @@ func TestKillAbortsEstablished(t *testing.T) {
 	if _, err := c.Read(buf); err == nil {
 		t.Fatal("connection survived Kill")
 	}
-	if active, _ := r.h.Conns("w1n-fwd/i/k1"); active != 0 {
-		t.Fatalf("Conns active = %d after Kill, want 0", active)
+	// The tracker deregisters through context.AfterFunc, which lags the Kill
+	// itself; under -race that lag is wide, so poll instead of reading once.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if active, _ := r.h.Conns("w1n-fwd/i/k1"); active == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			active, _ := r.h.Conns("w1n-fwd/i/k1")
+			t.Fatalf("Conns active = %d after Kill, want 0", active)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	// Stop removes the instance through the driver: the listener is gone.

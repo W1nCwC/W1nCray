@@ -64,6 +64,11 @@ type fakeWS struct {
 	conns   []*websocket.Conn
 	queries []string
 	got     []WSMessage
+	// inject carries extra server->client messages. Only the handler
+	// goroutine writes to the connection (gorilla allows one concurrent
+	// writer), so tests push events here instead of calling WriteMessage
+	// themselves.
+	inject chan WSMessage
 }
 
 func (f *fakeWS) handler(w http.ResponseWriter, r *http.Request) {
@@ -86,9 +91,45 @@ func (f *fakeWS) handler(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.conns = append(f.conns, c)
 	f.mu.Unlock()
+	// One writer goroutine per connection (gorilla allows a single
+	// concurrent writer); the feeder forwards the test's inject channel into
+	// it and exits with the connection.
+	wch := make(chan WSMessage, 32)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for m := range wch {
+			body := `{"event":"` + m.Event + `"`
+			if len(m.Data) > 0 {
+				body += `,"data":` + string(m.Data)
+			}
+			body += `}`
+			if c.WriteMessage(websocket.TextMessage, []byte(body)) != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case m, ok := <-f.inject:
+				if !ok {
+					return
+				}
+				select {
+				case wch <- m:
+				case <-done:
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
 	send := func(event string, data string) {
-		c.WriteMessage(websocket.TextMessage, []byte(`{"event":"`+event+`","data":`+data+`}`))
+		wch <- WSMessage{Event: event, Data: []byte(data)}
 	}
+	defer close(wch)
 	send("auth.success", `{"node_id":5}`)
 	// Full sync, as NodeEventHandlers::pushFullSync does (no base_config).
 	send("sync.config", `{"config":{"protocol":"vmess","listen_ip":"0.0.0.0","server_port":443,"network":"tcp","tls":0}}`)
@@ -108,6 +149,15 @@ func (f *fakeWS) last() *websocket.Conn {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.conns[len(f.conns)-1]
+}
+
+// closeLast closes the most recent server-side connection. net.Conn.Close is
+// safe against a concurrent Read.
+func (f *fakeWS) closeLast() {
+	f.mu.Lock()
+	c := f.conns[len(f.conns)-1]
+	f.mu.Unlock()
+	c.Close()
 }
 
 func (f *fakeWS) received(event string) []WSMessage {
@@ -143,7 +193,7 @@ func TestHandshake(t *testing.T) {
 }
 
 func TestWSClientProtocol(t *testing.T) {
-	f := &fakeWS{t: t}
+	f := &fakeWS{t: t, inject: make(chan WSMessage, 16)}
 	srv := httptest.NewServer(http.HandlerFunc(f.handler))
 	defer srv.Close()
 	c := New(Config{APIHost: srv.URL, Key: "tok", NodeID: 5})
@@ -174,14 +224,16 @@ func TestWSClientProtocol(t *testing.T) {
 	}
 	h.mu.Unlock()
 
-	conn := f.last()
-	conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"ping"}`))
+	// Server->client messages go through the handler goroutine only: a
+	// direct WriteMessage here would race with the client's pong writer on
+	// the same gorilla connection.
+	f.inject <- WSMessage{Event: "ping"}
 	waitFor(t, "pong", func() bool { return len(f.received(EventPong)) == 1 })
 
-	conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"sync.user.delta","data":{"action":"remove","users":[{"id":1}]}}`))
-	conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"sync.user.delta","data":{"action":"add","users":[{"id":"2","uuid":"b","speed_limit":"10","device_limit":2}]}}`))
+	f.inject <- WSMessage{Event: "sync.user.delta", Data: []byte(`{"action":"remove","users":[{"id":1}]}`)}
+	f.inject <- WSMessage{Event: "sync.user.delta", Data: []byte(`{"action":"add","users":[{"id":"2","uuid":"b","speed_limit":"10","device_limit":2}]}`)}
 	// Sparse PHP array: the IP list arrives as an object.
-	conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"sync.devices","data":{"users":{"2":{"0":"1.1.1.1","2":"2.2.2.2"},"3":["3.3.3.3"]}}}`))
+	f.inject <- WSMessage{Event: "sync.devices", Data: []byte(`{"users":{"2":{"0":"1.1.1.1","2":"2.2.2.2"},"3":["3.3.3.3"]}}`)}
 	waitFor(t, "deltas and devices", func() bool {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -213,8 +265,10 @@ func TestWSClientProtocol(t *testing.T) {
 	}
 
 	// The server drops the connection: the client reconnects and gets a
-	// new full sync.
-	conn.Close()
+	// new full sync. Closing via the handler's own connection object would
+	// race with nothing, but the test never kept a reference: ask the fake
+	// to close its last conn (Close is safe to call from any goroutine).
+	f.closeLast()
 	waitFor(t, "reconnect", func() bool {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -230,7 +284,7 @@ func TestWSClientProtocol(t *testing.T) {
 }
 
 func TestWSBadTokenRedacted(t *testing.T) {
-	f := &fakeWS{t: t}
+	f := &fakeWS{t: t, inject: make(chan WSMessage, 16)}
 	srv := httptest.NewServer(http.HandlerFunc(f.handler))
 	defer srv.Close()
 	c := New(Config{APIHost: srv.URL, Key: "wrong-s3cret", NodeID: 5})
