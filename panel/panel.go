@@ -28,6 +28,9 @@ type Panel struct {
 	agent   *bootstrap.Runtime
 	running bool
 
+	// remoteStop ends the agent's panel link (nil when it is not running).
+	remoteStop func()
+
 	reloadCh chan string
 	stop     chan struct{}
 	done     chan struct{}
@@ -123,6 +126,10 @@ func (p *Panel) start() error {
 			ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 			Policy:           cfg.Agent.PolicySpec(),
 			Log:              log.StandardLogger(),
+			// After a restart the persisted last good state comes back before
+			// (and without) the panel, so a panel that is down never costs
+			// forwarding.
+			Resume: true,
 		}, cr)
 		if err != nil {
 			log.Errorf("agent: boot: %v", err)
@@ -131,6 +138,7 @@ func (p *Panel) start() error {
 			if cfg.Agent.DesiredPath != "" {
 				p.applyAgentDesiredLocked(cfg.Agent.DesiredPath, rt)
 			}
+			p.startRemoteLocked(cfg.Agent.Panel, rt)
 		}
 	}
 	p.core, p.nodes, p.running = cr, nodes, true
@@ -149,11 +157,51 @@ func (p *Panel) applyAgentDesiredLocked(path string, rt *bootstrap.Runtime) {
 	log.Infof("agent: %s: %s (%d instance(s))", path, rep.Status, len(rep.Instances))
 }
 
+// AgentVersion is the version the agent reports to the panel. The command
+// package sets it from the build version; "dev" otherwise.
+var AgentVersion = "dev"
+
+// startRemoteLocked links the agent to the panel when it is configured. A
+// problem with the link (unreadable token file, bad options) is logged and
+// leaves the agent running on its local state. The caller must hold p.mu.
+func (p *Panel) startRemoteLocked(pc *AgentPanelConfig, rt *bootstrap.Runtime) {
+	if pc == nil || !pc.Enabled {
+		return
+	}
+	token, err := pc.ResolveToken()
+	if err != nil {
+		log.Errorf("agent: panel link not started: %v", err)
+		return
+	}
+	pull, report := pc.Intervals()
+	stop, err := rt.StartRemote(context.Background(), bootstrap.RemoteOptions{
+		URL:               pc.URL,
+		MachineID:         pc.MachineID,
+		Token:             token,
+		AllowInsecureHTTP: pc.AllowInsecureHTTP,
+		PullInterval:      pull,
+		ReportInterval:    report,
+		AgentVersion:      AgentVersion,
+		Log:               log.StandardLogger(),
+	})
+	if err != nil {
+		log.Errorf("agent: panel link not started: %v", err)
+		return
+	}
+	p.remoteStop = stop
+	log.Infof("agent: linked to the panel %s as machine %d", pc.URL, pc.MachineID)
+}
+
 func (p *Panel) shutdown() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.running {
 		return
+	}
+	// Stop the panel link first: no apply may race the teardown below.
+	if p.remoteStop != nil {
+		p.remoteStop()
+		p.remoteStop = nil
 	}
 	var wg sync.WaitGroup
 	for _, n := range p.nodes {

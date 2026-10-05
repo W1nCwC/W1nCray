@@ -187,7 +187,31 @@ Agent:
 - **引擎**：`xray` 是内嵌内核（无需安装，`External: false`）；`gost`、`frp`、`realm` 需要从签名清单安装二进制。清单里的版本、URL、哈希都以清单为准，期望状态只能指定版本号。
 - **信任根**：内嵌公钥（`kernel/manifest/trusted_keys.txt`）是生产信任根，发布时用 `-ldflags "-X github.com/W1nCwC/W1nCray/kernel/manifest.ExtraKeys=<hex>,<hex>"` 注入。`ManifestKeysPath` 用于本地/自托管阶段补充密钥；两者都没有时，任何清单都会被拒绝（fail-closed，这是预期行为）。
 - **热载**：`DesiredPath` 变更（含 `W1nCray` 自身的重载）触发一次应用；失败会回滚到上一个可用状态，并把失败的期望状态“冻结”，直到内容变化。
-- **手动应用**：`W1nCray agent-apply -f desired.json` 应用一次并打印 JSON 报告（报告不含任何 secret）。它不注册内嵌 xray 引擎，只用于外部内核；已启动的内核在命令退出后继续运行。
+- **手动应用**：`W1nCray agent-apply -f desired.json` 应用一次并打印 JSON 报告（报告不含任何 secret）。它不注册内嵌 xray 引擎，只用于外部内核；已启动的内核在命令退出后继续运行。它与常驻服务共用同一把单实例锁（`<配置文件>.lock`）：服务正在用同一份配置运行时会直接报错退出，请先 `W1nCray stop`，避免两个进程同时改写同一个 `StateDir`。
+
+#### 面板控制（Agent.Panel）
+
+Agent 可以连接面板（W1nCBoard / Xboard），由面板下发期望状态、接收应用结果与运行状态。**始终是 Agent 主动外连面板**，面板不会连接 Agent，因此 NAT 后的设备同样可管。线上契约见 [docs/PLAN-v7-panel-control.md](docs/PLAN-v7-panel-control.md)。
+
+```yaml
+Agent:
+  Enabled: true
+  Panel:
+    Enabled: true
+    URL: https://panel.example.com     # 必须是 https（loopback 或 AllowInsecureHTTP 除外）
+    MachineID: 7                       # 面板上的机器 ID
+    TokenFile: /etc/W1nCray/panel.token  # 与 Token 二选一；相对路径相对于配置文件目录
+    # Token: xxxxxxxx                  # 不推荐：令牌会留在配置文件里
+    PullIntervalSec: 30                # 拉取期望状态的间隔，默认 30，限制在 10–300
+    ReportIntervalSec: 30              # 上报运行状态的间隔，默认 30，限制在 10–300
+    # AllowInsecureHTTP: false         # 仅开发用：允许明文 http:// 到非 loopback 主机
+```
+
+- **本地策略永远优先**：面板下发的期望状态与本地 `DesiredPath` 走同一套校验（`Agent.Policy`），越界就是 `rejected`，面板无法放宽。面板只能下发声明式期望状态，命令只有白名单：`refresh`（立即拉取）与 `dump_state`（回传已脱敏的最近报告与健康状态）。
+- **面板不可达不影响转发**：拉取/上报失败只记日志并退避重试（30 秒起、翻倍、封顶 5 分钟，带 ±20% 抖动），已经运行的实例原样继续。启用 Agent 后，重启会先从本地 `last_good` 恢复实例，再去连面板，所以面板宕机时重启也不会丢转发。
+- **每次应用都会回执**：无论 `applied` / `rejected` / `failed` / `rolled_back`，都向面板发送 ack；ack 发送失败会在下一轮重试。期望状态含未知字段或 revision 不一致时，Agent 不应用，直接回 `rejected`。
+- **令牌文件权限**：`TokenFile` 在类 Unix 系统上若 group/other 可读（`mode & 077 != 0`）会被拒绝，请 `chmod 600`。令牌不会出现在日志、错误信息或命令行里。`W1nCray check` 会离线检查这一段（读取令牌文件、校验 URL 与权限，不联网）。
+- **一台机器只配一个来源**：`Agent.Panel` 与 `Agent.DesiredPath` 同时配置时，两者都会应用，后到者生效；通常应只选其一。
 
 ### 规则与行为说明
 
