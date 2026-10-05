@@ -133,7 +133,11 @@ type pair struct {
 }
 
 func newPair(t testing.TB, id string, n int, nets []string, tun spec.Tunnel) *pair {
-	p := &pair{ctrl: freePort(t), pubLo: freeRange(t, n), n: n, secret: "e2e-secret-" + id + "-0123456789abcdef"}
+	// One consecutive block for the control port and the public ports: two
+	// independent free-range picks can collide, and the driver's validation
+	// correctly refuses a public port that equals the control port.
+	base := freeRange(t, n+1)
+	p := &pair{ctrl: base, pubLo: base + 1, n: n, secret: "e2e-secret-" + id + "-0123456789abcdef"}
 	ports := fmt.Sprint(p.pubLo)
 	if n > 1 {
 		ports = fmt.Sprintf("%d-%d", p.pubLo, p.pubLo+n-1)

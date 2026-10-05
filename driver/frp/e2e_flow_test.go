@@ -907,7 +907,7 @@ func TestE2EAdminEndpointIsLocalAndAuthenticated(t *testing.T) {
 		t.Fatal("admin credentials were reused across a restart")
 	}
 	if runtime.GOOS != "windows" {
-		for _, path := range []string{a2.Cfg, filepath.Join(dirAdmin(e.rt), "i-"+p.portal.ID+".json"), filepath.Join(e.state, currentFile)} {
+		for _, path := range []string{a2.Cfg, filepath.Join(dirAdmin(e.rt), p.portal.ID+".json"), filepath.Join(e.state, currentFile)} {
 			st, err := os.Stat(path)
 			if err != nil {
 				t.Fatal(err)
