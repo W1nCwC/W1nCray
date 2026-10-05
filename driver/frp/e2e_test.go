@@ -49,6 +49,13 @@ func newEnv(t testing.TB) *env {
 	}
 	e.sup = newTestSup(t)
 	e.state = t.TempDir()
+	// t.TempDir() is created 0777&^umask (0755 with the usual umask), unlike
+	// os.MkdirTemp which uses 0700. The production path tightens the state
+	// directory itself (state.Store.Open), so mirror that here: the test
+	// below then checks that the driver does not loosen it again.
+	if err := os.Chmod(e.state, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	e.d = New()
 	e.rt = driver.Runtime{
 		Kernel:   driver.Installed{Path: e.frps, Version: "test"},

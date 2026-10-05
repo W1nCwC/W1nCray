@@ -1137,8 +1137,19 @@ func TestE2ETLSVerification(t *testing.T) {
 		t.Fatalf("bridge trusting another CA registered: %+v", h)
 	}
 	t.Logf("untrusted certificate: %s", firstLineContaining(e.logOf(p.bridge.ID), "x509"))
-	if !strings.Contains(e.logOf(p.bridge.ID), "x509") {
-		t.Fatalf("expected an x509 error in the frpc log:\n%s", e.logOf(p.bridge.ID))
+	log := e.logOf(p.bridge.ID)
+	// frp dials with a lazy TLS conn (golib's tlsAfterHook returns
+	// tls.Client without a handshake), so the certificate check runs when
+	// yamux writes its first stream header. frpc therefore reports either
+	// the x509 error itself or the yamux session teardown it causes
+	// ("session shutdown") - which of the two wins is a race. Both mean the
+	// untrusted certificate was refused, so accept either, and require the
+	// stronger property: the bridge never logged in.
+	if !strings.Contains(log, "x509") && !strings.Contains(log, "session shutdown") {
+		t.Fatalf("expected a TLS rejection (x509 or session shutdown) in the frpc log:\n%s", log)
+	}
+	if strings.Contains(log, "login to server success") {
+		t.Fatalf("bridge logged in despite an untrusted certificate:\n%s", log)
 	}
 	// Correct trust anchor: works.
 	caGood, _, _ := good.write(t, filepath.Join(mkdir(t, dir, "good2")))
