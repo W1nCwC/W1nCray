@@ -1,0 +1,22 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "[::]:7001",
+      "remote": "10.0.0.1:80",
+      "extra_remotes": [
+        "10.0.0.2:80"
+      ],
+      "balance": "roundrobin: 1, 4",
+      "listen_transport": "ws;host=cdn.example.com;path=/ws/relay",
+      "network": {
+        "send_proxy": true,
+        "send_proxy_version": 2,
+        "accept_proxy": true,
+        "accept_proxy_timeout": 5
+      }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "127.0.0.1:9003",
+      "remote": "10.0.0.1:80",
+      "network": {
+        "send_proxy": true,
+        "send_proxy_version": 1,
+        "accept_proxy": true,
+        "accept_proxy_timeout": 5
+      }
+    }
+  ]
+}

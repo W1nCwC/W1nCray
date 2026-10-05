@@ -1,0 +1,23 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "0.0.0.0:20000",
+      "remote": "backend.example.com:30000"
+    },
+    {
+      "listen": "0.0.0.0:20001",
+      "remote": "10.9.9.9:443"
+    },
+    {
+      "listen": "0.0.0.0:20002",
+      "remote": "backend.example.com:30002"
+    },
+    {
+      "listen": "0.0.0.0:20003",
+      "remote": "[2001:db8::7]:8443"
+    }
+  ]
+}

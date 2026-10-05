@@ -1,0 +1,15 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "0.0.0.0:9001",
+      "remote": "10.0.0.1:80",
+      "extra_remotes": [
+        "10.0.0.2:80"
+      ],
+      "balance": "iphash: 1, 5"
+    }
+  ]
+}
