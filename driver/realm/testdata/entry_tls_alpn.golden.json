@@ -1,0 +1,12 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "127.0.0.1:8080",
+      "remote": "exit.example.com:443",
+      "remote_transport": "tls;sni=exit.example.com;alpn=h2,http/1.1"
+    }
+  ]
+}
