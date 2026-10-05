@@ -356,7 +356,7 @@ func newReverse(t *testing.T, carrier string) *revSetup {
 	}
 	r.portal = spec.Instance{ID: "rp", Enabled: true, Engine: "xray", Kind: spec.KindReversePortal,
 		Listen: &spec.Listen{Addr: "127.0.0.1", Ports: fmt.Sprint(r.userPort)}, Network: []string{"tcp", "udp"},
-		Targets: []spec.Target{{Host: host, Ports: fmt.Sprint(port)}}, Secret: testSecret, Tunnel: pt,
+		Secret: testSecret, Tunnel: pt,
 		Reverse: &spec.Reverse{Domain: testDomain}}
 	r.bridge = spec.Instance{ID: "rb", Enabled: true, Engine: "xray", Kind: spec.KindReverseBridge, Network: []string{"tcp", "udp"},
 		Targets: []spec.Target{{Host: host, Ports: fmt.Sprint(port)}}, Secret: testSecret, Tunnel: bt,

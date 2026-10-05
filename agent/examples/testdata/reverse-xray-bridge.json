@@ -4,7 +4,7 @@
   "instances": [
     {
       "id": "rdp-home",
-      "name": "xray反向代理内网端（bridge）：主动连出，无需公网IP",
+      "name": "xray反向代理内网端（bridge）：主动连出，目的地由本端 targets 固定",
       "enabled": true,
       "engine": "xray",
       "kind": "reverse_bridge",
@@ -14,8 +14,7 @@
       "tunnel": { "type": "tcp", "server": "198.51.100.7:20901" },
       "reverse": {
         "link": "rdp-home",
-        "domain": "00112233445566778899aabbccddeeff",
-        "bridge_allow": [{ "host": "192.168.1.10", "ports": "3389" }]
+        "domain": "00112233445566778899aabbccddeeff"
       },
       "secret": "CHANGE-ME-32-chars-minimum-secret"
     }

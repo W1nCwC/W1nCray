@@ -57,7 +57,6 @@ func portalInst(id string) spec.Instance {
 		ID: id, Enabled: true, Engine: spec.EngineXray, Kind: spec.KindReversePortal,
 		Listen:  &spec.Listen{Addr: "127.0.0.1", Ports: "20001"},
 		Network: []string{"tcp", "udp"},
-		Targets: []spec.Target{{Host: "192.168.1.10", Ports: "3389"}},
 		Secret:  testSecret,
 		Tunnel:  &spec.Tunnel{Type: "tcp", Listen: "0.0.0.0:4444"},
 		Reverse: &spec.Reverse{Domain: testDomain},
@@ -640,18 +639,23 @@ func TestPortalBridgeRules(t *testing.T) {
 	if rs[0].InboundTag[0] != "w1n-fwd/r/r1" || rs[0].Domain[0] != "full:"+testDomain || rs[0].OutboundTag != "w1n-fwd/t/r1" {
 		t.Fatalf("%+v", rs[0])
 	}
-	if rs[1].IP[0] != "192.168.1.10" || rs[1].Port != "3389" || rs[1].OutboundTag != "w1n-fwd/o/r1" {
+	// the destination is fixed by the bridge's target: the relayed connection
+	// goes to a freedom outbound that redirects to it (no ip/port matching on
+	// what the portal asked for)
+	if len(rs[1].IP) != 0 || len(rs[1].Domain) != 0 || rs[1].Port != "" || rs[1].OutboundTag != "w1n-fwd/o/r1" {
 		t.Fatalf("%+v", rs[1])
 	}
 	if rs[len(rs)-1].OutboundTag != "w1n-fwd/k/r1" {
 		t.Fatalf("%+v", rs)
 	}
-	// BridgeAllow overrides targets
+	if fr := freedomOf(t, b, "w1n-fwd/o/r1"); fr.Redirect != "192.168.1.10:3389" {
+		t.Fatalf("redirect %q", fr.Redirect)
+	}
+	// BridgeAllow is refused (the targets are the allow list now)
 	in := bridgeInst("r2")
 	in.Reverse.BridgeAllow = []spec.Allow{{Host: "10.5.5.5", Ports: "22"}}
-	rs = rulesOf(t, mustCompile(t, in, testOpts()))
-	if rs[1].IP[0] != "10.5.5.5" || rs[1].Port != "22" {
-		t.Fatalf("%+v", rs[1])
+	if _, err := Compile(in, testOpts()); err == nil || !strings.Contains(err.Error(), "bridge_allow") || !strings.Contains(err.Error(), "targets") {
+		t.Fatalf("bridge_allow on the bridge: %v", err)
 	}
 	// a bridge without any destination is refused
 	in = bridgeInst("r3")
@@ -701,12 +705,34 @@ func TestIdleProfileLevels(t *testing.T) {
 		return dk.UserLevel
 	}
 	in := fwd("f1")
-	if level(in) != 103 {
-		t.Fatal("default tcp level")
+	// No idle_profile: TCP instances get tcp_long (an idle SSH session must
+	// survive), not the node's 30 s ConnectionConfig default.
+	if level(in) != 100 {
+		t.Fatal("default tcp level must be tcp_long (100)")
 	}
 	in.IdleProfile = "tcp_long"
 	if level(in) != 100 {
 		t.Fatal("tcp_long")
+	}
+	// An explicit tcp_default still selects the node policy.
+	in.IdleProfile = "tcp_default"
+	if level(in) != 103 {
+		t.Fatal("explicit tcp_default must stay 103")
+	}
+	// tcp+udp without a profile: the instance carries TCP, so tcp_long; an
+	// explicit udp profile is not overridden.
+	in.IdleProfile = ""
+	in.Network = []string{"tcp", "udp"}
+	if level(in) != 100 {
+		t.Fatal("default tcp+udp level must be tcp_long (100)")
+	}
+	in.IdleProfile = "udp_short"
+	if level(in) != 101 {
+		t.Fatal("explicit udp_short on tcp+udp must stay 101")
+	}
+	in.IdleProfile = "udp_long"
+	if level(in) != 102 {
+		t.Fatal("explicit udp_long on tcp+udp must stay 102")
 	}
 	in.Network = []string{"udp"}
 	in.IdleProfile = ""

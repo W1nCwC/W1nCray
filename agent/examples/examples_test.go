@@ -107,6 +107,7 @@ func TestCoverage(t *testing.T) {
 		"proxy-send", "proxy-accept", "proxy-passthrough",
 		"tunnel-vless-enc-entry", "tunnel-vless-enc-exit", "tunnel-tls-pin-entry", "tunnel-tls-pin-exit",
 		"reverse-frp-portal", "reverse-frp-bridge", "reverse-gost-portal", "reverse-gost-bridge",
+		"reverse-xray-portal", "reverse-xray-bridge",
 		"realm-relay", "realm-wss-entry", "realm-wss-exit", "gost-wss-entry", "gost-wss-exit",
 		"engine-auto",
 	} {
@@ -278,54 +279,58 @@ func TestPairs(t *testing.T) {
 	}
 }
 
-// TestPendingXrayReverse is a tripwire for a known contract conflict (see the
-// SPEC-REQUEST in the work package report): the xray driver compiles a
-// reverse_portal only if it has a target or a port_map for every listen port
-// (the dokodemo destination), while agent/validate refuses both on a
-// reverse_portal. Until one side changes, no xray reverse proxy can pass the
-// agent, so its sample pair lives in testdata/pending (not embedded, not
-// listed, not linked from the manual). When this test fails because the
-// conflict is gone, move the two files to testdata, add them to TestCoverage
-// and document them in docs/AGENT.md.
-func TestPendingXrayReverse(t *testing.T) {
-	load := func(name string) spec.Desired {
-		raw, err := os.ReadFile(filepath.Join("testdata", "pending", name))
-		if err != nil {
-			t.Fatal(err)
+// TestXrayReverseSemantics pins the reverse proxy contract the xray driver
+// shares with gost and frp: the portal has no targets, the bridge's targets
+// decide the destinations, and the old "portal decides" settings are refused
+// by the layer that owns them.
+func TestXrayReverseSemantics(t *testing.T) {
+	by := map[string]spec.Instance{}
+	for _, ex := range List() {
+		if strings.HasPrefix(ex.Name, "reverse-xray-") {
+			by[ex.Name] = ex.Desired.Instances[0]
 		}
-		d, err := Decode(raw)
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		return d
 	}
+	portal, bridge := by["reverse-xray-portal"], by["reverse-xray-bridge"]
+	if portal.ID == "" || bridge.ID == "" {
+		t.Fatal("the xray reverse samples are missing")
+	}
+	if len(portal.Targets) != 0 || len(portal.Listen.PortMap) != 0 {
+		t.Errorf("the portal sample must not name destinations: %+v", portal.Targets)
+	}
+	if len(bridge.Targets) == 0 {
+		t.Error("the bridge sample must name its destinations")
+	}
+	if bridge.Reverse != nil && len(bridge.Reverse.BridgeAllow) != 0 {
+		t.Error("the bridge sample must not use bridge_allow (xray refuses it; targets are the allow list)")
+	}
+
 	pol := testPolicy()
 	xr := realDrivers(pol)[spec.EngineXray]
 
-	bridge := load("reverse-xray-bridge.json")
-	if errs := validate.Desired(bridge, pol, validateOpts()); len(errs) > 0 {
-		t.Errorf("the bridge half should be valid on its own: %v", errs)
-	}
-	if err := xr.Validate(bridge.Instances[0]); err != nil {
-		t.Errorf("xray rejects the bridge half: %v", err)
-	}
-
-	portal := load("reverse-xray-portal.json")
-	errs := validate.Desired(portal, pol, validateOpts())
-	validatorRefuses := false
-	for _, e := range errs {
+	// The layer above refuses a portal with targets; the driver refuses that
+	// too, and a bridge with bridge_allow.
+	withTargets := portal
+	withTargets.Targets = bridge.Targets
+	one := spec.Desired{Version: spec.Version, Revision: 1, Instances: []spec.Instance{withTargets}}
+	refused := false
+	for _, e := range validate.Desired(one, pol, validateOpts()) {
 		if e.Field == "targets" && strings.Contains(e.Message, "not used by reverse_portal") {
-			validatorRefuses = true
+			refused = true
 		}
 	}
-	bare := portal.Instances[0]
-	bare.Targets = nil
-	driverNeedsTarget := xr.Validate(bare) != nil
-	if !validatorRefuses || !driverNeedsTarget {
-		t.Fatalf("the xray reverse_portal conflict changed (validator refuses targets: %v, driver refuses a portal without them: %v); "+
-			"promote testdata/pending/* to testdata and document it", validatorRefuses, driverNeedsTarget)
+	if !refused {
+		t.Error("validate no longer refuses targets on a reverse_portal")
 	}
-	t.Logf("known conflict still present: validate refuses reverse_portal targets, xray refuses a reverse_portal without them")
+	if err := xr.Validate(withTargets); err == nil {
+		t.Error("xray accepts a reverse_portal with targets")
+	}
+	allow := bridge
+	rv := *bridge.Reverse
+	rv.BridgeAllow = []spec.Allow{{Host: bridge.Targets[0].Host, Ports: bridge.Targets[0].Ports}}
+	allow.Reverse = &rv
+	if err := xr.Validate(allow); err == nil || !strings.Contains(err.Error(), "bridge_allow") {
+		t.Errorf("xray bridge with bridge_allow: %v", err)
+	}
 }
 
 func port(t *testing.T, hostport string) string {
@@ -678,6 +683,8 @@ var policyNeeds = map[string]string{
 	"reverse-frp-portal":     "listen",
 	"reverse-gost-bridge":    "private",
 	"reverse-gost-portal":    "listen",
+	"reverse-xray-bridge":    "private",
+	"reverse-xray-portal":    "listen",
 	"tunnel-tls-pin-entry":   "listen",
 	"tunnel-tls-pin-exit":    "listen",
 	"tunnel-vless-enc-entry": "listen",
