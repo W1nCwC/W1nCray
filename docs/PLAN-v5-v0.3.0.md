@@ -90,7 +90,7 @@
 | V3 | `check --online` 输出旧 tag → 新 tag 对照 |
 | V4 | 全量回归通过 |
 | V5 | install.sh：`dash -n`、`busybox ash -n`、`shfmt -ln posix` 通过；架构检测/服务后端选择/XrayR 探测在模拟环境中对各映射表项给出预期结果 |
-| V6 | 三种服务后端（systemd / OpenRC / procd）的脚本在真实 init 下安装、启动、崩溃自动重启、停止、开机自启启用/禁用、日志查看均正常（隔离环境；无法验证的写明） |
+| V6 | 【已验证】在 Debian 12 测试机（测试机，与其上运行的 XrayR 隔离：`unshare -pfm` + chroot，不动宿主服务）上用**真实 rootfs** 验证：Alpine 3.20.3（OpenRC 0.54、supervise-daemon、busybox wget）与 OpenWRT 23.05.5 x86-64（procd、uclient-fetch、logd/logread）。两者均通过：安装→默认配置→检查失败时不启动；start/stop/restart；`kill -9` 后 10 秒内重生（新 PID）；enable/disable（OpenRC runlevel / `/etc/rc.d` 的 S99、K10）；日志（`/var/log/W1nCray.log` / logread）；单实例锁拒绝第二实例；switch→回滚互相切换 XrayR 服务各 3 轮；升级时服务运行中则重启；`uninstall`/`--purge`；OpenWRT 的 `sysupgrade.conf` 写入与清理 |
 | V7 | `W1nCray`（无参数）出现菜单；status/log/check/uninstall 等快捷命令可用；未识别参数透传给程序本体 |
 | V8 | 12 个目标的完整版与 lite 版均可构建；lite 版遇到不支持的 DNS provider 时 check 在启动前报错，http/tls/file 证书不受影响 |
 | V9 | 已安装旧版用户可通过旧 install.sh 升级到新版（未压缩 amd64/arm64 资产与校验和保持可用） |
@@ -108,3 +108,14 @@
 | V6 | 【待确认】OpenRC/procd 的真实 init 下行为未验证（脚本内容已按调研结果生成并通过 `sh -n`），需要 Alpine / OpenWRT 真机或 chroot 环境 | — |
 
 `install.sh` 的 `latest_tag` 在 atom 回退路径上加了 `head -n1`（测试夹具暴露了同一行多个条目时会输出多个 tag 的隐患）。
+
+### 5.1 真实环境验证中发现并修复的问题
+1. `status`/`switch` 用 `pidof W1nCray` 取 PID：busybox 的 `pidof` 也会按脚本名匹配，导致管理脚本自身 PID 被列入（Alpine 上显示 `PID 573 543 531`）。改为 `daemon_pids`：只保留 `/proc/<pid>/exe` 指向 `$BIN` 的进程。
+2. OpenWRT 卸载后 `/etc/sysupgrade.conf` 残留 W1nCray 条目：现在 `uninstall` 去掉 init 脚本条目，`--purge` 再去掉配置目录条目，用户自己的条目保持不变（新增测试 `t_uninstall_openwrt_sysupgrade`）。
+
+### 5.2 验证环境的局限
+- 两个 rootfs 都是 x86-64 的 chroot，**不是**真机；MIPS/ARM 路由器上的内存与性能仍未实测（arm/mips 的二进制仅完成交叉编译与 `gzip -t`）。
+- chroot 中 OpenRC 需要先执行 `openrc default`（并设 `rc_sys="lxc"`），否则 `rc-service` 会误报 “already starting”；这是 chroot 环境的限制，非脚本问题。procd 需手动启动 ubusd/logd/procd 并创建 `/tmp/lock`。
+- switch 的“成功”分支用了“`check` 恒通过”的包装脚本；失败回滚分支与 check 失败分支用真实二进制验证。真实面板的 `check --online` 仍需在有面板的节点上验证。
+- 在 OpenWRT 的 busybox（无 install/od/stat/timeout/curl/bash）下运行 `tests/install_test.sh`：184/184 通过；Alpine busybox ash：178/178（当时尚无 sysupgrade 清理的用例）。
+- GitHub API、`releases.atom`、`releases/download/...` 的跨主机重定向在 OpenWRT 23.05.5 的 uclient-fetch 上实测可用；更旧版本（21.02）未测。
