@@ -37,7 +37,10 @@ const (
 	// link is accepted on Tunnel.Listen, user traffic on Listen.
 	KindReversePortal Kind = "reverse_portal"
 	// KindReverseBridge is the NAT side: it dials Tunnel.Server and serves
-	// the requests relayed by the portal to Targets.
+	// the requests relayed by the portal to Targets. By convention
+	// Listen.Ports of a bridge names the portal-side public port(s) it
+	// serves (required by frp, which registers them; informational for the
+	// other engines) and Listen.Addr is unused.
 	KindReverseBridge Kind = "reverse_bridge"
 )
 
