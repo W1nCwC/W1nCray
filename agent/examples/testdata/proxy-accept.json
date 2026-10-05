@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "proxy-accept",
+      "name": "接收PROXY协议：仅回环监听，前置的nginx或haproxy送入",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "127.0.0.1", "ports": "20610" },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.61", "ports": "8080" }],
+      "accept_proxy_protocol": true
+    }
+  ]
+}

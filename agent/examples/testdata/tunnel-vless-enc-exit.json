@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "tun-web",
+      "name": "隧道出口（机器B）：只放行声明的目标，与entry文件成对",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "tunnel_exit",
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.70", "ports": "443" }],
+      "tunnel": {
+        "type": "tcp",
+        "listen": "0.0.0.0:20701",
+        "security": "vless_enc"
+      },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

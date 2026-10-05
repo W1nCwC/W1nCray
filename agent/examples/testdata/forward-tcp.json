@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "web-80",
+      "name": "TCP直连转发：本机20080转到203.0.113.10:80，空闲上限1小时",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "20080" },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.10", "ports": "80" }],
+      "idle_profile": "tcp_long"
+    }
+  ]
+}

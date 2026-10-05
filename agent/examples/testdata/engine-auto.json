@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "auto-simple",
+      "name": "engine为auto：普通转发，由agent在能胜任的引擎里自选",
+      "enabled": true,
+      "engine": "auto",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "21300" },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.95", "ports": "443" }]
+    },
+    {
+      "id": "auto-iphash",
+      "name": "engine为auto：iphash哈希只有gost与realm支持，xray不行",
+      "enabled": true,
+      "engine": "auto",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "21301" },
+      "network": ["tcp"],
+      "targets": [
+        { "host": "203.0.113.96", "ports": "443" },
+        { "host": "203.0.113.97", "ports": "443" }
+      ],
+      "balance": { "strategy": "iphash" }
+    }
+  ]
+}

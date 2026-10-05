@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "realm-tun",
+      "name": "realm隧道入口（机器A）：wss，与exit文件成对",
+      "enabled": true,
+      "engine": "realm",
+      "kind": "tunnel_entry",
+      "listen": { "addr": "0.0.0.0", "ports": "21100" },
+      "network": ["tcp"],
+      "tunnel": {
+        "type": "wss",
+        "server": "relay.example.com:21101",
+        "host": "relay.example.com",
+        "sni": "relay.example.com",
+        "path": "/realm"
+      },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}
