@@ -36,40 +36,65 @@
 | Hysteria v1 / TUIC / AnyTLS / Naive / Mieru | ❌ 官方 Xray 无对应入站，启动时会报错提示 |
 | 传输 H2 / QUIC | ❌ 已被 Xray 移除，请改用 XHTTP |
 
-## 安装（Linux）
+## 安装（Linux：Debian/Ubuntu、Alpine、OpenWRT 等）
+
+支持 systemd（Debian/Ubuntu/CentOS…）、OpenRC（Alpine）、procd（OpenWRT）三种服务管理器，脚本为 POSIX sh，只依赖 busybox 自带的工具。
 
 ```bash
-# 一键安装（从 GitHub Releases 下载对应架构的二进制）
-bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.sh) install
+# 一键安装（curl 或 wget 任选其一；OpenWRT 没有 curl，用 wget）
+(curl -fsSL -o /tmp/W1nCray-install.sh https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.sh \
+  || wget -O /tmp/W1nCray-install.sh https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.sh) \
+  && sh /tmp/W1nCray-install.sh install
 # 或使用本地编译的二进制
-bash install.sh install --binary ./W1nCray-linux-amd64
+sh install.sh install --binary ./W1nCray-linux-amd64
 ```
 
-安装后脚本保存在 `/usr/local/W1nCray/install.sh`，之后的命令都用它执行。
+安装参数：`--lite | --full`（版本类型）、`--prefix DIR`（安装目录，空间不足时指向外部存储）、`--with-geo`（强制下载 geo 文件）、`--version vX.Y.Z`、`--url 地址`、`--binary 文件`。
 
 安装脚本会：
 
-1. 安装到 `/usr/local/W1nCray/W1nCray`，配置目录 `/etc/W1nCray`，注册 systemd 服务 `W1nCray`；
-2. **检测到 `/etc/XrayR/config.yml` 时自动迁移**（`config.yml` 以及 dns/route/出入站/规则列表、geo 文件、XrayR 已签发的证书），XrayR 的文件只读、不会被修改；没有 XrayR 时生成默认配置；
-3. 缺少 `geoip.dat` / `geosite.dat` 时自动下载；
-4. 运行 `W1nCray check --online`：向面板拉取每个节点并实际构建入站，不监听端口；
-5. **XrayR 仍在运行时不会启动 W1nCray**（端口冲突），确认后再切换。
+1. 按 CPU 自动选择资产（amd64 / 386 / arm64 / armv5-7 / mips / mipsle / mips64(le) / riscv64 / loong64；MIPS 通过 ELF 头判断字节序，ARM 通过 `/proc/cpuinfo` 判断 VFP，运行自检失败时自动换更低要求的版本），下载后校验 `SHA256SUMS`；
+2. 安装到 `/usr/local/W1nCray/W1nCray`，配置目录 `/etc/W1nCray`，注册服务 `W1nCray`；并把管理命令放到 `/usr/local/bin/W1nCray`（OpenWRT 为 `/usr/bin/W1nCray`）；
+3. **检测到 `/etc/XrayR/config.yml` 时自动迁移**（`config.yml` 以及 dns/route/出入站/规则列表、geo 文件、XrayR 已签发的证书），XrayR 的文件只读、不会被修改；没有 XrayR 时生成默认配置；
+4. 缺少 `geoip.dat` / `geosite.dat` 时自动下载（OpenWRT 默认不下载，约 27 MB，需要时加 `--with-geo`）；
+5. 运行 `W1nCray check --online`：向面板拉取每个节点并实际构建入站，不监听端口；
+6. **XrayR 仍在运行时不会启动 W1nCray**（端口冲突），确认后再切换。
+
+### 管理命令（装好后直接输入 `W1nCray`）
 
 ```bash
-bash /usr/local/W1nCray/install.sh switch     # 停用 XrayR、启用 W1nCray；5 秒内未正常运行会自动回滚
-bash /usr/local/W1nCray/install.sh rollback   # 随时回到 XrayR
-bash /usr/local/W1nCray/install.sh migrate    # 重新迁移（先把现有 /etc/W1nCray 备份为 /etc/W1nCray.bak.<时间>）
-bash /usr/local/W1nCray/install.sh check | status | log | uninstall [--purge]
+W1nCray                      # 管理菜单
+W1nCray status               # 版本、运行状态、开机自启、节点数、最近错误
+W1nCray log [-n 100]         # 实时日志（-n 只看最近若干行）
+W1nCray check                # 检查配置并向面板验证每个节点
+W1nCray start|stop|restart   # 服务控制
+W1nCray enable|disable       # 开机自启
+W1nCray config               # 编辑配置，保存后可立即检查
+W1nCray update [vX.Y.Z] [--lite|--full]
+W1nCray switch               # 停用 XrayR、启用 W1nCray；5 秒内未正常运行会自动回滚
+W1nCray rollback             # 随时回到 XrayR
+W1nCray migrate              # 重新迁移（先把现有 /etc/W1nCray 备份为 /etc/W1nCray.bak.<时间>）
+W1nCray uninstall [--purge]  # 卸载（--purge 同时删除配置）
 ```
 
-### 命令
+其余子命令（`version`、`x25519`、`init`、带参数的 `migrate` / `check` 等）原样交给程序本体。
+
+### Alpine / OpenWRT 说明
+
+- **Alpine**：用 OpenRC 的 `supervise-daemon` 托管，崩溃后每 10 秒无限重启，日志在 `/var/log/W1nCray.log`。
+- **OpenWRT**：用 procd 托管（`respawn 3600 10 0`），日志用 `logread -e W1nCray`；默认安装精简版（`-lite`，约 39 MB，ACME DNS 验证仅含 alidns / cloudflare / dnspod / godaddy / namesilo / tencentcloud），内存小于 1 GiB 时自动设置 `GOMEMLIMIT`。路由器内置闪存通常装不下，请把外部存储挂载（extroot 或 USB/SD）后用 `--prefix /mnt/xxx/W1nCray` 安装。配置与服务脚本会写入 `/etc/sysupgrade.conf`，固件升级后保留配置，但程序文件需要重新执行安装命令。
+- 精简版缺少的 DNS 提供商可用 `W1nCray update --full` 换回完整版。
+- 同一份配置同一时间只允许一个 W1nCray 实例（`<配置文件>.lock`），避免多进程互相踢掉面板 WebSocket。
+- 从 XrayR 迁移时，路由里的旧入站 tag（形如 `V2ray_0.0.0.0_65534`）会自动映射到对应节点的入站，无需修改 `route.json`。
+
+### 命令（程序本体）
 
 ```bash
 W1nCray -c /etc/W1nCray/config.yml                     # 运行
 W1nCray migrate --from /etc/XrayR --to /etc/W1nCray    # 迁移 XrayR（--dry-run 只预览，--force 覆盖）
 W1nCray check -c /etc/W1nCray/config.yml [--online]    # 检查配置（--online 同时向面板验证节点）
 W1nCray init --dir /etc/W1nCray                        # 写入默认配置
-W1nCray version                                        # 版本与内核版本
+W1nCray version                                        # 版本、内核版本与构建类型（full / lite）
 W1nCray x25519                                         # 生成 REALITY 密钥对
 ```
 
@@ -78,10 +103,10 @@ W1nCray x25519                                         # 生成 REALITY 密钥�
 ### 编译与发布
 
 ```bash
-bash release/build.sh v1.0.0   # 产出 dist/W1nCray-linux-amd64、W1nCray-linux-arm64 与 SHA256SUMS
+bash release/build.sh v0.3.0 [arch ...]   # 默认 12 个架构 × full/lite；产出 .gz 与 SHA256SUMS
 ```
 
-把 `dist/` 里的文件上传到 GitHub Release，`install.sh install` 即可直接下载。
+产物：`W1nCray-linux-<arch>.gz`、`W1nCray-linux-<arch>-lite.gz`，另保留 `W1nCray-linux-amd64|arm64` 裸文件供 v0.3.0 之前的安装脚本升级。把 `dist/` 里的文件全部上传到 GitHub Release 即可。lite 构建标签：`dnslite,fallbackroots`。
 
 ## 配置
 
@@ -155,6 +180,8 @@ Xboard 开启节点 WebSocket 后（后台开关 + 运行 `ws-server`），W1nCr
 ```bash
 go test ./...            # 单元测试 + 端到端测试（真实 Xray 客户端经各协议代理）
 go run ./tools/protogen  # 重新生成 app/dispatcher/config.pb.go（无需 protoc）
+sh tests/install_test.sh # 安装脚本测试（dash / busybox ash / bash 均可，不碰系统）
+go test -tags dnslite,fallbackroots ./common/cert/ ./core/ # lite 构建
 ```
 
 设计与验证记录见 [docs/PLAN.md](docs/PLAN.md)、[docs/PLAN-v2-migration.md](docs/PLAN-v2-migration.md)。

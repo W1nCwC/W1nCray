@@ -12,6 +12,7 @@ require (
 	github.com/spf13/viper v1.18.2
 	github.com/xtls/xray-core v1.260327.0
 	go.yaml.in/yaml/v3 v3.0.5
+	golang.org/x/crypto/x509roots/fallback v0.0.0-20261004121123-8f0f1112abdb
 	golang.org/x/time v0.16.0
 	google.golang.org/protobuf v1.36.11
 )

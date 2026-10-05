@@ -387,6 +387,9 @@ func (m *migration) planACMECert(label string, c *yaml.Node) {
 	if (mode != cert.ModeDNS && mode != cert.ModeHTTP && mode != cert.ModeTLS) || domain == "" {
 		return
 	}
+	if mode == cert.ModeDNS && !cert.DNSProviderSupported(scalar(c, "Provider")) {
+		m.report.warn("%s: 证书使用 DNS 供应商 %q，当前程序是 %s 版，不包含它；请安装完整版（W1nCray update --full），否则 W1nCray 无法自动续期该证书", label, scalar(c, "Provider"), cert.BuildFlavor)
+	}
 	cfg := &cert.Config{CertDomain: domain, CertFile: scalar(c, "CertFile"), KeyFile: scalar(c, "KeyFile")}
 	dstCert, dstKey := cert.TargetPaths(filepath.Join(m.toDir, "cert"), cfg)
 	name := strings.ReplaceAll(domain, "*", "_")

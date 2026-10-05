@@ -230,6 +230,7 @@ func buildConfig(opts Options) ([]byte, *RuleManager, error) {
 			return nil, nil, fmt.Errorf("custom inbound config: %w", err)
 		}
 		cfg["inbounds"] = raw
+		rm.reserved = reservedInboundTags(opts.InboundConfigPath)
 	}
 
 	// Outbounds: the first custom outbound stays the default handler (as in

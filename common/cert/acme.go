@@ -19,7 +19,6 @@ import (
 	"github.com/go-acme/lego/v4/challenge/http01"
 	"github.com/go-acme/lego/v4/challenge/tlsalpn01"
 	"github.com/go-acme/lego/v4/lego"
-	"github.com/go-acme/lego/v4/providers/dns"
 	"github.com/go-acme/lego/v4/registration"
 )
 
@@ -123,7 +122,7 @@ func (m *Manager) obtain(cfg *Config) (certPEM, keyPEM []byte, err error) {
 		for k, v := range cfg.DNSEnv {
 			os.Setenv(k, v)
 		}
-		p, perr := dns.NewDNSChallengeProviderByName(cfg.Provider)
+		p, perr := newDNSProvider(cfg.Provider)
 		if perr != nil {
 			return nil, nil, fmt.Errorf("DNS provider %s: %w", cfg.Provider, perr)
 		}

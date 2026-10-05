@@ -501,9 +501,11 @@ func (c *Controller) applyNode(nc *xboard.NodeConfig, users []xboard.User) error
 		warn:         c.log.Warnf,
 	}
 	nr := rs.build(c.cfg, nc.Routes, nc.CustomRoutes, c.localRules)
+	nr.Port = int(nc.ServerPort)
 	if err := c.core.Rules.SetNode(c.tag, nr); err != nil {
 		c.log.Errorf("panel routing rules rejected (%v); using only the built-in rules", err)
 		safe := rs.build(&Config{BlockPrivateIP: c.cfg.BlockPrivateIP, DisableGetRule: true}, nil, nil, nil)
+		safe.Port = int(nc.ServerPort)
 		if err := c.core.Rules.SetNode(c.tag, safe); err != nil {
 			return fmt.Errorf("routing rules: %w", err)
 		}
