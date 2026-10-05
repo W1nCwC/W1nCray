@@ -87,7 +87,11 @@ func TestGracefulStopUsesSIGTERM(t *testing.T) {
 	if err := s.Stop(bg(), "graceful"); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(start) > time.Second {
+	// The point is that the child exits on SIGTERM instead of being killed
+	// after StopTimeout (5 s by default). Keep the bound well above 1 s: a
+	// child built with -race sleeps for GORACE's atexit_sleep_ms (1 s) before
+	// it exits, which made a 1 s bound fail on every -race run.
+	if time.Since(start) > 3*time.Second {
 		t.Fatalf("graceful stop took %v", time.Since(start))
 	}
 	if !strings.Contains(readFile(p.LogFile), "got SIGTERM") {
