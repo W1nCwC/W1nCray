@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
@@ -54,6 +54,11 @@ type Options struct {
 	AllowHTTP bool
 	// Log receives driver, supervisor, kernel and reconciler events.
 	Log driver.Logger
+	// Resume makes Boot re-apply the persisted last good state before it
+	// returns, so forwarding comes back after a restart without waiting for the
+	// panel. A failed resume never fails Boot: it is logged and kept for
+	// ResumeReport. Default false (the caller applies a state itself).
+	Resume bool
 }
 
 // Runtime is a booted agent. It owns the supervisor and the reconciler.
@@ -63,8 +68,11 @@ type Runtime struct {
 	Kernels    *kernelx.Ensurer
 	State      *state.Store
 
-	log     driver.Logger
-	applied atomic.Bool
+	log driver.Logger
+
+	resumeMu  sync.Mutex
+	resumeRep reconcile.Report
+	resumeOK  bool
 }
 
 type nopLog struct{}
@@ -118,7 +126,40 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		State:   st,
 		Log:     log,
 	}
-	return &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log}, nil
+	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log}
+	if opts.Resume {
+		rt.resume()
+	}
+	return rt, nil
+}
+
+// resume re-applies the persisted last good state and records the outcome. It
+// never fails the caller: a state that cannot be restored must not keep the
+// agent (and the panel link) from starting.
+func (r *Runtime) resume() {
+	rep, err := r.Reconciler.Resume(context.Background())
+	if err != nil {
+		r.log.Warnf("bootstrap: resuming the last good state: %v", err)
+		if rep.Hash == "" {
+			// Failed before an apply started (for example an unreadable
+			// state file): give the report something to say.
+			rep = reconcile.Report{Status: reconcile.StatusFailed, Message: err.Error(), At: time.Now()}
+		}
+	} else if rep.Hash != "" {
+		r.log.Infof("bootstrap: resumed the last good state (revision %d): %s, %d instance(s)", rep.Revision, rep.Status, len(rep.Instances))
+	}
+	r.resumeMu.Lock()
+	// ok is false only when there was nothing to resume.
+	r.resumeRep, r.resumeOK = rep, err != nil || rep.Hash != ""
+	r.resumeMu.Unlock()
+}
+
+// ResumeReport returns the outcome of the resume Boot ran (Options.Resume). ok
+// is false if Boot did not resume or there was no persisted state to resume.
+func (r *Runtime) ResumeReport() (rep reconcile.Report, ok bool) {
+	r.resumeMu.Lock()
+	defer r.resumeMu.Unlock()
+	return r.resumeRep, r.resumeOK
 }
 
 // buildDrivers is the production driver registry.
@@ -139,11 +180,7 @@ func buildDrivers(c *core.Core, pol spec.Policy, log driver.Logger) (map[string]
 
 // Apply makes d the running state and returns the report.
 func (r *Runtime) Apply(ctx context.Context, d spec.Desired) (reconcile.Report, error) {
-	rep, err := r.Reconciler.Apply(ctx, d)
-	if err == nil {
-		r.applied.Store(true)
-	}
-	return rep, err
+	return r.Reconciler.Apply(ctx, d)
 }
 
 // ApplyFile reads a spec.Desired JSON file (strict: unknown fields are
@@ -165,18 +202,16 @@ func (r *Runtime) ApplyFile(path string) (reconcile.Report, error) {
 	return r.Apply(context.Background(), d)
 }
 
-// Shutdown stops every kernel and the supervised processes. An empty desired
-// state is applied first so in-process kernels (the builtin xray and any
-// driver holding listeners) are torn down through the normal apply path; the
-// apply error, if any, is logged and does not prevent the supervisor from
-// stopping.
+// Shutdown stops every kernel and the supervised processes. The reconciler
+// stops its instances without touching the persisted desired and last good
+// state (applying an empty desired state would erase them), so the next start
+// can resume where this one stopped. A stop error is logged and does not
+// prevent the supervisor from stopping.
 func (r *Runtime) Shutdown(ctx context.Context) error {
-	if r.applied.Load() {
-		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		if _, err := r.Reconciler.Apply(stopCtx, spec.Desired{Version: spec.Version}); err != nil {
-			r.log.Warnf("bootstrap: stopping instances during shutdown: %v", err)
-		}
-		cancel()
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	if err := r.Reconciler.Stop(stopCtx); err != nil {
+		r.log.Warnf("bootstrap: stopping instances during shutdown: %v", err)
 	}
+	cancel()
 	return r.Sup.Shutdown(ctx)
 }
