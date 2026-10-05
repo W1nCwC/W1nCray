@@ -4,11 +4,17 @@ package panel
 
 import (
 	"fmt"
+	"io"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 
+	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/node"
 )
@@ -50,6 +56,36 @@ type AgentConfig struct {
 	// Policy is the local root-of-trust policy; remote desired state can never
 	// relax it.
 	Policy *AgentPolicy `mapstructure:"Policy"`
+	// Panel links the agent to a panel (W1nCBoard/Xboard) that pushes the
+	// desired state and receives the status reports. It requires the agent to
+	// be enabled and never relaxes Policy.
+	Panel *AgentPanelConfig `mapstructure:"Panel"`
+}
+
+// AgentPanelConfig configures the agent <-> panel link (the wire contract is
+// docs/PLAN-v7-panel-control.md). The agent connects out to the panel; the
+// panel never connects to the agent.
+type AgentPanelConfig struct {
+	Enabled bool `mapstructure:"Enabled"`
+	// URL is the panel origin, for example https://panel.example.com. It must
+	// be https unless it is a loopback host or AllowInsecureHTTP is set.
+	URL string `mapstructure:"URL"`
+	// MachineID is the machine id on the panel.
+	MachineID int `mapstructure:"MachineID"`
+	// Token is the machine token. Exactly one of Token and TokenFile must be
+	// set; TokenFile keeps the secret out of the config file.
+	Token string `mapstructure:"Token"`
+	// TokenFile holds the machine token (surrounding whitespace is ignored).
+	// On Unix-like systems the file must not be readable by group or other.
+	// A relative path is resolved against the config file's directory.
+	TokenFile string `mapstructure:"TokenFile"`
+	// PullIntervalSec and ReportIntervalSec default to 30 and are clamped to
+	// [10, 300] seconds.
+	PullIntervalSec   int `mapstructure:"PullIntervalSec"`
+	ReportIntervalSec int `mapstructure:"ReportIntervalSec"`
+	// AllowInsecureHTTP permits plain http:// to a non-loopback host
+	// (development only).
+	AllowInsecureHTTP bool `mapstructure:"AllowInsecureHTTP"`
 }
 
 // AgentPolicy maps agent/spec.Policy fields onto the config file. A zero value
@@ -134,6 +170,9 @@ func (c *Config) resolvePaths(configPath string) {
 	if c.Agent.KernelsDir == "" {
 		c.Agent.KernelsDir = filepath.Join(c.Agent.StateDir, "kernels")
 	}
+	if pc := c.Agent.Panel; pc != nil && pc.TokenFile != "" && !filepath.IsAbs(pc.TokenFile) {
+		pc.TokenFile = filepath.Join(base, pc.TokenFile)
+	}
 }
 
 func (c *Config) validate() error {
@@ -201,7 +240,15 @@ func merge(dst, src *node.Config) {
 // parsed in full by the agent core when a desired state is applied.
 func (a *AgentConfig) validate() error {
 	if !a.Enabled {
+		if a.Panel != nil && a.Panel.Enabled {
+			return fmt.Errorf("config: Agent.Panel.Enabled requires Agent.Enabled")
+		}
 		return nil
+	}
+	if a.Panel != nil {
+		if err := a.Panel.validate(); err != nil {
+			return err
+		}
 	}
 	if a.Policy != nil {
 		if n := len(a.Policy.PortRange); n != 0 && n != 2 {
@@ -241,4 +288,105 @@ func (a *AgentConfig) PolicySpec() spec.Policy {
 		out.PortRange = [2]int{p.PortRange[0], p.PortRange[1]}
 	}
 	return out
+}
+
+// Intervals returns the pull and report intervals, defaulted and clamped.
+func (p *AgentPanelConfig) Intervals() (pull, report time.Duration) {
+	return panelclient.ClampInterval(time.Duration(p.PullIntervalSec) * time.Second),
+		panelclient.ClampInterval(time.Duration(p.ReportIntervalSec) * time.Second)
+}
+
+// validate checks the panel section without touching the network or the token
+// file (ResolveToken reads it when the link starts, and "W1nCray check" reads
+// it to report problems early).
+func (p *AgentPanelConfig) validate() error {
+	if !p.Enabled {
+		return nil
+	}
+	if p.MachineID <= 0 {
+		return fmt.Errorf("config: Agent.Panel.MachineID must be a positive number")
+	}
+	switch {
+	case p.Token != "" && p.TokenFile != "":
+		return fmt.Errorf("config: Agent.Panel.Token and Agent.Panel.TokenFile are both set; use only one")
+	case p.Token == "" && p.TokenFile == "":
+		return fmt.Errorf("config: Agent.Panel needs Token or TokenFile")
+	}
+	if p.PullIntervalSec < 0 || p.ReportIntervalSec < 0 {
+		return fmt.Errorf("config: Agent.Panel.PullIntervalSec and ReportIntervalSec must not be negative")
+	}
+	// The client enforces the URL rules (https, no user info, loopback
+	// exception); a placeholder token lets it check the URL alone.
+	if _, err := panelclient.New(panelclient.Options{
+		BaseURL:           p.URL,
+		MachineID:         p.MachineID,
+		Token:             "-",
+		AllowInsecureHTTP: p.AllowInsecureHTTP,
+	}); err != nil {
+		return fmt.Errorf("config: Agent.Panel.URL: %s", strings.TrimPrefix(err.Error(), "panelclient: "))
+	}
+	return nil
+}
+
+// ResolveToken returns the machine token: Token as is, or the contents of
+// TokenFile (checked for safe permissions on Unix-like systems).
+func (p *AgentPanelConfig) ResolveToken() (string, error) {
+	if p.Token != "" {
+		return p.Token, nil
+	}
+	if p.TokenFile == "" {
+		return "", fmt.Errorf("Agent.Panel needs Token or TokenFile")
+	}
+	return readTokenFile(p.TokenFile)
+}
+
+// maxTokenFileBytes bounds what is read from a token file.
+const maxTokenFileBytes = 4096
+
+// readTokenFile reads a token file and returns the trimmed token. The file's
+// permissions are checked on the opened file, so the check cannot be raced.
+func readTokenFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("Agent.Panel.TokenFile: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("Agent.Panel.TokenFile: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("Agent.Panel.TokenFile %s is not a regular file", path)
+	}
+	if err := checkTokenFileMode(path, fi.Mode(), runtime.GOOS); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("Agent.Panel.TokenFile: %w", err)
+	}
+	if len(data) > maxTokenFileBytes {
+		return "", fmt.Errorf("Agent.Panel.TokenFile %s is larger than %d bytes", path, maxTokenFileBytes)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("Agent.Panel.TokenFile %s is empty", path)
+	}
+	if strings.ContainsAny(token, " \t\r\n") {
+		return "", fmt.Errorf("Agent.Panel.TokenFile %s must contain just the token", path)
+	}
+	return token, nil
+}
+
+// checkTokenFileMode refuses a token file that group or other can access. The
+// permission bits carry no meaning on Windows (access is by ACL), so goos
+// "windows" skips the check; goos is a parameter so the rule is testable.
+func checkTokenFileMode(path string, mode fs.FileMode, goos string) error {
+	if goos == "windows" {
+		return nil
+	}
+	if perm := mode.Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("Agent.Panel.TokenFile %s has mode %04o: it must not be accessible by group or other (run: chmod 600 %s)", path, perm, path)
+	}
+	return nil
 }

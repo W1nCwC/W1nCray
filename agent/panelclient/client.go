@@ -118,7 +118,7 @@ func New(o Options) (*Client, error) {
 		baseURL:   strings.TrimRight(o.BaseURL, "/"),
 		machineID: o.MachineID,
 		token:     o.Token,
-		userAgent: "W1Ncray-agent/" + version,
+		userAgent: "W1nCray-agent/" + version,
 		http:      httpClient,
 	}, nil
 }

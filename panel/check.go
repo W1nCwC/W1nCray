@@ -111,6 +111,35 @@ func checkAgent(w io.Writer, cfg *Config) error {
 			fmt.Fprintf(w, "  ✓ Agent.DesiredPath: %s\n", a.DesiredPath)
 		}
 	}
+	return checkAgentPanel(w, a.Panel)
+}
+
+// checkAgentPanel reports the panel link section. It never connects: it
+// validates the settings and reads the token file (so a bad file mode is found
+// before the service starts). The token itself is never printed.
+func checkAgentPanel(w io.Writer, pc *AgentPanelConfig) error {
+	if pc == nil || !pc.Enabled {
+		return nil
+	}
+	// Structure and URL were validated by LoadConfig.
+	pull, report := pc.Intervals()
+	fmt.Fprintf(w, "  Agent.Panel: 已启用（%s，机器 ID %d，拉取间隔 %s，上报间隔 %s）\n", pc.URL, pc.MachineID, pull, report)
+	if (pc.PullIntervalSec != 0 && time.Duration(pc.PullIntervalSec)*time.Second != pull) ||
+		(pc.ReportIntervalSec != 0 && time.Duration(pc.ReportIntervalSec)*time.Second != report) {
+		fmt.Fprintln(w, "  ! 间隔已被限制在 10–300 秒之内")
+	}
+	if pc.AllowInsecureHTTP {
+		fmt.Fprintln(w, "  ! Agent.Panel.AllowInsecureHTTP 已开启：令牌将以明文传输，仅限开发环境")
+	}
+	if _, err := pc.ResolveToken(); err != nil {
+		fmt.Fprintf(w, "  ✗ %v\n", err)
+		return err
+	}
+	if pc.TokenFile != "" {
+		fmt.Fprintf(w, "  ✓ Agent.Panel.TokenFile: %s\n", pc.TokenFile)
+	} else {
+		fmt.Fprintln(w, "  ! 令牌写在配置文件里；建议改用 Agent.Panel.TokenFile（权限 600）")
+	}
 	return nil
 }
 
