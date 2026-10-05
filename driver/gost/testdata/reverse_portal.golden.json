@@ -1,0 +1,27 @@
+{
+ "services": [
+  {
+   "name": "po.portal",
+   "addr": "0.0.0.0:8443",
+   "handler": {
+    "type": "relay",
+    "auth": {
+     "username": "8d58dbee4199",
+     "password": "s3cr3t-s3cr3t-s3cr3t-0123"
+    },
+    "metadata": {
+     "bind": "true"
+    }
+   },
+   "listener": {
+    "type": "ws",
+    "metadata": {
+     "path": "/r"
+    }
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  }
+ ]
+}

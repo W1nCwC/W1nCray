@@ -1,0 +1,29 @@
+{
+ "services": [
+  {
+   "name": "pp.tcp.9000",
+   "addr": "127.0.0.1:9000",
+   "handler": {
+    "type": "tcp",
+    "metadata": {
+     "proxyProtocol": "1"
+    }
+   },
+   "listener": {
+    "type": "tcp"
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "10.0.0.5:80"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true",
+    "proxyProtocol": "2"
+   }
+  }
+ ]
+}

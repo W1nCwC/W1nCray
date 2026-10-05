@@ -1,0 +1,80 @@
+{
+ "services": [
+  {
+   "name": "br.tcp.2222",
+   "addr": "0.0.0.0:2222",
+   "handler": {
+    "type": "rtcp"
+   },
+   "listener": {
+    "type": "rtcp",
+    "chain": "br.chain"
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "127.0.0.1:22"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  },
+  {
+   "name": "br.udp.2222",
+   "addr": "0.0.0.0:2222",
+   "handler": {
+    "type": "rudp"
+   },
+   "listener": {
+    "type": "rudp",
+    "chain": "br.chain",
+    "metadata": {
+     "ttl": "60s"
+    }
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "127.0.0.1:22"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  }
+ ],
+ "chains": [
+  {
+   "name": "br.chain",
+   "hops": [
+    {
+     "name": "br.hop",
+     "nodes": [
+      {
+       "name": "br.node",
+       "addr": "portal.example.com:8443",
+       "connector": {
+        "type": "relay",
+        "auth": {
+         "username": "8d58dbee4199",
+         "password": "s3cr3t-s3cr3t-s3cr3t-0123"
+        }
+       },
+       "dialer": {
+        "type": "ws",
+        "metadata": {
+         "path": "/r"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
