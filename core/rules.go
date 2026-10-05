@@ -9,6 +9,8 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/infra/conf"
+
+	"github.com/W1nCwC/W1nCray/app/routeguard"
 )
 
 // NodeRules are the routing rules of one node. Every rule must be restricted
@@ -264,15 +266,26 @@ func (m *RuleManager) apply() error {
 	if err != nil {
 		return err
 	}
-	if err := m.router.AddRule(tm, false); err != nil {
-		return m.restore(err)
+	// One write section covers the reload and, if the router refuses it, the
+	// restore: a refused reload leaves the router with an emptied or partial
+	// table until the restore completes, and route selection must not see
+	// that. m.router is the raw router (not routeguard.Router), because the
+	// write lock is already held here and is not re-entrant. Nothing inside
+	// the section selects a route or takes the guard again.
+	if err := routeguard.Mutate(func() error {
+		if err := m.router.AddRule(tm, false); err != nil {
+			return m.restore(err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	m.lastGood = tm
 	return nil
 }
 
 // restore reloads the last accepted config after the router refused a new
-// one. Before any config was accepted it falls back to the global rules, which
+// one. It runs inside apply's write section and must not take the guard.Before any config was accepted it falls back to the global rules, which
 // is what the instance was started with.
 func (m *RuleManager) restore(cause error) error {
 	prev := m.lastGood
