@@ -27,6 +27,7 @@ func Check(path string, online bool, w io.Writer) error {
 	quietKernelLog()
 
 	var ns []core.NameServer
+	nodePorts := map[int]string{}
 	if online {
 		certs := cert.NewManager(certDir(path, cfg))
 		for _, nc := range cfg.NodesConfig {
@@ -41,9 +42,15 @@ func Check(path string, online bool, w io.Writer) error {
 			}
 			fmt.Fprintf(w, "  ✓ %s: %s\n", ctl.Tag(), summary)
 			ns = append(ns, ctl.NameServers()...)
+			if p := ctl.PendingPort(); p > 0 {
+				if _, taken := nodePorts[p]; !taken {
+					nodePorts[p] = ctl.Tag()
+				}
+			}
 		}
 	}
 
+	reportLegacyTags(w, cfg, nodePorts, online)
 	opts := coreOptions(cfg, ns)
 	// Keep the kernel's debug/info output out of the check report.
 	if opts.LogLevel == "debug" || opts.LogLevel == "info" {
@@ -84,4 +91,24 @@ func (f warningFilter) Handle(msg xlog.Message) {
 		return
 	}
 	f.next.Handle(msg)
+}
+
+// reportLegacyTags lists XrayR-style inbound tags (V2ray_0.0.0.0_65534) in
+// route.json. They keep working: W1nCray maps them to the node listening on
+// that port; the report says which node, and recommends the new tag.
+func reportLegacyTags(w io.Writer, cfg *Config, nodePorts map[int]string, online bool) {
+	refs, err := core.LegacyTagsInRoute(cfg.RouteConfigPath, cfg.InboundConfigPath)
+	if err != nil || len(refs) == 0 {
+		return
+	}
+	for _, r := range refs {
+		switch node, ok := nodePorts[r.Port]; {
+		case ok:
+			fmt.Fprintf(w, "  ! route.json 使用了 XrayR 旧入站 tag %s，已自动对应到 %s（建议改为新 tag）\n", r.Tag, node)
+		case online:
+			fmt.Fprintf(w, "  ! route.json 使用了 XrayR 旧入站 tag %s，但没有节点监听端口 %d，该规则不会生效\n", r.Tag, r.Port)
+		default:
+			fmt.Fprintf(w, "  ! route.json 使用了 XrayR 旧入站 tag %s（对应端口 %d 的节点；加 --online 可查看对应关系）\n", r.Tag, r.Port)
+		}
+	}
 }

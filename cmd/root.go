@@ -67,6 +67,11 @@ func run() error {
 		return err
 	}
 	setAssetLocation(path)
+	lock, err := acquireInstanceLock(path)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
 	cfg, err := panel.LoadConfig(path)
 	if err != nil {
 		return err

@@ -207,6 +207,12 @@ func startServer(t *testing.T, nodeJSON string, users []map[string]any, mutate f
 
 func startServerOn(t *testing.T, fp *fakePanel, mutate func(*Config)) *server {
 	t.Helper()
+	return startServerWith(t, fp, mutate, nil)
+}
+
+// startServerWith also lets a test adjust the kernel options (route.json etc).
+func startServerWith(t *testing.T, fp *fakePanel, mutate func(*Config), coreMut func(*core.Options)) *server {
+	t.Helper()
 	cfg := DefaultConfig()
 	cfg.ListenIP = "127.0.0.1"
 	off := false
@@ -225,11 +231,15 @@ func startServerOn(t *testing.T, fp *fakePanel, mutate func(*Config)) *server {
 	if err := ctl.Prefetch(ctx); err != nil {
 		t.Fatal(err)
 	}
-	cr, err := core.New(core.Options{
+	copts := core.Options{
 		LogLevel:    "warning",
 		Connection:  core.ConnectionPolicy{Handshake: 4, ConnIdle: 30, UplinkOnly: 2, DownlinkOnly: 4, BufferSize: 64},
 		NameServers: ctl.NameServers(),
-	})
+	}
+	if coreMut != nil {
+		coreMut(&copts)
+	}
+	cr, err := core.New(copts)
 	if err != nil {
 		t.Fatal(err)
 	}

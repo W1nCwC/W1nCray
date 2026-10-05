@@ -13,6 +13,9 @@ import (
 // NodeRules are the routing rules of one node. Every rule must be restricted
 // to the node's inbound tag so that nodes cannot affect each other.
 type NodeRules struct {
+	// Port is the port the node listens on; XrayR-style inbound tags in the
+	// global route.json that name this port are mapped to this node.
+	Port int
 	// Head rules are evaluated before the global route config (security
 	// and panel rules).
 	Head []json.RawMessage
@@ -34,6 +37,8 @@ type RuleManager struct {
 	balancers json.RawMessage
 	nodes     map[string]*NodeRules
 	order     []string
+	reserved  map[string]bool // tags of the user's custom inbounds
+	logged    map[string]bool
 }
 
 // SetNode installs or replaces the rules of a node.
@@ -89,11 +94,38 @@ func (m *RuleManager) compose() []json.RawMessage {
 	for _, tag := range m.order {
 		rules = append(rules, m.nodes[tag].Head...)
 	}
-	rules = append(rules, m.global...)
+	rules = append(rules, m.globalRules()...)
 	for _, tag := range m.order {
 		rules = append(rules, m.nodes[tag].Tail...)
 	}
 	return rules
+}
+
+// globalRules returns the route.json rules with XrayR inbound tags mapped to
+// the nodes that listen on the same port. Rules without such tags are
+// returned as they are.
+func (m *RuleManager) globalRules() []json.RawMessage {
+	ports := make(map[int]string)
+	for _, tag := range m.order {
+		if p := m.nodes[tag].Port; p > 0 {
+			if _, taken := ports[p]; !taken {
+				ports[p] = tag
+			}
+		}
+	}
+	if len(ports) == 0 {
+		return m.global
+	}
+	if m.logged == nil {
+		m.logged = make(map[string]bool)
+	}
+	out := make([]json.RawMessage, len(m.global))
+	for i, r := range m.global {
+		out[i] = rewriteLegacyTags(r, ports, m.reserved, func(ref LegacyRef, node string) {
+			logLegacyOnce(m.logged, ref, node)
+		})
+	}
+	return out
 }
 
 func (m *RuleManager) apply() error {

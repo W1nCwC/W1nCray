@@ -92,6 +92,16 @@ func (c *Controller) Check(ctx context.Context) (string, error) {
 	return s, nil
 }
 
+// PendingPort is the port of the node config fetched by Prefetch/Check.
+func (c *Controller) PendingPort() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending == nil {
+		return 0
+	}
+	return int(c.pending.ServerPort)
+}
+
 // checkCert finds the certificate the node would use. When it does not exist
 // yet (it is obtained at start), a temporary self-signed one stands in so the
 // rest of the TLS settings can still be validated; cleanup removes it.
@@ -102,6 +112,9 @@ func (c *Controller) checkCert(nc *xboard.NodeConfig) (paths *certPaths, note st
 		return nil, "", cleanup, fmt.Errorf("TLS 已启用但未配置证书（面板 cert_config 或本地 CertConfig）")
 	}
 	cf, kf := cert.TargetPaths(c.certs.Dir, cc)
+	if cc.CertMode == cert.ModeDNS && !cert.DNSProviderSupported(cc.Provider) {
+		return nil, "", cleanup, fmt.Errorf("证书使用 DNS 供应商 %q，当前程序是 %s 版，不包含它；请安装完整版: W1nCray update --full", cc.Provider, cert.BuildFlavor)
+	}
 	if _, err := tls.LoadX509KeyPair(cf, kf); err == nil {
 		return &certPaths{CertFile: cf, KeyFile: kf, RejectUnknownSNI: cc.RejectUnknownSni}, "证书: " + cf, cleanup, nil
 	}
