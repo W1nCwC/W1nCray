@@ -140,9 +140,13 @@ func (d *Driver) Caps() driver.Caps {
 		// frps cannot read a PROXY header from the public side.
 		ProxyIn: false,
 		// frpc writes PROXY v1/v2 towards the local target (TCP only).
-		ProxyOut:         true,
-		ProxyOutUDP:      false,
-		Balance:          nil,
+		ProxyOut:    true,
+		ProxyOutUDP: false,
+		// A bridge has one target per port, so the only strategy it can
+		// express is failover (with an active health check the proxy is
+		// withdrawn while the target is down: TestE2EActiveHealthCheck).
+		// Portals accept no balance section; their Validate refuses it.
+		Balance:          []string{"failover"},
 		HealthCheck:      "active", // frpc healthCheck, TCP targets only
 		Stats:            "api",
 		Reload:           "api", // frpc only; frps restarts (see package doc)

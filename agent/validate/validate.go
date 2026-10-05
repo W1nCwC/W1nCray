@@ -66,7 +66,10 @@ type Options struct {
 var (
 	reID      = regexp.MustCompile(`^[a-z0-9_-]{1,40}$`)
 	reVersion = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
-	reSecret  = regexp.MustCompile(`^[A-Za-z0-9_.~+/=-]{16,256}$`)
+	// reSecret is the intersection of what every engine accepts: xray
+	// refuses '~', frp refuses ':' and '@', gost needs printable ASCII and
+	// realm only checks the length.
+	reSecret  = regexp.MustCompile(`^[A-Za-z0-9_.+/=-]{16,256}$`)
 	rePin     = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 	reHostHdr = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$`)
 	rePath    = regexp.MustCompile(`^/[A-Za-z0-9._~%+=:@/-]{0,254}$`)
@@ -619,9 +622,6 @@ func (x *inst) tunnel() {
 		if t.Listen != "" {
 			x.err("tunnel.listen", "not used by kind %q", k)
 		}
-		if t.Cert != nil {
-			x.err("tunnel.cert", "server-side certificate not used by kind %q", k)
-		}
 	}
 	if server {
 		if t.Listen == "" {
@@ -676,18 +676,40 @@ func (x *inst) tunnel() {
 		x.err("tunnel.pin_sha256", "only meaningful with security tls_pin")
 	}
 	if t.Cert != nil {
-		x.cert(t.Cert)
+		x.cert(t.Cert, client)
 	}
 }
 
-func (x *inst) cert(c *spec.Cert) {
+func validCertPath(p string) bool {
+	return reCertCh.MatchString(p) && !strings.Contains(p, "..")
+}
+
+// cert checks tunnel.cert. On the server side (exit, portal) it is the
+// certificate to present. On the client side (entry, bridge) it can only be a
+// trust anchor: mode "file" with cert_file naming the CA (or the server's own
+// certificate) and no key_file. An engine that cannot honour it refuses it in
+// its own Validate.
+func (x *inst) cert(c *spec.Cert, client bool) {
 	if !contains(certModes, c.Mode) {
 		x.err("tunnel.cert.mode", "unknown mode %q (want self, file or panel)", c.Mode)
 		return
 	}
+	if client {
+		if c.Mode != "file" {
+			x.err("tunnel.cert.mode", "kind %q only supports mode \"file\" (cert_file is the trust anchor used to verify the server)", x.in.Kind)
+			return
+		}
+		if !validCertPath(c.CertFile) {
+			x.err("tunnel.cert.cert_file", "must be an absolute path (letters, digits and . _ / - only, no '..')")
+		}
+		if c.KeyFile != "" {
+			x.err("tunnel.cert.key_file", "not used by kind %q (client certificates are not supported; cert_file is only the trust anchor)", x.in.Kind)
+		}
+		return
+	}
 	if c.Mode == "file" {
 		for _, f := range []struct{ name, val string }{{"tunnel.cert.cert_file", c.CertFile}, {"tunnel.cert.key_file", c.KeyFile}} {
-			if !reCertCh.MatchString(f.val) || strings.Contains(f.val, "..") {
+			if !validCertPath(f.val) {
 				x.err(f.name, "must be an absolute path (letters, digits and . _ / - only, no '..')")
 			}
 		}
@@ -738,7 +760,7 @@ func (x *inst) secret() {
 	}
 	if !reSecret.MatchString(s) {
 		// Never echo the secret itself.
-		x.err("secret", "must be 16-256 characters of [A-Za-z0-9_.~+/=-]")
+		x.err("secret", "must be 16-256 characters of [A-Za-z0-9_.+/=-] (the set every engine accepts)")
 	}
 }
 

@@ -684,6 +684,66 @@ var policyNeeds = map[string]string{
 	"tunnel-vless-enc-exit":  "listen",
 }
 
+// TestHealthSamples: the two samples that carry a balance.health section run
+// through the real pipeline, each on the engine that implements it (gost:
+// passive ejection, frp: active frpc healthCheck).
+func TestHealthSamples(t *testing.T) {
+	for name, engine := range map[string]string{"forward-gost-limits": spec.EngineGost, "reverse-frp-bridge": spec.EngineFrp} {
+		name, engine := name, engine
+		t.Run(name, func(t *testing.T) {
+			d := sample(t, name)
+			in := d.Instances[0]
+			if in.Balance == nil || in.Balance.Health == nil || in.Balance.Strategy != "failover" {
+				t.Fatalf("sample must carry failover + health: %+v", in.Balance)
+			}
+			r := newReconciler(t, testPolicy(), spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm)
+			rep, err := r.Apply(context.Background(), d)
+			if err != nil {
+				raw, _ := json.MarshalIndent(rep, "", "  ")
+				t.Fatalf("Apply: %v\n%s", err, raw)
+			}
+			if got := rep.Instances[0].Engine; got != engine {
+				t.Fatalf("ran on %q, want %q", got, engine)
+			}
+		})
+	}
+}
+
+// TestClientTrustAnchor: a private CA given as tunnel.cert.cert_file (mode
+// file, no key_file) on the dialling side passes the validator and the engines
+// that honour it (gost: CA file, frp: trustedCaFile), and reaches the rendered
+// configuration.
+func TestClientTrustAnchor(t *testing.T) {
+	pol := testPolicy()
+	drivers := realDrivers(pol)
+	for name, ca := range map[string]string{"gost-wss-entry": "/etc/w1ncray/relay-ca.pem", "reverse-frp-bridge": "/etc/w1ncray/portal-ca.pem"} {
+		name, ca := name, ca
+		t.Run(name, func(t *testing.T) {
+			d := sample(t, name)
+			in := &d.Instances[0]
+			in.Tunnel.Cert = &spec.Cert{Mode: "file", CertFile: ca}
+			if errs := validate.Desired(d, pol, validateOpts()); len(errs) > 0 {
+				t.Fatalf("validate: %v", errs)
+			}
+			drv := drivers[in.Engine]
+			if err := drv.Validate(*in); err != nil {
+				t.Fatalf("%s Validate: %v", in.Engine, err)
+			}
+			art, err := drv.Render(*in)
+			if err != nil {
+				t.Fatalf("%s Render: %v", in.Engine, err)
+			}
+			found := false
+			for _, f := range art.Files {
+				found = found || strings.Contains(string(f), ca)
+			}
+			if !found {
+				t.Errorf("the rendered configuration does not reference the trust anchor %s", ca)
+			}
+		})
+	}
+}
+
 func TestMain(m *testing.M) {
 	// The tests only read embedded data and the testdata directory; make sure
 	// the working directory is the package directory (go test does that).

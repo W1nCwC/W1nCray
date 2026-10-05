@@ -127,7 +127,15 @@ func TestRefusals(t *testing.T) {
 			want:   "PROXY protocol is TCP only and cannot be combined with network udp"},
 		{name: "secret-charset", sample: "tunnel-vless-enc-entry", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Secret = placeholderSecret + "!" },
-			want:   "secret: must be 16-256 characters of [A-Za-z0-9_.~+/=-]"},
+			want:   "secret: must be 16-256 characters of [A-Za-z0-9_.+/=-]"},
+		// '~' was legal in the validator but xray refuses it; ':' and '@' are
+		// refused by frp. Now none of them gets past the validator.
+		{name: "secret-tilde", sample: "reverse-frp-bridge", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) { inst(d).Secret = placeholderSecret + "~" },
+			want:   "secret: must be 16-256 characters of [A-Za-z0-9_.+/=-]"},
+		{name: "secret-colon", sample: "tunnel-vless-enc-entry", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) { inst(d).Secret = placeholderSecret + ":@" },
+			want:   "secret: must be 16-256 characters of [A-Za-z0-9_.+/=-]"},
 		{name: "secret-missing", sample: "tunnel-vless-enc-entry", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Secret = "" },
 			want:   `required for kind "tunnel_entry" (at least 16 characters)`},
@@ -156,9 +164,26 @@ func TestRefusals(t *testing.T) {
 		{name: "strategy-unsupported-by-engine", sample: "forward-balance", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Balance.Strategy = "iphash" },
 			want:   `balance strategy "iphash" is not supported`},
-		{name: "gost-active-health", sample: "forward-gost-limits", policy: fullPolicy(),
-			mutate: func(d *spec.Desired) { inst(d).Balance.Health = &spec.Health{Type: "tcp", IntervalS: 30} },
-			want:   "active health checks are not supported"},
+		{name: "realm-health", sample: "forward-gost-limits", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) {
+				inst(d).Engine, inst(d).Limits = spec.EngineRealm, nil
+				inst(d).Balance = &spec.Balance{Strategy: "round_robin", Health: &spec.Health{Type: "tcp"}}
+			},
+			want: `engine "realm" cannot run this instance: health checks are not supported`},
+		{name: "gost-http-health", sample: "forward-gost-limits", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) { inst(d).Balance.Health = &spec.Health{Type: "http", ProbeURL: "/healthz"} },
+			want:   "gost removes failing targets passively; active health checks are not implemented"},
+		{name: "frp-bridge-strategy", sample: "reverse-frp-bridge", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) { inst(d).Balance.Strategy = "round_robin" },
+			want:   `balance strategy "round_robin" is not supported`},
+		{name: "client-cert-key-file", sample: "reverse-frp-bridge", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) {
+				inst(d).Tunnel.Cert = &spec.Cert{Mode: "file", CertFile: "/etc/w1ncray/portal-ca.pem", KeyFile: "/etc/w1ncray/client.key"}
+			},
+			want: "tunnel.cert.key_file: not used by kind"},
+		{name: "client-cert-self", sample: "gost-wss-entry", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) { inst(d).Tunnel.Cert = &spec.Cert{Mode: "self"} },
+			want:   `only supports mode "file"`},
 		{name: "realm-acl", sample: "forward-tcp", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) {
 				inst(d).Engine = spec.EngineRealm
