@@ -522,7 +522,7 @@ func TestE2EHotAddRemoveIsolation(t *testing.T) {
 	}
 	// a changed instance is replaced and only it is reported
 	f3b := fwdInst("f3", p3, h, p)
-	f3b.IdleProfile = "tcp_long"
+	f3b.IdleProfile = "tcp_default" // tcp_long is the default now, so it would not change the instance
 	res = n.apply(f1, f3b)
 	if len(res.Restarted) != 1 || res.Restarted[0] != "f3" {
 		t.Fatalf("%+v", res)

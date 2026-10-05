@@ -62,7 +62,6 @@ func TestE2EReverseChurnStopsAndDoesNotLeak(t *testing.T) {
 		po := spec.Instance{ID: "rp-" + id, Enabled: true, Engine: "xray", Kind: spec.KindReversePortal,
 			Listen:  &spec.Listen{Addr: "127.0.0.1", Ports: fmt.Sprint(user)},
 			Network: []string{"tcp"},
-			Targets: []spec.Target{{Host: host, Ports: fmt.Sprint(port)}},
 			Secret:  testSecret,
 			Tunnel:  &spec.Tunnel{Type: "tcp", Security: "vless_enc", Listen: tunnelAddr},
 			Reverse: &spec.Reverse{Domain: testDomain}}

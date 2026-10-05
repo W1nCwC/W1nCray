@@ -15,8 +15,10 @@ import (
 )
 
 // CompileVersion is part of every artifact hash; bump it whenever the
-// compiler output for the same input changes.
-const CompileVersion = 1
+// compiler output for the same input changes. Version 2: reverse proxies use
+// the bridge-decides semantics (placeholder destination on the portal,
+// redirect outbounds on the bridge) and the default idle level is tcp_long.
+const CompileVersion = 2
 
 // Part is one inbound or outbound object (Xray JSON) with its tag.
 type Part struct {
@@ -204,12 +206,54 @@ func hostPortStr(h hostRef, port int) string {
 
 // ---------------------------------------------------------------- user inbound
 
+// placeholderHost is the destination a reverse_portal's dokodemo inbound
+// stamps on user connections. It is a TEST-NET-1 address (RFC 5737): never
+// routable, so even a bug that let it escape would not reach a local service.
+// It is never dialled: the bridge rewrites the destination of every relayed
+// connection to one of its own targets (see bridge). The port carries the
+// destination slot (index of the public port + 1) so that a bridge with a
+// target port range can map public port n to target port n.
+const placeholderHost = "192.0.2.1"
+
 // userInbound adds the dokodemo inbound that receives user traffic.
 func (b *builder) userInbound() string {
 	p := b.p
 	tag := tagIn(p.in.ID)
 	d := jDokodemo{Network: strings.Join(p.networks, ","), UserLevel: p.level}
 	pm := map[string]string{}
+	if p.in.Kind == spec.KindReversePortal {
+		// A portal has no targets: the destination is a placeholder that the
+		// bridge overwrites, so the users cannot choose it.
+		d.Address, d.Port = placeholderHost, 1
+		if n := p.listenPorts.Len(); n > 1 {
+			for i := 0; i < n; i++ {
+				pm[strconv.Itoa(p.listenPorts.Lo+i)] = net.JoinHostPort(placeholderHost, strconv.Itoa(i+1))
+			}
+		}
+	} else {
+		b.userDestination(&d, pm)
+	}
+	if len(pm) > 0 {
+		d.PortMap = pm
+	}
+	var st *jStream
+	if p.in.AcceptProxyProtocol {
+		st = &jStream{Sockopt: &jSockopt{AcceptProxyProtocol: true}}
+	}
+	listen := ""
+	if p.listenAddr.IsValid() {
+		listen = p.listenAddr.String()
+	}
+	b.addIn(tag, "dokodemo-door", listen, p.listenPorts.String(), d, st)
+	b.claimListen()
+	b.c.Stats.InboundTag = tag
+	return tag
+}
+
+// userDestination fills in the destination of a forward or tunnel_entry user
+// inbound from its targets and port map.
+func (b *builder) userDestination(d *jDokodemo, pm map[string]string) {
+	p := b.p
 	switch {
 	case len(p.targets) == 1:
 		t := p.targets[0]
@@ -236,21 +280,6 @@ func (b *builder) userInbound() string {
 	if d.Address == "" && len(keys) > 0 {
 		d.Address = p.portMap[keys[0]].Host.Host
 	}
-	if len(pm) > 0 {
-		d.PortMap = pm
-	}
-	var st *jStream
-	if p.in.AcceptProxyProtocol {
-		st = &jStream{Sockopt: &jSockopt{AcceptProxyProtocol: true}}
-	}
-	listen := ""
-	if p.listenAddr.IsValid() {
-		listen = p.listenAddr.String()
-	}
-	b.addIn(tag, "dokodemo-door", listen, p.listenPorts.String(), d, st)
-	b.claimListen()
-	b.c.Stats.InboundTag = tag
-	return tag
 }
 
 // accessRules emits the ACL rules of an inbound followed by pass (the rule
@@ -608,6 +637,13 @@ func (b *builder) portal() error {
 	return nil
 }
 
+// bridge compiles the dialling side of a reverse proxy. Every connection the
+// portal relays enters under the inbound tag rev and is rewritten to one of
+// the bridge's own targets: each destination outbound is a freedom with a
+// redirect, and there is no rule that routes rev traffic to a freedom without
+// one, so neither the portal nor its users can pick the destination. The only
+// other routes are the rendezvous request (to the tunnel, to reach the portal
+// itself) and the final block.
 func (b *builder) bridge() error {
 	p := b.p
 	id := p.in.ID
@@ -617,16 +653,41 @@ func (b *builder) bridge() error {
 	block := b.addBlock()
 	rev := tagReverse(id)
 	b.c.Reverse = &ReverseSpec{Role: "bridge", Tag: rev, Domain: p.rdomain}
-	out := tagOut(id)
-	b.addOut(out, "freedom", jFreedom{UserLevel: p.level, ProxyProtocol: uint32(p.in.ProxyProtocolOut)}, nil)
 	b.c.Stats.InboundTag = rev
-	b.c.Stats.OutboundTags = []string{out}
 	// The bridge worker dials the rendezvous domain with inbound tag rev.
 	b.addRule(jRule{InboundTag: []string{rev}, Domain: []string{"full:" + p.rdomain}, OutboundTag: tagTunnelOut(id)})
-	if p.allowAny {
-		b.addRule(jRule{InboundTag: []string{rev}, OutboundTag: out})
-	} else {
-		b.allowRules(rev, nil, p.allow, out, strings.Join(p.networks, ","))
+	// A relay restricted to the instance's networks; both networks need no
+	// condition.
+	network := ""
+	if n := strings.Join(p.networks, ","); n != "tcp,udp" {
+		network = n
+	}
+	redirect := func(tag string, t target, port int) {
+		b.addOut(tag, "freedom", jFreedom{
+			Redirect: hostPortStr(t.Host, port), UserLevel: p.level, ProxyProtocol: uint32(p.in.ProxyProtocolOut),
+		}, nil)
+		b.c.Stats.OutboundTags = append(b.c.Stats.OutboundTags, tag)
+	}
+	switch {
+	case len(p.targets) > 1:
+		pass, err := b.targetOutbounds(rev, "")
+		if err != nil {
+			return err
+		}
+		pass.InboundTag, pass.Network = []string{rev}, network
+		b.addRule(pass)
+	case p.slots > 1:
+		// Target port range: public port n (slot n) goes to target port n.
+		t := p.targets[0]
+		for k := 0; k < p.slots; k++ {
+			tag := tagOutN(id, k)
+			redirect(tag, t, t.Ports.Lo+k)
+			b.addRule(jRule{InboundTag: []string{rev}, Port: strconv.Itoa(k + 1), Network: network, OutboundTag: tag})
+		}
+	default:
+		tag := tagOut(id)
+		redirect(tag, p.targets[0], p.targets[0].Ports.Lo)
+		b.addRule(jRule{InboundTag: []string{rev}, Network: network, OutboundTag: tag})
 	}
 	b.addRule(jRule{InboundTag: []string{rev}, OutboundTag: block})
 	return nil

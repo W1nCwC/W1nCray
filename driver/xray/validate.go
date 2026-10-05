@@ -319,7 +319,11 @@ type plan struct {
 	allowAny bool
 	tunnel   *tunnelPlan
 	rdomain  string
-	allow    []target // bridge allow list (resolved)
+	// slots is the number of destination slots of a reverse bridge: the
+	// portal's n-th public port carries slot n, and slot n is redirected to
+	// the n-th port of the bridge's single target range (1 when the target
+	// has a single port).
+	slots int
 
 	balance string // "", round_robin, random, failover
 	health  *spec.Health
@@ -403,7 +407,7 @@ func newPlan(in spec.Instance, opts Options) (*plan, error) {
 	default:
 		return nil, p.fail("unknown idle_profile %q", in.IdleProfile)
 	}
-	p.level = idleLevel(opts.levels(), in.IdleProfile, p.hasTCP, p.hasUDP)
+	p.level = idleLevel(opts.levels(), in.IdleProfile, p.hasTCP)
 
 	// ACL.
 	if err := checkACL(in.ACL); err != nil {
@@ -415,8 +419,8 @@ func newPlan(in spec.Instance, opts Options) (*plan, error) {
 		if opts.Policy == nil || !opts.Policy.AllowAnyTarget {
 			return nil, p.fail("allow_any_target is not permitted by the local policy")
 		}
-		if in.Kind != spec.KindTunnelExit && in.Kind != spec.KindReverseBridge {
-			return nil, p.fail("allow_any_target applies to tunnel_exit and reverse_bridge only")
+		if in.Kind != spec.KindTunnelExit {
+			return nil, p.fail("allow_any_target applies to tunnel_exit only (a reverse_bridge's targets fix its destinations)")
 		}
 		p.allowAny = true
 	}
@@ -439,7 +443,13 @@ func newPlan(in spec.Instance, opts Options) (*plan, error) {
 	return p, nil
 }
 
-func idleLevel(l Levels, profile string, tcp, udp bool) uint32 {
+// idleLevel maps an idle profile to its policy level. An explicit profile is
+// honoured as written. With no profile an instance that carries TCP gets
+// tcp_long and a UDP-only instance gets udp_short: the node ConnectionConfig
+// (tcp_default, 30 s idle out of the box) would cut SSH-style long-lived
+// connections that sit idle, which is the wrong default for a forwarder.
+// tcp_default stays available as an explicit choice.
+func idleLevel(l Levels, profile string, tcp bool) uint32 {
 	switch profile {
 	case "tcp_long":
 		return l.TCPLong
@@ -450,10 +460,10 @@ func idleLevel(l Levels, profile string, tcp, udp bool) uint32 {
 	case "udp_long":
 		return l.UDPLong
 	}
-	if udp && !tcp {
-		return l.UDPShort
+	if tcp {
+		return l.TCPLong
 	}
-	return l.TCPDefault
+	return l.UDPShort
 }
 
 func checkACL(a *spec.ACL) error {
@@ -778,6 +788,12 @@ func (p *plan) checkExit() error {
 	return p.checkTunnel(true, p.hasUDP)
 }
 
+// Reverse proxy semantics (shared with the gost and frp drivers): the bridge
+// side decides the destinations. A reverse_portal only accepts users and has
+// no targets; a reverse_bridge rewrites every connection the portal relays to
+// one of its own targets, so a portal (or its users) can never choose where
+// the bridge connects.
+
 func (p *plan) checkPortal() error {
 	in := p.in
 	if in.Tunnel == nil || in.Tunnel.Listen == "" {
@@ -790,18 +806,15 @@ func (p *plan) checkPortal() error {
 		return p.fail("proxy_protocol_out is not valid for reverse_portal (set it on the bridge)")
 	}
 	if in.Balance != nil {
-		return p.fail("balance is not valid for reverse_portal")
+		return p.fail("balance is not valid for reverse_portal (set it on the bridge)")
+	}
+	if len(in.Targets) > 0 {
+		return p.fail("targets are not used by reverse_portal (the bridge's targets decide the destinations)")
+	}
+	if in.Listen != nil && len(in.Listen.PortMap) > 0 {
+		return p.fail("listen.port_map is not valid for reverse_portal (the bridge's targets decide the destinations)")
 	}
 	if err := p.checkListen(true); err != nil {
-		return err
-	}
-	if err := p.checkTargets(false); err != nil {
-		return err
-	}
-	if len(p.targets) > 1 {
-		return p.fail("reverse_portal supports a single target (the destination reached from the bridge side)")
-	}
-	if err := p.checkMapping(); err != nil {
 		return err
 	}
 	if err := p.checkReverseDomain(); err != nil {
@@ -821,47 +834,46 @@ func (p *plan) checkBridge() error {
 	if in.AcceptProxyProtocol {
 		return p.fail("accept_proxy_protocol is not valid for reverse_bridge")
 	}
-	if in.Balance != nil {
-		return p.fail("balance is not valid for reverse_bridge")
-	}
+	// Listen.Ports names the portal side public ports; nothing is bound here,
+	// only the number of ports matters (see slots).
+	listenLen := 0
 	if in.Listen != nil {
-		// Informational only (portal-side public ports); syntax check.
-		if _, err := parsePorts(in.Listen.Ports); err != nil {
+		if len(in.Listen.PortMap) > 0 {
+			return p.fail("listen.port_map is not valid for reverse_bridge")
+		}
+		pr, err := parsePorts(in.Listen.Ports)
+		if err != nil {
 			return p.fail("listen.ports: %v", err)
 		}
+		listenLen = pr.Len()
 	}
-	if err := p.checkTargets(false); err != nil {
+	if err := p.checkTargets(true); err != nil {
 		return err
 	}
 	if err := p.checkReverseDomain(); err != nil {
 		return err
 	}
-	if !p.allowAny {
-		src := in.Reverse.BridgeAllow
-		if len(src) > 0 {
-			for i, a := range src {
-				h, err := parseHost(a.Host)
-				if err != nil {
-					return p.fail("reverse.bridge_allow[%d].host: %v", i, err)
-				}
-				if err := p.checkTargetHost(h); err != nil {
-					return p.fail("%v", err)
-				}
-				pr, err := parsePorts(a.Ports)
-				if err != nil {
-					return p.fail("reverse.bridge_allow[%d].ports: %v", i, err)
-				}
-				p.allow = append(p.allow, target{Host: h, Ports: pr, Weight: 1})
+	p.slots = 1
+	switch {
+	case len(p.targets) > 1:
+		for i, t := range p.targets {
+			if t.Ports.Len() != 1 {
+				return p.fail("targets[%d]: several targets must use single ports", i)
 			}
-		} else {
-			p.allow = p.targets
 		}
-		if len(p.allow) == 0 {
-			return p.fail("reverse_bridge needs targets or reverse.bridge_allow (an unrestricted bridge needs allow_any_target in the local policy)")
+		if listenLen > 1 {
+			return p.fail("several targets are only supported with a single listen port")
 		}
-		if len(p.allow) > 64 {
-			return p.fail("too many allowed destinations")
+	default:
+		if n := p.targets[0].Ports.Len(); n > 1 {
+			if listenLen != n {
+				return p.fail("target ports (%d) and listen.ports (%d, the portal's public ports) must have the same length", n, listenLen)
+			}
+			p.slots = n
 		}
+	}
+	if err := p.checkBalance(); err != nil {
+		return err
 	}
 	return p.checkTunnel(false, p.hasUDP)
 }
@@ -882,8 +894,9 @@ func (p *plan) checkReverseDomain() error {
 		return p.fail("reverse.domain does not look random")
 	}
 	p.rdomain = r.Domain
-	if p.in.Kind == spec.KindReversePortal && len(r.BridgeAllow) > 0 {
-		return p.fail("reverse.bridge_allow is only valid for reverse_bridge")
+	if len(r.BridgeAllow) > 0 {
+		return p.fail("reverse.bridge_allow is not supported by the xray driver: the bridge rewrites every relayed connection " +
+			"to its targets, so list the permitted destinations in targets instead")
 	}
 	return nil
 }
