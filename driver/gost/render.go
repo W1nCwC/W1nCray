@@ -29,6 +29,22 @@ const (
 	dummyTarget = "127.0.0.1:0"
 )
 
+// relayUser derives the gost relay username shared by the two ends of a
+// tunnel or reverse link. gost matches the connector's auth against the
+// handler's auth, so both sides must render the same username; deriving it
+// from the shared secret (instead of the instance id) makes the two ends
+// agree and does not leak ids or secrets into configs or logs.
+func relayUser(secret string) string {
+	sum := sha256.Sum256([]byte("w1ncray relay " + secret))
+	return hex.EncodeToString(sum[:6])
+}
+
+// gostBytes formats bytes/s for a gost traffic-limiter limits string.
+// gost parses limits with units.ParseBase2Bytes, which rejects bare
+// integers (they parse to 0 and the limiter is silently not created);
+// an explicit B suffix is always accepted.
+func gostBytes(n int64) string { return strconv.FormatInt(n, 10) + "B" }
+
 // Render implements driver.Driver. It is a pure function of in.
 func (d *Driver) Render(in spec.Instance) (driver.Artifact, error) {
 	p, err := d.analyze(in)
@@ -89,7 +105,7 @@ func (p *plan) build() (fragment, []driver.PortClaim) {
 	var limRef, climRef string
 	if p.rateUp > 0 || p.rateDown > 0 {
 		limRef = p.id + ".limit"
-		f.Limiters = append(f.Limiters, limiter{Name: limRef, Limits: []string{fmt.Sprintf("$ %d %d", p.rateUp, p.rateDown)}})
+		f.Limiters = append(f.Limiters, limiter{Name: limRef, Limits: []string{fmt.Sprintf("$ %s %s", gostBytes(p.rateUp), gostBytes(p.rateDown))}})
 	}
 	if p.maxConns > 0 {
 		climRef = p.id + ".climit"
@@ -151,7 +167,7 @@ func (p *plan) build() (fragment, []driver.PortClaim) {
 			Addr:       p.tun.listen.String(),
 			Admissions: admRefs,
 			Metadata:   map[string]string{"enableStats": "true"},
-			Handler:    handler{Type: "relay", Auth: &auth{Username: p.id, Password: p.secret}},
+			Handler:    handler{Type: "relay", Auth: &auth{Username: relayUser(p.secret), Password: p.secret}},
 			Listener:   p.tunnelListener(),
 		}
 		if len(p.targets) > 0 {
@@ -166,7 +182,7 @@ func (p *plan) build() (fragment, []driver.PortClaim) {
 			Addr:       p.tun.listen.String(),
 			Admissions: admRefs,
 			Metadata:   map[string]string{"enableStats": "true"},
-			Handler: handler{Type: "relay", Auth: &auth{Username: p.id, Password: p.secret},
+			Handler: handler{Type: "relay", Auth: &auth{Username: relayUser(p.secret), Password: p.secret},
 				Metadata: map[string]string{"bind": "true"}},
 			Listener: p.tunnelListener(),
 		}
@@ -239,7 +255,7 @@ func (p *plan) buildChain() chain {
 			Nodes: []chainNode{{
 				Name:      p.id + ".node",
 				Addr:      t.server.String(),
-				Connector: connector{Type: "relay", Auth: &auth{Username: p.id, Password: p.secret}},
+				Connector: connector{Type: "relay", Auth: &auth{Username: relayUser(p.secret), Password: p.secret}},
 				Dialer:    dl,
 			}},
 		}},

@@ -368,7 +368,7 @@ func TestTunnelRenderShapes(t *testing.T) {
 	// Exit: relay handler in forward mode, no bind.
 	x := frag(t, g["tunnel_exit"])
 	s := x.Services[0]
-	if s.Handler.Type != "relay" || s.Handler.Auth == nil || s.Handler.Auth.Username != "ex" || s.Forwarder == nil || len(s.Forwarder.Nodes) != 1 {
+	if s.Handler.Type != "relay" || s.Handler.Auth == nil || s.Handler.Auth.Username != relayUser(testSecret) || s.Forwarder == nil || len(s.Forwarder.Nodes) != 1 {
 		t.Errorf("exit %+v", s)
 	}
 	if s.Handler.Metadata["bind"] != "" {
@@ -407,7 +407,7 @@ func TestACLAndLimitsMapping(t *testing.T) {
 		t.Errorf("service refs %+v", s)
 	}
 	// rate_up 8 Mbit/s = 1,000,000 B/s, rate_down 16 Mbit/s = 2,000,000 B/s.
-	if f.Limiters[0].Limits[0] != "$ 1000000 2000000" || f.CLimiters[0].Limits[0] != "$ 50" {
+	if f.Limiters[0].Limits[0] != "$ 1000000B 2000000B" || f.CLimiters[0].Limits[0] != "$ 50" {
 		t.Errorf("limits %+v %+v", f.Limiters, f.CLimiters)
 	}
 }

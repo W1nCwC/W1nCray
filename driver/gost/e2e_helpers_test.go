@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	mrand "math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
@@ -201,30 +202,35 @@ func gostBin(t *testing.T) string {
 	return abs
 }
 
-// node is one driver instance with its own supervisor and state directory,
-// i.e. one agent host.
-type node struct {
+// testNode is one driver instance with its own supervisor and state directory,
+// i.e. one agent host. (Named testNode to avoid the gost forwarder "node"
+// type in model.go.)
+type testNode struct {
 	t   *testing.T
 	d   *Driver
 	rt  driver.Runtime
 	sup *testSup
 }
 
-func newNode(t *testing.T, opts Options) *node {
+func newNode(t *testing.T, opts Options) *testNode {
 	t.Helper()
 	bin := gostBin(t)
-	sup := newTestSup(t)
+	// t.Cleanup is LIFO: register the TempDir removal BEFORE the supervisor
+	// cleanup, so gost processes are stopped (and gost.log released) before
+	// the directory is removed. On Windows an open log file cannot be
+	// unlinked, which failed every e2e test at TempDir cleanup.
 	dir := filepath.Join(t.TempDir(), "state")
+	sup := newTestSup(t)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	return &node{
+	return &testNode{
 		t: t, d: New(opts), sup: sup,
 		rt: driver.Runtime{Kernel: driver.Installed{Path: bin, Version: "3.3.0"}, StateDir: dir, Sup: sup, Log: testLog{t}},
 	}
 }
 
-func (n *node) render(ins ...spec.Instance) []driver.Rendered {
+func (n *testNode) render(ins ...spec.Instance) []driver.Rendered {
 	n.t.Helper()
 	var set []driver.Rendered
 	for _, in := range ins {
@@ -237,7 +243,7 @@ func (n *node) render(ins ...spec.Instance) []driver.Rendered {
 	return set
 }
 
-func (n *node) apply(ins ...spec.Instance) driver.ApplyResult {
+func (n *testNode) apply(ins ...spec.Instance) driver.ApplyResult {
 	n.t.Helper()
 	res, err := n.d.Apply(context.Background(), n.rt, n.render(ins...))
 	if err != nil || len(res.Failed) > 0 {
@@ -246,11 +252,11 @@ func (n *node) apply(ins ...spec.Instance) driver.ApplyResult {
 	return res
 }
 
-func (n *node) applyRaw(ins ...spec.Instance) (driver.ApplyResult, error) {
+func (n *testNode) applyRaw(ins ...spec.Instance) (driver.ApplyResult, error) {
 	return n.d.Apply(context.Background(), n.rt, n.render(ins...))
 }
 
-func (n *node) stats() map[string]driver.Counter {
+func (n *testNode) stats() map[string]driver.Counter {
 	n.t.Helper()
 	cs, err := n.d.Stats(context.Background(), n.rt)
 	if err != nil {
@@ -282,18 +288,17 @@ func eventually(t *testing.T, timeout time.Duration, what string, f func() bool)
 var portMu sync.Mutex
 
 // freePorts returns n consecutive ports free for tcp and udp on 127.0.0.1.
+// It searches below the default ephemeral port ranges (Linux 32768-60999,
+// Windows 49152-65535): the OS can otherwise hand a just-probed port out as
+// the source port of an unrelated connection before the kernel under test
+// binds it, which fails with EADDRINUSE.
 func freePorts(t *testing.T, n int) int {
 	t.Helper()
 	portMu.Lock()
 	defer portMu.Unlock()
-	for try := 0; try < 200; try++ {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		base := l.Addr().(*net.TCPAddr).Port
-		l.Close()
-		ok := base+n < 65000
+	for try := 0; try < 500; try++ {
+		base := 20000 + mrand.IntN(11000)
+		ok := base+n < 31000
 		var held []io.Closer
 		for i := 0; ok && i < n; i++ {
 			a := fmt.Sprintf("127.0.0.1:%d", base+i)

@@ -548,7 +548,9 @@ func TestE2EProxyThroughTunnelAndBridge(t *testing.T) {
 	c.Close()
 
 	bridge, portal := newNode(t, Options{}), newNode(t, Options{})
-	hb2 := startHeadBackend(t, 12)
+	// 48 bytes: enough for a full PROXY v1 line (43-47 bytes including the
+	// CRLF) plus a few payload bytes; 12 would only cover the v2 signature.
+	hb2 := startHeadBackend(t, 48)
 	ctl2, pub := freePorts(t, 1), freePorts(t, 1)
 	po := spec.Instance{ID: "po", Enabled: true, Engine: spec.EngineGost, Kind: spec.KindReversePortal, Secret: e2eSecret,
 		Listen: &spec.Listen{Addr: "127.0.0.1", Ports: fmt.Sprint(pub)}, Tunnel: &spec.Tunnel{Type: "ws", Listen: addr(ctl2)}}
@@ -964,7 +966,7 @@ func TestE2EStateFilesAndSecrets(t *testing.T) {
 	}
 	// The secret must not be in argv, the artifact hash, or in any file
 	// except the 0600 state files.
-	for _, nd := range []*node{entry, exit} {
+	for _, nd := range []*testNode{entry, exit} {
 		ps := nd.sup.Status(procID)
 		if ps.PID == 0 {
 			t.Fatal("no pid")

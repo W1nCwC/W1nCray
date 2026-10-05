@@ -235,10 +235,22 @@ func TestValidateRejectsUnsupported(t *testing.T) {
 		{"no secret", func() spec.Instance { i := g["tunnel_entry"]; i.Secret = ""; return i }, "secret is required"},
 		{"exit needs target xor any", func() spec.Instance { i := g["tunnel_exit"]; i.Targets = nil; return i }, "exactly one"},
 		{"exit both", func() spec.Instance { i := g["tunnel_exit"]; i.AllowAnyTarget = true; return i }, "exactly one"},
-		{"exit target range", func() spec.Instance { i := g["tunnel_exit"]; i.Targets = []spec.Target{{Host: "10.0.0.1", Ports: "1-3"}}; return i }, "ranges are not supported"},
-		{"exit with listen", func() spec.Instance { i := g["tunnel_exit"]; i.Listen = &spec.Listen{Addr: "0.0.0.0", Ports: "1"}; return i }, "not used by tunnel_exit"},
+		{"exit target range", func() spec.Instance {
+			i := g["tunnel_exit"]
+			i.Targets = []spec.Target{{Host: "10.0.0.1", Ports: "1-3"}}
+			return i
+		}, "ranges are not supported"},
+		{"exit with listen", func() spec.Instance {
+			i := g["tunnel_exit"]
+			i.Listen = &spec.Listen{Addr: "0.0.0.0", Ports: "1"}
+			return i
+		}, "not used by tunnel_exit"},
 		{"any target on forward", func() spec.Instance { i := fwd(); i.AllowAnyTarget = true; return i }, "only applies to tunnel_exit"},
-		{"portal acl", func() spec.Instance { i := g["reverse_portal"]; i.ACL = &spec.ACL{Allow: []string{"10.0.0.0/8"}}; return i }, "reverse_portal"},
+		{"portal acl", func() spec.Instance {
+			i := g["reverse_portal"]
+			i.ACL = &spec.ACL{Allow: []string{"10.0.0.0/8"}}
+			return i
+		}, "reverse_portal"},
 		{"portal targets", func() spec.Instance { i := g["reverse_portal"]; i.Targets = fwd().Targets; return i }, "no targets"},
 		{"bridge no listen", func() spec.Instance { i := g["reverse_bridge"]; i.Listen = nil; return i }, "listen is required"},
 		{"bridge no target", func() spec.Instance { i := g["reverse_bridge"]; i.Targets = nil; return i }, "no target"},
