@@ -96,7 +96,9 @@ func (c *fakeClock) fire(t *testing.T, d time.Duration) {
 // logic depends on real time.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	// Under -race the runner's goroutines are much slower to observe the
+	// fired clock, so give the handshake a wide window.
+	deadline := time.Now().Add(60 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
