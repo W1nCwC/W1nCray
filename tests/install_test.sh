@@ -450,6 +450,23 @@ t_install_from_release() {
 	hasnt "no temp download dir left after a failure" "$(ls -a "$BIN_DIR")" ".dl."
 }
 
+t_update_version_shorthand() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	publish W1nCray-linux-amd64.gz "$W1NCRAY_ROOT/fakebin"
+	: >"$DL_LOG"
+	cmd_update v1.2.3 --no-geo >/dev/null 2>&1
+	has "update vX.Y.Z downloads that version" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/W1nCray-linux-amd64.gz"
+	: >"$DL_LOG"
+	cmd_update --version v1.2.4 --no-geo >/dev/null 2>&1
+	has "update --version still works" "$(cat "$DL_LOG")" "/releases/download/v1.2.4/W1nCray-linux-amd64.gz"
+}
+
 t_space_check() {
 	unset W1NCRAY_SKIP_SPACE_CHECK
 	df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/x 1000000 990000 5000 99%% /\n'; }
@@ -637,7 +654,7 @@ run() { # name
 
 for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_generated_scripts \
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
-	t_install_flavor_prefix_upgrade t_install_from_release t_space_check t_switch_rollback \
+	t_install_flavor_prefix_upgrade t_install_from_release t_update_version_shorthand t_space_check t_switch_rollback \
 	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend; do
 	run "$t"
 done

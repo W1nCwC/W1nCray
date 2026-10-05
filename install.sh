@@ -792,6 +792,14 @@ cmd_install() {
 
 cmd_update() {
 	require_bin
+	# "W1nCray update v1.2.3" is shorthand for "--version v1.2.3".
+	case "${1:-}" in
+	v[0-9]*)
+		_v="$1"
+		shift
+		set -- --version "$_v" "$@"
+		;;
+	esac
 	# Fetch the newest script first: it may know new platforms or flags.
 	_new="$BIN_DIR/install.sh.latest"
 	if download "https://raw.githubusercontent.com/$REPO/main/install.sh" "$_new" >/dev/null 2>&1 && [ -s "$_new" ]; then
