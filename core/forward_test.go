@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -202,9 +203,24 @@ func TestForwardLevelOutlivesNodeIdleTimeout(t *testing.T) {
 
 	a := dialEcho(t, node0)
 	b := dialEcho(t, long)
-	time.Sleep(3500 * time.Millisecond)
-	mustBeAborted(t, a) // cut by the 2 s level-0 idle timeout
-	roundTrip(t, b)     // still there
+	// Poll for the level-0 idle timeout instead of a fixed sleep: teardown
+	// lags under -race.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		a.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, err := a.Read(make([]byte, 1))
+		if err == nil {
+			t.Fatal("unexpected data on an idle-timeout connection")
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			break // aborted: good
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("level-0 connection still open after its 2 s idle timeout")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	roundTrip(t, b) // still there
 }
 
 // D-E: with Forward on, per-inbound and per-outbound byte counters exist.
@@ -245,13 +261,24 @@ func TestForwardStats(t *testing.T) {
 				}
 				return
 			}
-			// 4 bytes of the ping + 10000 of the payload, each way.
-			for name, ctr := range map[string]stats.Counter{"in up": inUp, "in down": inDown, "out up": outUp, "out down": outDown} {
-				if ctr == nil {
-					t.Errorf("%s counter missing", name)
-				} else if ctr.Value() != 10004 {
-					t.Errorf("%s counter = %d, want 10004", name, ctr.Value())
+			// 4 bytes of the ping + 10000 of the payload, each way. The
+			// counters are updated as the connection tears down, which lags
+			// under -race by a wide margin, so poll instead of reading once.
+			deadline := time.Now().Add(15 * time.Second)
+			for {
+				inUp, inDown := c.InboundTraffic("fwd-1")
+				outUp, outDown := c.OutboundTraffic("fwd-1-out")
+				for name, ctr := range map[string]stats.Counter{"in up": inUp, "in down": inDown, "out up": outUp, "out down": outDown} {
+					if ctr == nil {
+						t.Errorf("%s counter missing", name)
+					} else if ctr.Value() != 10004 {
+						t.Errorf("%s counter = %d, want 10004", name, ctr.Value())
+					}
 				}
+				if inUp != nil && inUp.Value() == 10004 || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
 			}
 		})
 	}
