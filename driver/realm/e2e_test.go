@@ -26,6 +26,13 @@
 //
 // On Windows the Windows release (realm-x86_64-pc-windows-msvc.tar.gz, binary
 // named "realm" without extension: copy it to realm.exe) works the same way.
+// Asset digests verified against the GitHub release API for v2.9.6:
+//
+//	realm-x86_64-pc-windows-msvc.tar.gz       7d06f4d4c3baaa0d7b84d1b5b345e96c41d4e150eab330bbb806aaaf027a9190
+//	realm-slim-x86_64-pc-windows-msvc.tar.gz  f3c6e4d49a4f5f3b316088f52e5e2726e5417dd6dcb2d5f6fba9c32150834003
+//
+// (the slim build is what W1NCRAY_TEST_REALM_SLIM_BIN must point at: Apply has
+// to refuse it, see TestE2EBinaryCheck).
 
 package realm
 
