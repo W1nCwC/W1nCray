@@ -49,7 +49,9 @@
 sh install.sh install --binary ./W1nCray-linux-amd64
 ```
 
-安装参数：`--lite | --full`（版本类型）、`--prefix DIR`（安装目录，空间不足时指向外部存储）、`--with-geo`（强制下载 geo 文件）、`--version vX.Y.Z`、`--url 地址`、`--binary 文件`。
+安装参数：`--lite | --full`（版本类型）、`--prefix DIR`（安装目录，空间不足时指向外部存储）、`--with-geo`（强制下载 geo 文件）、`--version vX.Y.Z`、`--url 地址`、`--binary 文件`、`--insecure-skip-verify`。
+
+**校验失败即拒绝（fail-closed）**：从发行页下载的程序必须通过 `SHA256SUMS` 校验。缺少 `sha256sum`、取不到 `SHA256SUMS`、校验值缺失/格式错误或与文件不符，一律中止安装并保持现有程序不变。只有明知风险时才用 `--insecure-skip-verify`（或环境变量 `W1NCRAY_INSECURE_SKIP_VERIFY=1`）整体跳过校验，脚本会打印醒目警告。`--binary` 指定的本地文件不经校验。
 
 安装脚本会：
 

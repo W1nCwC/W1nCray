@@ -131,6 +131,12 @@ func (p *Panel) shutdown() {
 		}(n)
 	}
 	wg.Wait()
+	// Closing the instance does not end accepted connections; abort the
+	// tracked ones (none unless a tag prefix is watched) so that a reload does
+	// not leave sessions of the old instance behind.
+	if n := p.core.Conns().KillAll(); n > 0 {
+		log.Infof("aborted %d tracked connection(s)", n)
+	}
 	if err := p.core.Close(); err != nil {
 		log.Errorf("close xray: %v", err)
 	}

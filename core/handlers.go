@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/protocol"
 	xcore "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/stats"
@@ -23,17 +24,33 @@ func (c *Core) RemoveInbound(tag string) error {
 	return c.ibm.RemoveHandler(context.Background(), tag)
 }
 
+// RemoveInboundAndKill removes an inbound and aborts its tracked sessions
+// (see Conns), returning how many were aborted. Plain RemoveInbound leaves
+// established connections running: Xray only stops the listener.
+func (c *Core) RemoveInboundAndKill(tag string) (int, error) {
+	err := c.RemoveInbound(tag)
+	return c.conns.Kill(tag), err
+}
+
 // AddOutbound adds an outbound handler.
 func (c *Core) AddOutbound(cfg *xcore.OutboundHandlerConfig) error {
 	return xcore.AddOutboundHandler(c.Instance, cfg)
 }
 
-// RemoveOutbound removes an outbound handler; a missing tag is not an error.
+// RemoveOutbound closes and removes an outbound handler; a missing tag is not
+// an error. Xray's outbound manager only forgets a removed handler, so without
+// the Close a handler that owns background work (the mux client of a reverse
+// bridge, which redials by itself) would keep running as a zombie.
 func (c *Core) RemoveOutbound(tag string) error {
-	if c.obm.GetHandler(tag) == nil {
+	h := c.obm.GetHandler(tag)
+	if h == nil {
 		return nil
 	}
-	return c.obm.RemoveHandler(context.Background(), tag)
+	closeErr := common.Close(h)
+	if err := c.obm.RemoveHandler(context.Background(), tag); err != nil {
+		return err
+	}
+	return closeErr
 }
 
 // HasOutbound reports whether an outbound with the tag exists.
@@ -95,6 +112,24 @@ func (c *Core) RemoveUsers(tag string, emails []string) error {
 func (c *Core) TrafficCounters(email string) (up, down stats.Counter) {
 	up = c.stats.GetCounter("user>>>" + email + ">>>traffic>>>uplink")
 	down = c.stats.GetCounter("user>>>" + email + ">>>traffic>>>downlink")
+	return up, down
+}
+
+// InboundTraffic returns the byte counters of an inbound: bytes received from
+// (up) and sent to (down) its clients. Both are nil unless Options.Forward is
+// set, or while the inbound does not exist.
+func (c *Core) InboundTraffic(tag string) (up, down stats.Counter) {
+	up = c.stats.GetCounter("inbound>>>" + tag + ">>>traffic>>>uplink")
+	down = c.stats.GetCounter("inbound>>>" + tag + ">>>traffic>>>downlink")
+	return up, down
+}
+
+// OutboundTraffic returns the byte counters of an outbound: bytes sent to
+// (up) and received from (down) its peer. Both are nil unless Options.Forward
+// is set, or while the outbound does not exist.
+func (c *Core) OutboundTraffic(tag string) (up, down stats.Counter) {
+	up = c.stats.GetCounter("outbound>>>" + tag + ">>>traffic>>>uplink")
+	down = c.stats.GetCounter("outbound>>>" + tag + ">>>traffic>>>downlink")
 	return up, down
 }
 

@@ -6,6 +6,11 @@
 #
 #   sh install.sh install [--lite|--full] [--prefix DIR] [--with-geo]
 #                         [--binary FILE | --url URL | --version vX.Y.Z]
+#                         [--insecure-skip-verify]
+#
+# Release downloads are checked against SHA256SUMS and refused when the check
+# is impossible or fails; --insecure-skip-verify (or
+# W1NCRAY_INSECURE_SKIP_VERIFY=1) is the only way to skip it.
 #
 # After installation the same script is the `W1nCray` command: run it without
 # arguments for a menu, or use the shortcuts (see `W1nCray help`). XrayR files
@@ -28,6 +33,13 @@ WAIT_SWITCH="${W1NCRAY_WAIT:-5}"
 # Size needed to download, unpack and replace (KiB): gzip + binary + old binary.
 NEED_KB_LITE=90000
 NEED_KB_FULL=170000
+# Release downloads are verified against SHA256SUMS and refused otherwise.
+# Only an explicit opt-out (--insecure-skip-verify, or this variable set to 1)
+# skips the check. It never applies to --binary files, which are not checked.
+INSECURE_SKIP_VERIFY=0
+if [ "${W1NCRAY_INSECURE_SKIP_VERIFY:-}" = 1 ]; then
+	INSECURE_SKIP_VERIFY=1
+fi
 
 # ---- output ----------------------------------------------------------------
 
@@ -252,22 +264,33 @@ latest_tag() {
 }
 
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+have_sha256sum() { command -v sha256sum >/dev/null 2>&1; }
 
-# verify_sha256 FILE ASSET TAG checks FILE against the release SHA256SUMS.
+# verify_sha256 FILE ASSET TAG checks FILE against the release SHA256SUMS. It
+# fails closed: a missing sha256sum, a missing or unreadable SHA256SUMS, a
+# missing or malformed digest and a mismatch all abort the installation. The
+# only way past it is the explicit opt-out (--insecure-skip-verify or
+# W1NCRAY_INSECURE_SKIP_VERIFY=1), which skips the check altogether.
 verify_sha256() {
-	if ! command -v sha256sum >/dev/null 2>&1; then
-		yellow "未找到 sha256sum，跳过校验"
+	if [ "$INSECURE_SKIP_VERIFY" = 1 ]; then
+		red "警告: 已跳过 SHA256 校验（--insecure-skip-verify）：$2 未经验证，可能被篡改或损坏！" >&2
 		return 0
 	fi
+	have_sha256sum ||
+		die "未找到 sha256sum，无法校验下载文件的完整性。请安装 sha256sum（coreutils 或 busybox），或改用 --binary 提供本地文件；明知风险仍要继续请加 --insecure-skip-verify"
 	_sums="$(mktemp)"
-	if ! download "https://github.com/$REPO/releases/download/$3/SHA256SUMS" "$_sums" >/dev/null 2>&1; then
+	if ! download "https://github.com/$REPO/releases/download/$3/SHA256SUMS" "$_sums" >/dev/null 2>&1 || [ ! -s "$_sums" ]; then
 		rm -f "$_sums"
-		yellow "该版本没有 SHA256SUMS，跳过校验"
-		return 0
+		die "无法获取 $3 的 SHA256SUMS，拒绝安装未经校验的程序。请检查网络或版本号；明知风险仍要继续请加 --insecure-skip-verify"
 	fi
 	_want="$(awk -v n="$2" '{f=$2; sub(/^\*/, "", f); if (f == n) {print $1; exit}}' "$_sums")"
 	rm -f "$_sums"
 	[ -n "$_want" ] || die "SHA256SUMS 中没有 $2 的校验值"
+	case "$_want" in
+	*[!0-9A-Fa-f]*) die "SHA256SUMS 中 $2 的校验值不是十六进制: $_want" ;;
+	esac
+	[ "${#_want}" -eq 64 ] || die "SHA256SUMS 中 $2 的校验值长度不是 64: $_want"
+	_want="$(printf '%s' "$_want" | tr 'A-F' 'a-f')"
 	_got="$(sha256_of "$1")"
 	[ "$_want" = "$_got" ] || die "SHA256 校验失败（期望 $_want，实际 $_got）"
 	green "SHA256 校验通过: $2"
@@ -713,6 +736,10 @@ cmd_install() {
 			_geo=no
 			shift
 			;;
+		--insecure-skip-verify)
+			INSECURE_SKIP_VERIFY=1
+			shift
+			;;
 		-y | --yes)
 			ASSUME_YES=1
 			shift
@@ -1009,6 +1036,10 @@ W1nCray 管理命令
 首次安装:
   sh install.sh install [--lite|--full] [--prefix DIR] [--with-geo]
                         [--binary 文件 | --url 地址 | --version vX.Y.Z]
+                        [--insecure-skip-verify]
+
+  下载的发行包必须通过 SHA256SUMS 校验，缺少 sha256sum / SHA256SUMS 或不匹配都会拒绝安装；
+  明知风险仍要跳过时才加 --insecure-skip-verify（或设置 W1NCRAY_INSECURE_SKIP_VERIFY=1）。
 EOF
 }
 
