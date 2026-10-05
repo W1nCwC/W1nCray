@@ -585,6 +585,28 @@ t_uninstall() {
 	refute "--purge removes the config directory" test -d "$CONF_DIR"
 }
 
+t_uninstall_openwrt_sysupgrade() {
+	mock_backend
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	mkdir -p "$W1NCRAY_ROOT/etc"
+	echo "DISTRIB_ID='OpenWrt'" >"$W1NCRAY_ROOT/etc/openwrt_release"
+	printf '/etc/mine.conf\n' >"$W1NCRAY_ROOT/etc/sysupgrade.conf"
+	load_env
+	mock_backend
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" >/dev/null 2>&1
+	has "install added the entries" "$(cat "$W1NCRAY_ROOT/etc/sysupgrade.conf")" "/etc/init.d/W1nCray"
+	cmd_uninstall -y >/dev/null 2>&1
+	sc="$(cat "$W1NCRAY_ROOT/etc/sysupgrade.conf")"
+	hasnt "uninstall drops the init script entry" "$sc" "/etc/init.d/W1nCray"
+	has "uninstall keeps the config entry while the config stays" "$sc" "/etc/W1nCray/"
+	has "uninstall keeps the user's own entries" "$sc" "/etc/mine.conf"
+	cmd_uninstall --purge -y >/dev/null 2>&1
+	sc="$(cat "$W1NCRAY_ROOT/etc/sysupgrade.conf")"
+	hasnt "purge drops the config entry" "$sc" "/etc/W1nCray/"
+	has "purge keeps the user's own entries" "$sc" "/etc/mine.conf"
+}
+
 t_uninstall_refuses_odd_paths() {
 	mock_backend
 	CONF_DIR="/home/someone/data"
@@ -616,7 +638,7 @@ run() { # name
 for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_generated_scripts \
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
 	t_install_flavor_prefix_upgrade t_install_from_release t_space_check t_switch_rollback \
-	t_manager_dispatch t_menu t_uninstall t_uninstall_refuses_odd_paths t_none_backend; do
+	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend; do
 	run "$t"
 done
 

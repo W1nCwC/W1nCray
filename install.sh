@@ -549,14 +549,28 @@ be_none_log() { no_backend; }
 be_none_follow() { no_backend; }
 be_none_levels() { :; }
 
+# daemon_pids prints the PIDs of the running program. busybox pidof also matches
+# scripts by name, which would include this manager script itself.
+daemon_pids() {
+	_all="$(pidof W1nCray 2>/dev/null || true)"
+	_out=""
+	for _p in $_all; do
+		_exe="$(readlink "/proc/$_p/exe" 2>/dev/null || true)"
+		case "$_exe" in
+		"$BIN" | "$BIN "*) _out="$_out $_p" ;;
+		esac
+	done
+	echo $_out
+}
+
 # stable_running UNIT SECONDS: running, and the same process the whole time
 # (supervisors report a crash-looping service as started).
 stable_running() {
 	svc active "$1" || return 1
-	_p1="$(pidof "$1" 2>/dev/null || true)"
+	_p1="$(daemon_pids)"
 	sleep "$2"
 	svc active "$1" || return 1
-	_p2="$(pidof "$1" 2>/dev/null || true)"
+	_p2="$(daemon_pids)"
 	[ "$_p1" = "$_p2" ]
 }
 
@@ -637,6 +651,22 @@ keep_on_sysupgrade() {
 	for _p in "/etc/W1nCray/" "/etc/init.d/W1nCray"; do
 		grep -qxF "$_p" "$_sc" 2>/dev/null || printf '%s\n' "$_p" >>"$_sc"
 	done
+}
+
+# drop_sysupgrade_entries removes what keep_on_sysupgrade added; the config
+# directory entry stays unless the config itself is purged.
+drop_sysupgrade_entries() { # $1 = 1 to drop the config directory entry too
+	is_openwrt || return 0
+	_sc="$ROOT/etc/sysupgrade.conf"
+	[ -f "$_sc" ] || return 0
+	_tmp="$(mktemp)"
+	grep -vxF "/etc/init.d/W1nCray" "$_sc" >"$_tmp" || true
+	if [ "$1" -eq 1 ]; then
+		grep -vxF "/etc/W1nCray/" "$_tmp" >"$_tmp.2" || true
+		mv "$_tmp.2" "$_tmp"
+	fi
+	cat "$_tmp" >"$_sc"
+	rm -f "$_tmp"
 }
 
 cmd_install() {
@@ -878,7 +908,7 @@ cmd_status() {
 	printf '服务管理器: %s\n' "$BACKEND"
 	if svc exists W1nCray; then
 		if svc active W1nCray; then
-			_pid="$(pidof W1nCray 2>/dev/null || true)"
+			_pid="$(daemon_pids)"
 			printf '运行状态:   %s运行中%s（PID %s）\n' "$C_GREEN" "$C_OFF" "${_pid:-?}"
 		else
 			printf '运行状态:   %s未运行%s\n' "$C_RED" "$C_OFF"
@@ -932,6 +962,7 @@ cmd_uninstall() {
 	svc remove W1nCray || true
 	rm -f "$BIN" "$BIN_DIR/install.sh" "$MGR"
 	rmdir "$BIN_DIR" 2>/dev/null || true
+	drop_sysupgrade_entries "$_purge"
 	if [ "$_purge" -eq 1 ]; then
 		case "$CONF_DIR" in
 		*/etc/W1nCray) rm -rf "$CONF_DIR" ;;
