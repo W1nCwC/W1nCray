@@ -119,3 +119,15 @@
 - switch 的“成功”分支用了“`check` 恒通过”的包装脚本；失败回滚分支与 check 失败分支用真实二进制验证。真实面板的 `check --online` 仍需在有面板的节点上验证。
 - 在 OpenWRT 的 busybox（无 install/od/stat/timeout/curl/bash）下运行 `tests/install_test.sh`：184/184 通过；Alpine busybox ash：178/178（当时尚无 sysupgrade 清理的用例）。
 - GitHub API、`releases.atom`、`releases/download/...` 的跨主机重定向在 OpenWRT 23.05.5 的 uclient-fetch 上实测可用；更旧版本（21.02）未测。
+
+## 6. 发布后验证（v0.3.0 预发布版，2026-10-05）
+发布：<https://github.com/W1nCwC/W1nCray/releases/tag/v0.3.0>，27 个资产（12 架构 × full/lite 的 `.gz` 共 24 个、amd64/arm64 裸文件 2 个、SHA256SUMS）；GitHub 记录的摘要与本地 SHA256SUMS 逐项一致（26 项）。
+
+| 项 | 结果 |
+|---|---|
+| 真实一键命令（raw 脚本 → API 取最新版 → 下载 → SHA256 校验）在 Alpine chroot（busybox wget） | 【已验证】默认 full；`update --lite` 切换为 lite，install.env 同步 |
+| 同上在 OpenWRT 23.05.5 chroot（uclient-fetch，无 curl） | 【已验证】默认 lite；`update --full` 切换；不下载 geo |
+| Debian 12 + systemd 真机（测试机 测试机，上面有运行中的 XrayR，2 个节点） | 【已验证】一键安装 → 自动迁移 → `check --online` 两个节点（shadowsocks、VLESS+REALITY）通过；XrayR 全程未改动（同一 PID、端口不变）；W1nCray 因 XrayR 在运行而未启动 |
+| V9 旧脚本升级 | 【已验证（模拟）】旧脚本用 `grep "W1nCray-linux-<arch>$"` 在 SHA256SUMS 中取校验值，对新 SHA256SUMS 各只匹配 1 行（裸文件），裸文件资产保留；未在真机跑旧脚本 |
+| 发现并修复 | `W1nCray update vX.Y.Z` 被拒绝为未知参数 → 转换为 `--version`（commit 59e1513，脚本从 main 获取，无需重新发版） |
+| 未做 | 在测试机上执行 `switch`（会短暂停止运行中的 XrayR）；ARM/MIPS 真机 |
