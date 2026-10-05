@@ -249,6 +249,20 @@ func (n *node) apply(ins ...spec.Instance) driver.ApplyResult {
 	return res
 }
 
+// kill simulates a node crash. Closing the Xray instance alone does not drop
+// established connections (Xray's dispatcher Close is a no-op and the outbound
+// handlers do not close in-flight links), and the self-managed reverse bridge
+// keeps dialing, so the driver is stopped first: that closes the reverse
+// workers and with them the tunnel connections, exactly as a process exit
+// would, and then the instance is closed.
+func (n *node) kill() {
+	n.t.Helper()
+	if err := n.drv.Stop(context.Background(), n.rt); err != nil {
+		n.t.Fatalf("kill: %v", err)
+	}
+	n.host.Close()
+}
+
 // freePort returns a port that is free for TCP and UDP on loopback.
 func freePort(t testing.TB) int {
 	t.Helper()

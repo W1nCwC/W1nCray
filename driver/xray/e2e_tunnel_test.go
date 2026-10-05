@@ -401,7 +401,7 @@ func TestE2EReverseRecoveryAndRemove(t *testing.T) {
 	eventually(t, 15*time.Second, "initial link", r.check)
 
 	// (a) kill the bridge side (whole Xray instance), start a fresh one
-	r.bridgeNode.host.Close()
+	r.bridgeNode.kill()
 	time.Sleep(300 * time.Millisecond)
 	if err := r.check(); err == nil {
 		t.Fatal("link still works with the bridge down")
@@ -414,7 +414,7 @@ func TestE2EReverseRecoveryAndRemove(t *testing.T) {
 	r.bridgeNode = nb
 
 	// (b) kill the portal side, start a fresh one on the same ports
-	r.portalNode.host.Close()
+	r.portalNode.kill()
 	time.Sleep(300 * time.Millisecond)
 	np := newNode(t, testOpts())
 	t0 := time.Now()

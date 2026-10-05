@@ -429,6 +429,14 @@ func (d *Driver) teardown(l *live) {
 		l.health = nil
 	}
 	if l.rev != nil {
+		// A portal is registered as an outbound handler, not through
+		// AddOutbound, so it is removed from the manager here. This must
+		// happen outside portal.Close: the outbound manager holds its lock
+		// while closing handlers during shutdown, and RemoveHandler would
+		// deadlock against it (see portal.Close).
+		if rs := l.c.Reverse; rs != nil && rs.Role == "portal" {
+			_ = d.host.OutboundManager().RemoveHandler(context.Background(), rs.Tag)
+		}
 		l.rev.Close()
 		l.rev = nil
 	}

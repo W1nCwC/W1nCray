@@ -71,16 +71,16 @@ func startPortal(om outbound.Manager, tag, domain string) (*portal, error) {
 	return p, nil
 }
 
-// Close removes the handler and closes every bridge link. It is idempotent and
-// safe to call from the outbound manager (which does not hold its lock while
-// closing a handler) as well as from the driver.
+// Close closes every bridge link and is idempotent. It must NOT touch the
+// outbound manager: Xray's outbound.Manager.Close holds its write lock while
+// calling Handler.Close on every registered handler, so a RemoveHandler call
+// here would re-acquire the same (non-reentrant) RWMutex on the same goroutine
+// and deadlock the whole process on shutdown. Removal from the manager is the
+// driver's job (see teardown in apply.go); this method only tears down the
+// workers this portal owns.
 func (p *portal) Close() error {
-	var err error
-	p.once.Do(func() {
-		err = p.om.RemoveHandler(context.Background(), p.tag)
-		p.shutdown()
-	})
-	return err
+	p.once.Do(p.shutdown)
+	return nil
 }
 
 // shutdown closes the workers; it is also reached when the outbound manager
