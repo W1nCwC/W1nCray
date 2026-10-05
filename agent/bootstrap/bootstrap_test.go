@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -168,6 +170,13 @@ func (f *fakeDriver) Rollback(ctx context.Context, rt driver.Runtime) error {
 func (f *fakeDriver) Stop(ctx context.Context, rt driver.Runtime, ids ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(ids) == 0 { // driver contract: no ids means every instance
+		for id, r := range f.current {
+			closeRun(r)
+			delete(f.current, id)
+		}
+		return nil
+	}
 	for _, id := range ids {
 		if r, ok := f.current[id]; ok {
 			closeRun(r)
@@ -298,5 +307,212 @@ func TestApplyFileStrict(t *testing.T) {
 	rt := &Runtime{}
 	if _, err := rt.ApplyFile(path); err == nil {
 		t.Fatal("expected an error for an unknown field")
+	}
+}
+
+// ---- shutdown / resume ---------------------------------------------------
+
+type recLog struct {
+	mu    sync.Mutex
+	warns []string
+}
+
+func (l *recLog) Debugf(string, ...any) {}
+func (l *recLog) Infof(string, ...any)  {}
+func (l *recLog) Warnf(f string, a ...any) {
+	l.mu.Lock()
+	l.warns = append(l.warns, fmt.Sprintf(f, a...))
+	l.mu.Unlock()
+}
+func (l *recLog) Errorf(string, ...any) {}
+func (l *recLog) warnText() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.warns, "\n")
+}
+
+// useFake substitutes the engine registry with the given fake for the test.
+func useFake(t *testing.T, fd *fakeDriver) {
+	t.Helper()
+	orig := driverBuilder
+	driverBuilder = func(c *core.Core, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
+		return map[string]driver.Driver{spec.EngineGost: fd}, nil
+	}
+	t.Cleanup(func() { driverBuilder = orig })
+}
+
+// bootCycle is one "process lifetime": a new fake engine and a new Boot on the
+// given directory.
+func bootCycle(t *testing.T, dir string, resume bool, log driver.Logger) (*Runtime, *fakeDriver) {
+	t.Helper()
+	fd := newFakeDriver()
+	useFake(t, fd)
+	rt, err := Boot(Options{
+		StateDir:   filepath.Join(dir, "state"),
+		KernelsDir: filepath.Join(dir, "kernels"),
+		Resume:     resume,
+		Log:        log,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Boot(Resume:%v): %v", resume, err)
+	}
+	t.Cleanup(func() { _ = rt.Shutdown(context.Background()) })
+	return rt, fd
+}
+
+func fwdInstance(port int) string {
+	return fmt.Sprintf(`{"id":"fwd1","enabled":true,"engine":"gost","kind":"forward","listen":{"addr":"127.0.0.1","ports":"%d"},"targets":[{"host":"1.1.1.1","ports":"80"}]}`, port)
+}
+
+func TestShutdownKeepsStateAndBootResumeRestoresInstances(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	desiredPath := filepath.Join(dir, "desired.json")
+	port := freePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	writeDesired(t, desiredPath, fwdInstance(port))
+
+	// lifetime 1: apply, then shut down
+	rt1, _ := bootCycle(t, dir, false, nil)
+	if _, err := rt1.ApplyFile(desiredPath); err != nil {
+		t.Fatalf("ApplyFile: %v", err)
+	}
+	if !dialOK(addr) {
+		t.Fatalf("%s not reachable after apply", addr)
+	}
+	lgBefore, err := os.ReadFile(filepath.Join(stateDir, "last_good.json"))
+	if err != nil {
+		t.Fatalf("last_good.json missing after apply: %v", err)
+	}
+	dsBefore, err := os.ReadFile(filepath.Join(stateDir, "desired.json"))
+	if err != nil {
+		t.Fatalf("desired.json missing after apply: %v", err)
+	}
+	if err := rt1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if dialOK(addr) {
+		t.Fatalf("%s still reachable after Shutdown", addr)
+	}
+	// the corrected semantic: Shutdown must not erase the persisted state
+	lgAfter, err := os.ReadFile(filepath.Join(stateDir, "last_good.json"))
+	if err != nil || !bytes.Equal(lgBefore, lgAfter) {
+		t.Fatalf("last_good.json changed by Shutdown (err=%v):\nbefore %s\nafter  %s", err, lgBefore, lgAfter)
+	}
+	dsAfter, err := os.ReadFile(filepath.Join(stateDir, "desired.json"))
+	if err != nil || !bytes.Equal(dsBefore, dsAfter) {
+		t.Fatalf("desired.json changed by Shutdown (err=%v)", err)
+	}
+	// a second Shutdown is harmless
+	if err := rt1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+
+	// lifetime 2 without Resume: nothing comes back by itself
+	rt2, fd2 := bootCycle(t, dir, false, nil)
+	if dialOK(addr) {
+		t.Fatal("instance running after Boot(Resume:false)")
+	}
+	if rep, ok := rt2.ResumeReport(); ok {
+		t.Fatalf("ResumeReport ok without Resume: %+v", rep)
+	}
+	if len(fd2.current) != 0 {
+		t.Fatal("fake engine has instances after Boot(Resume:false)")
+	}
+	if err := rt2.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if lg, err := os.ReadFile(filepath.Join(stateDir, "last_good.json")); err != nil || !bytes.Equal(lg, lgBefore) {
+		t.Fatalf("last_good.json lost across a Resume:false lifetime (err=%v)", err)
+	}
+
+	// lifetime 3 with Resume: the instance is back without any ApplyFile
+	rt3, _ := bootCycle(t, dir, true, nil)
+	rep, ok := rt3.ResumeReport()
+	if !ok || rep.Status != reconcile.StatusApplied || len(rep.Instances) != 1 || rep.Instances[0].State != reconcile.StateRunning {
+		t.Fatalf("ResumeReport = %+v ok=%v", rep, ok)
+	}
+	if !dialOK(addr) {
+		t.Fatalf("%s not reachable after Boot(Resume:true)", addr)
+	}
+	// and it can be shut down and resumed again
+	if err := rt3.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if dialOK(addr) {
+		t.Fatal("still reachable after the second Shutdown")
+	}
+	rt4, _ := bootCycle(t, dir, true, nil)
+	if rep, ok := rt4.ResumeReport(); !ok || rep.Status != reconcile.StatusApplied {
+		t.Fatalf("second resume: %+v ok=%v", rep, ok)
+	}
+	if !dialOK(addr) {
+		t.Fatal("not reachable after the second resume")
+	}
+}
+
+func TestBootResumeWithNothingPersisted(t *testing.T) {
+	rt, _ := bootCycle(t, t.TempDir(), true, nil)
+	if rep, ok := rt.ResumeReport(); ok {
+		t.Fatalf("ResumeReport ok with nothing to resume: %+v", rep)
+	}
+}
+
+func TestBootResumeFailureDoesNotFailBoot(t *testing.T) {
+	// unreadable last_good.json
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "last_good.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lg := &recLog{}
+	rt, _ := bootCycle(t, dir, true, lg)
+	rep, ok := rt.ResumeReport()
+	if !ok || rep.Status != reconcile.StatusFailed || !strings.Contains(rep.Message, "corrupt") || rep.At.IsZero() {
+		t.Fatalf("ResumeReport = %+v ok=%v", rep, ok)
+	}
+	if !strings.Contains(lg.warnText(), "resuming the last good state") {
+		t.Fatalf("no warning logged: %q", lg.warnText())
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "last_good.json")); err != nil {
+		t.Fatal("the corrupt file must be left in place for inspection")
+	}
+
+	// readable but not applicable: the port is taken by someone else
+	dir2 := t.TempDir()
+	port := freePort(t)
+	desiredPath := filepath.Join(dir2, "desired.json")
+	writeDesired(t, desiredPath, fwdInstance(port))
+	rt1, _ := bootCycle(t, dir2, false, nil)
+	if _, err := rt1.ApplyFile(desiredPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt1.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	lg2 := &recLog{}
+	rt2, _ := bootCycle(t, dir2, true, lg2)
+	rep, ok = rt2.ResumeReport()
+	if !ok || rep.Status != reconcile.StatusRejected || !strings.Contains(rep.Message, "port conflict") {
+		t.Fatalf("ResumeReport = %+v ok=%v", rep, ok)
+	}
+	if lg2.warnText() == "" {
+		t.Fatal("no warning logged for the failed resume")
+	}
+	// the runtime is still usable: once the port is free the state applies
+	l.Close()
+	if _, err := rt2.ApplyFile(desiredPath); err != nil {
+		t.Fatalf("ApplyFile after failed resume: %v", err)
+	}
+	if !dialOK(fmt.Sprintf("127.0.0.1:%d", port)) {
+		t.Fatal("not reachable after the manual apply")
 	}
 }
