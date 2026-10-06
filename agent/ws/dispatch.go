@@ -5,7 +5,9 @@
 package ws
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -23,10 +25,13 @@ const errorRateLimit = time.Second
 // keep a stale id alive forever.
 const defaultCmdTTLS = 300
 
-// TerminalSink is the terminal implementation (agent/terminal, phase 3). A nil
-// sink means "this agent has no terminal": every term.* frame is answered with
+// TerminalSink is the terminal implementation (agent/terminal). A nil sink
+// means "this agent has no terminal": every term.* frame is answered with
 // term.error{code:"terminal_disabled"} instead of being silently dropped, so
 // the panel can tell "not supported" from "lost on the wire".
+//
+// *terminal.Manager implements it directly; the interface lives here so the
+// transport never imports the terminal package.
 type TerminalSink interface {
 	Open(session string, cols, rows int) error
 	Input(session string, data []byte) error
@@ -49,7 +54,9 @@ type Hooks struct {
 	// Event reports a local event to the caller (used by the Agent to push an
 	// "event" frame).
 	Event func(kind, level, message string)
-	// Terminal is nil until phase 3.
+	// Terminal serves term.open/input/resize/close. Nil (no local terminal, or
+	// Terminal.Enabled=false) answers every term.* frame with
+	// term.error{terminal_disabled}.
 	Terminal TerminalSink
 	// Send writes one frame back to the panel. A nil Send makes the dispatcher
 	// read-only, which is only useful in unit tests.
@@ -228,11 +235,27 @@ func (d *Dispatcher) handleTerm(env wsproto.Envelope) {
 	if payload.Session == "" {
 		payload.Session = session
 	}
+	// Every term.* frame is addressed by session. A term.open without one would
+	// create a session the panel cannot name afterwards, so it is refused
+	// before the sink sees it.
+	if payload.Session == "" {
+		d.answerTermError(env.ID, "", "terminal_error", "term."+strings.TrimPrefix(env.T, "term.")+" carries no session")
+		return
+	}
 	switch env.T {
 	case wsproto.TypeTermOpen:
 		err = d.hooks.Terminal.Open(payload.Session, payload.Cols, payload.Rows)
 	case wsproto.TypeTermInput:
-		err = d.hooks.Terminal.Input(payload.Session, []byte(payload.Data))
+		// The contract carries terminal bytes base64 encoded inside d
+		// (docs/WS-PROTOCOL.md section 1), so the raw payload string is not
+		// the input.
+		var data []byte
+		if data, err = base64.StdEncoding.DecodeString(payload.Data); err == nil {
+			err = d.hooks.Terminal.Input(payload.Session, data)
+		} else {
+			d.answerError(env.ID, wsproto.ErrCodeBadPayload, "term.input data is not valid base64")
+			return
+		}
 	case wsproto.TypeTermResize:
 		err = d.hooks.Terminal.Resize(payload.Session, payload.Cols, payload.Rows)
 	case wsproto.TypeTermClose:

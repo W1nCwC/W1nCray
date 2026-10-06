@@ -24,6 +24,9 @@ func respawn(exe string, argv []string, h HelperOptions, log driver.Logger) erro
 		return fmt.Errorf("selfupdate: no state directory for the respawn helper")
 	}
 	args := append([]string{HelperCommand}, HelperArgv(exe, argv, h)...)
+	//nolint:noshell -- exe is this agent's own executable (os.Executable,
+	// resolved through EvalSymlinks by the caller) and the arguments are an
+	// argv array, never a shell or a command string.
 	cmd := exec.Command(exe, args...)
 	cmd.Env = os.Environ()
 	cmd.Stdin = nil

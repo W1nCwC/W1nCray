@@ -462,7 +462,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 `Agent.DesiredPath` 设置后，修改该文件即自动应用（§3）。看结果：日志里的 `agent: <path>: <status> (<n> instance(s))`，失败时有具体错误。
 
-### 面板命令（`kernel_*` 与 `component_restart`）
+### 面板命令（`kernel_*`、`file_*`、`files_*` 与 `component_restart`）
 
 面板可以在两条通道上下发命令，两条通道**共用同一个命令注册表与同一个按 id 去重的空间**（`agent/opscmd`）：
 
@@ -480,6 +480,10 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 与 `xray` 一律拒绝（见下）。 |
+| `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。 |
+| `file_read` | `{root, path, offset?, limit?}` | 回 `{data:"<base64>", size, eof}`。`limit` 不得超过本机上限（默认 128 KiB，契约 §7-8），超限回 `failed` + `result.code="too_large"`。 |
+| `file_write` | `{root, path, data:"<base64>", mode?, sha256?}` | 原子写（同目录临时文件 + `rename`）。`mode` 是八进制字符串（缺省 0644）：可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；给了 `sha256` 就先核对。 |
+| `file_delete` | `{root, path}` | 删一个**普通文件**（目录一律拒绝），回 `{path, deleted:true}`。 |
 | `files_apply` | `{}` | 长命令。对**最近一次 desired 的 `files` 段**执行：下载 blob（按 sha256，命中缓存不重复下载）→ 暂存 → 校验 → 原子替换（先留 `last_good`）→ 重载。结果 `{status, files[], reload, applied_pending?, errors?, reason?, rolled_back?}`。 |
 | `files_validate` | `{}` | 只暂存 + 校验，**不写任何受管文件、不重载**。结果同 `files_apply`（`reload:"not_needed"`）。 |
 | `files_rollback` | `{}` | 用 `last_good` 快照恢复受管文件并重载。结果 `{status:"rolled_back", rolled_back:true, files[], reload}`。 |
@@ -492,6 +496,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 - **`KernelEntry` 字段**：`{name, version, current, previous, path, size_bytes, installed_at, in_use}`（契约 §3）。`size_bytes` 是**清单声明**的安装体积（各文件声明大小之和），不是磁盘实测。`kernel_list` 不额外发明 `size_on_disk`/`in_use_exact` 等字段（契约里没有）。
 - **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。
 - **能力声明**：`hello.capabilities`（以及 HTTP `/config` 的 `features`）里出现 `kernel` 的条件是**内核安装器可用且已加载一份已签名清单**——没有清单时 `kernel_install` 无法解析版本，所以不做这个承诺（契约 §7-1）。
+- **`file_*` 的根与错误码**：`root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`invalid_args`。
 - **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
 - **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
 - **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
@@ -513,6 +518,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 - **固定白名单与固定目录**：`config.yml`、`route.json`、`custom_inbound.json`、`custom_outbound.json`、`dns.json`、`geoip.dat`、`geosite.dat`，只写在 xray 配置目录。名字必须是纯文件名：`../evil`、绝对路径、`sub/route.json`、`agent.yml`、状态文件一律拒绝，命令不执行。
 - **`config.yml` 只在 `agent.yml` 分离布局下可写**（契约 §7-2）：否则该文件就是 agent 自己的配置，面板写它等于让 agent 自杀。这种情况下 agent 不声明 `files` 能力，面板也就不会下发。
+- **`files` 能力名是两个功能的交集**（契约 §3 里 `files` 只有一个名字）：面板据它决定是否在 revision 里下发 `desired.files`（受管 xray 文件），也用同一个名字决定是否提供 `file_*` 文件管理。所以只有当**两者都能服务**时才声明：受管层已接线、本地 `Files.Roots` 非空、`agent.yml` 分离布局，且 `file_*` 命令已注册。单文件布局下 `file_*` 命令仍然注册可用（`file_list` 等照常执行，直接发命令即可），但**不声明** `files`。契约目前没有任何字段能区分这两个功能（`capabilities` 是集合，`policy.files` 只有 `roots`/`unrestricted`），这是 WP-G5 与 WP-G6 合并时的保守取舍：宁可少声明，也不让面板下发本机无法应用的 `desired.files`。风险与待决项见合并报告。
 - **校验先于替换**：四个 JSON 先逐个 `core.CheckFiles`，再用**整实例预检**（`core.New` 只构造、不 `Start`，因此**不绑端口**）抓组合错误；`config.yml` 走完整 `LoadConfig`。校验不过 → 一个受管文件都不动、不重载，回 `status:"invalid"` 与带文件名/规则序号的错误。
 - **blob 完整性**：边写边算 sha256，与 desired 的 `sha256`/`size` 不符**不落缓存、不替换**；`If-None-Match` 拿到 304 而本地又没有缓存时重取一次。单文件上限默认 64 MiB（`Files.MaxBytes` 可改；设为负值 = 本机禁用 geo 下发，回显式原因而不是静默跳过）。
 - **原子替换与回滚**：替换前把当前文件快照成 `last_good`（缺失的文件记为"缺失"，回滚时删掉），替换走同目录临时文件 + `rename`。重载被拒（`LoadConfig` 失败）→ 恢复 `last_good` 并回 `status:"rolled_back"`。
@@ -575,7 +581,21 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
 8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。脚本执行或任意命令通道仍然不存在，外部命令一律用参数数组启动。**交互终端是例外**：它默认开启（§3），只由本机 `Terminal.Enabled` 控制，面板不能远程打开；不需要的机器请显式关闭（`Terminal: {Enabled: false}` 或 `--noterminal`），尤其是升级后的老机器。
 
-## 10 已知限制与未决事项
+## 10 安全模型变更记录（D8：交互终端）
+
+本节是**有意识的安全模型变更**的正式记录，由 `agent/terminal/noshell_allow_test.go` 反向断言：白名单里的每个包都必须在本节里按包路径写出来，改了代码不改这里，测试就会失败。
+
+1. **变更内容**：agent 从"没有终端、没有脚本执行、没有任意命令通道"变成"有一个**本机开关控制**的交互终端"。这是本手册与 `docs/PLAN-v6-agent-forward.md`、`docs/PLAN-v7-panel-control.md` 里"不存在终端"表述的**唯一例外**，其余约束（外部命令一律 argv 数组、期望状态不含 URL/哈希、无脚本推送）逐字不变。
+2. **唯一允许起 shell 的包**：`agent/terminal`。`agent/supervisor/noshell_test.go` 的 `AllowedShellPackages` 是**包级白名单**，只有这一个条目，并附有理由；白名单之外的任何 `agent/**` 包一旦出现 `exec.Command(<shell>)`、`<shell>,"-c"`、`syscall.ForkExec/Exec`、`pty.Start*`，或 `exec.Command(<变量>)`（无法静态判定时保守报错，需 `//nolint:noshell` 显式豁免并计数），测试直接失败。
+3. **本机开关**：`Terminal.Enabled` **缺省为 true**（RULINGS v9 第 17 条）。机器只能在**本地**关闭：`agent.yml` 写 `Terminal: {Enabled: false}`，或安装/关联时用 `--noterminal`（`install.sh --noterminal`、`W1nCray link --noterminal`）。面板**无法远程打开或关闭**：本机状态只通过 `hello.policy.terminal` 上报，面板据此显示"该机器已在本地关闭终端"。
+4. **平台支持是运行时探测的**：`terminal.Supported()` 在运行时打开 `/dev/ptmx` 判断本机能否建立 PTY；不支持的平台/内核（部分 OpenWrt 无 devpts）**不声明** `terminal` 能力，`hello.capabilities` 与 `/config.features` 里都不会出现它。编译通过不等于能工作。
+5. **会话边界**：每机最多 2 个并发会话（`Terminal.MaxSessions` 上限也是 2）；空闲 15 分钟（`IdleTimeoutS`）回收；最长 4 小时（`MaxDurationS`）回收；agent 退出或面板链路关闭时 `CloseAll` 杀掉**整个进程组**，不留孤儿 shell；单个 `term.input` 帧 ≤ 64 KiB。
+6. **环境净化**：子进程只拿到固定白名单变量（`TERM/LANG/LC_ALL/LC_CTYPE/PATH/HOME/USER/LOGNAME/SHELL/TZ/PWD`），其余一律剔除——包括机器 token、任何 `Agent.*` 值、`LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT`/`BASH_ENV`/`NODE_OPTIONS`/`PYTHONPATH` 等注入面。
+7. **审计只有元数据**：`terminal.AuditEvent` 结构体里**没有任何内容字段**（编译期保证），只有会话 id、动作、时间、时长、`BytesIn`/`BytesOut`、结束原因。终端字节永远不会进入审计、日志或事件帧。
+8. **`agent/fileops` 的边界**：`file_*` 只在 `Files.Roots` 内工作（默认 xray 配置目录 + agent 状态目录），`agent.yml`、`desired.json`、`last_good.json` **永不在任何 root 内**；拒绝 `..`、绝对路径、符号链接逃逸、FIFO/设备/非常规文件、目录删除；可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；`file_read.limit` 与 `file_write` 载荷各 ≤ 128 KiB（WS 单帧 256 KiB 契约，RULINGS v9 第 9 条）。
+9. **已知限制（TOCTOU）**：`os` 包没有 `openat`，`fileops` 的"逐段 Lstat + `O_NOFOLLOW` 打开"之间存在极小的 TOCTOU 窗口。因此部署要求：**root 内不应有可被非 root 用户改写的目录**。这一条已在 `agent/fileops` 的包注释里写明。
+
+## 11 已知限制与未决事项
 
 以下是写样例和本手册时发现的、**需要代码侧决定**的不一致，均有测试或命令输出佐证；它们不影响上面样例的有效性，但会限制能写出什么：
 

@@ -135,9 +135,18 @@ type Deps struct {
 	Kernels KernelOps
 	// Comp serves component_restart. Nil answers it with not_supported.
 	Comp ComponentOps
-	// Files serves files_apply / files_validate / files_rollback. Nil answers
-	// them with not_supported (protocol ruling 5: never silently ignored).
+	// Files serves files_apply / files_validate / files_rollback, the MANAGED
+	// xray files (D4/D5). Nil answers them with not_supported (protocol ruling
+	// 5: never silently ignored).
 	Files FilesOps
+	// FileCmds serves the file_* commands (WP-G6): file_list, file_read,
+	// file_write, file_delete, the confined file manager. It is a separate
+	// field from Files because the two features are different: Files replaces
+	// the managed xray files from the panel's revision, FileCmds browses and
+	// edits single files inside the local roots. RegisterFileCmds installs
+	// them, because a machine without a configured root must not expose the
+	// commands at all.
+	FileCmds FileCmdOps
 	// Events reports kernel.installed / kernel.removed / files.applied /
 	// files.rolled_back (ruling 10). Nil drops them.
 	Events EventSink

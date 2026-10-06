@@ -43,6 +43,10 @@ type Streams interface {
 	Kernels() []wsproto.KernelEntry
 	Policy() wsproto.Policy
 	Capabilities() []string
+	// TerminalSupported reports whether this machine could really serve a
+	// terminal session: the local switch is on and the platform has a PTY. The
+	// capability list must agree with it (protocol ruling 1).
+	TerminalSupported() bool
 }
 
 // Commands is the single command entry point, shared with the HTTP Runner so
@@ -83,7 +87,13 @@ type AgentOptions struct {
 	Commands Commands
 	// Nodes is the D3 hook. It may be nil.
 	Nodes NodeToggle
-	// Files is the managed-file hook (a "files" hint). It may be nil.
+	// Terminal serves the term.* frames (agent/terminal, phase 3). It may be
+	// nil: the dispatcher then answers every term.* frame with
+	// term.error{code:"terminal_disabled"}, which is what a machine with
+	// Terminal.Enabled=false or without a PTY must do.
+	Terminal TerminalSink
+	// Files is the managed-file hook (a "files" hint, D4/D5). It may be nil:
+	// the hint is then answered with not_supported instead of being ignored.
 	Files FileSync
 	// Log receives the agent's events.
 	Log driver.Logger
@@ -145,7 +155,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		Hint:     ag.onHint,
 		Event:    ag.queueEvent,
 		Log:      a.Log,
-		Terminal: nil, // phase 3; nil = term.error{terminal_disabled}
+		Terminal: a.Terminal, // nil = term.error{terminal_disabled}
 	})
 	ag.dispatcher = disp
 

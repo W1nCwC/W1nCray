@@ -329,6 +329,13 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		if agentOpts.Nodes == nil {
 			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), refresh: runner.RequestRefresh, log: log}
 		}
+		// The interactive terminal is wired only when this machine really has
+		// one; a nil sink is what answers term.error{terminal_disabled}
+		// (WP-G6 acceptance 3). The local switch was already applied at Boot,
+		// so a remote frame can never turn it on (ruling 13).
+		if r.Terminal != nil {
+			agentOpts.Terminal = wsTerminal{m: r.Terminal}
+		}
 		wsAgent, err = ws.NewAgent(wsOpts, agentOpts)
 		if err != nil {
 			return nil, fmt.Errorf("bootstrap: panel link: %w", err)
@@ -343,6 +350,12 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		// in the HTTP contract, so nothing is sent.
 		if r.Ops != nil {
 			r.Ops.SetEvents(opscmd.EventFunc(wsAgent.SendEvent))
+		}
+		// Terminal session open/close: metadata only, as event frames. The
+		// sink exists only with a socket, because the HTTP contract has no
+		// event channel.
+		if r.Terminal != nil {
+			r.Terminal.SetAuditor(terminalAuditor{events: wsAgent, log: log})
 		}
 		// A rollback the respawn helper performed before this process started
 		// is reported once, now that there is a channel (ruling 10).

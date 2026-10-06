@@ -187,6 +187,9 @@ func runHelper(ctx context.Context, h HelperOptions, start startFunc, sleep func
 // window. Any exit inside the window (clean or not) counts as a failure: an
 // agent that exits is not serving.
 func startWindow(exe string, argv []string, window time.Duration) error {
+	//nolint:noshell -- exe is this agent's own executable (os.Executable or the
+	// binary a committed update put in place) and the arguments are an argv
+	// array, never a shell or a command string.
 	cmd := exec.Command(exe, argv...)
 	cmd.Env = os.Environ()
 	cmd.Stdout = os.Stdout

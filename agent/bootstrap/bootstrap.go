@@ -23,6 +23,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/fileops"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
@@ -30,6 +31,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/state"
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
+	"github.com/W1nCwC/W1nCray/agent/terminal"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/corehost"
 	"github.com/W1nCwC/W1nCray/driver/frp"
@@ -79,6 +81,14 @@ type Options struct {
 	AgentVersion string
 	// AllowHTTP permits http:// kernel sources (development only).
 	AllowHTTP bool
+	// Terminal is the local terminal policy (D8). Enabled is the resolved
+	// agentcfg value: on unless the machine opted out. A machine without a PTY
+	// gets no manager, so it never declares the capability.
+	Terminal terminal.Options
+	// FileOps is the local confined file-operation policy (D9/WP-G6). No roots
+	// means no file_* commands and no "files" capability. It is distinct from
+	// Files, the managed xray files the panel replaces (D4/D5).
+	FileOps fileops.Options
 	// Log receives driver, supervisor, kernel and reconciler events.
 	Log driver.Logger
 	// Resume makes Boot re-apply the persisted last good state before it
@@ -97,6 +107,10 @@ type Runtime struct {
 	// Ops is the operations command registry (kernel_* and, later, the other
 	// operation commands). It is nil only for a Runtime built by hand.
 	Ops *opscmd.Registry
+	// Terminal is the interactive terminal manager (D8/WP-G6). It is nil when
+	// the local switch is off or the platform has no PTY, and the "terminal"
+	// capability is then not declared.
+	Terminal *terminal.Manager
 	// Updater replaces the agent's own binary with a version from the signed
 	// manifest (self_update). It is nil when the executable path cannot be
 	// resolved; upgradeReady is the one-time verdict of its Ready check.
@@ -105,6 +119,10 @@ type Runtime struct {
 	// Files is the managed-file layer (D4/D5); nil when the local policy or the
 	// configuration has no xray directory to manage.
 	Files *FilesRuntime
+	// FileOps is the confined file manager (D9/WP-G6): the file_* commands. It
+	// is nil when no root is configured, and the "files" capability is then not
+	// declared.
+	FileOps *fileops.Ops
 	// cfg is the local agent configuration the capability list and the policy
 	// gates are read from (nil means the defaults).
 	cfg *agentcfg.Config
@@ -172,6 +190,19 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		Log:     log,
 	}
 	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log, cfg: opts.AgentConfig}
+	// The interactive terminal (D8) exists only when the local switch is on and
+	// this machine can really create a PTY. A nil manager is what makes the
+	// dispatcher answer term.error{terminal_disabled} and keeps the capability
+	// out of hello.capabilities.
+	rt.Terminal = newTerminalManager(opts.Terminal, log)
+	// The file operations (D9) exist only when at least one root is configured;
+	// a machine without roots must not advertise the commands. They are the
+	// file_* commands, not the managed xray files (D4/D5, rt.Files below).
+	fileOps, err := newFileOps(opts.FileOps, log)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: file operations: %w", err)
+	}
+	rt.FileOps = fileOps
 	// The managed-file layer (D4/D5). It is built here because the xray
 	// configuration directory and the state directory are known now; the blob
 	// fetcher and the validator are installed by the panel link (StartRemote)
@@ -188,6 +219,14 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
+	}
+	// The file_* commands are additive: RegisterFileCmds refuses a manager
+	// without roots, so a machine with no file policy simply does not have
+	// them.
+	if fileOps != nil {
+		if err := opscmd.RegisterFileCmds(ops, fileOps); err != nil {
+			return nil, fmt.Errorf("bootstrap: %w", err)
+		}
 	}
 	rt.Ops = ops
 	// The self-update updater: it stages the agent's own manifest entry (the
@@ -340,11 +379,23 @@ func (r *Runtime) ApplyFile(path string) (reconcile.Report, error) {
 // state (applying an empty desired state would erase them), so the next start
 // can resume where this one stopped. A stop error is logged and does not
 // prevent the supervisor from stopping.
+//
+// The interactive terminal is closed first: CloseAll kills every session's
+// process group, so the agent never leaves an orphaned shell behind (WP-G6
+// acceptance 4).
 func (r *Runtime) Shutdown(ctx context.Context) error {
+	if r.Terminal != nil {
+		r.Terminal.CloseAll(terminal.ReasonAgentShutdown)
+	}
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	if err := r.Reconciler.Stop(stopCtx); err != nil {
-		r.log.Warnf("bootstrap: stopping instances during shutdown: %v", err)
+	if r.Reconciler != nil {
+		if err := r.Reconciler.Stop(stopCtx); err != nil {
+			r.log.Warnf("bootstrap: stopping instances during shutdown: %v", err)
+		}
 	}
 	cancel()
+	if r.Sup == nil {
+		return nil
+	}
 	return r.Sup.Shutdown(ctx)
 }

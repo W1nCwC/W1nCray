@@ -34,10 +34,10 @@ func TestFileCapabilityRequiresTheSeparatedLayoutAndRoots(t *testing.T) {
 	if rt.fileCapable() {
 		t.Error("a runtime without a managed-file layer claims the capability")
 	}
-	if got := capabilities(&agentcfg.Config{}, false, false); hasCapability(got, wsproto.CapFiles) {
+	if got := capabilities(&agentcfg.Config{}, false, false, false); hasCapability(got, wsproto.CapFiles) {
 		t.Errorf("capabilities = %v, want no files", got)
 	}
-	if got := capabilities(&agentcfg.Config{}, false, true); !hasCapability(got, wsproto.CapFiles) {
+	if got := capabilities(&agentcfg.Config{}, false, false, true); !hasCapability(got, wsproto.CapFiles) {
 		t.Errorf("capabilities = %v, want files", got)
 	}
 
@@ -70,6 +70,16 @@ func TestFileCapabilityRequiresTheSeparatedLayoutAndRoots(t *testing.T) {
 	})
 	if !rt.fileCapable() {
 		t.Error("the capability was not promised with the separated layout and a root")
+	}
+	// The single contract name "files" is the conjunction of both file
+	// features: the managed layer alone is not enough, because the panel gates
+	// desired.files on this one capability and the file_* commands must be
+	// servable under it too (see filesCapable).
+	if rt.filesCapable() {
+		t.Error("filesCapable was promised although the file_* commands are not registered")
+	}
+	if rt.fileCmdsCapable() {
+		t.Error("a runtime without a confined file manager claims the file_* commands")
 	}
 
 	// No local root: the panel may not manage anything.

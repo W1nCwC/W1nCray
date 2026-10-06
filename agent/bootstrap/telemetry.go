@@ -84,7 +84,7 @@ func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
 // the kernel commands servable, and the panel must see the new list without a
 // restart.
 func (s runtimeStreams) Capabilities() []string {
-	caps := capabilities(s.cfg, s.rt.kernelCapable(), s.rt.fileCapable())
+	caps := capabilities(s.cfg, s.rt.kernelCapable(), s.rt.TerminalSupported(), s.rt.filesCapable())
 	// upgrade is a promise that self_update is served here: the command is
 	// registered only when the executable is replaceable in place, a service
 	// manager runs it and the process has a restart hook (protocol ruling 11).
@@ -94,18 +94,26 @@ func (s runtimeStreams) Capabilities() []string {
 	return caps
 }
 
+// TerminalSupported reports whether this machine can really serve a terminal
+// session: the local switch is on and a PTY exists (WP-G6 acceptance 3).
+func (s runtimeStreams) TerminalSupported() bool { return s.rt.TerminalSupported() }
+
 // capabilities lists what this machine can really do; the panel must not offer
-// anything else (protocol ruling 1). telemetry is always served; xray_nodes
-// only when the local module gate allows it (ruling 6); kernel only when the
-// kernel installer can actually serve kernel_* commands; files only when the
-// managed-file layer is wired and the local layout permits it (ruling 2).
-func capabilities(cfg *agentcfg.Config, kernel, files bool) []string {
+// anything else (protocol ruling 1). telemetry is always there; xray_nodes only
+// when the local module gate allows it (ruling 6); kernel only when the kernel
+// installer can actually serve kernel_* commands; terminal only when the local
+// switch is on and the platform has a PTY (ruling 17 + design section 6.8);
+// files only when BOTH file features can be served (see filesCapable).
+func capabilities(cfg *agentcfg.Config, kernel, term, files bool) []string {
 	caps := []string{wsproto.CapTelemetry}
 	if cfg.XrayNodesEnabled() {
 		caps = append(caps, wsproto.CapXrayNodes)
 	}
 	if kernel {
 		caps = append(caps, wsproto.CapKernel)
+	}
+	if term {
+		caps = append(caps, wsproto.CapTerminal)
 	}
 	if files {
 		caps = append(caps, wsproto.CapFiles)
@@ -150,6 +158,45 @@ func (r *Runtime) kernelCapable() bool {
 // cannot keep.
 func (r *Runtime) upgradeCapable() bool {
 	return r != nil && r.Ops != nil && r.Ops.Has(panelclient.CmdSelfUpdate)
+}
+
+// TerminalSupported reports whether the runtime has a live terminal manager.
+// The manager is nil when the local switch is off or the platform has no PTY,
+// so this single check covers both (WP-G6 acceptance 3).
+func (r *Runtime) TerminalSupported() bool {
+	return r != nil && r.Terminal != nil && r.Terminal.Available()
+}
+
+// filesCapable reports whether the single contract capability "files" may be
+// declared. The contract has ONE "files" name for two unrelated features:
+//
+//   - the managed xray files the panel puts in a revision (desired.files,
+//     files_apply / files_validate / files_rollback, D4/D5), and
+//   - the confined file_* commands (file_list / file_read / file_write /
+//     file_delete, D9/WP-G6).
+//
+// The panel gates the desired.files key on this capability (protocol ruling 1)
+// and the agent decodes a revision strictly, so declaring "files" when the
+// managed layer is not wired would let the panel publish a key this machine
+// cannot apply. The capability is therefore the CONJUNCTION: it is declared
+// only when the managed layer is servable (fileCapable) AND the file_*
+// commands are registered (fileCmdsCapable). In the panel's wiring the second
+// condition is implied by the first (both read cfg.Files.Roots), so this only
+// withholds the declaration where the managed layout is deliberately off.
+//
+// The contract has no field that tells the two apart (capabilities is a set,
+// policy.files carries only roots/unrestricted), so this is the conservative
+// stopgap: it never over-promises, and it is recorded in the merge report as
+// the open protocol question.
+func (r *Runtime) filesCapable() bool {
+	return r.fileCapable() && r.fileCmdsCapable()
+}
+
+// fileCmdsCapable reports whether the file_* commands can be served: a manager
+// with at least one root exists. A machine without roots must not declare the
+// capability, and the commands are not registered either.
+func (r *Runtime) fileCmdsCapable() bool {
+	return r != nil && r.FileOps != nil && len(r.FileOps.RootNames()) > 0
 }
 
 // localPolicy maps the agent.yml local policy onto the wire type. A nil config
