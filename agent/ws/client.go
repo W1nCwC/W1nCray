@@ -168,6 +168,17 @@ type Client struct {
 	queue   chan []byte
 	online  bool
 	session string
+	// connCancel ends the serve loop of the current connection; it is nil while
+	// offline. RequestReconnect uses it to close the connection cleanly.
+	connCancel context.CancelFunc
+	// reconnectReq is set by RequestReconnect and consumed by Run, so a
+	// deliberate reconnect waits only the minimum backoff instead of inheriting
+	// one that had grown.
+	reconnectReq bool
+	// closeReason is what the close frame says when this connection ends. It is
+	// reset for every connection and set by RequestReconnect, so a capability
+	// reconnect is not reported to the panel as a shutdown.
+	closeReason string
 
 	// runMu serialises Run: two reconnect loops would fight over one machine
 	// identity on the panel.
@@ -299,10 +310,17 @@ func (c *Client) URL() string { return c.url }
 // backoff 1s -> 60s (+/-20% jitter). It never returns a transport error: a
 // panel that is down, unreachable or answering garbage only delays the next
 // attempt, because a panel fixed later must heal without an agent restart.
+//
+// A connection ended by RequestReconnect is the exception to the growth: its
+// next dial waits the minimum backoff, because the caller asked for a fresh
+// hello now, not for a retry after a failure.
 func (c *Client) Run(ctx context.Context) error {
 	c.runMu.Lock()
 	defer c.runMu.Unlock()
 
+	// A request that raced the previous Run must not shorten this Run's first
+	// backoff.
+	c.takeReconnectRequest()
 	backoff := c.backoffMin
 	for {
 		if err := ctx.Err(); err != nil {
@@ -329,7 +347,13 @@ func (c *Client) Run(ctx context.Context) error {
 		default:
 			c.logf().Debugf("ws: connection ended: %v", err)
 		}
-		if alive >= stableConnection {
+		switch {
+		case c.takeReconnectRequest():
+			// A deliberate local close (RequestReconnect): the caller wants a
+			// fresh connection now, so the first retry is the minimum interval
+			// and the grown backoff is discarded.
+			backoff = c.backoffMin
+		case alive >= stableConnection:
 			backoff = c.backoffMin
 		}
 		if !c.sleep(ctx, c.wait(backoff)) {
@@ -337,6 +361,37 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 		backoff = min(backoff*2, c.backoffMax)
 	}
+}
+
+// RequestReconnect ends the current connection cleanly so the next dial sends a
+// fresh hello, and makes that next dial wait only the minimum backoff. It is a
+// no-op while offline: the next connection builds its hello from the current
+// state anyway. The reason, when non-empty, is carried in the close frame.
+func (c *Client) RequestReconnect(reason string) {
+	c.mu.Lock()
+	cancel := c.connCancel
+	if cancel != nil {
+		c.reconnectReq = true
+		if reason != "" {
+			c.closeReason = reason
+		}
+	}
+	c.mu.Unlock()
+	if cancel != nil {
+		// Cancelling the connection context is the same clean end the
+		// transport uses on shutdown: the serve loop returns nil, the reader
+		// and the writer are joined, and Run reconnects.
+		cancel()
+	}
+}
+
+// takeReconnectRequest consumes the flag set by RequestReconnect.
+func (c *Client) takeReconnectRequest() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	req := c.reconnectReq
+	c.reconnectReq = false
+	return req
 }
 
 // Send queues one frame. It never blocks on the network: it fails with
@@ -474,12 +529,17 @@ func (c *Client) connect(ctx context.Context) error {
 	c.mu.Lock()
 	c.queue = queue
 	c.conn = conn
+	c.connCancel = cancel
 	c.online = false
 	c.session = ""
+	// A close reason belongs to one connection: the previous one must not leak
+	// into this connection's close frame.
+	c.closeReason = ""
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
 		c.conn = nil
+		c.connCancel = nil
 		c.online = false
 		c.session = ""
 		c.mu.Unlock()
@@ -683,6 +743,21 @@ func (c *Client) writeLoop(ctx context.Context, conn *websocket.Conn, queue <-ch
 	}
 }
 
+// writeClose ends the connection with a normal closure. The reason is the one
+// RequestReconnect recorded for this connection (a deliberate reconnect), or
+// the transport's shutdown wording otherwise.
+func (c *Client) writeClose(conn *websocket.Conn) {
+	c.mu.Lock()
+	reason := c.closeReason
+	c.mu.Unlock()
+	if reason == "" {
+		reason = "agent shutting down"
+	}
+	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, reason)
+	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+	_ = conn.WriteMessage(websocket.CloseMessage, msg)
+}
+
 // writeRaw writes one already-encoded frame. Encoding happens in Send (and once
 // for hello), so a frame cannot be wrapped twice on its way out.
 func (c *Client) writeRaw(conn *websocket.Conn, raw []byte) error {
@@ -697,12 +772,6 @@ func (c *Client) writePing(conn *websocket.Conn) error {
 		return err
 	}
 	return conn.WriteMessage(websocket.PingMessage, nil)
-}
-
-func (c *Client) writeClose(conn *websocket.Conn) {
-	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "agent shutting down")
-	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
-	_ = conn.WriteMessage(websocket.CloseMessage, msg)
 }
 
 // sleep waits for d, returning false when ctx ended first.
