@@ -10,6 +10,14 @@
 //	POST /api/v1/server/UniProxy/status     {cpu,mem,swap,disk}
 //
 // Authentication is token + node_id (+ optional node_type) on every request.
+//
+// Machine mode (Config.MachineID and Config.MachineToken) talks to the panel's
+// /api/v2/server/machine/agent/node/* endpoints instead: the machine token
+// authenticates the host through headers (never through the URL), the panel
+// decides which nodes the host runs, and node_id selects the node:
+//
+//	GET  {URL}/api/v2/server/machine/agent/nodes      nodes assigned to the machine
+//	GET  {URL}/api/v2/server/machine/agent/node/config etc.
 package xboard
 
 import (
@@ -27,10 +35,25 @@ import (
 	"time"
 )
 
-const basePath = "/api/v1/server/UniProxy/"
+const (
+	basePath        = "/api/v1/server/UniProxy/"
+	machineBasePath = "/api/v2/server/machine/agent/node/"
+	// machineNodesPath is absolute: the node list is not under the node/ prefix.
+	machineNodesPath = "/api/v2/server/machine/agent/nodes"
+)
 
 // ErrNotModified is returned when the panel answers 304.
 var ErrNotModified = errors.New("not modified")
+
+// Machine-mode answers of the panel. The panel reports them as 401
+// {"error":"bad_credentials"}, 403 {"error":"machine_disabled"} and 404
+// {"error":"unknown_node"}; the sentinels keep the *StatusError reachable, so
+// callers can still read the status code.
+var (
+	ErrBadCredentials  = errors.New("bad credentials")
+	ErrMachineDisabled = errors.New("machine disabled")
+	ErrUnknownNode     = errors.New("unknown node")
+)
 
 // StatusError is a non-2xx answer of the panel.
 type StatusError struct {
@@ -43,6 +66,27 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("request %s: status %d: %s", e.Path, e.Code, e.Body)
 }
 
+// machineError maps the panel's machine-mode status codes onto the sentinels.
+func machineError(se *StatusError) error {
+	switch se.Code {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: %w", ErrBadCredentials, se)
+	case http.StatusForbidden:
+		return fmt.Errorf("%w: %w", ErrMachineDisabled, se)
+	case http.StatusNotFound:
+		return fmt.Errorf("%w: %w", ErrUnknownNode, se)
+	}
+	return se
+}
+
+// MachineNode is one node the panel assigned to a machine.
+type MachineNode struct {
+	ID        int
+	Type      string // vless, vmess, trojan, ... (empty: the panel decides)
+	Name      string
+	UpdatedAt int64
+}
+
 // Config configures a Client.
 type Config struct {
 	APIHost  string
@@ -50,14 +94,21 @@ type Config struct {
 	NodeID   int
 	NodeType string // optional, Xboard node type (vmess, vless, ...)
 	Timeout  time.Duration
+
+	// MachineID and MachineToken switch the client to machine mode: both must
+	// be set. NodeID then selects the node inside the machine.
+	MachineID    int
+	MachineToken string
 }
 
 // Client talks to one Xboard node.
 type Client struct {
-	cfg   Config
-	base  string
-	query url.Values
-	http  *http.Client
+	cfg     Config
+	base    string
+	prefix  string
+	machine bool
+	query   url.Values
+	http    *http.Client
 
 	mu        sync.Mutex
 	configTag string
@@ -69,17 +120,32 @@ func New(cfg Config) *Client {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
+	machine := cfg.MachineID != 0 && cfg.MachineToken != ""
 	q := url.Values{}
-	q.Set("token", cfg.Key)
-	q.Set("node_id", strconv.Itoa(cfg.NodeID))
-	if cfg.NodeType != "" {
-		q.Set("node_type", cfg.NodeType)
+	if machine {
+		// The machine token travels in a header; putting it in the URL would
+		// leak it into proxy and access logs.
+		if cfg.NodeID > 0 {
+			q.Set("node_id", strconv.Itoa(cfg.NodeID))
+		}
+	} else {
+		q.Set("token", cfg.Key)
+		q.Set("node_id", strconv.Itoa(cfg.NodeID))
+		if cfg.NodeType != "" {
+			q.Set("node_type", cfg.NodeType)
+		}
+	}
+	prefix := basePath
+	if machine {
+		prefix = machineBasePath
 	}
 	return &Client{
-		cfg:   cfg,
-		base:  strings.TrimRight(cfg.APIHost, "/"),
-		query: q,
-		http:  &http.Client{Timeout: cfg.Timeout},
+		cfg:     cfg,
+		base:    strings.TrimRight(cfg.APIHost, "/"),
+		prefix:  prefix,
+		machine: machine,
+		query:   q,
+		http:    &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
@@ -88,6 +154,9 @@ func (c *Client) Host() string { return c.cfg.APIHost }
 
 // NodeID returns the configured node id.
 func (c *Client) NodeID() int { return c.cfg.NodeID }
+
+// MachineMode reports whether the client authenticates as a machine.
+func (c *Client) MachineMode() bool { return c.machine }
 
 // ResetETags forces the next config/user requests to return full bodies.
 func (c *Client) ResetETags() {
@@ -137,7 +206,7 @@ func retryable(err error) bool {
 }
 
 func (c *Client) attempt(ctx context.Context, method, name string, body any, etag string) (*http.Response, error) {
-	path := basePath + name
+	path := c.prefix + name
 	if strings.HasPrefix(name, "/") {
 		path = name // absolute API path, e.g. the V2 handshake
 	}
@@ -159,6 +228,10 @@ func (c *Client) attempt(ctx context.Context, method, name string, body any, eta
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if c.machine {
+		req.Header.Set("X-Machine-Id", strconv.Itoa(c.cfg.MachineID))
+		req.Header.Set("Authorization", "Bearer "+c.cfg.MachineToken)
+	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
@@ -173,13 +246,18 @@ func (c *Client) attempt(ctx context.Context, method, name string, body any, eta
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
-		return nil, &StatusError{Path: name, Code: resp.StatusCode, Body: c.redactString(strings.TrimSpace(string(b)))}
+		se := &StatusError{Path: name, Code: resp.StatusCode, Body: c.redactString(strings.TrimSpace(string(b)))}
+		if c.machine {
+			return nil, machineError(se)
+		}
+		return nil, se
 	}
 	return resp, nil
 }
 
 // redact removes the node token from errors: *url.Error embeds the full
-// request URL, whose query carries the token, and errors end up in logs.
+// request URL, whose query carries the token, and errors end up in logs. The
+// machine token never travels in the URL, but a panel answer could echo it.
 func (c *Client) redact(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
@@ -189,11 +267,14 @@ func (c *Client) redact(err error) error {
 }
 
 func (c *Client) redactString(s string) string {
-	if c.cfg.Key == "" {
-		return s
+	for _, secret := range []string{c.cfg.Key, c.cfg.MachineToken} {
+		if secret == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, url.QueryEscape(secret), "***")
+		s = strings.ReplaceAll(s, secret, "***")
 	}
-	s = strings.ReplaceAll(s, url.QueryEscape(c.cfg.Key), "***")
-	return strings.ReplaceAll(s, c.cfg.Key, "***")
+	return s
 }
 
 // GetNodeConfig fetches the node config. It returns ErrNotModified when the
@@ -301,6 +382,42 @@ func (c *Client) GetAliveList(ctx context.Context) (map[int]int, error) {
 // PushStatus reports the machine load.
 func (c *Client) PushStatus(ctx context.Context, s *Status) error {
 	return c.post(ctx, "status", s)
+}
+
+// ListMachineNodes returns the nodes the panel assigned to this machine and
+// the version of that assignment. The version changes whenever a node is
+// added to or removed from the machine, so callers can poll it cheaply. It is
+// only meaningful for a machine-mode client.
+func (c *Client) ListMachineNodes(ctx context.Context) ([]MachineNode, string, error) {
+	resp, err := c.do(ctx, http.MethodGet, machineNodesPath, nil, "")
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Nodes []struct {
+			ID        Int    `json:"id"`
+			Type      String `json:"type"`
+			Name      String `json:"name"`
+			UpdatedAt Int    `json:"updated_at"`
+		} `json:"nodes"`
+		Version String `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		// encoding/json can echo the offending value, which could carry the
+		// token if the panel put it in the list.
+		return nil, "", fmt.Errorf("decode machine nodes: %s", c.redactString(err.Error()))
+	}
+	out := make([]MachineNode, 0, len(body.Nodes))
+	for _, n := range body.Nodes {
+		out = append(out, MachineNode{
+			ID:        int(n.ID),
+			Type:      string(n.Type),
+			Name:      string(n.Name),
+			UpdatedAt: int64(n.UpdatedAt),
+		})
+	}
+	return out, string(body.Version), nil
 }
 
 func (c *Client) post(ctx context.Context, name string, body any) error {

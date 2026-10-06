@@ -112,6 +112,43 @@ Agent:
 
 校验：`PortRange` 必须恰好两个元素 `[lo, hi]`；`Policy.AllowEngines` 只能出现 `auto` / `xray` / `gost` / `frp` / `realm`。
 
+### 机器模式节点（`MachineNodes`）
+
+在面板上把节点绑定到一台「机器」后，本机不必再逐个写 `Nodes`，只配一个机器令牌即可：W1nCray 用 `Agent.Panel` 的 `URL` / `MachineID` / `Token`（或 `TokenFile`）向面板查询这台机器名下的节点，并为每个节点自动起一个控制器。节点增删由面板决定，本机不改配置、不重启。
+
+```yaml
+Nodes: []          # 机器模式下允许为空；静态 Nodes 与机器节点可以共存
+Agent:
+  Enabled: true
+  Panel:
+    Enabled: true
+    URL: https://panel.example.com
+    MachineID: 12
+    TokenFile: /etc/W1nCray/machine.token
+    MachineNodes: true
+    NodeController:            # 机器节点共用的 ControllerConfig 模板
+      ListenIP: 0.0.0.0
+      CertConfig:
+        CertMode: dns
+        Provider: cloudflare
+        DNSEnv:
+          CF_DNS_API_TOKEN: "..."
+```
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `MachineNodes` | `false` | 打开机器模式。要求 `Agent.Enabled` 与 `Agent.Panel.Enabled`，否则配置被判无效（`MachineNodes requires Agent.Panel.Enabled` / `Agent.Panel.Enabled requires Agent.Enabled`） |
+| `NodeController` | 节点默认值（`ListenIP: 0.0.0.0`、`SendIP: 0.0.0.0`、`DNSType: AsIs`） | 机器节点共用的 `ControllerConfig`（`ListenIP`、`CertConfig`、`DisableWebSocket` …）。只写想覆盖的字段，其余回落到 `node.DefaultConfig()` |
+
+行为与边界：
+
+- **认证**：请求头 `X-Machine-Id: <MachineID>` + `Authorization: Bearer <令牌>`；令牌**绝不**出现在 URL、日志或报错里。面板返回 401 `bad_credentials` / 403 `machine_disabled` / 404 `unknown_node` 时，分别映射为凭据错误、机器被禁用、未知节点（错误里保留 HTTP 状态码）。
+- **发现失败不影响静态节点**：面板不可达或令牌错误时，静态 `Nodes` 照常启动，只记一条 warn（`machine nodes: … (static nodes keep running; retrying)`），并在后台延时 30 s 通过重载机制重试。
+- **节点变化自动生效**：启动后每 60 s 查询一次节点列表的 `version`，变化即触发一次整体重载（`reloading: machine nodes changed`）：新增的节点被拉起，移除的节点被关闭。
+- **机器节点不启用 WebSocket**：面板 WS 握手会把令牌放进 URL，违反「令牌不进 URL」，所以机器节点只走 HTTP 轮询（debug 日志 `machine mode: websocket disabled, using HTTP polling`）。
+- **`W1nCray check`**：离线时打印机器 ID 与「节点由面板下发」；加 `--online` 才联网，列出节点数与列表版本。
+- 机器节点的 tag 形如 `node<节点ID>@machine<机器ID>`，与静态节点的 `node<节点ID>@<主机>` 不会重名。
+
 ## 4 本地策略 `Policy`
 
 策略只能写在本机配置里，**远端或文件里的期望状态无法放宽它**。字段与默认值取自 `panel/config.go`（`AgentPolicy`）和 `agent/validate`（`NormalizePolicy`）。**默认就是拒绝**：不写 `Policy` 时，只允许监听 `127.0.0.1`、不允许 1024 以下端口、不允许私网目标、不允许任意目标、不允许公网监听接收 PROXY。
@@ -304,4 +341,4 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 4. **`secret` 字符集（已解决）**：`validate` 收紧到四个引擎的交集 `[A-Za-z0-9_.+/=-]`，`~` `:` `@` 等在校验阶段就被拒。
 5. **xray 的 `cert.mode: file` / `panel` 在内置装配里不可用**（`bootstrap.buildDrivers` 没配证书目录和面板证书源），xray TLS 隧道目前只能 `self` + `tls_pin`。
 6. `W1nCray check` 不校验 `desired.json` 内容，也没有 dry-run 命令。
-7. 面板下发、多机批量配置属 v7 阶段，未实现。
+7. 面板下发（`Agent.Panel` 的期望状态与「机器模式节点」，见 §3）已实现；多机批量配置仍属后续阶段。

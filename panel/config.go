@@ -86,6 +86,15 @@ type AgentPanelConfig struct {
 	// AllowInsecureHTTP permits plain http:// to a non-loopback host
 	// (development only).
 	AllowInsecureHTTP bool `mapstructure:"AllowInsecureHTTP"`
+	// MachineNodes makes the panel decide which nodes this machine runs
+	// (instead of the per-node Nodes entries): W1nCray asks the panel for the
+	// machine's node list and starts one controller per node. It requires
+	// Panel.Enabled (and the agent).
+	MachineNodes bool `mapstructure:"MachineNodes"`
+	// NodeController is the ControllerConfig template shared by every machine
+	// node (ListenIP, CertConfig, ...). Missing fields fall back to the node
+	// defaults.
+	NodeController *node.Config `mapstructure:"NodeController"`
 }
 
 // AgentPolicy maps agent/spec.Policy fields onto the config file. A zero value
@@ -184,6 +193,8 @@ func (c *Config) validate() error {
 	}
 	// D-F: a machine may run the agent without any Xboard node, so an empty
 	// Nodes list is only an error when neither Nodes nor the agent is enabled.
+	// Machine mode (Agent.Panel.MachineNodes) needs the agent, so it is covered
+	// by the same rule.
 	if len(c.NodesConfig) == 0 && (c.Agent == nil || !c.Agent.Enabled) {
 		return fmt.Errorf("config: no Nodes configured and Agent.Enabled is not set (configure Nodes, or an Agent)")
 	}
@@ -240,7 +251,7 @@ func merge(dst, src *node.Config) {
 // parsed in full by the agent core when a desired state is applied.
 func (a *AgentConfig) validate() error {
 	if !a.Enabled {
-		if a.Panel != nil && a.Panel.Enabled {
+		if a.Panel != nil && (a.Panel.Enabled || a.Panel.MachineNodes) {
 			return fmt.Errorf("config: Agent.Panel.Enabled requires Agent.Enabled")
 		}
 		return nil
@@ -300,6 +311,9 @@ func (p *AgentPanelConfig) Intervals() (pull, report time.Duration) {
 // file (ResolveToken reads it when the link starts, and "W1nCray check" reads
 // it to report problems early).
 func (p *AgentPanelConfig) validate() error {
+	if p.MachineNodes && !p.Enabled {
+		return fmt.Errorf("config: Agent.Panel.MachineNodes requires Agent.Panel.Enabled")
+	}
 	if !p.Enabled {
 		return nil
 	}
@@ -325,7 +339,27 @@ func (p *AgentPanelConfig) validate() error {
 	}); err != nil {
 		return fmt.Errorf("config: Agent.Panel.URL: %s", strings.TrimPrefix(err.Error(), "panelclient: "))
 	}
+	if p.MachineNodes {
+		cc := node.DefaultConfig()
+		if p.NodeController != nil {
+			merge(cc, p.NodeController)
+		}
+		p.NodeController = cc
+	}
 	return nil
+}
+
+// machinePanel returns the panel section when machine mode is on: the panel
+// then owns the node list and every node shares NodeController.
+func machinePanel(cfg *Config) *AgentPanelConfig {
+	if cfg.Agent == nil || !cfg.Agent.Enabled || cfg.Agent.Panel == nil {
+		return nil
+	}
+	pc := cfg.Agent.Panel
+	if !pc.Enabled || !pc.MachineNodes {
+		return nil
+	}
+	return pc
 }
 
 // ResolveToken returns the machine token: Token as is, or the contents of
