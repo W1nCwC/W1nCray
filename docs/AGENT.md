@@ -85,7 +85,61 @@
 
 ## 3 `Agent:` 配置块
 
-写在 `config.yml` 里（与 `Nodes` 同级，YAML）。未启用（`Enabled: false` 或整块缺省）时 Agent 完全不工作。
+agent 自己的配置可以放在两个地方：与 `config.yml` 同目录的 **`agent.yml`**（推荐），或 `config.yml` 里的 `Agent:` 块（旧布局，仍然兼容）。
+
+### `agent.yml`（独立文件，推荐）
+
+`agent.yml` 是 agent 配置的**根**（没有 `Agent:` 外层），字段名与 `config.yml` 的 `Agent:` 块完全相同。示例见 [`release/config/agent.yml.example`](../release/config/agent.yml.example)。
+
+**优先级**：同目录只要存在 `agent.yml`，就**整体以它为准**——`config.yml` 里遗留的 `Agent:` 块被完全忽略（不合并、也不报错），`W1nCray check` 会打印一行 `! … 的 Agent 段被 agent.yml 覆盖（已忽略）`。没有 `agent.yml` 时行为不变：`config.yml` 的 `Agent:` 块生效。`agent.yml` 存在但解析失败会让配置加载失败（启动失败 / 热重载放弃），所以它握有**服务能否启动的否决权**：改动前先备份，`W1nCray check` 会把它的问题放在第一屏。
+
+路径（`StateDir`、`KernelsDir`、`Panel.TokenFile`）相对**生效文件所在目录**解析；两个文件同目录时与以前完全一致。
+
+```yaml
+# /etc/W1nCray/agent.yml
+Enabled: true
+StateDir: /etc/W1nCray/state
+Policy:
+  AllowListen: ["0.0.0.0"]
+  PortRange: [20000, 40000]
+Panel:
+  Enabled: true
+  URL: https://panel.example.com
+  MachineID: 12
+  TokenFile: /etc/W1nCray/agent.token
+  MachineNodes: true
+Terminal:
+  Enabled: false # 只在本机关闭交互终端（缺省开启）
+Files:
+  Roots: []
+Modules:
+  XrayNodes: true
+```
+
+| 段 | 字段 |
+|---|---|
+| 根 | `Enabled`、`StateDir`、`ManifestPath`、`ManifestKeysPath`、`KernelsDir`、`DesiredPath`（含义同下表） |
+| `Policy` | 见 §4（本地根信任，远端无法放宽） |
+| `Panel` | 见「机器模式节点」一节 |
+| `Terminal` | `Enabled`（缺省 **true**）、`MaxSessions`（≤2）、`IdleTimeoutS`、`MaxDurationS` |
+| `Files` | `Roots`、`Unrestricted`、`AllowExec` |
+| `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
+
+**迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
+
+- 目标目录没有 `agent.yml`：写出一份新的 `agent.yml`（**原子写**：同目录临时文件 + rename，权限 0600），`config.yml` 只保留 xray 内核的配置。
+- `config.yml` 里还有旧的 `Agent:` 块：该块被**迁移**进 `agent.yml`——本机设置（`Policy`、`DesiredPath`、`Terminal`、`Files`、`Modules` 等）原样保留（所以已经本地关闭终端的机器迁移后仍然是关闭的）；`Panel` 段按本次 `link` 的参数重写，但 link 不负责的 Panel 键（`ManifestSync`、`PullIntervalSec`、`NodeController` 模板等）同样保留，不会被悄悄改回默认值；`config.yml` 原处留一行 `# Agent: 段已迁移到 agent.yml …` 注释。迁移后的配置能通过 `W1nCray check`。
+- `agent.yml` 已经存在：**拒绝覆盖**并给出明确错误（不会动任何文件）；只有 `link --force` 才覆盖，且**先备份**为 `agent.yml.bak-<时间戳>`。
+- `--dry-run` 依然不写任何文件（`config.yml`、`agent.yml`、令牌、备份都不写）。
+- 写入前仍做「只比较本次转换**新增**的失败项」的基线校验；`--skip-check` 跳过它。
+
+**终端（D8 / RULINGS v9 第 17 条）**：交互终端**默认开启**——不写 `Terminal` 段即为开启。机器只能在**本地**关闭它：写 `Terminal: {Enabled: false}`，或在安装/关联时用 `--noterminal`（`install.sh --noterminal`、`W1nCray link --noterminal`）。面板无法远程打开或关闭它：本机状态只通过 `hello.policy` 上报，面板据此显示「该机器已在本地关闭终端」。
+
+> ⚠️ **升级提醒**：已经部署的机器升级到带终端的版本后，由于缺省是开启，会**自动获得终端能力**（面板可以申请交互会话）。不需要的机器请显式写 `Terminal: {Enabled: false}`，或用 `--noterminal` 重新关联。
+
+### `config.yml` 的 `Agent:` 块（旧布局）
+
+写在 `config.yml` 里（与 `Nodes` 同级，YAML）。未启用（`Enabled: false` 或整块缺省）时 Agent 完全不工作。同目录一旦出现 `agent.yml`，本块即被整体忽略（见上）。
 
 ```yaml
 Agent:
@@ -115,6 +169,8 @@ Agent:
 ### 机器模式节点（`MachineNodes`）
 
 在面板上把节点绑定到一台「机器」后，本机不必再逐个写 `Nodes`，只配一个机器令牌即可：W1nCray 用 `Agent.Panel` 的 `URL` / `MachineID` / `Token`（或 `TokenFile`）向面板查询这台机器名下的节点，并为每个节点自动起一个控制器。节点增删由面板决定，本机不改配置、不重启。
+
+> 下面的例子按 `config.yml` 的旧布局写；放进 `agent.yml` 时去掉 `Agent:` 这一层（`Panel:` 顶格），其余完全不变。
 
 ```yaml
 Nodes: []          # 机器模式下允许为空；静态 Nodes 与机器节点可以共存
@@ -207,7 +263,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.
   --panel https://panel.example.com --machine 3 --token <TOKEN>
 ```
 
-安装脚本在装好二进制与服务的同时，写出上面的机器模式配置（`Log` + `Agent` 段）：
+安装脚本在装好二进制与服务的同时，写出机器模式配置：`config.yml` 只写 xray 侧（`Log: {Level: info}`），agent 侧写进 `<配置目录>/agent.yml`。
 
 | 参数 | 说明 |
 |---|---|
@@ -216,11 +272,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.
 | `--token TOKEN` / `--token-file FILE` | 二选一提供机器令牌；`--token-file` 读文件（首尾空白与换行会被去掉） |
 | `--allow-http` | 面板地址是**非回环**的 `http://` 时必须显式给出，否则拒绝安装并说明原因 |
 | `--port-range LO-HI` | `Policy.PortRange`，默认 `20000-40000` |
+| `--noterminal` | 在本机关闭交互终端（终端默认开启），并透传给提示里的 `W1nCray link` 命令 |
 
-- `--panel` / `--machine` / 令牌三者必须同时提供，缺任何一个都会以中文报错并非 0 退出；`--port-range` 与 `--allow-http` 只在 `--panel` 下有效。
-- 令牌写入 `<配置目录>/agent.token`（先 `umask 077` 再写，再 `chmod 600`，内容不带换行），生成的配置用 `Agent.Panel.TokenFile` 引用它；令牌**不会**进入 `config.yml`、日志或传给子进程的参数。`uninstall` 会一并删除 `agent.token`。
-- 加 `--allow-http` 时配置里会写 `AllowInsecureHTTP: true`（否则 `Agent.Panel` 会拒绝明文 http 的非回环地址）。
-- 若 `config.yml` 已存在，安装**不会覆盖**：新配置写到 `<配置目录>/config.panel.yml.new`，安装以黄色警告提示如何合并，返回码仍为 0。
+- `--panel` / `--machine` / 令牌三者必须同时提供，缺任何一个都会以中文报错并非 0 退出；`--port-range`、`--allow-http` 与 `--noterminal` 只在 `--panel` 下有效。
+- 令牌写入 `<配置目录>/agent.token`（先 `umask 077` 再写，再 `chmod 600`，内容不带换行），生成的 `agent.yml` 用 `Panel.TokenFile` 引用它；令牌**不会**进入 `config.yml`、`agent.yml`、日志或传给子进程的参数。`uninstall` 会一并删除 `agent.token`。
+- 加 `--allow-http` 时 `agent.yml` 里会写 `AllowInsecureHTTP: true`（否则 `Agent.Panel` 会拒绝明文 http 的非回环地址）。
+- `agent.yml` 是**原子写**（同目录临时文件 + `mv`，权限 0600）；覆盖已有的 `agent.yml` 前会先备份为 `agent.yml.bak-<时间戳>`。
+- **幂等**：若 `agent.yml` 已存在且已关联面板（`Panel.Enabled: true`），安装**不覆盖**它，只以黄色提示说明；`config.yml` 已存在时同样不覆盖（只提示）。
+- 若 `config.yml` 已存在且还有静态 `Nodes`：安装不覆盖它，也不写 `agent.yml`，而是提示先在面板绑定这些节点，再手动执行 `W1nCray link …`（`link` 把静态节点与旧的 `Agent:` 段迁移到 `agent.yml`）；提示里的 `link` 命令会带上你给的 `--noterminal`。
 - 机器模式安装时的配置检查是离线的（`check` 不带 `--online`）：面板暂时不可达不会阻止服务启动，agent 会在后台重试领取节点。
 - 安装结束会提示「已关联面板，agent 将自动领取节点与转发规则」并给出查看日志的命令；提示里不回显令牌。
 
@@ -384,18 +443,20 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 ### `W1nCray link`
 
-`W1nCray link --panel <URL> --machine <ID> (--token <T> | --token-file <F>) [-c config.yml] [--port-range LO-HI] [--allow-http] [--dry-run] [--ignore-api-overrides] [--skip-check]` 把 v0.3 的静态节点转成机器模式，**不重启服务**。它按文本行级改写 `config.yml`（注释与无关的键原样保留）：
+`W1nCray link --panel <URL> --machine <ID> (--token <T> | --token-file <F>) [-c config.yml] [--port-range LO-HI] [--allow-http] [--noterminal] [--force] [--dry-run] [--ignore-api-overrides] [--skip-check]` 把 v0.3 的静态节点转成机器模式，**不重启服务**。它按文本行级改写 `config.yml`（注释与无关的键原样保留），并把 agent 配置写进同目录的 `agent.yml`：
 
 - 只转换 `ApiConfig.ApiHost` 的 scheme+host（含端口）与 `--panel` 一致的节点；其余节点保持静态并在报告里说明原因。
 - `ApiConfig` 里有机器模式无法表达的本地覆盖（`SpeedLimit > 0`、`DeviceLimit > 0`、`RuleListPath` 非空）时该节点不转换，除非加 `--ignore-api-overrides`。
-- 被转换的条目整块注释掉（块首是 `#LINKED-<日期> …` 回滚标记），它的 `ControllerConfig` 原样右移两格放进 `Agent.Panel.NodeControllers[<节点ID>]`（凭据仍只在本机）。
-- 没有 `Agent:` 块时追加一个完整块（`Enabled`、`StateDir`、`Policy`（`AllowListen` / `PortRange`，不写 `AllowEngines`）、`Panel`（`Enabled` / `URL` / `MachineID` / `TokenFile` / `MachineNodes` / `NodeControllers`））；已有 `Agent:` 块时一律报错，请手工合并（不会猜位置、不会覆盖）。
-- 令牌写入 `<配置目录>/agent.token`（先 `umask 077`、权限 0600、不带换行）；已存在且内容相同则跳过，内容不同则报错且不覆盖。令牌不会出现在配置、stdout、stderr 或错误里。
-- 写入前做**基线对比**：先把**原配置**（同目录临时拷贝）跑一遍完整校验，收集失败项集合 B；再把生成的新配置跑一遍，收集集合 N。只有 `N` 中**新增**的失败项（`N \ B`）才中止并**不改动任何文件**（打印新增失败项的完整文本）。若 `N ⊆ B` 且 `B` 非空则继续转换，并打印显眼的警告列出原配置**转换前就有**的问题（最多 10 条，与本次转换无关）。`B`、`N` 都为空时静默通过。失败项用 `W1nCray check` 打印的 `✗` 文本做稳定标识（剔除临时文件名/时间戳等易变部分）；除离线 `check` 外还会检查机器模式下才生效的 `NodeControllers[].CertConfig.CertMode`。
+- 被转换的条目整块注释掉（块首是 `#LINKED-<日期> …` 回滚标记），它的 `ControllerConfig` 原样放进 `agent.yml` 的 `Panel.NodeControllers[<节点ID>]`（凭据仍只在本机）。
+- `agent.yml`（原子写、0600）包含 `Enabled`、`StateDir`、`Policy`（`AllowListen` / `PortRange`，不写 `AllowEngines`）、`Panel`（`Enabled` / `URL` / `MachineID` / `TokenFile` / `MachineNodes` / `NodeControllers`）；`config.yml` 里不再写 `Agent:` 段。旧的 `Agent:` 块会被**迁移**进 `agent.yml`（本机设置与 link 不负责的 `Panel` 键保留，`Panel` 的连接字段按本次参数重写），原处留一行注释说明已迁出。详见 §3「`agent.yml`」。
+- `agent.yml` 已存在时**拒绝覆盖**（零改动）；`--force` 才覆盖，且先备份为 `agent.yml.bak-<时间戳>`。
+- `--noterminal` 在 `agent.yml` 里写 `Terminal: {Enabled: false}`；不加时**不写**该键，即终端保持默认开启。
+- 令牌写入 `<配置目录>/agent.token`（先 `umask 077`、权限 0600、不带换行）；已存在且内容相同则跳过，内容不同则报错且不覆盖。令牌不会出现在 `config.yml`、`agent.yml`、stdout、stderr 或错误里。
+- 写入前做**基线对比**：先把**原配置**（同目录临时拷贝）跑一遍完整校验，收集失败项集合 B；再把生成的新配置（把将要写入的 `agent.yml` 内联成 `Agent:` 块）跑一遍，收集集合 N。只有 `N` 中**新增**的失败项（`N \ B`）才中止并**不改动任何文件**（打印新增失败项的完整文本）。若 `N ⊆ B` 且 `B` 非空则继续转换，并打印显眼的警告列出原配置**转换前就有**的问题（最多 10 条，与本次转换无关）。`B`、`N` 都为空时静默通过。失败项用 `W1nCray check` 打印的 `✗` 文本做稳定标识（剔除临时文件名/时间戳等易变部分）；除离线 `check` 外还会检查机器模式下才生效的 `NodeControllers[].CertConfig.CertMode`。已有 `agent.yml` 时（`--force`）会额外单独校验将要写入的新文件。
 - `--skip-check` 跳过上述写入前校验（会打印警告），生成结果直接写入。
-- 成功后备份为 `config.yml.bak-link-<时间戳>`（0600）再原子替换。
-- `--dry-run` 只打印计划（不写任何文件，包括令牌）。
-- 对已转换过的配置（有 `#LINKED-` 标记且 `Agent.Panel` 已启用）再次运行会以清晰错误退出且零改动。
+- 成功后 `config.yml` 备份为 `config.yml.bak-link-<时间戳>`（0600）再原子替换；`agent.yml` 由原子写覆盖，原文件备份为 `agent.yml.bak-<时间戳>`。
+- `--dry-run` 只打印计划（不写任何文件，包括令牌与 `agent.yml`）。
+- 对已转换过的配置（有 `#LINKED-` 标记，或 `agent.yml` 已存在）再次运行会以清晰错误退出且零改动；需要重做时先恢复备份，或用 `--force`。
 
 ### 常驻服务
 
@@ -452,7 +513,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 5. **本地策略是根信任**，期望状态无法放宽它；默认拒绝公网监听、私网目标、任意目标、公网收 PROXY。`AllowPrivate` 打开后仍拒绝环回、链路本地、云元数据地址。
 6. **优先用字面 IP 作目标**：域名只在校验时解析一次，存在 DNS 重绑定的时间窗。
 7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
-8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。Agent 没有终端、脚本执行或任意命令通道，外部命令一律用参数数组启动。
+8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。脚本执行或任意命令通道仍然不存在，外部命令一律用参数数组启动。**交互终端是例外**：它默认开启（§3），只由本机 `Terminal.Enabled` 控制，面板不能远程打开；不需要的机器请显式关闭（`Terminal: {Enabled: false}` 或 `--noterminal`），尤其是升级后的老机器。
 
 ## 10 已知限制与未决事项
 
