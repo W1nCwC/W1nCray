@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
 done
 if [ "${#EXTRA[@]}" -gt 0 ]; then parse_common "${EXTRA[@]}"; else parse_common; fi
 
-: "${W1NCRAY_WS_IMAGE:=ghcr.io/cedar2025/xboard:latest}"
+: "${W1NCRAY_WS_IMAGE:=ghcr.io/cedar2025/xboard:new}"
 
 # The override is generated here and copied to the host; it is committed as a
 # template so the content is reviewable before it is ever used.

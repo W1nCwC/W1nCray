@@ -1,6 +1,6 @@
 # DEPLOY-v9 — PLAN v9 生产部署运行手册（可审阅、可回滚）
 
-面向：面板机 `167.253.156.95`（宝塔 + docker + nginx，站点 `subscribe.w1ncray.xyz`）与落地机
+面向：面板机 `167.253.156.95`（宝塔 + docker + nginx，站点 `subscribe.w1nc.xyz`）与落地机
 `82.152.167.105`（systemd `W1nCray.service`，当前 v0.4.1）。
 
 本文只描述**怎么部署**；不描述功能。功能与契约见
@@ -225,7 +225,7 @@ scripts/deploy-v9/60-verify-panel.sh
 ```bash
 ENABLE_TERMINAL=no \
 W1NCRAY_BINARY=dist/W1nCray-linux-amd64 \
-PANEL_URL=https://subscribe.w1ncray.xyz \
+PANEL_URL=https://subscribe.w1nc.xyz \
 MACHINE_ID=3 \
 TOKEN_FILE=/etc/W1nCray/agent.token \
 scripts/deploy-v9/70-agent-upgrade.sh
@@ -342,8 +342,8 @@ PROXY_CMD='connect.exe -S 127.0.0.1:7890 %h %p'
 PANEL_ROOT=/www/wwwroot/xboard      PANEL_CODE=/www
 PANEL_WEB_CONTAINER=xboard-web-1    PANEL_COMPOSE_FILE=docker-compose.yml
 PANEL_WS_OVERRIDE=compose.w1ncray-ws.yaml
-PANEL_NGINX_CONF=/www/server/panel/vhost/nginx/subscribe.w1ncray.xyz.conf
-PANEL_NGINX_LOG=/www/wwwlogs/subscribe.w1ncray.xyz.log
+PANEL_NGINX_CONF=/www/server/panel/vhost/nginx/subscribe.w1nc.xyz.conf
+PANEL_NGINX_LOG=/www/wwwlogs/subscribe.w1nc.xyz.log
 PANEL_GATEWAY_PORT=8077             PANEL_LEGACY_PORT=8076
 PANEL_HTTP_PORT=7001                PANEL_NGINX_SCHEME=http  PANEL_NGINX_PORT=80
 PANEL_SPA_DIR=public/assets/admin   PANEL_W1NCRAY_DIR=public/w1ncray
@@ -353,7 +353,7 @@ LANDING_SERVICE=W1nCray.service         LANDING_TOKEN_FILE=/etc/W1nCray/agent.to
 PANEL_SRC=C:/W1nCBoard
 NGINX_TEST_CMD='/www/server/nginx/sbin/nginx -t'
 NGINX_RELOAD_CMD='/etc/init.d/nginx reload'
-PANEL_SITE_HOST=subscribe.w1ncray.xyz   CURL_INSECURE=   # 站点只监听 443 时设 -k
+PANEL_SITE_HOST=subscribe.w1nc.xyz   CURL_INSECURE=   # 站点只监听 443 时设 -k
 ```
 
 第 40/60 步对 nginx 的探测默认打 `http://127.0.0.1:80`；站点只监听 443 时用

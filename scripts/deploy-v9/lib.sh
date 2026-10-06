@@ -42,10 +42,10 @@
 : "${PANEL_CODE:=/www}"                        # in-container code path
 : "${PANEL_WEB_CONTAINER:=xboard-web-1}"       # octane container
 : "${PANEL_HORIZON_CONTAINER:=xboard-horizon-1}"
-: "${PANEL_COMPOSE_FILE:=docker-compose.yml}"  # relative to PANEL_ROOT
+: "${PANEL_COMPOSE_FILE:=compose.yaml}"  # relative to PANEL_ROOT
 : "${PANEL_WS_OVERRIDE:=compose.w1ncray-ws.yaml}"
-: "${PANEL_NGINX_CONF:=/www/server/panel/vhost/nginx/subscribe.w1ncray.xyz.conf}"
-: "${PANEL_NGINX_LOG:=/www/wwwlogs/subscribe.w1ncray.xyz.log}"
+: "${PANEL_NGINX_CONF:=/www/server/panel/vhost/nginx/subscribe.w1nc.xyz.conf}"
+: "${PANEL_NGINX_LOG:=/www/wwwlogs/subscribe.w1nc.xyz.log}"
 : "${PANEL_GATEWAY_PORT:=8077}"                # w1ncray-ws listen port
 : "${PANEL_LEGACY_PORT:=8076}"                 # legacy /ws, never touched
 : "${PANEL_HTTP_PORT:=7001}"                   # octane, published on 127.0.0.1
