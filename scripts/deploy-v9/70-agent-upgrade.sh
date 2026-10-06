@@ -51,6 +51,9 @@ if [ "${#EXTRA[@]}" -gt 0 ]; then parse_common "${EXTRA[@]}"; else parse_common;
 
 : "${ENABLE_TERMINAL:=no}"
 : "${W1NCRAY_BINARY:=}"
+# Alternative to W1NCRAY_BINARY: the landing host downloads the release asset itself
+# (much faster than an upload through the proxy) and checks it against SHA256SUMS.
+: "${W1NCRAY_RELEASE_BASE:=}"   # e.g. https://github.com/W1nCwC/W1nCray/releases/download/v0.5.0
 : "${PANEL_URL:=}"
 : "${MACHINE_ID:=}"
 : "${TOKEN_FILE:=$LANDING_TOKEN_FILE}"
@@ -93,8 +96,10 @@ step_begin "70 agent upgrade on $LANDING_HOST (terminal: $ENABLE_TERMINAL)"
 # ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------
-[ -n "$W1NCRAY_BINARY" ] || die "set W1NCRAY_BINARY to the new linux/amd64 binary (build it with release/build.sh)"
-[ -f "$W1NCRAY_BINARY" ] || die "no such binary: $W1NCRAY_BINARY"
+if [ -z "$W1NCRAY_RELEASE_BASE" ]; then
+  [ -n "$W1NCRAY_BINARY" ] || die "set W1NCRAY_BINARY (local linux/amd64 binary) or W1NCRAY_RELEASE_BASE (release download URL)"
+  [ -f "$W1NCRAY_BINARY" ] || die "no such binary: $W1NCRAY_BINARY"
+fi
 
 case "$ENABLE_TERMINAL" in
   yes|no) : ;;
@@ -107,9 +112,13 @@ else
   info "ENABLE_TERMINAL=no: --noterminal writes 'Terminal: {Enabled: false}' into agent.yml."
 fi
 
+if [ -n "$W1NCRAY_RELEASE_BASE" ]; then
+  info "binary source: $W1NCRAY_RELEASE_BASE (downloaded and verified on the landing host)"
+elif true; then
 info "local binary"
 ls -la "$W1NCRAY_BINARY"
-if [ "${DRY_RUN:-0}" != "1" ]; then
+fi
+if [ -z "$W1NCRAY_RELEASE_BASE" ] && [ "${DRY_RUN:-0}" != "1" ]; then
   MAGIC="$(od -An -tx1 -N4 "$W1NCRAY_BINARY" | tr -d ' \n')"
   case "$MAGIC" in
     7f454c46) ok "ELF header present" ;;
@@ -156,9 +165,23 @@ ok "backup taken"
 # ---------------------------------------------------------------------------
 # upload + offline validation (nothing is stopped yet)
 # ---------------------------------------------------------------------------
+if [ -n "$W1NCRAY_RELEASE_BASE" ]; then
+  info "downloading W1nCray-linux-amd64.gz + SHA256SUMS on the landing host and verifying"
+  rsh "$LANDING_HOST" "set -e
+T=\$(mktemp -d)
+cd \"\$T\"
+curl -fsSL -m 300 -o W1nCray-linux-amd64.gz $(printf '%q' "$W1NCRAY_RELEASE_BASE/W1nCray-linux-amd64.gz")
+curl -fsSL -m 60 -o SHA256SUMS $(printf '%q' "$W1NCRAY_RELEASE_BASE/SHA256SUMS")
+grep -E ' \*?W1nCray-linux-amd64\.gz\$' SHA256SUMS | sed 's/ \*/  /' | sha256sum -c -
+gzip -dc W1nCray-linux-amd64.gz > $(printf '%q' "$LANDING_BIN.next")
+cd / && rm -rf \"\$T\"
+chmod 755 $(printf '%q' "$LANDING_BIN.next")
+echo DOWNLOAD-VERIFIED" | tee /dev/stderr | grep -q DOWNLOAD-VERIFIED || die "download/verification failed; nothing was changed"
+else
 info "uploading to $LANDING_BIN.next"
 rput "$W1NCRAY_BINARY" "$LANDING_BIN.next" "$LANDING_HOST"
 rsh "$LANDING_HOST" "chmod 755 $(printf '%q' "$LANDING_BIN.next")"
+fi
 
 info "the new binary must run and accept the live config before anything stops"
 if [ "${DRY_RUN:-0}" = "1" ]; then
