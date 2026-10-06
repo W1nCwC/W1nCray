@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
@@ -20,6 +21,13 @@ import (
 // queue. A result that cannot be delivered must not be remembered as answered,
 // so it is worth a short block (design section 3.2).
 const CommandQueueTimeout = 2 * time.Second
+
+// ErrAnswered is returned by Commands.Execute when the Agent must not answer
+// the command itself: either the implementation already delivered the result
+// (for example over the shared HTTP runner) or the id was answered on the
+// other channel. The panel must see exactly one result per command id
+// (docs/WS-PROTOCOL.md section 7 ruling 7), so the Agent then sends nothing.
+var ErrAnswered = errors.New("ws: command already answered")
 
 // eventQueueSize is how many local events may wait for a connection. Events are
 // best effort: when the queue is full the oldest are simply lost, which is
@@ -72,6 +80,8 @@ type AgentOptions struct {
 	Log driver.Logger
 	// InstanceID is reported in hello.instance_id.
 	InstanceID string
+	// AgentVersion is reported in hello.agent_version ("dev" when empty).
+	AgentVersion string
 }
 
 // Agent is the ready-to-run unit: it owns the Client and the periodic senders.
@@ -83,6 +93,7 @@ type Agent struct {
 	nodes      NodeToggle
 	log        driver.Logger
 	instanceID string
+	version    string
 
 	events chan wsproto.Envelope
 
@@ -110,6 +121,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		nodes:      a.Nodes,
 		log:        a.Log,
 		instanceID: a.InstanceID,
+		version:    a.AgentVersion,
 		events:     make(chan wsproto.Envelope, eventQueueSize),
 		wake:       make(chan struct{}, 1),
 		telemetry:  time.Duration(DefaultTelemetryIntervalS) * time.Second,
@@ -189,8 +201,9 @@ func (a *Agent) queueEvent(kind, level, message string) {
 // hello builds the first frame of a connection.
 func (a *Agent) hello() wsproto.Hello {
 	h := wsproto.Hello{
-		InstanceID: a.instanceID,
-		Seq:        a.client.NextHelloSeq(),
+		AgentVersion: a.version,
+		InstanceID:   a.instanceID,
+		Seq:          a.client.NextHelloSeq(),
 	}
 	if a.streams == nil {
 		// No runtime wired: still send a hello so the panel can open a session
@@ -200,6 +213,9 @@ func (a *Agent) hello() wsproto.Hello {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	h.HostInfo = a.streams.HostInfo(ctx)
+	// The platform repeats the two fields the device sample already knows, so
+	// the panel does not have to dig into host_info for them (R14).
+	h.Platform = wsproto.Platform{OS: h.HostInfo.OS, Arch: h.HostInfo.Arch}
 	h.Capabilities = a.streams.Capabilities()
 	h.Policy = a.streams.Policy()
 	h.Kernels = a.streams.Kernels()
@@ -396,6 +412,12 @@ func (a *Agent) execute(id string, cmd wsproto.Cmd, ttlS int) {
 	// Long commands answer "accepted" first (ruling 7). The shared runner
 	// decides the final status; this hook only forwards it.
 	status, result, err := a.commands.Execute(ctx, id, cmd, expiresAt)
+	if errors.Is(err, ErrAnswered) {
+		// The implementation owns the answer (it de-duplicates across the
+		// HTTP and WS channels and may have delivered the result itself):
+		// sending a frame here would answer one command twice.
+		return
+	}
 	body := wsproto.CmdResult{Status: status, Result: result}
 	if err != nil {
 		if status == "" {

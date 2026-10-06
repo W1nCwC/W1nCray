@@ -114,6 +114,16 @@ type RunnerOptions struct {
 	// Host samples the machine load; nil uses the machine's real sampler. It
 	// may return nil when nothing is available.
 	Host func() *HostStat
+	// SuppressHost, when non-nil, is consulted before every report: a true
+	// result omits the host payload. The WebSocket telemetry channel carries
+	// the same numbers, and two writers would interleave on the panel
+	// (docs/WS-PROTOCOL.md section 3, design section 3.3). A nil function
+	// never suppresses.
+	SuppressHost func() bool
+	// Features is the capability list sent in /config; it must be exactly the
+	// list the agent declared in hello.capabilities (ruling 1). Nil sends no
+	// "features" key.
+	Features []string
 	// Manifest, when non-nil, enables the signed kernel manifest sync loop:
 	// the Runner fetches GET /manifest and hands the body to this sink, which
 	// verifies it locally. A nil sink disables the loop entirely.
@@ -142,7 +152,10 @@ type Runner struct {
 	pull    time.Duration
 	report  time.Duration
 	host    func() *HostStat
-	fixedID string
+	// suppressHost is consulted on every report; features travels in /config.
+	suppressHost func() bool
+	features     []string
+	fixedID      string
 
 	manifest      ManifestSink
 	manifestPath  string
@@ -187,6 +200,8 @@ func NewRunner(api API, app Applier, o RunnerOptions) (*Runner, error) {
 		pull:          ClampInterval(o.PullInterval),
 		report:        ClampInterval(o.ReportInterval),
 		host:          o.Host,
+		suppressHost:  o.SuppressHost,
+		features:      append([]string(nil), o.Features...),
 		fixedID:       o.InstanceID,
 		manifest:      o.Manifest,
 		manifestPath:  o.ManifestPersistPath,
@@ -264,6 +279,11 @@ func newInstanceID() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// NewInstanceID returns the random id the Runner uses for one run. It is
+// exported so a caller that also opens the WebSocket channel can report the
+// same instance id in hello.instance_id as the HTTP link.
+func NewInstanceID() string { return newInstanceID() }
 
 // ---- loops -----------------------------------------------------------------
 
@@ -402,6 +422,9 @@ func (r *Runner) pullOnce(ctx context.Context) error {
 		HaveHash:     hash,
 		Platform:     Platform{OS: runtime.GOOS, Arch: runtime.GOARCH},
 		Engines:      append([]string{}, r.engines...),
+	}
+	if len(r.features) > 0 {
+		req.Features = append([]string{}, r.features...)
 	}
 	if r.kernels != nil {
 		req.Kernels = r.kernels()
@@ -565,7 +588,12 @@ func (r *Runner) reportOnce(ctx context.Context) error {
 		AppliedHash:     hash,
 		Health:          health,
 		Instances:       mergeInstances(last, hasLast, counters),
-		Host:            r.host(),
+	}
+	// While the WebSocket telemetry channel is up it carries the load; the
+	// HTTP report then omits "host" entirely so the panel has one writer at a
+	// time (design section 3.3). A disconnected WebSocket restores it at once.
+	if r.suppressHost == nil || !r.suppressHost() {
+		req.Host = r.host()
 	}
 	if hasLast && len(last.Kernels) > 0 {
 		req.Kernels = last.Kernels
@@ -630,26 +658,83 @@ func (r *Runner) handleCommands(ctx context.Context, cmds []Command) {
 	}
 }
 
+// ErrCommandAnswered is returned by ExecuteCommand for a command id that was
+// already handled (on either channel): the caller must not answer it again, or
+// the panel would see two results for one command id (ruling 7).
+var ErrCommandAnswered = errors.New("panelclient: command already answered")
+
+// ExecuteCommand runs one whitelisted command and returns its result without
+// sending it: the caller delivers the result and then calls MarkAnswered. It is
+// the single entry point shared by the HTTP command lists and the WebSocket cmd
+// frames, so the whitelist, the expiry check and the id de-duplication exist
+// exactly once (design section 3.4).
+//
+// expiresAt is an absolute unix second (0 = no expiry). ErrCommandAnswered
+// means the id was already executed and must not be executed or answered again.
+func (r *Runner) ExecuteCommand(ctx context.Context, id, typ string, args json.RawMessage, expiresAt int64) (string, json.RawMessage, error) {
+	if id == "" {
+		// A command without an id cannot be de-duplicated or answered.
+		return "", nil, ErrCommandAnswered
+	}
+	r.mu.Lock()
+	if _, dup := r.seen[id]; dup || r.inflight[id] {
+		r.mu.Unlock()
+		return "", nil, ErrCommandAnswered
+	}
+	r.inflight[id] = true
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.inflight, id)
+		r.mu.Unlock()
+	}()
+
+	status, result := r.execute(ctx, Command{ID: id, Type: typ, Args: args, ExpiresAt: expiresAt})
+	return status, result, nil
+}
+
+// MarkAnswered records that the result of id reached the panel, so a
+// redelivery on either channel is ignored. A result that could not be delivered
+// must not be marked: the panel is expected to send the command again.
+func (r *Runner) MarkAnswered(id string) { r.remember(id) }
+
+// RequestRefresh wakes the pull loop, so the desired state is pulled now
+// instead of at the end of the interval (the "refresh" command and the
+// "desired" hint).
+func (r *Runner) RequestRefresh() {
+	select {
+	case r.refresh <- struct{}{}:
+	default: // a refresh is already pending
+	}
+}
+
+// InstanceID returns the id this link uses: the configured one before Run, the
+// generated one once it is running ("" when neither exists yet). The WebSocket
+// hello reports the same id, so both channels identify one agent run.
+func (r *Runner) InstanceID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.instanceID != "" {
+		return r.instanceID
+	}
+	return r.fixedID
+}
+
 func (r *Runner) runCommand(ctx context.Context, c Command) {
 	if c.ID == "" {
 		r.log.Warnf("panel: ignoring a command without an id")
 		return
 	}
-	r.mu.Lock()
-	if _, dup := r.seen[c.ID]; dup || r.inflight[c.ID] {
-		r.mu.Unlock()
+	status, result, err := r.ExecuteCommand(ctx, c.ID, c.Type, c.Args, c.ExpiresAt)
+	if errors.Is(err, ErrCommandAnswered) {
+		// Already executed (or unanswerable): never execute or answer twice.
 		return
 	}
-	r.inflight[c.ID] = true
-	r.mu.Unlock()
-	defer func() {
-		r.mu.Lock()
-		delete(r.inflight, c.ID)
-		r.mu.Unlock()
-	}()
-
-	status, result := r.execute(ctx, c)
-	err := r.api.CommandResult(ctx, CommandResultRequest{
+	if err != nil {
+		r.log.Warnf("panel: command %q not executed: %v", c.ID, err)
+		return
+	}
+	err = r.api.CommandResult(ctx, CommandResultRequest{
 		Schema:     Schema,
 		InstanceID: r.id(),
 		ID:         c.ID,
@@ -660,7 +745,7 @@ func (r *Runner) runCommand(ctx context.Context, c Command) {
 		r.log.Warnf("panel: result of command %q not delivered: %v", c.ID, err)
 		return
 	}
-	r.remember(c.ID)
+	r.MarkAnswered(c.ID)
 }
 
 // execute runs one command and returns its status and result.
@@ -671,10 +756,7 @@ func (r *Runner) execute(ctx context.Context, c Command) (string, json.RawMessag
 	}
 	switch c.Type {
 	case CmdRefresh:
-		select {
-		case r.refresh <- struct{}{}:
-		default: // a refresh is already pending
-		}
+		r.RequestRefresh()
 		rev, _ := r.have()
 		return ResultDone, mustJSON(map[string]int64{"revision": rev})
 	case CmdDumpState:

@@ -50,6 +50,11 @@ type ConfigRequest struct {
 	Platform     Platform          `json:"platform"`
 	Engines      []string          `json:"engines"`
 	Kernels      map[string]string `json:"kernels,omitempty"`
+	// Features is the same capability list the agent declared in
+	// hello.capabilities (docs/WS-PROTOCOL.md section 7 ruling 1). The panel
+	// must only put a desired key into a revision for an agent that declared
+	// the matching capability, because the agent decodes desired strictly.
+	Features []string `json:"features,omitempty"`
 }
 
 // Command is a whitelisted panel command.
