@@ -133,6 +133,7 @@ type Agent struct {
 	commands   Commands
 	nodes      NodeToggle
 	files      FileSync
+	terminal   TerminalSink
 	log        driver.Logger
 	instanceID string
 	version    string
@@ -177,6 +178,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		commands:   a.Commands,
 		nodes:      a.Nodes,
 		files:      a.Files,
+		terminal:   a.Terminal,
 		log:        a.Log,
 		instanceID: a.InstanceID,
 		version:    a.AgentVersion,
@@ -187,13 +189,14 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		nowFn:      a.Now,
 	}
 	disp := NewDispatcher(Hooks{
-		Hello:    ag.hello,
-		HelloOK:  ag.helloOK,
-		Command:  ag.execute,
-		Hint:     ag.onHint,
-		Event:    ag.queueEvent,
-		Log:      a.Log,
-		Terminal: a.Terminal, // nil = term.error{terminal_disabled}
+		Hello:      ag.hello,
+		HelloOK:    ag.helloOK,
+		Command:    ag.execute,
+		Hint:       ag.onHint,
+		Event:      ag.queueEvent,
+		Log:        a.Log,
+		Terminal:   a.Terminal, // nil = term.error{terminal_disabled}
+		Disconnect: ag.onDisconnect,
 	})
 	ag.dispatcher = disp
 
@@ -211,6 +214,29 @@ func (a *Agent) Client() *Client { return a.client }
 
 // Dispatcher returns the frame router, so callers can add hooks before Run.
 func (a *Agent) Dispatcher() *Dispatcher { return a.dispatcher }
+
+// SendFrame encodes one agent -> panel frame and queues it on the current
+// connection. Unlike SendEvent it reports the transport error, which is what a
+// stream that must react to a dead link (the terminal pump) needs: a failed
+// send means the socket is gone, not that a best-effort frame was dropped.
+func (a *Agent) SendFrame(t string, body any) error {
+	env, err := Encode(t, "", body)
+	if err != nil {
+		return err
+	}
+	return a.client.Send(env)
+}
+
+// onDisconnect tells a terminal sink that owns live sessions to drop them: a
+// session belongs to the connection that opened it (the panel deletes its own
+// state at the same moment).
+func (a *Agent) onDisconnect(error) {
+	d, ok := a.terminal.(TerminalDisconnecter)
+	if !ok {
+		return
+	}
+	d.Disconnected()
+}
 
 // Run blocks until ctx is cancelled: it starts the client and the event
 // sender, and stops both before returning.

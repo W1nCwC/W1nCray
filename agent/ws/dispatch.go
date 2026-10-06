@@ -39,6 +39,16 @@ type TerminalSink interface {
 	Close(session string) error
 }
 
+// TerminalDisconnecter is the optional extension of TerminalSink that owns live
+// sessions. The Agent calls Disconnected when a connection ends, because a
+// terminal session does not survive the socket that opened it: the panel drops
+// its own half on the same event, and a shell nobody can address would be an
+// orphan. A sink that does not implement it (a test stub, an HTTP-only agent)
+// is simply left alone.
+type TerminalDisconnecter interface {
+	Disconnected()
+}
+
 // Hooks are the caller side of the dispatcher. Every field is optional; a nil
 // hook turns the corresponding frame into an explicit error answer where the
 // contract has one.
@@ -61,6 +71,10 @@ type Hooks struct {
 	// Send writes one frame back to the panel. A nil Send makes the dispatcher
 	// read-only, which is only useful in unit tests.
 	Send func(env wsproto.Envelope) error
+	// Disconnect is called after a connection ended and before the next dial
+	// (Handler.Disconnected). It is what lets a sink that owns per-connection
+	// state — the terminal — clean up.
+	Disconnect func(err error)
 	// Log receives the dispatcher's own events; never a token or a payload.
 	Log driver.Logger
 	// Now is the clock used for the error rate limit; nil uses time.Now. It is
@@ -109,12 +123,13 @@ func (d *Dispatcher) HelloOK(ok wsproto.HelloOK) {
 	}
 }
 
-// Disconnected forwards the connection end. The Agent installs its own hook
-// through Hooks.Event, so there is nothing to route here beyond the per-
-// connection error budget.
+// Disconnected forwards the connection end: it forgets the per-connection
+// error budget and tells a per-connection sink (the terminal) to clean up.
 func (d *Dispatcher) Disconnected(err error) {
 	d.Reset()
-	_ = err
+	if d.hooks.Disconnect != nil {
+		d.hooks.Disconnect(err)
+	}
 }
 
 // Frame is the routing table.

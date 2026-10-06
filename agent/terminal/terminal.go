@@ -58,6 +58,13 @@ const (
 	ReasonIdleTimeout   = "idle_timeout"   // Options.IdleTimeout of silence
 	ReasonMaxLifetime   = "max_lifetime"   // Options.MaxLifetime in total
 	ReasonAgentShutdown = "agent_shutdown" // CloseAll
+	// ReasonDisconnected ends a session whose panel link went away. A session
+	// belongs to the connection that opened it: the panel deletes its own state
+	// on the same event (its onClose synthesises reason=agent_disconnected), so
+	// the agent must not keep a shell nobody can address. The spelling matches
+	// the panel's synthetic reason so the browser shows one message for both
+	// halves of the same event.
+	ReasonDisconnected = "agent_disconnected"
 )
 
 // Errors the manager returns. They are sentinel values so a caller (the
