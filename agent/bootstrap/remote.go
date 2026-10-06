@@ -333,12 +333,21 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		// one; a nil sink is what answers term.error{terminal_disabled}
 		// (WP-G6 acceptance 3). The local switch was already applied at Boot,
 		// so a remote frame can never turn it on (ruling 13).
+		var termSink *wsTerminal
 		if r.Terminal != nil {
-			agentOpts.Terminal = wsTerminal{m: r.Terminal}
+			termSink = &wsTerminal{m: r.Terminal, log: log}
+			agentOpts.Terminal = termSink
 		}
 		wsAgent, err = ws.NewAgent(wsOpts, agentOpts)
 		if err != nil {
 			return nil, fmt.Errorf("bootstrap: panel link: %w", err)
+		}
+		if termSink != nil {
+			// The pump's outlet is the agent's own send queue, so term.opened,
+			// term.data and term.exit travel on the connection the term.open
+			// arrived on. It is wired before Run starts, so no frame can race
+			// an unwired adapter.
+			termSink.setSend(wsAgent.SendFrame)
 		}
 		wsClient = wsAgent.Client()
 		if c, ok := commands.(*wsCommands); ok {
