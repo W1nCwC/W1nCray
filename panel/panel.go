@@ -46,10 +46,10 @@ type Panel struct {
 	// remoteStop ends the agent's panel link (nil when it is not running).
 	remoteStop func()
 
-	// wsStop ends the agent's persistent WebSocket channel (nil when it is not
-	// running). It is stopped before remoteStop: the WS commands run through
-	// the same Runner the HTTP link owns (design §3.6). The WS wiring lands
-	// with the agent/ws package; until then the field stays nil.
+	// wsStop ends the agent's persistent WebSocket channel. The channel's
+	// lifecycle belongs to bootstrap.StartRemote's stop (it owns both links and
+	// ends the socket before the HTTP runner), so this field stays nil and is
+	// kept only for a future split.
 	wsStop func()
 
 	// machineCancel ends the machine-node tasks of the running instance (nil
@@ -398,6 +398,12 @@ func (p *Panel) startRemoteLocked(a *AgentConfig, rt *bootstrap.Runtime) {
 		ReportInterval:    report,
 		AgentVersion:      AgentVersion,
 		Log:               log.StandardLogger(),
+		// The persistent WebSocket channel rides on the same validated link:
+		// it only exists once a token and a machine id did (design section
+		// 3.1). Without them startRemoteLocked returned above, so an agent in
+		// the legacy node mode never opens a socket.
+		WS:          true,
+		AgentConfig: a,
 	}
 	// The panel may also serve the signed kernel manifest; the agent verifies
 	// it locally before it is used, so a compromised panel cannot push a
