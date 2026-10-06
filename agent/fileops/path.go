@@ -219,8 +219,15 @@ func checkRoot(p string, allowSystem bool) (string, error) {
 // them is still confined, and the agent's own files are excluded separately.
 var systemRoots = []string{"/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys"}
 
-// checkRootIsSane refuses a system directory and demands at least two path
-// levels below the filesystem root.
+// pseudoRoots are kernel/device trees: nothing below them is ever a sane root.
+// The other system directories are refused only as themselves (`/etc`), not
+// their application subdirectories: the agent's own default root is its config
+// directory, which is /etc/W1nCray on every standard install.
+var pseudoRoots = []string{"/dev", "/proc", "/sys"}
+
+// checkRootIsSane refuses a filesystem root, a system directory itself, anything
+// below a pseudo filesystem, and demands at least two path levels below the
+// filesystem root.
 func checkRootIsSane(abs string) error {
 	vol := filepath.VolumeName(abs)
 	rest := strings.TrimPrefix(abs, vol)
@@ -229,7 +236,12 @@ func checkRootIsSane(abs string) error {
 	}
 	cleaned := filepath.ToSlash(rest)
 	for _, sys := range systemRoots {
-		if cleaned == sys || strings.HasPrefix(cleaned, sys+"/") {
+		if cleaned == sys {
+			return fmt.Errorf("root %s is a system directory", abs)
+		}
+	}
+	for _, sys := range pseudoRoots {
+		if strings.HasPrefix(cleaned, sys+"/") {
 			return fmt.Errorf("root %s is inside a system directory (%s)", abs, sys)
 		}
 	}

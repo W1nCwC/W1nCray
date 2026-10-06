@@ -206,9 +206,12 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 	// The file operations (D9) exist only when at least one root is configured;
 	// a machine without roots must not advertise the commands. They are the
 	// file_* commands, not the managed xray files (D4/D5, rt.Files below).
+	// A refused root disables the file_* commands; it must never stop the agent
+	// (a v0.5.0 install under /etc/W1nCray failed to boot exactly this way).
 	fileOps, err := newFileOps(opts.FileOps, log)
 	if err != nil {
-		return nil, fmt.Errorf("bootstrap: file operations: %w", err)
+		log.Errorf("bootstrap: file operations disabled: %v", err)
+		fileOps = nil
 	}
 	rt.FileOps = fileOps
 	// The managed-file layer (D4/D5). It is built here because the xray
