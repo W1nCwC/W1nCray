@@ -1,0 +1,52 @@
+# compose.w1ncray-ws.yaml — compose OVERRIDE that adds the W1nCray gateway.
+#
+# Installed by scripts/deploy-v9/30-gateway-service.sh as
+#   <panel root>/compose.w1ncray-ws.yaml
+# and applied as
+#   docker compose -f <base compose> -f compose.w1ncray-ws.yaml up -d w1ncray-ws
+#
+# The base compose file is never edited, so the rollback is "delete this file".
+#
+# Placeholders substituted by the script:
+#   @IMAGE@  the panel image (default ghcr.io/cedar2025/xboard:latest)
+#   @PORT@   the gateway port (default 8077)
+#
+# Notes that matter:
+#   * ports are published on 127.0.0.1 only; nginx on the host is the only
+#     client, and W1NCRAY_WS_HOST=127.0.0.1 keeps the bind inside the container
+#     loopback as well (docs/DEPLOY-W1NCRAY-WS.md §2),
+#   * ENABLE_* mirror the base file's `ws-server` service so the container starts
+#     exactly one program: the gateway.  ENABLE_REDIS=false matters when the
+#     base file does not set it (the shipped sample does not) — otherwise
+#     supervisord would also start a redis inside this container,
+#   * the volumes are the same shared set the base file gives `web`/`ws-server`
+#     (the gateway reads /www/.env, writes /www/storage/logs and must see the
+#     same /www code), so the gateway sees the code the deploy just wrote,
+#   * CACHE_DRIVER=redis is required for browser tickets: the gateway process is
+#     not the web process (docs/DEPLOY-W1NCRAY-WS.md §2).
+services:
+  w1ncray-ws:
+    image: @IMAGE@
+    restart: unless-stopped
+    command: php artisan w1ncray:ws-server start
+    depends_on:
+      - redis
+    ports:
+      - "127.0.0.1:@PORT@:@PORT@"
+    volumes:
+      - ./.env:/www/.env
+      - ./.docker/.data/:/www/.docker/.data
+      - ./storage/logs:/www/storage/logs
+      - ./storage/theme:/www/storage/theme
+      - ./plugins:/www/plugins
+    environment:
+      docker: "true"
+      ENABLE_CADDY: "false"
+      ENABLE_WEB: "false"
+      ENABLE_HORIZON: "false"
+      ENABLE_WS_SERVER: "false"
+      ENABLE_REDIS: "false"
+      W1NCRAY_WS_HOST: "127.0.0.1"
+      W1NCRAY_WS_PORT: "@PORT@"
+      W1NCRAY_WS_PATH: "/w1ncray-ws"
+      CACHE_DRIVER: "redis"
