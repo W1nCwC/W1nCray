@@ -1,0 +1,465 @@
+// This file joins the transport with the agent runtime: it builds the hello,
+// drives the telemetry/components cadence the panel negotiated, answers
+// commands and turns hints into pulls. It is the only place in agent/ws that
+// knows what a command or a hint means.
+
+package ws
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"sync"
+	"time"
+
+	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/wsproto"
+)
+
+// CommandQueueTimeout bounds how long a cmd.result waits for room in the send
+// queue. A result that cannot be delivered must not be remembered as answered,
+// so it is worth a short block (design section 3.2).
+const CommandQueueTimeout = 2 * time.Second
+
+// eventQueueSize is how many local events may wait for a connection. Events are
+// best effort: when the queue is full the oldest are simply lost, which is
+// correct for live data that is never replayed.
+const eventQueueSize = 16
+
+// Streams is what the WS layer needs from the agent runtime. bootstrap
+// implements it; the interface keeps ws free of bootstrap/panel imports.
+type Streams interface {
+	HostInfo(ctx context.Context) wsproto.HostInfo
+	Telemetry(ctx context.Context) wsproto.Telemetry
+	Components(ctx context.Context) wsproto.Components
+	Kernels() []wsproto.KernelEntry
+	Policy() wsproto.Policy
+	Capabilities() []string
+}
+
+// Commands is the single command entry point, shared with the HTTP Runner so
+// the whitelist, the de-duplication and the result encoding exist exactly once
+// (design section 3.4).
+type Commands interface {
+	// Execute runs one command. expiresAt is an absolute unix second (0 = no
+	// expiry). status is one of accepted | done | failed.
+	Execute(ctx context.Context, id string, c wsproto.Cmd, expiresAt int64) (status string, result any, err error)
+	// Refresh wakes the pull loop.
+	Refresh()
+}
+
+// NodeToggle reconciles the xray node controllers (D3). A nil value means
+// "not wired": the hint is answered with not_supported instead of being
+// ignored.
+type NodeToggle interface {
+	// SyncXrayNodes pulls this machine's node list and makes the running node
+	// controllers match it: an empty list stops every node, otherwise the
+	// listed nodes run. The local policy gate lives inside the implementation,
+	// so a remote hint can never relax it.
+	SyncXrayNodes(ctx context.Context) error
+}
+
+// AgentOptions configures NewAgent.
+type AgentOptions struct {
+	// Streams supplies hello, telemetry and components. It may be nil, in
+	// which case the agent only carries commands and events.
+	Streams Streams
+	// Commands is the shared command entry point. It may be nil.
+	Commands Commands
+	// Nodes is the D3 hook. It may be nil.
+	Nodes NodeToggle
+	// Log receives the agent's events.
+	Log driver.Logger
+	// InstanceID is reported in hello.instance_id.
+	InstanceID string
+}
+
+// Agent is the ready-to-run unit: it owns the Client and the periodic senders.
+type Agent struct {
+	client     *Client
+	dispatcher *Dispatcher
+	streams    Streams
+	commands   Commands
+	nodes      NodeToggle
+	log        driver.Logger
+	instanceID string
+
+	events chan wsproto.Envelope
+
+	// wake tells the sender that a new session started, so the first telemetry
+	// frame is sent immediately instead of waiting for a tick.
+	wake chan struct{}
+
+	// cmdCtx is the context commands run under: the agent's, not the frame's.
+	cmdMu  sync.Mutex
+	cmdCtx context.Context
+
+	// intervals is the cadence the panel negotiated in hello.ok. The reader
+	// writes it, the sender reads it.
+	intMu     sync.Mutex
+	telemetry time.Duration
+	comp      time.Duration
+}
+
+// NewAgent builds the client and the dispatcher. The Options are the
+// transport's; the AgentOptions are the runtime's.
+func NewAgent(o Options, a AgentOptions) (*Agent, error) {
+	ag := &Agent{
+		streams:    a.Streams,
+		commands:   a.Commands,
+		nodes:      a.Nodes,
+		log:        a.Log,
+		instanceID: a.InstanceID,
+		events:     make(chan wsproto.Envelope, eventQueueSize),
+		wake:       make(chan struct{}, 1),
+		telemetry:  time.Duration(DefaultTelemetryIntervalS) * time.Second,
+		comp:       time.Duration(DefaultComponentsIntervalS) * time.Second,
+	}
+	disp := NewDispatcher(Hooks{
+		Hello:    ag.hello,
+		HelloOK:  ag.helloOK,
+		Command:  ag.execute,
+		Hint:     ag.onHint,
+		Event:    ag.queueEvent,
+		Log:      a.Log,
+		Terminal: nil, // phase 3; nil = term.error{terminal_disabled}
+	})
+	ag.dispatcher = disp
+
+	client, err := New(o, disp)
+	if err != nil {
+		return nil, err
+	}
+	ag.client = client
+	disp.SetSend(client.Send)
+	return ag, nil
+}
+
+// Client returns the underlying transport, for callers that need Connected().
+func (a *Agent) Client() *Client { return a.client }
+
+// Dispatcher returns the frame router, so callers can add hooks before Run.
+func (a *Agent) Dispatcher() *Dispatcher { return a.dispatcher }
+
+// Run blocks until ctx is cancelled: it starts the client and the event
+// sender, and stops both before returning.
+func (a *Agent) Run(ctx context.Context) error {
+	a.cmdMu.Lock()
+	a.cmdCtx = ctx
+	a.cmdMu.Unlock()
+
+	// The sender is a child of Run, so it cannot outlive it: the wait below is
+	// what keeps the "no goroutine left behind" guarantee.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		a.sender(ctx)
+	}()
+	err := a.client.Run(ctx)
+	wg.Wait()
+	return err
+}
+
+// SendEvent pushes an "event" frame (best effort; dropped when offline).
+func (a *Agent) SendEvent(kind, level, message string) {
+	a.queueEvent(kind, level, message)
+}
+
+// queueEvent encodes a local event and hands it to the sender. It never blocks
+// the reader, which is the goroutine that calls it.
+func (a *Agent) queueEvent(kind, level, message string) {
+	env, err := Encode(wsproto.TypeEvent, "", map[string]any{
+		"kind":    kind,
+		"level":   level,
+		"message": message,
+	})
+	if err != nil {
+		a.logf().Warnf("ws: cannot encode %s event: %v", kind, err)
+		return
+	}
+	select {
+	case a.events <- env:
+	default:
+		// Best effort: events are live data and are not replayed.
+		a.logf().Debugf("ws: dropping event %s (queue full)", kind)
+	}
+}
+
+// hello builds the first frame of a connection.
+func (a *Agent) hello() wsproto.Hello {
+	h := wsproto.Hello{
+		InstanceID: a.instanceID,
+		Seq:        a.client.NextHelloSeq(),
+	}
+	if a.streams == nil {
+		// No runtime wired: still send a hello so the panel can open a session
+		// instead of timing out on a silent socket.
+		return h
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	h.HostInfo = a.streams.HostInfo(ctx)
+	h.Capabilities = a.streams.Capabilities()
+	h.Policy = a.streams.Policy()
+	h.Kernels = a.streams.Kernels()
+	return h
+}
+
+// helloOK applies the negotiated cadence and wakes the sender, so the first
+// telemetry frame goes out immediately: a panel page that just opened must not
+// wait a full interval for data.
+func (a *Agent) helloOK(ok wsproto.HelloOK) {
+	iv := clampIntervals(ok.Intervals)
+	a.intMu.Lock()
+	a.telemetry = time.Duration(iv.TelemetryS) * time.Second
+	a.comp = time.Duration(iv.ComponentsS) * time.Second
+	a.intMu.Unlock()
+	select {
+	case a.wake <- struct{}{}:
+	default:
+		// A wake-up is already pending: the sender will see the session.
+	}
+}
+
+// intervals returns the current cadence.
+func (a *Agent) intervals() (telemetry, comp time.Duration) {
+	a.intMu.Lock()
+	defer a.intMu.Unlock()
+	return a.telemetry, a.comp
+}
+
+// sender drives the telemetry and components cadence and flushes queued
+// events. It only runs while a session is up: before hello.ok there is no
+// cadence, and after a disconnect there is nobody to send to.
+func (a *Agent) sender(ctx context.Context) {
+	var (
+		session   string
+		telemetry = time.NewTicker(time.Duration(DefaultTelemetryIntervalS) * time.Second)
+		comp      = time.NewTicker(time.Duration(DefaultComponentsIntervalS) * time.Second)
+		lastComp  []byte
+	)
+	defer telemetry.Stop()
+	defer comp.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.wake:
+			// A session started: the check below adopts the cadence and sends
+			// the first frames right away.
+		case env := <-a.events:
+			if a.client.Connected() {
+				a.sendOrDrop(env)
+			}
+		case <-telemetry.C:
+			if !a.client.Connected() {
+				continue
+			}
+			a.sendTelemetry(ctx)
+			// A state change is reported as soon as it is seen, not only on
+			// the components tick (docs/WS-PROTOCOL.md section 3): the
+			// telemetry cadence is the faster of the two, so it is where the
+			// comparison happens.
+			lastComp = a.sendComponentsIfChanged(ctx, lastComp)
+		case <-comp.C:
+			if !a.client.Connected() {
+				continue
+			}
+			lastComp = a.sendComponents(ctx)
+		}
+
+		// A new session (first one, or after a reconnect) means: adopt the
+		// negotiated cadence and send one telemetry frame right away, so a
+		// freshly opened panel page has data without waiting a full interval.
+		cur := a.client.Session()
+		if cur != "" && cur != session {
+			session = cur
+			t, c := a.intervals()
+			telemetry.Reset(t)
+			comp.Reset(c)
+			lastComp = nil
+			a.sendTelemetry(ctx)
+			lastComp = a.sendComponents(ctx)
+		} else if cur == "" {
+			session = ""
+		}
+	}
+}
+
+// sendTelemetry samples and sends one telemetry frame.
+func (a *Agent) sendTelemetry(ctx context.Context) {
+	if a.streams == nil {
+		return
+	}
+	tel := a.streams.Telemetry(ctx)
+	env, err := Encode(wsproto.TypeTelemetry, "", tel)
+	if err != nil {
+		a.logf().Warnf("ws: cannot encode telemetry: %v", err)
+		return
+	}
+	a.sendOrDrop(env)
+}
+
+// sampleComponents collects the component list and fingerprints it. The
+// fingerprint ignores ts: a state change is what matters, not the clock.
+func (a *Agent) sampleComponents(ctx context.Context) (wsproto.Components, []byte, bool) {
+	if a.streams == nil {
+		return wsproto.Components{}, nil, false
+	}
+	items := a.streams.Components(ctx)
+	fp, err := json.Marshal(items.Items)
+	if err != nil {
+		a.logf().Warnf("ws: cannot fingerprint components: %v", err)
+		return wsproto.Components{}, nil, false
+	}
+	return items, fp, true
+}
+
+// sendComponents sends one components frame unconditionally (the interval
+// case) and returns the fingerprint that was sent.
+func (a *Agent) sendComponents(ctx context.Context) []byte {
+	items, fp, ok := a.sampleComponents(ctx)
+	if !ok {
+		return nil
+	}
+	env, err := Encode(wsproto.TypeComponents, "", items)
+	if err != nil {
+		a.logf().Warnf("ws: cannot encode components: %v", err)
+		return nil
+	}
+	if !a.sendOrDrop(env) {
+		return nil
+	}
+	return fp
+}
+
+// sendComponentsIfChanged sends a components frame only when the state moved,
+// so a change is reported between two components ticks.
+func (a *Agent) sendComponentsIfChanged(ctx context.Context, last []byte) []byte {
+	items, fp, ok := a.sampleComponents(ctx)
+	if !ok {
+		return last
+	}
+	if last != nil && bytes.Equal(fp, last) {
+		return last
+	}
+	env, err := Encode(wsproto.TypeComponents, "", items)
+	if err != nil {
+		a.logf().Warnf("ws: cannot encode components: %v", err)
+		return last
+	}
+	if !a.sendOrDrop(env) {
+		return last
+	}
+	return fp
+}
+
+// sendOrDrop queues a frame without blocking. Telemetry and components are
+// live data: a full queue means the panel is slower than the machine, and the
+// next tick will carry fresher numbers anyway.
+func (a *Agent) sendOrDrop(env wsproto.Envelope) bool {
+	switch err := a.client.Send(env); {
+	case err == nil:
+		return true
+	case err == ErrQueueFull:
+		a.logf().Debugf("ws: dropping %s frame (queue full)", env.T)
+	case err == ErrOffline:
+		// The connection went away between the check and the send.
+	default:
+		a.logf().Warnf("ws: cannot send %s: %v", env.T, err)
+	}
+	return false
+}
+
+// execute runs one command and answers it with cmd.result. A result that
+// cannot be delivered is logged and not remembered as answered by the shared
+// runner, so the panel's HTTP fallback can still deliver it.
+//
+// Commands.Execute is called from the reader goroutine, so it must return
+// promptly: a long command answers "accepted" and finishes in its own worker
+// (ruling 7), because the reader is not reading while this hook runs.
+func (a *Agent) execute(id string, cmd wsproto.Cmd, ttlS int) {
+	if a.commands == nil {
+		a.replyResult(id, "failed", nil, "commands are not wired")
+		return
+	}
+	a.cmdMu.Lock()
+	ctx := a.cmdCtx
+	a.cmdMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	expiresAt := commandExpiry(time.Now(), ttlS)
+
+	// Long commands answer "accepted" first (ruling 7). The shared runner
+	// decides the final status; this hook only forwards it.
+	status, result, err := a.commands.Execute(ctx, id, cmd, expiresAt)
+	body := wsproto.CmdResult{Status: status, Result: result}
+	if err != nil {
+		if status == "" {
+			body.Status = "failed"
+		}
+		body.Error = err.Error()
+	}
+	if body.Status == "" {
+		body.Status = "done"
+	}
+	env, encErr := Encode(wsproto.TypeCmdResult, id, body)
+	if encErr != nil {
+		a.logf().Warnf("ws: cannot encode cmd.result for %s: %v", id, encErr)
+		return
+	}
+	// A cmd.result must not be silently dropped: wait briefly for room.
+	if sendErr := a.client.SendWait(ctx, env, CommandQueueTimeout); sendErr != nil {
+		a.logf().Warnf("ws: cmd.result for %s not delivered: %v", id, sendErr)
+	}
+}
+
+// replyResult answers a command we cannot even start.
+func (a *Agent) replyResult(id, status string, result any, msg string) {
+	env, err := Encode(wsproto.TypeCmdResult, id, wsproto.CmdResult{Status: status, Result: result, Error: msg})
+	if err != nil {
+		return
+	}
+	a.sendOrDrop(env)
+}
+
+// onHint turns a hint into the matching pull. The dispatcher has already
+// rejected the hints this agent cannot serve.
+//
+// It runs in the reader goroutine: "desired" only wakes the pull loop, and
+// "nodes" must hand the pull to the node controller rather than performing a
+// long HTTP fetch inline, or the reader would stop reading.
+func (a *Agent) onHint(what string) {
+	switch what {
+	case "desired":
+		if a.commands == nil {
+			return
+		}
+		a.commands.Refresh()
+	case "nodes":
+		if a.nodes == nil {
+			return
+		}
+		a.cmdMu.Lock()
+		ctx := a.cmdCtx
+		a.cmdMu.Unlock()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		// The panel asks for the machine's node list; the agent pulls it and
+		// starts whatever the local policy allows.
+		if err := a.nodes.SyncXrayNodes(ctx); err != nil {
+			a.logf().Warnf("ws: xray nodes hint refused: %v", err)
+		}
+	}
+}
+
+func (a *Agent) logf() driver.Logger {
+	if a.log == nil {
+		return nopLog{}
+	}
+	return a.log
+}

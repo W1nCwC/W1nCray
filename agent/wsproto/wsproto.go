@@ -39,6 +39,27 @@ const (
 	CapXrayNodes = "xray_nodes"
 )
 
+// CapabilitiesAll is the closed set a hello.capabilities may contain. The
+// panel must not gate a feature on anything outside this list.
+var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapTelemetry}
+
+// Error codes used in an "error" frame's d.code.
+const (
+	ErrCodeUnknownType  = "unknown_type"
+	ErrCodeUnknownHint  = "unknown_hint"
+	ErrCodeNotSupported = "not_supported"
+	ErrCodeBadPayload   = "bad_payload"
+)
+
+// Interval bounds the agent enforces, so the panel cannot make it spin (a zero
+// interval) or stop reporting (an absurd one).
+const (
+	MinTelemetryIntervalS  = 1
+	MaxTelemetryIntervalS  = 300
+	MinComponentsIntervalS = 1
+	MaxComponentsIntervalS = 3600
+)
+
 // MaxFrame is the largest accepted frame (bytes).
 const MaxFrame = 256 << 10
 
