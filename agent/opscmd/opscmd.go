@@ -135,6 +135,10 @@ type Deps struct {
 	Kernels KernelOps
 	// Comp serves component_restart. Nil answers it with not_supported.
 	Comp ComponentOps
+	// Files serves the file_* commands (WP-G6). Nil answers them with
+	// not_supported; RegisterFiles installs them, because a machine without a
+	// configured root must not expose the commands at all.
+	Files FileOps
 	// Events reports kernel.installed / kernel.removed (ruling 10). Nil drops
 	// them.
 	Events EventSink

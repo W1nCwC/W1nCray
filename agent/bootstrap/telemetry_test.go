@@ -18,57 +18,87 @@ func capabilitiesOf(t *testing.T, rt *Runtime, cfg *agentcfg.Config) []string {
 	return rt.Streams(nil, cfg).Capabilities()
 }
 
-// TestCapabilitiesOnlyDeclareWhatThisBatchImplements covers protocol ruling 1:
-// the hello capability list is a promise. This batch serves telemetry only, so
-// terminal, files, kernel and upgrade must never appear; xray_nodes appears
-// only when the local module gate allows it (ruling 6).
-func TestCapabilitiesOnlyDeclareWhatThisBatchImplements(t *testing.T) {
+// TestCapabilitiesOnlyDeclareWhatIsImplemented covers protocol ruling 1: the
+// hello capability list is a promise. The local gates decide what is promised:
+// xray_nodes follows Modules.XrayNodes (ruling 6), kernel needs a usable
+// installer, terminal needs the local switch on AND a PTY on this machine
+// (ruling 17 plus design section 6.8), and files needs at least one configured
+// root. A capability must never appear for something the machine cannot serve.
+func TestCapabilitiesOnlyDeclareWhatIsImplemented(t *testing.T) {
 	rt, _ := bootCycle(t, t.TempDir(), false, nil)
 
-	cases := []struct {
-		name string
-		cfg  *agentcfg.Config
-		want []string
+	// The pure decision: only the local gates differ.
+	pure := []struct {
+		name             string
+		cfg              *agentcfg.Config
+		kernel, term, fl bool
+		want             []string
 	}{
-		{"no agent.yml", nil, []string{wsproto.CapTelemetry, wsproto.CapXrayNodes}},
-		{"defaults (module on)", &agentcfg.Config{}, []string{wsproto.CapTelemetry, wsproto.CapXrayNodes}},
-		{"module off", &agentcfg.Config{Modules: &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)}}, []string{wsproto.CapTelemetry}},
+		{"nothing but telemetry", &agentcfg.Config{Modules: &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)}}, false, false, false,
+			[]string{wsproto.CapTelemetry}},
+		{"module on", &agentcfg.Config{}, false, false, false,
+			[]string{wsproto.CapTelemetry, wsproto.CapXrayNodes}},
+		{"all gates on", &agentcfg.Config{}, true, true, true,
+			[]string{wsproto.CapTelemetry, wsproto.CapXrayNodes, wsproto.CapKernel, wsproto.CapTerminal, wsproto.CapFiles}},
+		{"terminal only", &agentcfg.Config{Modules: &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)}}, false, true, false,
+			[]string{wsproto.CapTelemetry, wsproto.CapTerminal}},
+		{"files only", &agentcfg.Config{Modules: &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)}}, false, false, true,
+			[]string{wsproto.CapTelemetry, wsproto.CapFiles}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := capabilitiesOf(t, rt, tc.cfg)
-			if len(got) != len(tc.want) {
+	for _, tc := range pure {
+		t.Run("pure/"+tc.name, func(t *testing.T) {
+			got := capabilities(tc.cfg, tc.kernel, tc.term, tc.fl)
+			if !sameStrings(got, tc.want) {
 				t.Fatalf("capabilities = %v, want %v", got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("capabilities = %v, want %v", got, tc.want)
-				}
-			}
-			for _, cap := range got {
-				switch cap {
-				case wsproto.CapTelemetry, wsproto.CapXrayNodes:
-				default:
-					t.Errorf("declared capability %q, which nothing in this batch implements", cap)
-				}
-			}
-			for _, forbidden := range []string{wsproto.CapTerminal, wsproto.CapFiles, wsproto.CapKernel, wsproto.CapUpgrade} {
-				for _, cap := range got {
-					if cap == forbidden {
-						t.Errorf("declared unimplemented capability %q", forbidden)
-					}
-				}
-			}
-			// The panel must not be able to mutate the list the hello is built
-			// from.
-			if len(got) > 0 {
-				got[0] = "mutated"
-				if again := capabilitiesOf(t, rt, tc.cfg); again[0] == "mutated" {
-					t.Error("Capabilities() returned a shared slice")
-				}
 			}
 		})
 	}
+
+	// The wired runtime: the terminal gate is the platform, and files follows
+	// the configured roots. The test asserts the invariant, not a fixed list,
+	// so it holds on a Windows machine without a PTY and on Linux alike.
+	cfg := &agentcfg.Config{}
+	got := capabilitiesOf(t, rt, cfg)
+	if hasCapability(got, wsproto.CapTerminal) != rt.TerminalSupported() {
+		t.Errorf("terminal capability = %v but TerminalSupported = %v", hasCapability(got, wsproto.CapTerminal), rt.TerminalSupported())
+	}
+	if hasCapability(got, wsproto.CapFiles) != rt.filesCapable() {
+		t.Errorf("files capability = %v but filesCapable = %v", hasCapability(got, wsproto.CapFiles), rt.filesCapable())
+	}
+	if hasCapability(got, wsproto.CapKernel) {
+		t.Error("kernel declared without a signed manifest")
+	}
+	if hasCapability(got, wsproto.CapUpgrade) {
+		t.Error("upgrade is not implemented in this batch")
+	}
+	for _, cap := range got {
+		switch cap {
+		case wsproto.CapTelemetry, wsproto.CapXrayNodes, wsproto.CapTerminal, wsproto.CapFiles:
+		default:
+			t.Errorf("declared capability %q, which nothing implements", cap)
+		}
+	}
+
+	// The panel must not be able to mutate the list the hello is built from.
+	if len(got) > 0 {
+		got[0] = "mutated"
+		if again := capabilitiesOf(t, rt, cfg); again[0] == "mutated" {
+			t.Error("Capabilities() returned a shared slice")
+		}
+	}
+}
+
+// sameStrings compares two string slices element by element.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestPolicyComesFromTheLocalAgentConfig checks that hello.policy reports the

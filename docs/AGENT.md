@@ -546,7 +546,21 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
 8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。脚本执行或任意命令通道仍然不存在，外部命令一律用参数数组启动。**交互终端是例外**：它默认开启（§3），只由本机 `Terminal.Enabled` 控制，面板不能远程打开；不需要的机器请显式关闭（`Terminal: {Enabled: false}` 或 `--noterminal`），尤其是升级后的老机器。
 
-## 10 已知限制与未决事项
+## 10 安全模型变更记录（D8：交互终端）
+
+本节是**有意识的安全模型变更**的正式记录，由 `agent/terminal/noshell_allow_test.go` 反向断言：白名单里的每个包都必须在本节里按包路径写出来，改了代码不改这里，测试就会失败。
+
+1. **变更内容**：agent 从"没有终端、没有脚本执行、没有任意命令通道"变成"有一个**本机开关控制**的交互终端"。这是本手册与 `docs/PLAN-v6-agent-forward.md`、`docs/PLAN-v7-panel-control.md` 里"不存在终端"表述的**唯一例外**，其余约束（外部命令一律 argv 数组、期望状态不含 URL/哈希、无脚本推送）逐字不变。
+2. **唯一允许起 shell 的包**：`agent/terminal`。`agent/supervisor/noshell_test.go` 的 `AllowedShellPackages` 是**包级白名单**，只有这一个条目，并附有理由；白名单之外的任何 `agent/**` 包一旦出现 `exec.Command(<shell>)`、`<shell>,"-c"`、`syscall.ForkExec/Exec`、`pty.Start*`，或 `exec.Command(<变量>)`（无法静态判定时保守报错，需 `//nolint:noshell` 显式豁免并计数），测试直接失败。
+3. **本机开关**：`Terminal.Enabled` **缺省为 true**（RULINGS v9 第 17 条）。机器只能在**本地**关闭：`agent.yml` 写 `Terminal: {Enabled: false}`，或安装/关联时用 `--noterminal`（`install.sh --noterminal`、`W1nCray link --noterminal`）。面板**无法远程打开或关闭**：本机状态只通过 `hello.policy.terminal` 上报，面板据此显示"该机器已在本地关闭终端"。
+4. **平台支持是运行时探测的**：`terminal.Supported()` 在运行时打开 `/dev/ptmx` 判断本机能否建立 PTY；不支持的平台/内核（部分 OpenWrt 无 devpts）**不声明** `terminal` 能力，`hello.capabilities` 与 `/config.features` 里都不会出现它。编译通过不等于能工作。
+5. **会话边界**：每机最多 2 个并发会话（`Terminal.MaxSessions` 上限也是 2）；空闲 15 分钟（`IdleTimeoutS`）回收；最长 4 小时（`MaxDurationS`）回收；agent 退出或面板链路关闭时 `CloseAll` 杀掉**整个进程组**，不留孤儿 shell；单个 `term.input` 帧 ≤ 64 KiB。
+6. **环境净化**：子进程只拿到固定白名单变量（`TERM/LANG/LC_ALL/LC_CTYPE/PATH/HOME/USER/LOGNAME/SHELL/TZ/PWD`），其余一律剔除——包括机器 token、任何 `Agent.*` 值、`LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT`/`BASH_ENV`/`NODE_OPTIONS`/`PYTHONPATH` 等注入面。
+7. **审计只有元数据**：`terminal.AuditEvent` 结构体里**没有任何内容字段**（编译期保证），只有会话 id、动作、时间、时长、`BytesIn`/`BytesOut`、结束原因。终端字节永远不会进入审计、日志或事件帧。
+8. **`agent/fileops` 的边界**：`file_*` 只在 `Files.Roots` 内工作（默认 xray 配置目录 + agent 状态目录），`agent.yml`、`desired.json`、`last_good.json` **永不在任何 root 内**；拒绝 `..`、绝对路径、符号链接逃逸、FIFO/设备/非常规文件、目录删除；可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；`file_read.limit` 与 `file_write` 载荷各 ≤ 128 KiB（WS 单帧 256 KiB 契约，RULINGS v9 第 9 条）。
+9. **已知限制（TOCTOU）**：`os` 包没有 `openat`，`fileops` 的"逐段 Lstat + `O_NOFOLLOW` 打开"之间存在极小的 TOCTOU 窗口。因此部署要求：**root 内不应有可被非 root 用户改写的目录**。这一条已在 `agent/fileops` 的包注释里写明。
+
+## 11 已知限制与未决事项
 
 以下是写样例和本手册时发现的、**需要代码侧决定**的不一致，均有测试或命令输出佐证；它们不影响上面样例的有效性，但会限制能写出什么：
 

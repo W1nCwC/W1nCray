@@ -83,22 +83,32 @@ func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
 // the kernel commands servable, and the panel must see the new list without a
 // restart.
 func (s runtimeStreams) Capabilities() []string {
-	return capabilities(s.cfg, s.rt.kernelCapable())
+	return capabilities(s.cfg, s.rt.kernelCapable(), s.rt.TerminalSupported(), s.rt.filesCapable())
 }
 
+// TerminalSupported reports whether this machine can really serve a terminal
+// session: the local switch is on and a PTY exists (WP-G6 acceptance 3).
+func (s runtimeStreams) TerminalSupported() bool { return s.rt.TerminalSupported() }
+
 // capabilities lists what this machine can really do; the panel must not offer
-// anything else (protocol ruling 1). This batch implements the telemetry
-// channel and the kernel commands: terminal, files and upgrade are still
-// deliberately absent because nothing serves them yet. xray_nodes is declared
-// only when the local module gate allows it (ruling 6); kernel only when the
-// kernel installer can actually serve kernel_* commands.
-func capabilities(cfg *agentcfg.Config, kernel bool) []string {
+// anything else (protocol ruling 1). telemetry is always there; xray_nodes only
+// when the local module gate allows it (ruling 6); kernel only when the kernel
+// installer can actually serve kernel_* commands; terminal only when the local
+// switch is on and the platform has a PTY (ruling 17 + design section 6.8);
+// files only when at least one managed root is configured.
+func capabilities(cfg *agentcfg.Config, kernel, term, files bool) []string {
 	caps := []string{wsproto.CapTelemetry}
 	if cfg.XrayNodesEnabled() {
 		caps = append(caps, wsproto.CapXrayNodes)
 	}
 	if kernel {
 		caps = append(caps, wsproto.CapKernel)
+	}
+	if term {
+		caps = append(caps, wsproto.CapTerminal)
+	}
+	if files {
+		caps = append(caps, wsproto.CapFiles)
 	}
 	return caps
 }
@@ -113,6 +123,20 @@ func (r *Runtime) kernelCapable() bool {
 	}
 	_, ok := r.Kernels.ManifestSequence()
 	return ok
+}
+
+// TerminalSupported reports whether the runtime has a live terminal manager.
+// The manager is nil when the local switch is off or the platform has no PTY,
+// so this single check covers both (WP-G6 acceptance 3).
+func (r *Runtime) TerminalSupported() bool {
+	return r != nil && r.Terminal != nil && r.Terminal.Available()
+}
+
+// filesCapable reports whether the file_* commands can be served: a manager
+// with at least one root exists. A machine without roots must not declare the
+// capability, and the commands are not registered either.
+func (r *Runtime) filesCapable() bool {
+	return r != nil && r.Files != nil && len(r.Files.RootNames()) > 0
 }
 
 // localPolicy maps the agent.yml local policy onto the wire type. A nil config

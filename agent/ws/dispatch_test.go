@@ -48,6 +48,9 @@ func (s *stubStreams) Capabilities() []string {
 	return []string{wsproto.CapTelemetry, wsproto.CapKernel}
 }
 
+// TerminalSupported is part of ws.Streams; this stub has no terminal.
+func (s *stubStreams) TerminalSupported() bool { return false }
+
 func (s *stubStreams) setItems(items ...wsproto.Component) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

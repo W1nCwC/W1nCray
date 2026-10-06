@@ -357,6 +357,9 @@ func (e *entry) alive() bool {
 
 // launch spawns the process once.
 func (e *entry) launch() (*running, error) {
+	//nolint:noshell -- the program is an installed kernel binary from the
+	// signed manifest (kernelx verified its hash before it was unpacked), and
+	// the arguments are an argv array from the driver, never a command string.
 	cmd := exec.Command(e.spec.Path, e.spec.Args...)
 	env := make([]string, 0, len(e.s.opts.BaseEnv)+len(e.spec.Env))
 	env = append(env, e.s.opts.BaseEnv...)

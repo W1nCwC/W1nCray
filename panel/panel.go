@@ -188,6 +188,13 @@ func (p *Panel) start() (err error) {
 			ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 			Policy:           cfg.Agent.PolicySpec(),
 			Log:              log.StandardLogger(),
+			// The local terminal policy (D8, WP-G6). Enabled is the resolved
+			// agentcfg value: on unless the machine opted out with
+			// Terminal.Enabled: false or --noterminal.
+			Terminal: terminalOptions(cfg.Agent),
+			// The confined file operations (D9, WP-G6). No roots means no
+			// file_* commands and no "files" capability.
+			Files: fileOptions(p.path, cfg.Agent),
 			// After a restart the persisted last good state comes back before
 			// (and without) the panel, so a panel that is down never costs
 			// forwarding.
