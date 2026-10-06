@@ -29,11 +29,12 @@ const (
 // ---- fake clock --------------------------------------------------------------
 
 type waiter struct {
-	d  time.Duration
+	at time.Time // the fake instant it fires
 	ch chan time.Time
 }
 
-// fakeClock never sleeps: After registers a waiter, and the test fires it.
+// fakeClock never sleeps: After registers a waiter at now+d, and the test
+// advances the clock, releasing whatever has come due.
 type fakeClock struct {
 	mu      sync.Mutex
 	now     time.Time
@@ -58,9 +59,10 @@ func (c *fakeClock) set(t time.Time) {
 func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	w := &waiter{d: d, ch: make(chan time.Time, 1)}
-	c.pending = append(c.pending, w)
+	w := &waiter{at: c.now.Add(d), ch: make(chan time.Time, 1)}
 	c.waits = append(c.waits, d)
+	c.pending = append(c.pending, w)
+	c.releaseReadyLocked()
 	return w.ch
 }
 
@@ -70,26 +72,41 @@ func (c *fakeClock) waitsCopy() []time.Duration {
 	return append([]time.Duration(nil), c.waits...)
 }
 
-// fire waits until a waiter of exactly d is pending and releases all of them.
+// fire advances the fake clock by d and releases every waiter whose deadline
+// has arrived. It first waits for the runner to (re)arm a wait that this fire
+// will release: the runner acts, then rearms its timer, so firing before the
+// rearm would advance the clock past a timer that is registered too late (the
+// lost wakeup this harness once had). If the runner never arms one, the
+// eventually below fails the test with a clear message.
 func (c *fakeClock) fire(t *testing.T, d time.Duration) {
 	t.Helper()
-	eventually(t, fmt.Sprintf("a pending wait of %s", d), func() bool {
+	eventually(t, fmt.Sprintf("a wait of %s (or less, due now after the fire) to be armed", d), func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		fired := false
-		rest := c.pending[:0]
+		limit := c.now.Add(d)
 		for _, w := range c.pending {
-			if w.d == d {
-				c.now = c.now.Add(d)
-				w.ch <- c.now
-				fired = true
-			} else {
-				rest = append(rest, w)
+			if !w.at.After(limit) {
+				return true
 			}
 		}
-		c.pending = rest
-		return fired
+		return false
 	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+	c.releaseReadyLocked()
+}
+
+func (c *fakeClock) releaseReadyLocked() {
+	rest := c.pending[:0]
+	for _, w := range c.pending {
+		if w.at.After(c.now) {
+			rest = append(rest, w)
+		} else {
+			w.ch <- c.now
+		}
+	}
+	c.pending = rest
 }
 
 // eventually polls cond; the polling only synchronises with goroutines, no
@@ -97,8 +114,15 @@ func (c *fakeClock) fire(t *testing.T, d time.Duration) {
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	// Under -race the runner's goroutines are much slower to observe the
-	// fired clock, so give the handshake a wide window.
-	deadline := time.Now().Add(60 * time.Second)
+	// fired clock, and the gate runs every package concurrently under load,
+	// so follow the test deadline (10 minutes when the test has none).
+	deadline, hasDL := t.Deadline()
+	if hasDL {
+		deadline = deadline.Add(-60 * time.Second)
+	} else {
+		deadline = time.Now().Add(10 * time.Minute)
+	}
+	_ = hasDL
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
