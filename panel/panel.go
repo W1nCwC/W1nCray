@@ -11,6 +11,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
 	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
@@ -44,6 +45,12 @@ type Panel struct {
 
 	// remoteStop ends the agent's panel link (nil when it is not running).
 	remoteStop func()
+
+	// wsStop ends the agent's persistent WebSocket channel (nil when it is not
+	// running). It is stopped before remoteStop: the WS commands run through
+	// the same Runner the HTTP link owns (design §3.6). The WS wiring lands
+	// with the agent/ws package; until then the field stays nil.
+	wsStop func()
 
 	// machineCancel ends the machine-node tasks of the running instance (nil
 	// when machine mode is off or nothing runs); machineWG joins them so
@@ -169,6 +176,11 @@ func (p *Panel) start() (err error) {
 	// The agent runs on top of the same Xray instance. A boot failure is
 	// logged, not fatal: the panel nodes keep serving.
 	if cfg.Agent != nil && cfg.Agent.Enabled {
+		// Say which file the agent's configuration came from: with two files
+		// in play, silence is exactly what makes a stale edit hard to find.
+		if src := cfg.AgentSourcePath(); src != "" {
+			log.Infof("agent: configuration from %s", src)
+		}
 		rt, err := bootstrap.Boot(bootstrap.Options{
 			StateDir:         cfg.Agent.StateDir,
 			KernelsDir:       cfg.Agent.KernelsDir,
@@ -262,7 +274,7 @@ func logUnassignedNodeControllers(pc *AgentPanelConfig, list []xboard.MachineNod
 	for _, mn := range list {
 		assigned[mn.ID] = true
 	}
-	for _, id := range pc.nodeControllerIDs() {
+	for _, id := range pc.NodeControllerIDs() {
 		if !assigned[id] {
 			log.Infof("NodeControllers[%d] is configured but the panel did not assign that node", id)
 		}
@@ -416,6 +428,12 @@ func (p *Panel) shutdown() {
 	// Stop the machine-node tasks first: no discovery or watch may race the
 	// teardown below. They never take p.mu, so waiting here cannot deadlock.
 	p.stopMachineLocked()
+	// Stop the WebSocket channel before the HTTP link: WS commands and hints
+	// run through the same Runner the HTTP link stops below (design §3.6).
+	if p.wsStop != nil {
+		p.wsStop()
+		p.wsStop = nil
+	}
 	// Stop the panel link first: no apply may race the teardown below.
 	if p.remoteStop != nil {
 		p.remoteStop()
@@ -589,6 +607,10 @@ func (p *Panel) watchedFiles() []string {
 	if p.cfg.Agent != nil && p.cfg.Agent.DesiredPath != "" {
 		files = append(files, p.cfg.Agent.DesiredPath)
 	}
+	// agent.yml is watched even before it exists: creating it switches the
+	// agent to the separated layout and must take effect without a restart
+	// (D1). The watcher registers the directory, so the create event arrives.
+	files = append(files, filepath.Join(filepath.Dir(p.path), agentcfg.FileName))
 	return files
 }
 
