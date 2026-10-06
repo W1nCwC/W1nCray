@@ -14,10 +14,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -364,98 +367,282 @@ func TestRollbackRestoresTheOldBinaryAndIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestRunHelperRollsBackAfterRepeatedStartFailures is the fault injection of
-// acceptance item 7: the new binary exits immediately, the helper retries three
-// times, restores exe.old and starts it.
-func TestRunHelperRollsBackAfterRepeatedStartFailures(t *testing.T) {
-	f := newFixture(t)
-	srv := serve(t, nil)
-	data := fakeBin("1.0.0", 64)
-	url := srv.url("/a.gz", gz(t, data))
+// fakeClock is the injected clock of the watchdog tests: now is read and sleep
+// advances it, so a 90 s budget is exercised in microseconds.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) sleep(d time.Duration)   { c.t = c.t.Add(d) }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// watchdogFixture commits an update over a distinct old binary and returns the
+// updater: exe is the new, unproven binary, exe.old the known-good one and
+// update/watchdog/ the verified copy of it the watchdog runs.
+func watchdogFixture(t *testing.T) (*Updater, string, string) {
+	t.Helper()
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "W1nCray")
 	writeFile(t, exe, "OLD-BINARY")
+	staged := filepath.Join(dir, "staged")
+	writeFile(t, staged, "NEW-BINARY")
 	state := filepath.Join(dir, "state")
-	up := f.updater(exe, state, f.installer(agentKernel{Version: "1.0.0", Data: data, URL: url}))
-
-	staged, err := up.Stage(context.Background(), "1.0.0")
+	up, err := New(Options{
+		ExePath: exe, StateDir: state, Log: nopLog{}, Ready: func(string) error { return nil },
+		AgentVersion: "0.5.0",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := up.Commit(staged); err != nil {
-		t.Fatal(err)
+	if err := up.Commit(Staged{Version: "0.6.0", Path: staged, SHA256: sha([]byte("NEW-BINARY"))}); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
+	return up, exe, state
+}
 
-	var (
-		calls  int
-		sawOld bool
-	)
-	start := func(path string, argv []string, window time.Duration) error {
-		calls++
-		if calls == 1 {
-			if got := readFile(t, path); got != string(data) {
-				t.Errorf("the first attempt did not run the new binary")
-			}
-		}
-		if got := readFile(t, path); got == "OLD-BINARY" {
-			sawOld = true
-			return nil // the restored binary comes up
-		}
-		return errors.New("exit status 1")
-	}
-	sleep := func(time.Duration) {}
-
-	err = runHelper(context.Background(), HelperOptions{
-		ExePath: exe, StateDir: state, Attempts: 3, RetryDelay: time.Millisecond, AliveWindow: time.Millisecond,
-	}, start, sleep, nopLog{})
-	if err != nil {
-		t.Fatalf("runHelper: %v", err)
-	}
-	if calls != 4 {
-		t.Errorf("start called %d times, want 3 attempts + 1 recovery", calls)
-	}
-	if !sawOld {
-		t.Error("the helper never ran the restored binary")
-	}
-	if got := readFile(t, exe); got != "OLD-BINARY" {
-		t.Errorf("exe after the rollback = %q", got)
-	}
-	if _, ok := up.Pending(); ok {
-		t.Error("the rollback must clear the pending marker")
-	}
-	rb, ok := up.TakeRollback()
-	if !ok || rb.Version != "1.0.0" {
-		t.Fatalf("rollback marker = %+v (ok=%v)", rb, ok)
-	}
-	if rb.Reason == "" {
-		t.Error("the rollback reason must be recorded")
+// watchdogBudget is a HelperOptions with a small, explicit budget. The probe is
+// injected, so the lock path is only a label here.
+func watchdogBudget(exe, state string) HelperOptions {
+	return HelperOptions{
+		ExePath: exe, StateDir: state, LockPath: filepath.Join(state, "config.yml.lock"),
+		Attempts: 3, AliveWindow: 10 * time.Second, Deadline: 90 * time.Second, PollInterval: 2 * time.Second,
 	}
 }
 
-// TestRunHelperGivesUpWhenTheNewBinarySurvives covers the happy path: one start
-// that stays alive ends the helper without a rollback.
-func TestRunHelperGivesUpWhenTheNewBinarySurvives(t *testing.T) {
-	f := newFixture(t)
-	dir := t.TempDir()
-	exe := filepath.Join(dir, "W1nCray")
-	writeFile(t, exe, "NEW-BINARY")
-	state := filepath.Join(dir, "state")
-	up := f.updater(exe, state, nil)
-	if err := up.Commit(Staged{Version: "1.0.0", Path: exe, SHA256: sha([]byte("NEW-BINARY"))}); err != nil {
-		t.Fatalf("Commit: %v", err)
+// TestWatchdogStopsWhenTheNewVersionConfirms covers the success rule: the
+// pending marker disappears (the new process reached the panel), the watchdog
+// exits, the new binary stays and the watchdog copy is cleaned up.
+func TestWatchdogStopsWhenTheNewVersionConfirms(t *testing.T) {
+	up, exe, state := watchdogFixture(t)
+	confirmed := false
+	probe := func() (int, bool) { return 4242, true }
+	sleep := func(time.Duration) {
+		if !confirmed {
+			confirmed = true
+			if err := up.Confirm(); err != nil {
+				t.Errorf("Confirm: %v", err)
+			}
+		}
 	}
-	calls := 0
-	start := func(string, []string, time.Duration) error { calls++; return nil }
-	if err := runHelper(context.Background(), HelperOptions{
-		ExePath: exe, StateDir: state, Attempts: 3, AliveWindow: time.Millisecond,
-	}, start, func(time.Duration) {}, nopLog{}); err != nil {
-		t.Fatalf("runHelper: %v", err)
+	if err := runWatchdog(context.Background(), watchdogBudget(exe, state), probe, time.Now, sleep, nopLog{}); err != nil {
+		t.Fatalf("runWatchdog: %v", err)
 	}
-	if calls != 1 {
-		t.Errorf("start called %d times, want 1", calls)
+	if _, ok := up.Pending(); ok {
+		t.Error("a confirmed update must leave no pending marker")
+	}
+	if got := readFile(t, exe); got != "NEW-BINARY" {
+		t.Errorf("exe = %q, want the new binary kept", got)
+	}
+	if _, err := os.Stat(up.watchdogDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a confirmed update must clean the watchdog copy")
+	}
+	if _, err := os.Stat(up.OldPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a confirmed update must clean the backup")
+	}
+}
+
+// TestWatchdogRollsBackAfterRepeatedRestarts covers the first rollback rule:
+// the new version keeps coming back with a new pid (the service manager is
+// restarting it) and never confirms.
+func TestWatchdogRollsBackAfterRepeatedRestarts(t *testing.T) {
+	up, exe, state := watchdogFixture(t)
+	clock := &fakeClock{t: time.Unix(1000, 0)}
+	pids := []int{1001, 1002, 1003, 1004}
+	i := 0
+	probe := func() (int, bool) {
+		p := pids[len(pids)-1]
+		if i < len(pids) {
+			p = pids[i]
+			i++
+		}
+		return p, true
+	}
+	h := watchdogBudget(exe, state)
+	if err := runWatchdog(context.Background(), h, probe, clock.now, clock.sleep, nopLog{}); err != nil {
+		t.Fatalf("runWatchdog: %v", err)
+	}
+	if i < h.Attempts+1 {
+		t.Errorf("the watchdog gave up after %d observation(s), want %d", i, h.Attempts+1)
+	}
+	if got := readFile(t, exe); got != "OLD-BINARY" {
+		t.Errorf("exe after the rollback = %q, want the previous binary", got)
+	}
+	if _, ok := up.Pending(); ok {
+		t.Error("a rollback must clear the pending marker")
+	}
+	rb, ok := up.TakeRollback()
+	if !ok || rb.Version != "0.6.0" || !strings.Contains(rb.Reason, "restarted") {
+		t.Fatalf("rollback marker = %+v (ok=%v)", rb, ok)
+	}
+	if _, err := os.Stat(up.watchdogDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a rollback must clean the watchdog copy")
+	}
+}
+
+// TestWatchdogRollsBackWhenNoAgentEverComesUp covers the second rollback rule:
+// the service manager cannot get an agent running at all (the reported fault
+// injection: the new binary exits 1 immediately and never takes the lock).
+func TestWatchdogRollsBackWhenNoAgentEverComesUp(t *testing.T) {
+	up, exe, state := watchdogFixture(t)
+	clock := &fakeClock{t: time.Unix(1000, 0)}
+	probe := func() (int, bool) { return 0, false }
+	h := watchdogBudget(exe, state)
+	if err := runWatchdog(context.Background(), h, probe, clock.now, clock.sleep, nopLog{}); err != nil {
+		t.Fatalf("runWatchdog: %v", err)
+	}
+	if got := readFile(t, exe); got != "OLD-BINARY" {
+		t.Errorf("exe after the rollback = %q, want the previous binary", got)
+	}
+	if _, ok := up.Pending(); ok {
+		t.Error("a rollback must clear the pending marker")
+	}
+	rb, ok := up.TakeRollback()
+	if !ok || !strings.Contains(rb.Reason, "alive") {
+		t.Fatalf("rollback marker = %+v (ok=%v)", rb, ok)
+	}
+}
+
+// TestWatchdogKeepsAStalledButAliveUpdate covers the "started but cannot reach
+// the panel" rule (protocol ruling 11): the deadline passes with an agent that
+// is alive and stable, so nothing is rolled back and the backup is kept.
+func TestWatchdogKeepsAStalledButAliveUpdate(t *testing.T) {
+	up, exe, state := watchdogFixture(t)
+	clock := &fakeClock{t: time.Unix(1000, 0)}
+	probe := func() (int, bool) { return 7, true } // one pid, never restarted
+	h := watchdogBudget(exe, state)
+	h.Deadline = 20 * time.Second
+	if err := runWatchdog(context.Background(), h, probe, clock.now, clock.sleep, nopLog{}); err != nil {
+		t.Fatalf("runWatchdog: %v", err)
 	}
 	if _, ok := up.Pending(); !ok {
-		t.Error("a surviving start must leave the confirmation to the new process")
+		t.Error("a stalled but alive update must keep its pending marker")
+	}
+	if got := readFile(t, exe); got != "NEW-BINARY" {
+		t.Errorf("exe = %q, want the new binary kept", got)
+	}
+	if _, err := os.Stat(up.OldPath()); err != nil {
+		t.Error("a stalled update must keep the backup for a manual rollback")
+	}
+	if _, err := os.Stat(up.watchdogDir()); err != nil {
+		t.Error("a stalled update must keep the watchdog copy")
+	}
+	if _, ok := up.TakeRollback(); ok {
+		t.Error("a stalled update must not record a rollback")
+	}
+	if clock.now().Before(time.Unix(1000, 0).Add(20 * time.Second)) {
+		t.Error("the watchdog stopped before its deadline")
+	}
+}
+
+// TestWatchdogRollbackIsIdempotent keeps the second run honest: once the
+// pending marker is gone, a watchdog (for example one restarted by the machine)
+// does nothing at all.
+func TestWatchdogRollbackIsIdempotent(t *testing.T) {
+	up, exe, state := watchdogFixture(t)
+	if err := up.Rollback("the first watchdog rolled it back"); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if _, ok := up.TakeRollback(); !ok {
+		t.Fatal("the first rollback must be recorded")
+	}
+	probe := func() (int, bool) { return 0, false }
+	if err := runWatchdog(context.Background(), watchdogBudget(exe, state), probe, time.Now, func(time.Duration) {}, nopLog{}); err != nil {
+		t.Fatalf("a second watchdog = %v, want a no-op", err)
+	}
+	if got := readFile(t, exe); got != "OLD-BINARY" {
+		t.Errorf("exe = %q", got)
+	}
+	if _, ok := up.TakeRollback(); ok {
+		t.Error("a second watchdog must not record a second rollback")
+	}
+}
+
+// TestLockPIDReadsTheSingleInstanceLock pins the contract with
+// cmd/lock_flock.go: the file holds "<pid>\n", and anything else means "no
+// agent" rather than a bogus rollback.
+func TestLockPIDReadsTheSingleInstanceLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml.lock")
+	writeFile(t, path, strconv.Itoa(4242)+"\n")
+	if got := lockPID(path); got != 4242 {
+		t.Errorf("lockPID = %d, want 4242", got)
+	}
+	for name, body := range map[string]string{"empty": "", "garbage": "not-a-pid\n"} {
+		t.Run(name, func(t *testing.T) {
+			writeFile(t, path, body)
+			if got := lockPID(path); got != 0 {
+				t.Errorf("lockPID(%q) = %d, want 0", body, got)
+			}
+		})
+	}
+	if got := lockPID(filepath.Join(dir, "missing.lock")); got != 0 {
+		t.Errorf("lockPID(missing) = %d, want 0", got)
+	}
+	if got := lockPID(""); got != 0 {
+		t.Errorf("lockPID(\"\") = %d, want 0", got)
+	}
+}
+
+// TestWatchdogWithoutALockPathOnlyReportsStalled keeps the missing-probe path
+// honest: with no single-instance lock the watchdog cannot tell a dead agent
+// from a live one, so it must never roll a good update back.
+func TestWatchdogWithoutALockPathOnlyReportsStalled(t *testing.T) {
+	up, exe, state := watchdogFixture(t)
+	clock := &fakeClock{t: time.Unix(1000, 0)}
+	h := watchdogBudget(exe, state)
+	h.LockPath = ""
+	h.Deadline = 20 * time.Second
+	if err := runWatchdog(context.Background(), h, nil, clock.now, clock.sleep, nopLog{}); err != nil {
+		t.Fatalf("runWatchdog: %v", err)
+	}
+	if _, ok := up.Pending(); !ok {
+		t.Error("a watchdog with no liveness signal must not roll back")
+	}
+	if _, err := os.Stat(up.OldPath()); err != nil {
+		t.Error("the backup must be kept")
+	}
+}
+
+// TestCommitCreatesAVerifiedWatchdogCopy covers the copy the watchdog runs
+// from: it must exist after Commit, be executable, and match the backup byte
+// for byte. Confirm and Rollback both clean it up.
+func TestCommitCreatesAVerifiedWatchdogCopy(t *testing.T) {
+	up, _, _ := watchdogFixture(t)
+	copyPath := up.WatchdogPath()
+	if filepath.Base(copyPath) != "W1nCray-0.5.0" {
+		t.Errorf("watchdog copy = %s, want it named after the previous version", copyPath)
+	}
+	fi, err := os.Stat(copyPath)
+	if err != nil {
+		t.Fatalf("the watchdog copy is missing: %v", err)
+	}
+	if !isWindows() && fi.Mode().Perm()&0o111 == 0 {
+		t.Errorf("the watchdog copy is not executable: %v", fi.Mode())
+	}
+	wantSum, wantSize, err := hashFile(up.OldPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSum, gotSize, err := hashFile(copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSum != wantSum || gotSize != wantSize {
+		t.Errorf("the watchdog copy is not the backup (sha256 %s/%d, want %s/%d)", gotSum, gotSize, wantSum, wantSize)
+	}
+
+	if err := up.Confirm(); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if _, err := os.Stat(up.watchdogDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("Confirm must clean the watchdog copy")
+	}
+
+	up2, _, _ := watchdogFixture(t)
+	if err := up2.Rollback("test"); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if _, err := os.Stat(up2.watchdogDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("Rollback must clean the watchdog copy")
 	}
 }
 
@@ -511,12 +698,13 @@ func TestStartupWatchdogReportsStalledWithoutRollingBack(t *testing.T) {
 	}
 }
 
-// TestHelperArgvRoundTrip keeps the helper's command line in sync with its
-// parser: the values the agent passes are the values the helper reads.
+// TestHelperArgvRoundTrip keeps the watchdog's command line in sync with its
+// parser: the values the agent passes are the values the watchdog reads.
 func TestHelperArgvRoundTrip(t *testing.T) {
 	h := HelperOptions{
 		ParentPID: 4242, ExePath: "/usr/bin/W1nCray", StateDir: "/var/lib/W1nCray/state",
-		Attempts: 3, RetryDelay: 5 * time.Second, AliveWindow: 10 * time.Second,
+		LockPath: "/etc/W1nCray/config.yml.lock", Unit: "W1nCray.service",
+		Attempts: 3, AliveWindow: 10 * time.Second, Deadline: 90 * time.Second, PollInterval: 2 * time.Second,
 	}
 	args := HelperArgv(h.ExePath, []string{"-c", "/etc/W1nCray/config.yml"}, h)
 	got, err := ParseHelperArgs(args)
@@ -526,14 +714,113 @@ func TestHelperArgvRoundTrip(t *testing.T) {
 	if got.ParentPID != h.ParentPID || got.ExePath != h.ExePath || got.StateDir != h.StateDir {
 		t.Fatalf("parsed = %+v", got)
 	}
-	if got.Attempts != 3 || got.RetryDelay != 5*time.Second || got.AliveWindow != 10*time.Second {
+	if got.LockPath != h.LockPath || got.Unit != h.Unit {
+		t.Fatalf("parsed watchdog settings = %+v", got)
+	}
+	if got.Attempts != 3 || got.AliveWindow != 10*time.Second || got.Deadline != 90*time.Second || got.PollInterval != 2*time.Second {
 		t.Fatalf("parsed retry settings = %+v", got)
 	}
 	if len(got.Argv) != 2 || got.Argv[0] != "-c" || got.Argv[1] != "/etc/W1nCray/config.yml" {
 		t.Fatalf("parsed argv = %v", got.Argv)
 	}
+	// The optional flags disappear when there is nothing to say.
+	bare, err := ParseHelperArgs(HelperArgv("/usr/bin/W1nCray", nil, HelperOptions{StateDir: "/s"}))
+	if err != nil {
+		t.Fatalf("ParseHelperArgs (bare): %v", err)
+	}
+	if bare.LockPath != "" || bare.Unit != "" {
+		t.Errorf("bare helper options = %+v", bare)
+	}
 	if _, err := ParseHelperArgs([]string{"-bogus", "1", "--"}); err == nil {
 		t.Error("an unknown helper option must be refused")
+	}
+}
+
+// TestWatchdogArgsIsAnArgvArray pins the watchdog's own command line: the
+// hidden subcommand first, then the parsed options, and never a shell.
+func TestWatchdogArgsIsAnArgvArray(t *testing.T) {
+	h := HelperOptions{
+		ParentPID: 7, ExePath: "/usr/bin/W1nCray", StateDir: "/s",
+		LockPath: "/etc/config.yml.lock", Unit: "W1nCray.service",
+		Attempts: 3, AliveWindow: 10 * time.Second, Deadline: 90 * time.Second, PollInterval: 2 * time.Second,
+		Argv: []string{"-c", "/etc/W1nCray/config.yml"},
+	}
+	got := WatchdogArgs(h)
+	if got[0] != HelperCommand {
+		t.Fatalf("argv[0] = %q, want %q", got[0], HelperCommand)
+	}
+	if HelperCommand != "__watchdog" {
+		t.Errorf("HelperCommand = %q, want __watchdog", HelperCommand)
+	}
+	// The parser must accept exactly what the builder produced.
+	if _, err := ParseHelperArgs(got[1:]); err != nil {
+		t.Fatalf("ParseHelperArgs(WatchdogArgs) = %v", err)
+	}
+	// Nothing is joined into one shell word: every flag and value is its own
+	// element and no element carries a separator.
+	for _, a := range got {
+		if strings.ContainsAny(a, " \t\n;&|$`") {
+			t.Errorf("argv element %q looks like a shell command string", a)
+		}
+	}
+}
+
+// TestSystemdRunArgv covers the systemd-run wrapper: the watchdog runs as its
+// own transient unit, and the executable and its arguments stay separate argv
+// elements (never a shell command string).
+func TestSystemdRunArgv(t *testing.T) {
+	h := HelperOptions{
+		ParentPID: 7, ExePath: "/usr/bin/W1nCray", StateDir: "/var/lib/W1nCray",
+		LockPath: "/etc/W1nCray/config.yml.lock", Unit: "W1nCray.service",
+		Attempts: 3, AliveWindow: 10 * time.Second, Deadline: 90 * time.Second, PollInterval: 2 * time.Second,
+	}
+	watchdog := "/var/lib/W1nCray/update/watchdog/W1nCray-0.5.0"
+	got := SystemdRunArgv("w1ncray-selfupdate-1700000000", watchdog, WatchdogArgs(h))
+	want := []string{
+		"systemd-run", "--quiet", "--collect", "--no-block",
+		"--unit=w1ncray-selfupdate-1700000000", "--",
+		watchdog, "__watchdog",
+		"-parent", "7", "-state", "/var/lib/W1nCray", "-exe", "/usr/bin/W1nCray",
+		"-attempts", "3", "-window", "10s", "-deadline", "1m30s", "-poll", "2s",
+		"-lock", "/etc/W1nCray/config.yml.lock", "-unit", "W1nCray.service", "--",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("argv = %q\nwant %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q\nfull: %q", i, got[i], want[i], got)
+		}
+	}
+	if n := systemdUnitName(time.Unix(1700000000, 0)); n != "w1ncray-selfupdate-1700000000" {
+		t.Errorf("systemdUnitName = %q", n)
+	}
+}
+
+// TestUseSystemdRunDecision covers when the watchdog can be moved out of the
+// service cgroup and when the caller has to fall back to setsid.
+func TestUseSystemdRunDecision(t *testing.T) {
+	found := func(string) (string, error) { return "/usr/bin/systemd-run", nil }
+	missing := func(string) (string, error) { return "", exec.ErrNotFound }
+	cases := []struct {
+		name         string
+		invocationID string
+		systemdDir   bool
+		look         func(string) (string, error)
+		want         bool
+	}{
+		{"systemd invocation with systemd-run", "abc", false, found, true},
+		{"systemd directory with systemd-run", "", true, found, true},
+		{"not systemd at all", "", false, found, false},
+		{"systemd but no systemd-run", "abc", false, missing, false},
+		{"no lookPath", "abc", true, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := useSystemdRun(tc.invocationID, tc.systemdDir, tc.look); got != tc.want {
+				t.Errorf("useSystemdRun(%q, %v) = %v, want %v", tc.invocationID, tc.systemdDir, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -568,13 +855,19 @@ func TestUnsupportedPlatformIsRefused(t *testing.T) {
 }
 
 // TestSelfUpdateHelperProcess is not a test: it is the child process the
-// fault-injection test starts. It exits 1 for the first N invocations (read
-// from a counter file), then stays alive, which is exactly "the new binary
-// cannot start, the restored one can".
+// fault-injection test starts as the new version. It exits 1 for the first N
+// invocations (read from a counter file), then stays alive, which is exactly
+// "the new binary cannot start, the restored one can". It stays alive for a
+// moment before failing so the watchdog can really observe its pid in the
+// single-instance lock.
 func TestSelfUpdateHelperProcess(t *testing.T) {
 	counter := os.Getenv("W1NCRAY_SELFUPDATE_COUNTER")
 	if counter == "" {
 		return
+	}
+	fails := 2
+	if v := os.Getenv("W1NCRAY_SELFUPDATE_FAILS"); v != "" {
+		_, _ = fmt.Sscanf(v, "%d", &fails)
 	}
 	n := 0
 	if b, err := os.ReadFile(counter); err == nil {
@@ -582,20 +875,21 @@ func TestSelfUpdateHelperProcess(t *testing.T) {
 	}
 	n++
 	_ = os.WriteFile(counter, []byte(strconv.Itoa(n)), 0o600)
-	if n <= 2 {
+	if n <= fails {
+		time.Sleep(200 * time.Millisecond)
 		os.Exit(1)
 	}
-	// Longer than the helper's alive window below, even for a race-instrumented
-	// child whose start-up alone takes a few hundred milliseconds.
-	time.Sleep(3 * time.Second)
+	// Longer than the watchdog's poll interval, short enough to keep the test
+	// quick.
+	time.Sleep(1500 * time.Millisecond)
 	os.Exit(0)
 }
 
-// TestRunHelperRecoversWithRealProcesses is the end-to-end fault injection of
-// acceptance item 7: the staged binary really exits 1 (a child of this test
-// binary), the helper really retries, really restores exe.old and really starts
-// it. The counter file makes the third start survive.
-func TestRunHelperRecoversWithRealProcesses(t *testing.T) {
+// TestWatchdogRollsBackARealCrashLoop is the end-to-end fault injection: a real
+// subprocess really exits 1 as the new version, a stand-in service manager
+// really restarts it and really writes the single-instance lock, and the
+// watchdog really reads that lock, counts the restarts and restores exe.old.
+func TestWatchdogRollsBackARealCrashLoop(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -614,39 +908,89 @@ func TestRunHelperRecoversWithRealProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := filepath.Join(dir, "state")
+	lock := filepath.Join(dir, "config.yml.lock")
 	counter := filepath.Join(dir, "counter")
-	up, err := New(Options{ExePath: exe, StateDir: state, Log: nopLog{}, Ready: func(string) error { return nil }})
+	up, err := New(Options{
+		ExePath: exe, StateDir: state, Log: nopLog{}, Ready: func(string) error { return nil },
+		AgentVersion: "0.5.0",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := up.Commit(Staged{Version: "1.0.0", Path: staged, SHA256: sha(mustRead(t, staged))}); err != nil {
+	if err := up.Commit(Staged{Version: "0.6.0", Path: staged, SHA256: sha(mustRead(t, staged))}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	t.Setenv("W1NCRAY_SELFUPDATE_COUNTER", counter)
+	t.Setenv("W1NCRAY_SELFUPDATE_FAILS", "2")
+
+	// The stand-in service manager: Restart=always. It starts the new binary,
+	// records its pid in the single-instance lock (what the real agent does in
+	// run()) and restarts it whenever it dies.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			//nolint:noshell -- exe is a copy of this test binary, run with an
+			// argv array, never a shell.
+			cmd := exec.Command(exe, "-test.run=TestSelfUpdateHelperProcess")
+			cmd.Env = os.Environ()
+			if err := cmd.Start(); err != nil {
+				return
+			}
+			_ = os.WriteFile(lock, []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o600)
+			_ = cmd.Wait()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
 
 	h := HelperOptions{
-		ExePath: exe, StateDir: state, Attempts: 2,
-		RetryDelay: 10 * time.Millisecond, AliveWindow: 1500 * time.Millisecond,
-		Argv: []string{"-test.run=TestSelfUpdateHelperProcess"},
+		ExePath: exe, StateDir: state, LockPath: lock,
+		Attempts: 2, AliveWindow: 2 * time.Second, Deadline: 30 * time.Second,
+		PollInterval: 10 * time.Millisecond,
 	}
-	if err := RunHelper(context.Background(), h, nopLog{}); err != nil {
-		t.Fatalf("RunHelper: %v", err)
+	runErr := RunHelper(context.Background(), h, nopLog{})
+	close(stop)
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("RunHelper: %v", runErr)
 	}
-	if _, err := os.Stat(exe); err != nil {
-		t.Fatalf("the executable is missing after the rollback: %v", err)
+
+	if got, want := sha(mustRead(t, exe)), sha(mustRead(t, self)); got != want {
+		t.Errorf("exe after the rollback is not the previous binary (sha256 %s, want %s)", got, want)
 	}
 	if _, ok := up.Pending(); ok {
 		t.Error("the rollback must clear the pending marker")
 	}
-	if rb, ok := up.TakeRollback(); !ok || rb.Version != "1.0.0" || rb.Reason == "" {
+	rb, ok := up.TakeRollback()
+	if !ok || rb.Version != "0.6.0" {
 		t.Fatalf("rollback marker = %+v (ok=%v)", rb, ok)
 	}
-	if got := string(mustRead(t, counter)); got == "1" || got == "0" {
-		t.Errorf("the new binary was started %s time(s); the helper did not retry", got)
+	// A platform with a real liveness probe counts the crash loop's restarts;
+	// Windows has none (self_update is refused there anyway), so the same real
+	// crash loop is caught by the "no agent alive" rule.
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(rb.Reason, "alive") {
+			t.Errorf("rollback reason = %q, want the no-agent-alive rule", rb.Reason)
+		}
+	} else if !strings.Contains(rb.Reason, "restarted") {
+		t.Errorf("rollback reason = %q, want the restart rule", rb.Reason)
 	}
-	// The restored binary survived the window and keeps running for a moment;
-	// wait for it to exit so the temporary directory can be removed (Windows
-	// keeps a running image locked).
+	if _, err := os.Stat(up.watchdogDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the rollback must clean the watchdog copy")
+	}
+	if got := string(mustRead(t, counter)); got == "0" || got == "1" {
+		t.Errorf("the new binary was started %s time(s); the crash loop did not run", got)
+	}
+	// The stand-in service manager may still be running the restored binary
+	// for a moment; wait for it to exit so the temporary directory can be
+	// removed (Windows keeps a running image locked).
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := os.Remove(exe); err == nil {

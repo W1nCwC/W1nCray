@@ -20,15 +20,16 @@ func findRespawn(t *testing.T) *cobra.Command {
 	return nil
 }
 
-// TestRespawnCommandIsHidden keeps the helper out of --help: it is an internal
-// re-exec of the agent, not something an operator runs.
+// TestRespawnCommandIsHidden keeps the watchdog out of --help: it is an
+// internal re-exec of the agent's previous binary, not something an operator
+// runs.
 func TestRespawnCommandIsHidden(t *testing.T) {
 	c := findRespawn(t)
 	if !c.Hidden {
-		t.Error("the respawn helper must be hidden")
+		t.Error("the self-update watchdog must be hidden")
 	}
 	if !c.DisableFlagParsing {
-		t.Error("the respawn helper must parse its own argv (the agent's own flags follow --)")
+		t.Error("the self-update watchdog must parse its own argv (the agent's own flags follow --)")
 	}
 }
 

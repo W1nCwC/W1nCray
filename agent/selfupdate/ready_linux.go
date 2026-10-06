@@ -82,6 +82,30 @@ func unitRuns(exe string) bool {
 	return false
 }
 
+// serviceUnitFor returns the systemd unit name that runs exe (for example
+// "W1nCray.service"), or "" when no systemd unit does. Only systemd is
+// restarted explicitly after a rollback: OpenRC and procd bring the restored
+// binary back with their own respawn, and "systemctl restart" would only fail
+// there.
+func serviceUnitFor(exe string) string {
+	if exe == "" {
+		return ""
+	}
+	for _, path := range serviceUnits {
+		if !strings.HasSuffix(path, ".service") {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if unitMentions(string(b), exe) {
+			return filepath.Base(path)
+		}
+	}
+	return ""
+}
+
 // unitMentions reports whether an init file starts exe: systemd's
 // "ExecStart=<exe> ...", OpenRC's command="<exe>" and procd's
 // procd_set_param command "<exe>" all put the path in a token of a line that

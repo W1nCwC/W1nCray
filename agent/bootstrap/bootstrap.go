@@ -79,6 +79,14 @@ type Options struct {
 	Files *FilesOptions
 	// AgentVersion is compared with a kernel's min_agent ("" skips).
 	AgentVersion string
+	// SelfVersion is the build version of this process. It names the
+	// known-good copy of the previous binary that the self-update watchdog
+	// runs (update/watchdog/W1nCray-<version>).
+	SelfVersion string
+	// LockPath is the single-instance lock file of the running config
+	// (<config>.lock). The self-update watchdog reads the agent pid from it to
+	// tell "the new version is up" from "a broken binary is restart-looping".
+	LockPath string
 	// AllowHTTP permits http:// kernel sources (development only).
 	AllowHTTP bool
 	// Terminal is the local terminal policy (D8). Enabled is the resolved
@@ -234,7 +242,7 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 	// commands use, and swaps the running executable. A machine that cannot
 	// replace its executable (Windows) or is not run by a service manager
 	// never declares the upgrade capability.
-	if up, uerr := newUpdater(kern, opts.StateDir, log); uerr != nil {
+	if up, uerr := newUpdater(kern, opts, log); uerr != nil {
 		log.Warnf("bootstrap: self-update is not available: %v", uerr)
 	} else {
 		rt.Updater = up
@@ -253,7 +261,7 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 // newUpdater builds the self-update updater around the running executable and
 // the kernel installer. The executable is resolved (EvalSymlinks) so the swap
 // replaces the real file a service manager runs, not a symlink to it.
-func newUpdater(kern *kernelx.Ensurer, stateDir string, log driver.Logger) (*selfupdate.Updater, error) {
+func newUpdater(kern *kernelx.Ensurer, opts Options, log driver.Logger) (*selfupdate.Updater, error) {
 	if kern == nil {
 		return nil, errors.New("no kernel installer")
 	}
@@ -265,10 +273,12 @@ func newUpdater(kern *kernelx.Ensurer, stateDir string, log driver.Logger) (*sel
 		exe = resolved
 	}
 	return selfupdate.New(selfupdate.Options{
-		ExePath:   exe,
-		StateDir:  stateDir,
-		Installer: kern,
-		Log:       log,
+		ExePath:      exe,
+		StateDir:     opts.StateDir,
+		LockPath:     opts.LockPath,
+		AgentVersion: opts.SelfVersion,
+		Installer:    kern,
+		Log:          log,
 	})
 }
 

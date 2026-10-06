@@ -366,8 +366,8 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		if r.Terminal != nil {
 			r.Terminal.SetAuditor(terminalAuditor{events: wsAgent, log: log})
 		}
-		// A rollback the respawn helper performed before this process started
-		// is reported once, now that there is a channel (ruling 10).
+		// A rollback the self-update watchdog performed before this process
+		// started is reported once, now that there is a channel (ruling 10).
 		if startup != nil && r.Ops != nil {
 			if rb, ok := startup.TakeRollback(); ok {
 				msg := fmt.Sprintf("version %s was rolled back: %s", rb.Version, rb.Reason)

@@ -11,9 +11,13 @@
 // The package owns four markers under <StateDir>/update:
 //
 //	pending.json   a commit happened and the new process has not confirmed yet
-//	rollback.json  the helper rolled the swap back (reported on the next start)
+//	rollback.json  the watchdog rolled the swap back (reported on the next start)
 //	staged/        verified next versions, waiting for Commit
 //	archive/       downloaded archives, verified before use
+//
+// A commit also leaves a copy of the previous, known-good executable in
+// update/watchdog/. That copy — never the new binary, which may be the thing
+// that cannot run — is what the detached watchdog runs (see restart.go).
 package selfupdate
 
 import (
@@ -35,11 +39,18 @@ import (
 // DefaultAgentName is the manifest kernel name reserved for self_update.
 const DefaultAgentName = "agent"
 
-// Defaults of the respawn helper and the start-up watchdog.
+// Defaults of the watchdog and the start-up watchdog.
 const (
-	DefaultAttempts      = 3
-	DefaultRetryDelay    = 5 * time.Second
-	DefaultAliveWindow   = 10 * time.Second
+	DefaultAttempts = 3
+	// DefaultAliveWindow is how long the watchdog tolerates "no agent alive"
+	// after the update before it rolls back.
+	DefaultAliveWindow = 10 * time.Second
+	// DefaultDeadline bounds the whole observation. Past it, an agent that is
+	// alive and stable but never confirmed is only reported as stalled.
+	DefaultDeadline = 90 * time.Second
+	// DefaultPollInterval is how often the watchdog probes the single-instance
+	// lock.
+	DefaultPollInterval  = 2 * time.Second
 	DefaultConfirmWindow = 10 * time.Minute
 	parentWaitTimeout    = 60 * time.Second
 )
@@ -72,6 +83,15 @@ type Options struct {
 	ExePath string
 	// StateDir holds the update/ markers. Required.
 	StateDir string
+	// LockPath is the single-instance lock file (<config>.lock) whose content
+	// is the pid of the running agent. The watchdog reads it to tell whether an
+	// agent is alive and how often it restarted. Empty means the watchdog has
+	// no liveness signal and never rolls back on its own.
+	LockPath string
+	// AgentVersion is the version of the binary that is running right now. It
+	// names the known-good copy of it that Commit keeps for the watchdog
+	// (update/watchdog/W1nCray-<version>). Empty falls back to "old".
+	AgentVersion string
 	// AgentName is the manifest kernel name; empty means DefaultAgentName.
 	AgentName string
 	// Installer stages a version. It may be nil for the start-up watchdog,
@@ -80,10 +100,14 @@ type Options struct {
 	Now       func() time.Time
 	Log       driver.Logger
 
-	// Attempts, RetryDelay and AliveWindow configure the respawn helper.
-	Attempts    int
-	RetryDelay  time.Duration
-	AliveWindow time.Duration
+	// Attempts, AliveWindow, Deadline and PollInterval configure the watchdog.
+	// Attempts is how many agent restarts it tolerates before rolling back;
+	// AliveWindow is how long it tolerates no live agent; Deadline is the total
+	// budget before it gives up (and only reports the update as stalled).
+	Attempts     int
+	AliveWindow  time.Duration
+	Deadline     time.Duration
+	PollInterval time.Duration
 	// ConfirmWindow is how long a new process may run without reaching the
 	// panel before self_update.stalled is reported. It never triggers a
 	// rollback (protocol ruling 11).
@@ -99,14 +123,17 @@ type Updater struct {
 	exe       string
 	stateDir  string
 	dir       string
+	lockPath  string
 	agentName string
+	version   string
 	installer Installer
 	now       func() time.Time
 	log       driver.Logger
 
 	attempts      int
-	retryDelay    time.Duration
 	aliveWindow   time.Duration
+	deadline      time.Duration
+	pollInterval  time.Duration
 	confirmWindow time.Duration
 	ready         func(exePath string) error
 }
@@ -165,14 +192,17 @@ func New(o Options) (*Updater, error) {
 		exe:       exe,
 		stateDir:  state,
 		dir:       filepath.Join(state, "update"),
+		lockPath:  o.LockPath,
 		agentName: o.AgentName,
+		version:   o.AgentVersion,
 		installer: o.Installer,
 		now:       o.Now,
 		log:       o.Log,
-		// attempt/retry settings
+		// watchdog settings
 		attempts:      o.Attempts,
-		retryDelay:    o.RetryDelay,
 		aliveWindow:   o.AliveWindow,
+		deadline:      o.Deadline,
+		pollInterval:  o.PollInterval,
 		confirmWindow: o.ConfirmWindow,
 		ready:         o.Ready,
 	}
@@ -191,11 +221,14 @@ func New(o Options) (*Updater, error) {
 	if u.attempts <= 0 {
 		u.attempts = DefaultAttempts
 	}
-	if u.retryDelay <= 0 {
-		u.retryDelay = DefaultRetryDelay
-	}
 	if u.aliveWindow <= 0 {
 		u.aliveWindow = DefaultAliveWindow
+	}
+	if u.deadline <= 0 {
+		u.deadline = DefaultDeadline
+	}
+	if u.pollInterval <= 0 {
+		u.pollInterval = DefaultPollInterval
 	}
 	if u.confirmWindow <= 0 {
 		u.confirmWindow = DefaultConfirmWindow
@@ -211,6 +244,66 @@ func (u *Updater) ExePath() string { return u.exe }
 
 // OldPath is where Commit keeps the previous executable.
 func (u *Updater) OldPath() string { return u.exe + ".old" }
+
+// LockPath is the single-instance lock the watchdog probes ("" when unknown).
+func (u *Updater) LockPath() string { return u.lockPath }
+
+// watchdogDir is <StateDir>/update/watchdog.
+func (u *Updater) watchdogDir() string { return filepath.Join(u.dir, "watchdog") }
+
+// WatchdogPath is the known-good copy of the previous executable that the
+// watchdog runs. Commit creates it; RespawnHelper starts it.
+func (u *Updater) WatchdogPath() string {
+	tag := u.version
+	if tag == "" {
+		tag = "old"
+	}
+	return filepath.Join(u.watchdogDir(), "W1nCray-"+tag)
+}
+
+// CleanupWatchdog removes the watchdog copy. It is idempotent and is called
+// once the update is confirmed, rolled back or no longer being watched.
+func (u *Updater) CleanupWatchdog() error {
+	if err := os.RemoveAll(u.watchdogDir()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// installWatchdogCopy copies the previous executable (already renamed aside)
+// into the watchdog directory and verifies the copy byte for byte. The watchdog
+// must be a known-good binary: the new one may be exactly the thing that cannot
+// start, so it can never be its own watchdog.
+func (u *Updater) installWatchdogCopy(old string) error {
+	dir := u.watchdogDir()
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	dst := u.WatchdogPath()
+	if err := copyFile(old, dst, 0o755); err != nil {
+		return err
+	}
+	if err := os.Chmod(dst, 0o755); err != nil && !isWindows() {
+		return err
+	}
+	wantSum, wantSize, err := hashFile(old)
+	if err != nil {
+		return err
+	}
+	gotSum, gotSize, err := hashFile(dst)
+	if err != nil {
+		return err
+	}
+	if gotSum != wantSum || gotSize != wantSize {
+		return fmt.Errorf("selfupdate: the watchdog copy does not match the backup (sha256 %s/%d, want %s/%d)",
+			gotSum, gotSize, wantSum, wantSize)
+	}
+	u.log.Infof("selfupdate: watchdog copy of the previous binary at %s", dst)
+	return nil
+}
 
 // ConfirmWindow is how long a new process may run without confirming.
 func (u *Updater) ConfirmWindow() time.Duration { return u.confirmWindow }
@@ -340,12 +433,23 @@ func (u *Updater) Commit(s Staged) error {
 	}
 	_ = syncDir(dir)
 
+	// The watchdog has to be run by a binary that is known to work. The new one
+	// just took the executable's place and is unproven, so keep a verified copy
+	// of the previous one before the pending marker makes the swap official.
+	if err := u.installWatchdogCopy(old); err != nil {
+		_ = os.Rename(u.exe, next)
+		_ = os.Rename(old, u.exe)
+		_ = u.CleanupWatchdog()
+		return fmt.Errorf("selfupdate: preparing the watchdog: %w", err)
+	}
+
 	p := Pending{Version: s.Version, OldPath: old, ExePath: u.exe, At: u.now().UTC()}
 	if err := writeJSONAtomic(u.pendingPath(), &p, 0o600); err != nil {
-		// The swap happened; without the marker the helper cannot roll it
+		// The swap happened; without the marker the watchdog cannot roll it
 		// back, so restore immediately.
 		_ = os.Rename(u.exe, next)
 		_ = os.Rename(old, u.exe)
+		_ = u.CleanupWatchdog()
 		return fmt.Errorf("selfupdate: writing %s: %w", u.pendingPath(), err)
 	}
 	u.log.Infof("selfupdate: committed %s (previous binary kept at %s)", s.Version, old)
@@ -395,6 +499,13 @@ func (u *Updater) Rollback(reason string) error {
 	if err := os.Remove(u.pendingPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	// The old binary is the executable again, so the watchdog copy of it is
+	// redundant. Removing the file while the watchdog runs from it is safe on
+	// every platform this supports. A failure here is logged, not returned:
+	// the rollback itself already succeeded and must be reported as such.
+	if err := u.CleanupWatchdog(); err != nil {
+		u.log.Warnf("selfupdate: cleaning the watchdog copy: %v", err)
+	}
 	u.log.Warnf("selfupdate: rolled back to the previous binary (%s)", reason)
 	return nil
 }
@@ -410,7 +521,10 @@ func (u *Updater) Confirm() error {
 	if err := os.Remove(u.pendingPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return nil
+	// The watchdog sees the pending marker disappear and stops on its own; the
+	// copy it runs from is cleaned here too so a watchdog that never started
+	// (or was killed with the machine) leaves nothing behind.
+	return u.CleanupWatchdog()
 }
 
 // Pending reports the committed update that has not been confirmed yet.

@@ -78,10 +78,10 @@ func run() error {
 		return err
 	}
 
-	// A committed self_update asks the process to exit so the respawn helper
-	// (or the service manager) starts the binary that was put in place. The
-	// signal is the existing, graceful shutdown path: kernels are stopped and
-	// Xray is closed before this process returns.
+	// A committed self_update asks the process to exit so the self-update
+	// watchdog (or the service manager) brings the binary that was put in place
+	// back up. The signal is the existing, graceful shutdown path: kernels are
+	// stopped and Xray is closed before this process returns.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	panel.RequestRestart = func() {

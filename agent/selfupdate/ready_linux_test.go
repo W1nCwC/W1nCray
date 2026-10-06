@@ -68,6 +68,46 @@ func TestWritableDirReportsTheRealAnswer(t *testing.T) {
 	}
 }
 
+// TestServiceUnitForNamesTheUnitToRestart covers the rollback half of the
+// systemd integration: after a rollback the watchdog restarts exactly the unit
+// that runs the executable, by the name systemctl knows it under.
+func TestServiceUnitForNamesTheUnitToRestart(t *testing.T) {
+	dir := t.TempDir()
+	unit := filepath.Join(dir, "W1nCray.service")
+	body := "[Service]\nExecStart=/usr/local/bin/W1nCray -c /etc/W1nCray/config.yml\nRestart=always\n"
+	if err := os.WriteFile(unit, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := serviceUnits
+	serviceUnits = []string{unit}
+	t.Cleanup(func() { serviceUnits = old })
+
+	if got := serviceUnitFor("/usr/local/bin/W1nCray"); got != "W1nCray.service" {
+		t.Errorf("serviceUnitFor = %q, want W1nCray.service", got)
+	}
+	if got := serviceUnitFor("/usr/bin/other"); got != "" {
+		t.Errorf("serviceUnitFor(other) = %q, want empty", got)
+	}
+	if got := serviceUnitFor(""); got != "" {
+		t.Errorf("serviceUnitFor(\"\") = %q, want empty", got)
+	}
+
+	// An OpenRC init file runs the executable but is not a systemd unit: the
+	// watchdog must not try "systemctl restart" there.
+	openrc := filepath.Join(dir, "W1nCray")
+	body = "#!/sbin/openrc-run\ncommand=\"/usr/local/bin/W1nCray\"\n"
+	if err := os.WriteFile(openrc, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	serviceUnits = []string{openrc}
+	if got := serviceUnitFor("/usr/local/bin/W1nCray"); got != "" {
+		t.Errorf("serviceUnitFor(openrc) = %q, want empty", got)
+	}
+	if !unitRuns("/usr/local/bin/W1nCray") {
+		t.Error("unitRuns must still accept an OpenRC init file")
+	}
+}
+
 // TestReadyNeedsAServiceUnit proves the gate refuses a binary that no init file
 // runs, which is what keeps the upgrade capability honest on a development box.
 func TestReadyNeedsAServiceUnit(t *testing.T) {
