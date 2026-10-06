@@ -169,7 +169,9 @@ confirm "Reload Octane now?"
 if [ "${DRY_RUN:-0}" = "1" ]; then
   log "  (dry-run) docker exec $PANEL_WEB_CONTAINER php artisan octane:reload"
 else
-  probe_out "$PANEL_HOST" "docker exec $(printf '%q' "$PANEL_WEB_CONTAINER") php artisan octane:reload 2>&1 | tail -2"     || fail "octane:reload failed - inspect: docker logs $PANEL_WEB_CONTAINER (fallback: the USR1 reload of the swoole master used by earlier deploys)"
+  # `octane:reload` cannot find its state file in this image ("Octane server is not
+  # running"), so reload the way the earlier deploys did: USR1 to the swoole master.
+  probe_out "$PANEL_HOST" "docker exec $(printf '%q' "$PANEL_WEB_CONTAINER") sh -c 'kill -USR1 \$(pgrep -f \"swoole_http_server: master\")' && echo USR1-SENT"     | grep -q USR1-SENT || fail "USR1 reload of the swoole master failed - inspect: docker logs $PANEL_WEB_CONTAINER"
 fi
 
 info "waiting for Octane"

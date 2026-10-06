@@ -21,7 +21,7 @@
 | # | 事项 | 默认 | 影响 / 怎么定 |
 |---|---|---|---|
 | 1 | **落地机是否开启终端** | **否**（`ENABLE_TERMINAL=no`） | 本版本终端能力**默认开启**（RULINGS v9 第 17 条）。脚本默认取保守值：`ENABLE_TERMINAL=no` 会给 `W1nCray link` 加 `--noterminal`，在 `agent.yml` 写入 `Terminal: {Enabled: false}`。要保留终端就显式 `ENABLE_TERMINAL=yes`。注意：面板仍要求管理员重输密码才签发终端 ticket，但**面板被攻破 ≈ 开了终端的机器被攻破**（与 nezha/komari 同级）。落地机上目前跑着 3 个节点，用户需要知情。 |
-| 2 | **nginx 与 compose 变更的窗口** | 无默认 | 第 30 步用 `php artisan octane:reload` 平滑重载 Octane 工作进程（与以往部署的 USR1 重载等效，不重启容器、不中断请求）。第 40 步 nginx 是 `reload`，**不掉连接**。需要用户给出可接受的时间窗，并避开订阅高峰。 |
+| 2 | **nginx 与 compose 变更的窗口** | 无默认 | 第 30 步用 `kill -USR1 <swoole master>` 平滑重载 Octane 工作进程（与以往部署的 USR1 重载等效，不重启容器、不中断请求）。第 40 步 nginx 是 `reload`，**不掉连接**。需要用户给出可接受的时间窗，并避开订阅高峰。 |
 | 3 | **是否同时升级落地机 agent** | 由 `W1NCRAY_BINARY` 是否提供决定 | 只做面板侧（第 00–60 步）不需要任何 agent 二进制；面板侧完成后老 agent 会走 HTTP 轮询继续工作，只是没有实时通道。第 70 步会让落地机的 3 个节点**中断 3–10 秒**（一次 `systemctl restart`）。 |
 | 4 | **签名清单的托管** | 本次不托管 | 面板只做**存储与分发**，它既不签名也不验签（`app/Services/Agent/ManifestStore.php`）。`php artisan agent:manifest put <manifest.json>` 要求：正整数 `sequence`（不能倒退，相等=幂等重传）、`signature{alg:"ed25519",key_id,sig}`、≤ 1 MiB。**发布方的 ed25519 私钥不在面板仓库里**，位置未知——用户需要确认用哪一份 manifest、序号是多少、由谁签。不托管时 agent 只用内嵌 xray，`kernel_*` 与 `self_update` 不可用（fail-closed，不静默降级）。 |
 
@@ -155,7 +155,7 @@ scripts/deploy-v9/30-gateway-service.sh
 - **备份**：不改动基础 compose 文件。新文件是 `<root>/compose.w1ncray-ws.yaml`（override），
   回滚=删掉它。
 - **执行**：装 override → `docker compose -f <base> -f compose.w1ncray-ws.yaml up -d w1ncray-ws`
-  → `php artisan octane:reload`（平滑）。
+  → `kill -USR1 <swoole master>`（平滑）。
 - **验证**：8077 监听；`docker compose ps`；容器内 `storage/logs/w1ncray-ws-server.{pid,log}` 存在；
   `artisan list` 有新命令；`http://127.0.0.1:7001` 有响应。
 - **回滚**：`scripts/deploy-v9/30-gateway-service.sh --rollback-only`
@@ -285,7 +285,7 @@ docker exec xboard-web-1 php artisan migrate:rollback --step=4 --force
 
 # 6. 面板代码回到第 10 步之前，然后重建容器
 scripts/deploy-v9/10-panel-files.sh --rollback-only --stage /root/w1ncray-deploy-<TS>-panel-files
-docker exec xboard-web-1 php artisan octane:reload
+docker exec xboard-web-1 kill -USR1 <swoole master>
 ```
 
 顺序理由：先让 agent 回到旧二进制（旧二进制不认 `agent.yml` 时仍能读 `config.yml` 的
@@ -414,7 +414,7 @@ app/Http/Routes/V2/ServerRoute.php
 cd /www/wwwroot/xboard
 mkdir -p /root/w1ncray-deploy-legacy-removed
 for f in <上面的列表>; do [ -e "$f" ] && { mkdir -p "/root/w1ncray-deploy-legacy-removed/$(dirname "$f")"; cp -a "$f" "/root/w1ncray-deploy-legacy-removed/$f"; rm -f "$f"; }; done
-docker exec xboard-web-1 php artisan octane:reload
+docker exec xboard-web-1 kill -USR1 <swoole master>
 ```
 
 回滚：把 `/root/w1ncray-deploy-legacy-removed/` 里的文件拷回去，再重建容器。
