@@ -122,16 +122,25 @@ func realFS(fstype string) bool {
 	return !strings.HasPrefix(f, "cgroup")
 }
 
-// interfaceIPs lists this machine's own addresses. It only looks at the local
-// interfaces: there is no external probe, so ips.public stays empty (design
-// §6-R4).
+// interfaceIPs lists this machine's own addresses, read from the local
+// interfaces only (no external probe, design §6-R4). An address configured on
+// an interface is private when it is RFC 1918/4193 or carrier-grade NAT, and
+// public when it is any other global unicast address (a VPS usually has its
+// public address right on eth0). Behind NAT the public list stays empty.
 func interfaceIPs() wsproto.IPs {
 	addrs, err := interfaceAddrs()
 	if err != nil {
 		return wsproto.IPs{}
 	}
+	return classifyIPs(addrs)
+}
+
+// cgnat is 100.64.0.0/10 (RFC 6598): shared address space, never public.
+var cgnat = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
+func classifyIPs(addrs []net.Addr) wsproto.IPs {
 	seen := make(map[string]bool, len(addrs))
-	var private []string
+	var private, public []string
 	for _, a := range addrs {
 		var ip net.IP
 		switch v := a.(type) {
@@ -140,9 +149,9 @@ func interfaceIPs() wsproto.IPs {
 		case *net.IPAddr:
 			ip = v.IP
 		}
-		// Only addresses that identify the machine on a private network: loopback and
-		// link-local addresses are the same on every host and mean nothing to the panel.
-		if ip == nil || !ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		// Loopback and link-local addresses are the same on every host and
+		// mean nothing to the panel.
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || !ip.IsGlobalUnicast() {
 			continue
 		}
 		s := ip.String()
@@ -150,10 +159,15 @@ func interfaceIPs() wsproto.IPs {
 			continue
 		}
 		seen[s] = true
-		private = append(private, s)
+		if ip.IsPrivate() || cgnat.Contains(ip) {
+			private = append(private, s)
+		} else {
+			public = append(public, s)
+		}
 	}
 	sort.Strings(private)
-	return wsproto.IPs{Private: private}
+	sort.Strings(public)
+	return wsproto.IPs{Private: private, Public: public}
 }
 
 // timezoneName prefers the zone the process was started with (TZ). Without it
