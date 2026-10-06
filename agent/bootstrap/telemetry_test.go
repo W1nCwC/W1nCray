@@ -19,9 +19,10 @@ func capabilitiesOf(t *testing.T, rt *Runtime, cfg *agentcfg.Config) []string {
 }
 
 // TestCapabilitiesOnlyDeclareWhatThisBatchImplements covers protocol ruling 1:
-// the hello capability list is a promise. This batch serves telemetry only, so
-// terminal, files, kernel and upgrade must never appear; xray_nodes appears
-// only when the local module gate allows it (ruling 6).
+// the hello capability list is a promise. telemetry is always served;
+// xray_nodes appears only when the local module gate allows it (ruling 6);
+// terminal, files and upgrade never appear for a runtime without the matching
+// layer (the file capability has its own test in files_test.go).
 func TestCapabilitiesOnlyDeclareWhatThisBatchImplements(t *testing.T) {
 	rt, _ := bootCycle(t, t.TempDir(), false, nil)
 

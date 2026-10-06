@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
@@ -67,6 +68,13 @@ type Options struct {
 	ManifestKeysPath string
 	// Policy is the local root-of-trust policy.
 	Policy spec.Policy
+	// AgentConfig is the local agent configuration the capability list and the
+	// local gates are read from (agent.yml). Nil means the defaults of a zero
+	// Config.
+	AgentConfig *agentcfg.Config
+	// Files is the local managed-file policy (D4/D5). Nil (or an empty
+	// ConfigDir) turns the managed-file commands off on this machine.
+	Files *FilesOptions
 	// AgentVersion is compared with a kernel's min_agent ("" skips).
 	AgentVersion string
 	// AllowHTTP permits http:// kernel sources (development only).
@@ -94,6 +102,12 @@ type Runtime struct {
 	// resolved; upgradeReady is the one-time verdict of its Ready check.
 	Updater      *selfupdate.Updater
 	upgradeReady bool
+	// Files is the managed-file layer (D4/D5); nil when the local policy or the
+	// configuration has no xray directory to manage.
+	Files *FilesRuntime
+	// cfg is the local agent configuration the capability list and the policy
+	// gates are read from (nil means the defaults).
+	cfg *agentcfg.Config
 
 	log driver.Logger
 
@@ -157,7 +171,12 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		State:   st,
 		Log:     log,
 	}
-	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log}
+	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log, cfg: opts.AgentConfig}
+	// The managed-file layer (D4/D5). It is built here because the xray
+	// configuration directory and the state directory are known now; the blob
+	// fetcher and the validator are installed by the panel link (StartRemote)
+	// and by the panel itself.
+	rt.Files = newFilesRuntime(opts)
 	// The operations registry is built here, where the kernel manager, the
 	// supervisor and the state store are all in scope. The channels (the HTTP
 	// link and the WebSocket) install their result and event sinks in

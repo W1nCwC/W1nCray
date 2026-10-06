@@ -79,6 +79,20 @@ type Config struct {
 	// part of the file format.
 	dir           string
 	excludedFiles []string
+	// source records which file the effective configuration came from
+	// (agent.yml or the config.yml "Agent:" block). panel.LoadConfig sets it
+	// through SetSource; the zero value means "not resolved".
+	source Source
+}
+
+// SetSource records which file the effective agent configuration came from. It
+// is called by the loader (panel.LoadConfig) right after Resolve, so the
+// managed-file layer can tell the separated layout from the single-file one
+// without re-reading the directory (ruling 2).
+func (c *Config) SetSource(s Source) {
+	if c != nil {
+		c.source = s
+	}
 }
 
 // PanelConfig configures the agent <-> panel link (the wire contract is
@@ -233,6 +247,15 @@ type FilesConfig struct {
 	Roots        []string `mapstructure:"Roots"`
 	Unrestricted bool     `mapstructure:"Unrestricted"`
 	AllowExec    bool     `mapstructure:"AllowExec"`
+	// MaxBytes bounds one managed-file blob (managed files are downloaded by
+	// sha256, see agent/filesync). 0 means the built-in default (64 MiB). A
+	// negative value turns geo downloads off locally: a machine that keeps no
+	// geoip.dat/geosite.dat (the OpenWrt installer default) refuses them with
+	// "geo files disabled by local policy" instead of silently skipping them.
+	MaxBytes int64 `mapstructure:"MaxBytes"`
+	// MaxGeoBytes overrides MaxBytes for geoip.dat and geosite.dat. 0 means
+	// MaxBytes.
+	MaxGeoBytes int64 `mapstructure:"MaxGeoBytes"`
 }
 
 // ModuleConfig is the local module switch (D3, ruling 6). A nil XrayNodes means
@@ -326,6 +349,26 @@ func (c *Config) Dir() string {
 		return ""
 	}
 	return c.dir
+}
+
+// SeparatedLayout reports whether this machine uses the agent.yml separation
+// (D1): the agent's own configuration lives in agent.yml, so config.yml only
+// carries the xray settings and may be managed by the panel (ruling 2). When
+// the agent configuration comes from the config.yml "Agent:" block, that file
+// is the agent's own configuration and must never be overwritten remotely.
+func (c *Config) SeparatedLayout() bool {
+	return c != nil && c.source == SourceAgentYML
+}
+
+// Separated reports whether an agent.yml exists next to configPath, which is
+// what makes config.yml a managed file (ruling 2). It is a plain existence
+// check: the caller may run before LoadConfig.
+func Separated(configPath string) bool {
+	if configPath == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(filepath.Dir(configPath), FileName))
+	return err == nil
 }
 
 // ExcludedFiles returns the absolute paths the managed-file layer must never

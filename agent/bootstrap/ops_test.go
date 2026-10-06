@@ -63,16 +63,19 @@ func bootWithManifest(t *testing.T) *Runtime {
 // commands can really be served (an installer with a signed manifest).
 func TestCapabilitiesDeclareKernelOnlyWithAUsableInstaller(t *testing.T) {
 	// The pure decision: the installer flag is the only difference.
-	without := capabilities(&agentcfg.Config{}, false)
+	without := capabilities(&agentcfg.Config{}, false, false)
 	if len(without) != 2 || without[0] != wsproto.CapTelemetry || without[1] != wsproto.CapXrayNodes {
 		t.Fatalf("capabilities without an installer = %v", without)
 	}
-	with := capabilities(&agentcfg.Config{}, true)
+	with := capabilities(&agentcfg.Config{}, true, false)
 	if len(with) != 3 || with[2] != wsproto.CapKernel {
 		t.Fatalf("capabilities with an installer = %v", with)
 	}
-	if moduleOff := capabilities(&agentcfg.Config{Modules: &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)}}, true); hasCapability(moduleOff, wsproto.CapXrayNodes) {
+	if moduleOff := capabilities(&agentcfg.Config{Modules: &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)}}, true, false); hasCapability(moduleOff, wsproto.CapXrayNodes) {
 		t.Errorf("the local module gate must still win: %v", moduleOff)
+	}
+	if withFiles := capabilities(&agentcfg.Config{}, true, true); !hasCapability(withFiles, wsproto.CapFiles) {
+		t.Errorf("capabilities = %v, want files", withFiles)
 	}
 
 	// A runtime without a kernel manager can never declare it.
