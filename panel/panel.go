@@ -12,10 +12,24 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
+	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/node"
 )
+
+// Machine mode timing. The intervals are variables so tests can shorten them.
+var (
+	// machinePollInterval is how often the machine's node list is polled.
+	machinePollInterval = 60 * time.Second
+	// machineRetryDelay is how long a failed discovery waits before it is
+	// retried through the reload mechanism; the delay keeps a panel outage from
+	// turning into a tight restart loop.
+	machineRetryDelay = 30 * time.Second
+)
+
+// machineRequestTimeout bounds one machine-node request.
+const machineRequestTimeout = 60 * time.Second
 
 // Panel owns the Xray instance and the node controllers.
 type Panel struct {
@@ -30,6 +44,12 @@ type Panel struct {
 
 	// remoteStop ends the agent's panel link (nil when it is not running).
 	remoteStop func()
+
+	// machineCancel ends the machine-node tasks of the running instance (nil
+	// when machine mode is off or nothing runs); machineWG joins them so
+	// shutdown never returns before they stopped.
+	machineCancel context.CancelFunc
+	machineWG     sync.WaitGroup
 
 	reloadCh chan string
 	stop     chan struct{}
@@ -68,7 +88,7 @@ func (p *Panel) Start() error {
 	return nil
 }
 
-func (p *Panel) start() error {
+func (p *Panel) start() (err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cfg := p.cfg
@@ -85,6 +105,32 @@ func (p *Panel) start() error {
 			Reload: p.requestReload,
 		}))
 	}
+
+	// Machine mode: the panel owns the node list. A discovery failure (panel
+	// down, bad token) never keeps the static nodes from starting: it logs a
+	// warning and is retried in the background through the reload mechanism.
+	var machine *xboard.Client
+	var machineVersion string
+	var machineCtx context.Context
+	if pc := machinePanel(cfg); pc != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		p.machineCancel = cancel
+		machineCtx = ctx
+		c, version, derr := p.discoverMachineNodes(pc, certs, &nodes)
+		if derr != nil {
+			log.Warnf("machine nodes: %v (static nodes keep running; retrying)", derr)
+			p.scheduleMachineRetry(ctx, "machine node discovery failed")
+		} else {
+			machine, machineVersion = c, version
+		}
+	}
+	// A start that fails after this point must not leave the machine tasks
+	// behind: the next start would otherwise start a second set.
+	defer func() {
+		if err != nil {
+			p.stopMachineLocked()
+		}
+	}()
 
 	// Fetch node configs first: panel DNS routes are part of the DNS app,
 	// which cannot change without rebuilding the instance.
@@ -145,9 +191,131 @@ func (p *Panel) start() error {
 			p.startRemoteLocked(cfg.Agent.Panel, rt)
 		}
 	}
+	// Watch the machine's node list so a node added or removed on the panel is
+	// picked up without a config change.
+	if machine != nil {
+		p.startMachineWatchLocked(machineCtx, machine, machineVersion)
+	}
 	p.core, p.nodes, p.running = cr, nodes, true
 	log.Infof("W1nCray started with %d node(s)", len(nodes))
 	return nil
+}
+
+// discoverMachineNodes asks the panel which nodes this machine runs and appends
+// a controller for each of them to nodes. It returns the machine client (for
+// the version watch) and the version of the assignment. The token is passed to
+// the client only; it never reaches a log or an error message.
+func (p *Panel) discoverMachineNodes(pc *AgentPanelConfig, certs *cert.Manager, nodes *[]*node.Controller) (*xboard.Client, string, error) {
+	token, err := pc.ResolveToken()
+	if err != nil {
+		return nil, "", err
+	}
+	c := xboard.New(xboard.Config{
+		APIHost:      pc.URL,
+		MachineID:    pc.MachineID,
+		MachineToken: token,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), machineRequestTimeout)
+	defer cancel()
+	list, version, err := c.ListMachineNodes(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, mn := range list {
+		*nodes = append(*nodes, node.New(node.Options{
+			API: &node.APIConfig{
+				APIHost:      pc.URL,
+				NodeID:       mn.ID,
+				NodeType:     mn.Type,
+				MachineID:    pc.MachineID,
+				MachineToken: token,
+			},
+			Config: machineControllerConfig(pc.NodeController),
+			Certs:  certs,
+			Reload: p.requestReload,
+		}))
+	}
+	log.Infof("machine %d: %d node(s) assigned by the panel", pc.MachineID, len(list))
+	return c, version, nil
+}
+
+// machineControllerConfig copies the shared ControllerConfig template so the
+// controllers never share mutable state. validate() already applied the
+// defaults to it.
+func machineControllerConfig(t *node.Config) *node.Config {
+	if t == nil {
+		return node.DefaultConfig()
+	}
+	c := *t
+	return &c
+}
+
+// startMachineWatchLocked starts the node-list watcher of the running instance.
+// The caller must hold p.mu.
+func (p *Panel) startMachineWatchLocked(ctx context.Context, c *xboard.Client, version string) {
+	p.machineWG.Add(1)
+	go func() {
+		defer p.machineWG.Done()
+		p.machineWatch(ctx, c, version)
+	}()
+}
+
+// machineWatch polls the machine's node list and asks for a reload when it
+// changes. It returns when the instance is shut down (ctx) or after it
+// requested a reload, which starts a fresh watcher.
+func (p *Panel) machineWatch(ctx context.Context, c *xboard.Client, version string) {
+	t := time.NewTicker(machinePollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, machineRequestTimeout)
+		_, next, err := c.ListMachineNodes(reqCtx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Warnf("machine nodes: %v", err)
+			continue
+		}
+		if next != version {
+			log.Infof("machine node list changed (version %s)", next)
+			p.requestReload("machine nodes changed")
+			return
+		}
+	}
+}
+
+// scheduleMachineRetry asks for a reload after machineRetryDelay, so a failed
+// discovery is retried without blocking the running nodes. The goroutine ends
+// with the instance context or after it fired. The caller must hold p.mu.
+func (p *Panel) scheduleMachineRetry(ctx context.Context, reason string) {
+	p.machineWG.Add(1)
+	go func() {
+		defer p.machineWG.Done()
+		t := time.NewTimer(machineRetryDelay)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+		case <-t.C:
+			p.requestReload(reason)
+		}
+	}()
+}
+
+// stopMachineLocked cancels and joins the machine-node tasks. The caller must
+// hold p.mu.
+func (p *Panel) stopMachineLocked() {
+	if p.machineCancel == nil {
+		return
+	}
+	p.machineCancel()
+	p.machineWG.Wait()
+	p.machineCancel = nil
 }
 
 // applyAgentDesiredLocked applies a desired-state file and logs the outcome.
@@ -202,6 +370,9 @@ func (p *Panel) shutdown() {
 	if !p.running {
 		return
 	}
+	// Stop the machine-node tasks first: no discovery or watch may race the
+	// teardown below. They never take p.mu, so waiting here cannot deadlock.
+	p.stopMachineLocked()
 	// Stop the panel link first: no apply may race the teardown below.
 	if p.remoteStop != nil {
 		p.remoteStop()

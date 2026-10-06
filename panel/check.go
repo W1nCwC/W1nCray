@@ -10,6 +10,7 @@ import (
 
 	xlog "github.com/xtls/xray-core/common/log"
 
+	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/node"
@@ -23,11 +24,21 @@ func Check(path string, online bool, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "配置文件: %s（%d 个节点）\n", path, len(cfg.NodesConfig))
+	fmt.Fprintf(w, "配置文件: %s（%d 个静态节点）\n", path, len(cfg.NodesConfig))
 	failed := false
+	agentOK := true
 	if cfg.Agent != nil && cfg.Agent.Enabled {
 		if err := checkAgent(w, cfg); err != nil {
-			failed = true
+			failed, agentOK = true, false
+		}
+	}
+	// Machine mode: the node list comes from the panel. Only --online talks to
+	// it; offline the section just says where the nodes come from.
+	if agentOK {
+		if pc := machinePanel(cfg); pc != nil {
+			if err := checkMachineNodes(w, pc, online); err != nil {
+				failed = true
+			}
 		}
 	}
 	quietKernelLog()
@@ -139,6 +150,37 @@ func checkAgentPanel(w io.Writer, pc *AgentPanelConfig) error {
 		fmt.Fprintf(w, "  ✓ Agent.Panel.TokenFile: %s\n", pc.TokenFile)
 	} else {
 		fmt.Fprintln(w, "  ! 令牌写在配置文件里；建议改用 Agent.Panel.TokenFile（权限 600）")
+	}
+	return nil
+}
+
+// checkMachineNodes reports the machine-mode node list. Offline it only states
+// where the nodes come from; online it asks the panel for the list. The token
+// is never printed.
+func checkMachineNodes(w io.Writer, pc *AgentPanelConfig, online bool) error {
+	token, err := pc.ResolveToken()
+	if err != nil {
+		fmt.Fprintf(w, "  ✗ %v\n", err)
+		return err
+	}
+	if !online {
+		fmt.Fprintf(w, "  机器模式: 节点由面板下发（机器 ID %d；加 --online 可列出节点）\n", pc.MachineID)
+		return nil
+	}
+	c := xboard.New(xboard.Config{APIHost: pc.URL, MachineID: pc.MachineID, MachineToken: token})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	list, version, err := c.ListMachineNodes(ctx)
+	if err != nil {
+		fmt.Fprintf(w, "  ✗ 机器节点列表（机器 ID %d）: %v\n", pc.MachineID, err)
+		return err
+	}
+	fmt.Fprintf(w, "  ✓ 机器节点列表（机器 ID %d）: %d 个节点，版本 %s\n", pc.MachineID, len(list), version)
+	for _, mn := range list {
+		fmt.Fprintf(w, "      - 节点 %d: %s %s\n", mn.ID, mn.Type, mn.Name)
+	}
+	if len(list) == 0 {
+		fmt.Fprintln(w, "  ! 面板当前没有给这台机器分配节点")
 	}
 	return nil
 }
