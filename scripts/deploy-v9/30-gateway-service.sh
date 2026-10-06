@@ -6,16 +6,17 @@
 #      compose file itself is never edited),
 #   2. `docker compose up -d w1ncray-ws`  -> the new Workerman process on
 #      127.0.0.1:8077, its own pid/log file, count=1,
-#   3. `docker compose up -d web horizon` -> recreates the two containers so the
-#      new PHP files and the new routes become live.
+#   3. `php artisan octane:reload` in the web container -> Octane restarts its
+#      workers in place so the new PHP files and routes become live (no container
+#      restart; `docker compose up -d web` would be a no-op for an unchanged service).
 #
 # The legacy `ws-server` service (127.0.0.1:8076) is NOT named anywhere in this
 # step: it is never stopped, restarted or reconfigured.
 #
 # Impact : the gateway start itself is additive (nothing else notices it).
-#          Recreating `web` and `horizon` is a restart of Octane and the queue
-#          workers: 3-8 s of HTTP 502/503 on the panel, and jobs pause for that
-#          window (Horizon drains by SIGINT/`horizon:terminate` first).
+#          `octane:reload` swaps the workers gracefully (in-flight requests finish),
+#          the same effect as the USR1 reload used by the earlier production deploys.
+#          Horizon is left alone: v9 adds no queued job class.
 # Rollback: `docker compose ... stop w1ncray-ws` + remove the override file.
 #          The panel code stays as deployed; use the step-10 rollback for that.
 #
@@ -163,9 +164,13 @@ ok "w1ncray-ws is listening on 127.0.0.1:$PANEL_GATEWAY_PORT"
 # activate the new code
 # ---------------------------------------------------------------------------
 log ""
-warn "the next command restarts Octane and Horizon (3-8 s of panel unavailability)"
-confirm "Recreate the web and horizon containers now?"
-compose "up -d web horizon"
+warn "the next command reloads the Octane workers in place (graceful; no container restart)"
+confirm "Reload Octane now?"
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  log "  (dry-run) docker exec $PANEL_WEB_CONTAINER php artisan octane:reload"
+else
+  probe_out "$PANEL_HOST" "docker exec $(printf '%q' "$PANEL_WEB_CONTAINER") php artisan octane:reload 2>&1 | tail -2"     || fail "octane:reload failed - inspect: docker logs $PANEL_WEB_CONTAINER (fallback: the USR1 reload of the swoole master used by earlier deploys)"
+fi
 
 info "waiting for Octane"
 if [ "${OFFLINE:-0}" = "1" ]; then
