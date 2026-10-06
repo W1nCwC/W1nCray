@@ -30,8 +30,8 @@ type SelfUpdateOps interface {
 	Pending() (selfupdate.Pending, bool)
 	// Ready reports why an in-place update is impossible on this machine.
 	Ready() error
-	// RespawnHelper starts the detached helper that restarts the new binary
-	// and rolls it back when it cannot start.
+	// RespawnHelper starts the detached watchdog: a copy of the previous
+	// binary that restores it when the new one cannot run.
 	RespawnHelper() error
 }
 
@@ -74,8 +74,8 @@ type selfUpdateCmds struct {
 }
 
 // EmitEvent reports an event through the registry's event sink. It exists for
-// events that are not tied to a command, such as a rollback the respawn helper
-// performed before this process started (protocol ruling 10).
+// events that are not tied to a command, such as a rollback the self-update
+// watchdog performed before this process started (protocol ruling 10).
 func (r *Registry) EmitEvent(kind, level, message string) { r.event(kind, level, message) }
 
 // selfUpdate answers self_update. The whole update (download, verify, extract,
@@ -113,10 +113,10 @@ func (c *selfUpdateCmds) selfUpdate(ctx context.Context, req Request, complete C
 			return
 		}
 		if err := c.up.RespawnHelper(); err != nil {
-			// The swap is committed but nothing will restart into it. The
-			// service manager still picks the new binary up on the next
-			// stop/start, so this is reported as a failure without undoing it.
-			complete(StatusFailed, nil, fmt.Errorf("committed %s but could not start the respawn helper: %w", staged.Version, err))
+			// The swap is committed but nothing will watch it. The service
+			// manager still picks the new binary up on the next stop/start, so
+			// this is reported as a failure without undoing it.
+			complete(StatusFailed, nil, fmt.Errorf("committed %s but could not start the self-update watchdog: %w", staged.Version, err))
 			return
 		}
 		c.reg.logf().Infof("opscmd: self_update to %s committed; restarting", staged.Version)

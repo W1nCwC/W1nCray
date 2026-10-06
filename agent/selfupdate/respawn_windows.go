@@ -12,7 +12,7 @@ import (
 func Supported() bool { return false }
 
 // respawn is not possible on this platform.
-func respawn(string, []string, HelperOptions, driver.Logger) error { return ErrNotSupported }
+func respawn(string, HelperOptions, driver.Logger) error { return ErrNotSupported }
 
-// processAlive cannot be answered portably here; the helper never runs.
+// processAlive cannot be answered portably here; the watchdog never runs.
 func processAlive(int) bool { return false }

@@ -128,8 +128,11 @@ A browser may hold at most one terminal session per machine; the panel enforces 
 10. **Events:** `self_update.started|rolled_back|stalled`, `kernel.installed|removed`, `files.applied|rolled_back`.
 11. **Self-update lives in the signed manifest as a `kernels` entry named `agent`** (reserved name: `kernel_install/remove/rollback`
     refuse it, the panel's kernel list hides it; only `self_update` uses it). It reuses all manifest validation and revocation.
-    "New process cannot start" is handled by a watchdog on the host (service manager `Restart=always` + a start-up self-check),
-    "started but cannot reach the panel" is only reported (`self_update.stalled`), never auto-rolled back.
+    "New process cannot start" is handled by a watchdog on the host: a detached helper run from a **copy of the previous binary**
+    (never the unproven new one) watches the single-instance lock and rolls the update back when the service manager is only
+    restarting a binary that cannot run. On systemd that helper is started through `systemd-run` in its own transient unit,
+    outside the service cgroup, because `KillMode=control-group` would otherwise kill it with the service it is watching.
+    "Started but cannot reach the panel" is only reported (`self_update.stalled`), never auto-rolled back.
 12. **High-risk operations** (issuing a terminal ticket, `self_update`, writes outside managed files) require the admin to
     re-enter their password (`confirm_password`, checked server side, rate limited).
 13. **Local gates the panel can never relax:** `Terminal.Enabled` (**default true** by the owner's decision; a machine opts out locally with `Terminal.Enabled: false`, installer/`link` flag `--noterminal`), `Files.Roots`, `Files.Unrestricted`,

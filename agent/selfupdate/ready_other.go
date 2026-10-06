@@ -6,3 +6,7 @@ package selfupdate
 // has the service managers (systemd, OpenRC, procd) this program installs
 // itself into, so every other platform is refused.
 func Ready(string) error { return ErrNotSupported }
+
+// serviceUnitFor names the service unit that runs exe. No supported service
+// manager exists on this platform, so there is none.
+func serviceUnitFor(string) string { return "" }

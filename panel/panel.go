@@ -237,8 +237,14 @@ func (p *Panel) start() (err error) {
 			ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 			Policy:           cfg.Agent.PolicySpec(),
 			AgentConfig:      cfg.Agent,
-			Files:            FilesOptionsFor(cfg, p.path),
-			Log:              log.StandardLogger(),
+			// The build version names the watchdog copy of the previous binary
+			// a committed self_update leaves behind, and the single-instance
+			// lock is how that watchdog tells a restarted broken binary from a
+			// running agent.
+			SelfVersion: AgentVersion,
+			LockPath:    p.path + ".lock",
+			Files:       FilesOptionsFor(cfg, p.path),
+			Log:         log.StandardLogger(),
 			// The local terminal policy (D8, WP-G6). Enabled is the resolved
 			// agentcfg value: on unless the machine opted out with
 			// Terminal.Enabled: false or --noterminal.
@@ -469,8 +475,9 @@ func (p *Panel) startRemoteLocked(a *AgentConfig, rt *bootstrap.Runtime) {
 		WS:          true,
 		AgentConfig: a,
 		// A committed self_update swaps the executable and asks this process to
-		// exit; the respawn helper (or the service manager) then starts the new
-		// binary. Without the hook the command is not registered.
+		// exit; the self-update watchdog (or the service manager) then brings
+		// the new binary back up. Without the hook the command is not
+		// registered.
 		OnRestart: RequestRestart,
 		// The managed-file layer needs the panel side of the two operations
 		// bootstrap cannot own: the offline pre-check (the panel has the live

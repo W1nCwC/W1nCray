@@ -507,11 +507,18 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 签名清单里名为 `agent` 的条目描述 agent 自己的版本（契约 §7-11）；`self_update {version}` 用它升级：
 
 - **长命令**：先回 `{"status":"accepted"}`，完成后再回同一 id 的 `done`/`failed`。目标版本必须出现在清单的 `agent` 条目里，并通过全部既有校验（签名、`revoked`、`min_agent`、平台 target、`archive_sha256`、成员 `sha256`/`size`）与清单声明的版本自检（`run.version_cmd`，argv 数组、不经 shell）。raw `.gz` 产物（`release/build.sh` 的 `dist/W1nCray-linux-<arch>.gz`，清单 `archive:"gz"`、恰好一个 extract 成员）与 `.tar.gz`/`.zip` 走同一条校验路径。**任何一步失败都不会写运行中的可执行文件**。
-- **原子替换**：`exe → exe.old`、已验证的暂存副本 → `exe`，然后写 `<StateDir>/update/pending.json`。任何一步失败都会把原二进制放回；`.old` 从不删除，最坏情况（助手也死了）用一条 `mv exe.old exe` 即可手工恢复，这是"不变砖"的最后一道兜底。
-- **重启**：提交后 agent 启动一个脱离会话的隐藏助手 `__respawn`，然后按原 argv 正常退出（走既有的优雅关停：停内核、关 Xray）。助手等本进程释放单实例锁后运行新二进制；连续 3 次（每次存活窗口 10 s、间隔 5 s）都起不来，就回滚到 `.old`、写 `<StateDir>/update/rollback.json`，再启动恢复后的二进制。systemd 单元是 `Restart=always`，OpenRC 用 `supervise-daemon`、procd 用 `respawn`，服务管理器是第二层保险。**注意**：systemd 默认 `KillMode=control-group` 会在主进程退出时连同 cgroup 杀掉助手，因此"助手能否存活"必须在目标机器实测；杀掉了就由服务管理器重启（新进程启动自检）兜底。
+- **原子替换**：`exe → exe.old`、已验证的暂存副本 → `exe`，然后写 `<StateDir>/update/pending.json`。任何一步失败都会把原二进制放回；`.old` 从不删除，最坏情况（看门狗也死了）用一条 `mv exe.old exe` 即可手工恢复，这是"不变砖"的最后一道兜底。
+- **看门狗（回滚）**：提交后 agent 启动一个隐藏助手 `__watchdog`，再按原 argv 正常退出（走既有的优雅关停：停内核、关 Xray）。助手**只做看门狗，绝不自己拉起 agent**——重启是服务管理器的职责（systemd `Restart=always`、OpenRC `supervise-daemon`、procd `respawn`）。
+  - **由旧二进制的副本运行**：Commit 会把旧二进制复制到 `<StateDir>/update/watchdog/W1nCray-<旧版本>`（0755，逐字节校验 sha256 与 `exe.old` 一致），助手用这个**已知良好**的副本执行 `__watchdog`。绝不能用新二进制当自己的看门狗：新二进制正是"可能起不来"的那一个。确认或回滚后副本被清理。
+  - **判定规则**（`pending.json` 存在期间，轮询间隔默认 2 s，总预算 `Deadline` 默认 90 s）：以单实例锁 `config.yml.lock`（内容是持有锁的 agent pid）为"agent 是否活着、重启了几次"的信号。
+    - `pending.json` 消失（新进程已 `Confirm()`）→ 成功，退出并清理副本。
+    - 观测期内 agent pid 变化（重启）≥ `Attempts`（默认 3），或连续 `AliveWindow`（默认 10 s）没有任何存活 agent → **回滚**：`Updater.Rollback` 把 `.old` 原子换回 `exe`、写 `<StateDir>/update/rollback.json`、清 pending；然后若是 systemd 则 best-effort 执行 `systemctl reset-failed <unit>` 与 `systemctl restart <unit>`（unit 名取 Ready 检测到的单元文件名），其他管理器靠自身 respawn。回滚是幂等的。
+    - `Deadline` 到了 agent 仍存活且稳定但没 `Confirm`（例如连不上面板）→ **不回滚**，助手退出并保留 pending/.old 供人工处理；`self_update.stalled` 仍由新进程按既有逻辑上报（面板故障不是二进制坏，契约 §7-11）。
+  - **`AliveWindow` 必须大于服务管理器的重启间隔**（systemd `RestartSec`）：服务被停止到新进程拿到单实例锁之间的空档如果超过 `AliveWindow`，一个正常的新进程也会被误判成"长期没有存活 agent"而回滚。默认 10 s 对应 `RestartSec` ≤ 5 s；`install.sh` 目前写的是 `RestartSec=10`，两者相等会在边界上竞态，部署时应把 `RestartSec` 调小（或在 `Options.AliveWindow` 里调大）。
+- **助手如何在 systemd 下活下来**：systemd 默认 `KillMode=control-group`，服务停止/重启时同一 cgroup 的所有进程都会被杀死，`Setsid` 也逃不掉——而"主进程退出 → 服务管理器重启"正是自升级的关键时刻，看门狗必须活过它。因此在 systemd 下助手用 `systemd-run --quiet --collect --no-block --unit=w1ncray-selfupdate-<unix时间> -- <旧二进制副本> __watchdog <args>` 启动，落在**独立的 transient unit/cgroup**，服务重启不会连坐。检测条件：环境变量 `INVOCATION_ID` 非空或 `/run/systemd/system` 存在，且 `systemd-run` 可执行；不满足（OpenRC/procd/无服务管理器）或 `systemd-run` 启动失败 → 记日志并回退到 `Setsid` 方式，**升级不会因为看门狗启动方式而失败**。命令一律是 argv 数组、不经 shell。
 - **确认**：新进程在第一次成功得到面板 `/config` 应答后调用 `Confirm()`，删除 `.old` 与 `pending.json`。
 - **连不上面板不回滚**：新进程起来了但 10 分钟内没连上面板，只发 `event{kind:"self_update.stalled"}`（事件是实时数据，断线不补发），**绝不自动回滚**——面板故障不是二进制坏。
-- **事件**：`self_update.started`（开始）、`self_update.rolled_back`（助手回滚后由下一次启动上报一次）、`self_update.stalled`。
+- **事件**：`self_update.started`（开始）、`self_update.rolled_back`（看门狗回滚后由下一次启动上报一次）、`self_update.stalled`。
 - **能力声明**：`hello.capabilities`（及 HTTP `/config` 的 `features`）出现 `upgrade` 的条件是 `self_update` 命令真的注册了：平台能替换自身 exe（Windows 一律不行）、可执行文件是常规文件且所在目录可写、有服务管理器（systemd/OpenRC/procd 的 init 文件里 `ExecStart`/`command` 指向该 exe），并且进程提供了重启钩子。不满足时命令回 `failed` + `result.code="not_supported"`，能力也不声明（契约 §7-1/§7-11）。
 ### 受管文件（`files_apply` / `files_validate` / `files_rollback`）
 
