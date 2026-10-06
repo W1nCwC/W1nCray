@@ -95,6 +95,7 @@ W1nCray uninstall [--purge]  # 卸载（--purge 同时删除配置）
 W1nCray -c /etc/W1nCray/config.yml                     # 运行
 W1nCray migrate --from /etc/XrayR --to /etc/W1nCray    # 迁移 XrayR（--dry-run 只预览，--force 覆盖）
 W1nCray check -c /etc/W1nCray/config.yml [--online]    # 检查配置（--online 同时向面板验证节点）
+W1nCray link --panel https://panel.example.com --machine 12 --token <T>  # 把静态节点转成机器模式（--dry-run 只预览）
 W1nCray init --dir /etc/W1nCray                        # 写入默认配置
 W1nCray version                                        # 版本、内核版本与构建类型（full / lite）
 W1nCray x25519                                         # 生成 REALITY 密钥对
