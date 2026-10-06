@@ -585,7 +585,9 @@ func TestSelfUpdateHelperProcess(t *testing.T) {
 	if n <= 2 {
 		os.Exit(1)
 	}
-	time.Sleep(800 * time.Millisecond)
+	// Longer than the helper's alive window below, even for a race-instrumented
+	// child whose start-up alone takes a few hundred milliseconds.
+	time.Sleep(3 * time.Second)
 	os.Exit(0)
 }
 
@@ -624,7 +626,7 @@ func TestRunHelperRecoversWithRealProcesses(t *testing.T) {
 
 	h := HelperOptions{
 		ExePath: exe, StateDir: state, Attempts: 2,
-		RetryDelay: 10 * time.Millisecond, AliveWindow: 150 * time.Millisecond,
+		RetryDelay: 10 * time.Millisecond, AliveWindow: 1500 * time.Millisecond,
 		Argv: []string{"-test.run=TestSelfUpdateHelperProcess"},
 	}
 	if err := RunHelper(context.Background(), h, nopLog{}); err != nil {
@@ -645,7 +647,7 @@ func TestRunHelperRecoversWithRealProcesses(t *testing.T) {
 	// The restored binary survived the window and keeps running for a moment;
 	// wait for it to exit so the temporary directory can be removed (Windows
 	// keeps a running image locked).
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := os.Remove(exe); err == nil {
 			break

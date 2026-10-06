@@ -458,6 +458,20 @@ func (m *Manager) finalize(s *session) {
 	reason := s.closeReason()
 	close(s.done)
 
+	// The audit record goes out before the session leaves the registry and before the
+	// exit is announced, so whoever sees the session gone (or the exit) can rely on the
+	// close event having been delivered.
+	ended := m.now()
+	m.audit(AuditEvent{
+		Session:   s.id,
+		Action:    "close",
+		At:        ended,
+		DurationS: int64(ended.Sub(s.started) / time.Second),
+		BytesIn:   s.BytesIn(),
+		BytesOut:  s.BytesOut(),
+		Reason:    reason,
+	})
+
 	m.mu.Lock()
 	if cur, ok := m.sessions[s.id]; ok && cur == s {
 		delete(m.sessions, s.id)
@@ -471,16 +485,6 @@ func (m *Manager) finalize(s *session) {
 	close(s.exited)
 	_ = s.proc.close()
 
-	ended := m.now()
-	m.audit(AuditEvent{
-		Session:   s.id,
-		Action:    "close",
-		At:        ended,
-		DurationS: int64(ended.Sub(s.started) / time.Second),
-		BytesIn:   s.BytesIn(),
-		BytesOut:  s.BytesOut(),
-		Reason:    reason,
-	})
 	m.logf().Infof("terminal: session %s closed: %s (code %d, %d in / %d out, %s)",
 		s.id, reason, code, s.BytesIn(), s.BytesOut(), ended.Sub(s.started).Round(time.Second))
 }

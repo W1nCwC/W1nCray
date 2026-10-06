@@ -188,8 +188,10 @@ func newTestManager(t *testing.T, o Options) (*Manager, *auditLog) {
 		o.Shell = DefaultShell
 	}
 	o.Enabled = true
-	o.startPTY = func(shell string, env []string, cols, rows uint16) (ptyProcess, error) {
-		return &fakePTY{peer: deadConn(t)}, nil
+	if o.startPTY == nil {
+		o.startPTY = func(shell string, env []string, cols, rows uint16) (ptyProcess, error) {
+			return &fakePTY{peer: deadConn(t)}, nil
+		}
 	}
 	m, err := New(o)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/fileops"
@@ -353,6 +354,15 @@ func TestWSTerminalAdapter(t *testing.T) {
 	}
 	if err := adapter.Close("s1"); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+	// Close is asynchronous: the session leaves the registry once its child has
+	// exited, and closing it again before that is an idempotent no-op.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := rt.Terminal.Get("s1"); !ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if err := adapter.Close("s1"); err != terminal.ErrNotFound {
 		t.Errorf("Close of a closed session = %v, want ErrNotFound", err)
