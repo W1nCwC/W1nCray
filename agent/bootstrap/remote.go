@@ -13,6 +13,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
@@ -168,6 +169,7 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		AgentVersion:   o.AgentVersion,
 		Engines:        r.engineNames(),
 		Kernels:        r.externalKernels,
+		KernelsList:    r.KernelEntries,
 		PullInterval:   o.PullInterval,
 		ReportInterval: o.ReportInterval,
 		Log:            log,
@@ -176,10 +178,20 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		// (design section 3.3).
 		SuppressHost: func() bool { return wsClient != nil && wsClient.Connected() },
 	}
+	// The operations registry serves every command the Runner does not
+	// implement itself, over both channels (design section 2.1).
+	if r.Ops != nil {
+		ro.Commands = r.Ops
+	}
 	// The declared capabilities travel in /config only when the WebSocket
 	// channel (which is what declares them) is running.
 	if o.WS && streams != nil {
+		// Both are set: the list is recomputed on every pull (FeaturesFunc
+		// wins), so a capability that appears later — the kernel installer
+		// getting a signed manifest — is declared at the same time in hello
+		// and in /config.features (ruling 1).
 		ro.Features = streams.Capabilities()
+		ro.FeaturesFunc = streams.Capabilities
 		// The instance id is generated once and handed to both channels, so the
 		// panel sees one agent run and not two. Without the socket the Runner
 		// keeps generating its own id exactly as before.
@@ -195,6 +207,15 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	runner, err := panelclient.NewRunner(client, remoteApplier{r}, ro)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: panel link: %w", err)
+	}
+
+	// Long commands (kernel_install today, self_update and files_apply later)
+	// answer "accepted" and deliver their final result through this sink. It
+	// exists for the HTTP link even without a WebSocket; the socket is adopted
+	// below when it is running.
+	late := &lateResult{runner: runner, log: log}
+	if r.Ops != nil {
+		r.Ops.SetSink(late)
 	}
 
 	if o.WS {
@@ -223,6 +244,13 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		wsClient = wsAgent.Client()
 		if c, ok := commands.(*wsCommands); ok {
 			c.client = wsClient
+		}
+		late.ws = wsClient
+		// kernel.installed / kernel.removed (protocol ruling 10). The event
+		// frame is the WebSocket's; without a socket there is no event channel
+		// in the HTTP contract, so nothing is sent.
+		if r.Ops != nil {
+			r.Ops.SetEvents(opscmd.EventFunc(wsAgent.SendEvent))
 		}
 	}
 
@@ -352,8 +380,12 @@ func (c *wsCommands) Execute(ctx context.Context, id string, cmd wsproto.Cmd, ex
 		// Not remembered: a redelivery (over either channel) is answered.
 		return "", nil, ws.ErrAnswered
 	}
-	c.runner.MarkAnswered(id)
-	// The result is on the wire; the Agent must not send it a second time.
+	if status != panelclient.ResultAccepted {
+		c.runner.MarkAnswered(id)
+	}
+	// A long command keeps its in-flight slot until its final result is
+	// delivered (lateResult), so a redelivery in between is dropped instead of
+	// running the command twice.
 	return "", nil, ws.ErrAnswered
 }
 

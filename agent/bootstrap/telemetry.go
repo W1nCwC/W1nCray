@@ -13,6 +13,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
@@ -44,7 +45,7 @@ func (r *Runtime) Streams(c *telemetry.Collector, cfg *agentcfg.Config) ws.Strea
 			Components: r.ComponentProbe(),
 		})
 	}
-	return runtimeStreams{rt: r, collector: c, cfg: cfg, caps: capabilities(cfg)}
+	return runtimeStreams{rt: r, collector: c, cfg: cfg}
 }
 
 // runtimeStreams implements ws.Streams on top of a booted Runtime.
@@ -52,7 +53,6 @@ type runtimeStreams struct {
 	rt        *Runtime
 	collector *telemetry.Collector
 	cfg       *agentcfg.Config
-	caps      []string
 }
 
 var _ ws.Streams = runtimeStreams{}
@@ -78,22 +78,41 @@ func (s runtimeStreams) Kernels() []wsproto.KernelEntry { return s.rt.installedK
 func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
 
 // Capabilities returns a copy: the caller must not be able to mutate the list
-// the hello is built from.
+// the hello is built from. It is computed on every call, because the list can
+// change while the agent runs: a signed manifest arriving later is what makes
+// the kernel commands servable, and the panel must see the new list without a
+// restart.
 func (s runtimeStreams) Capabilities() []string {
-	return append([]string(nil), s.caps...)
+	return capabilities(s.cfg, s.rt.kernelCapable())
 }
 
 // capabilities lists what this machine can really do; the panel must not offer
 // anything else (protocol ruling 1). This batch implements the telemetry
-// channel only: terminal, files, kernel and upgrade are deliberately absent
-// because nothing serves them yet. xray_nodes is declared only when the local
-// module gate allows it (ruling 6).
-func capabilities(cfg *agentcfg.Config) []string {
+// channel and the kernel commands: terminal, files and upgrade are still
+// deliberately absent because nothing serves them yet. xray_nodes is declared
+// only when the local module gate allows it (ruling 6); kernel only when the
+// kernel installer can actually serve kernel_* commands.
+func capabilities(cfg *agentcfg.Config, kernel bool) []string {
 	caps := []string{wsproto.CapTelemetry}
 	if cfg.XrayNodesEnabled() {
 		caps = append(caps, wsproto.CapXrayNodes)
 	}
+	if kernel {
+		caps = append(caps, wsproto.CapKernel)
+	}
 	return caps
+}
+
+// kernelCapable reports whether the kernel installer can serve the kernel_*
+// commands: an installer is wired and a signed manifest is in force. Without a
+// manifest kernel_install cannot resolve a version and the catalog is empty, so
+// the capability is not promised (a capability is a promise, ruling 1).
+func (r *Runtime) kernelCapable() bool {
+	if r == nil || r.Kernels == nil {
+		return false
+	}
+	_, ok := r.Kernels.ManifestSequence()
+	return ok
 }
 
 // localPolicy maps the agent.yml local policy onto the wire type. A nil config
@@ -218,24 +237,27 @@ func kernelVersion(rep reconcile.Report, engine string) string {
 	return v
 }
 
-// installedKernels maps the kernel manager's installed versions onto the wire
-// type. A runtime without a kernel manager (or one that cannot read its
-// directory) yields nil: the contract allows an empty list.
-func (r *Runtime) installedKernels() []wsproto.KernelEntry {
-	if r.Kernels == nil {
-		return nil
+// KernelEntries lists the installed kernels in the contract's structured shape
+// (hello.kernels, /config and /report's "kernel_entries"). "In use" is the
+// version a live managed process executes when the platform can verify it, and
+// otherwise falls back to the current pointer (design section 3.2). A runtime
+// without a kernel manager yields no entries.
+func (r *Runtime) KernelEntries() ([]wsproto.KernelEntry, error) {
+	if r == nil || r.Kernels == nil {
+		return nil, nil
 	}
-	in := r.Kernels.Installer()
-	if in == nil {
-		return nil
-	}
-	list, err := in.List()
+	list, err := r.Kernels.List()
 	if err != nil {
-		r.warnf("bootstrap: listing the installed kernels: %v", err)
-		return nil
+		return nil, err
 	}
 	out := make([]wsproto.KernelEntry, 0, len(list))
+	running := map[string]string{}
+	exact := map[string]bool{}
 	for _, e := range list {
+		if _, seen := exact[e.Name]; !seen {
+			v, ex := r.Kernels.RunningVersion(e.Name)
+			running[e.Name], exact[e.Name] = v, ex
+		}
 		entry := wsproto.KernelEntry{
 			Name:      e.Name,
 			Version:   e.Version,
@@ -243,16 +265,26 @@ func (r *Runtime) installedKernels() []wsproto.KernelEntry {
 			Previous:  e.Previous,
 			Path:      e.Path,
 			SizeBytes: e.Size,
-			// "in use" is the version the agent made current; a running
-			// instance may still be on the previous one during a rollback.
-			InUse: e.Current,
+			// One rule for kernel_list and hello/report (opscmd.InUse).
+			InUse: opscmd.InUse(e, running[e.Name], exact[e.Name]),
 		}
 		if !e.InstalledAt.IsZero() {
 			entry.InstalledAt = e.InstalledAt.Unix()
 		}
 		out = append(out, entry)
 	}
-	return out
+	return out, nil
+}
+
+// installedKernels is the hello/components view of KernelEntries: a collection
+// failure is logged and reported as an empty list, never as an invented entry.
+func (r *Runtime) installedKernels() []wsproto.KernelEntry {
+	entries, err := r.KernelEntries()
+	if err != nil {
+		r.warnf("bootstrap: listing the installed kernels: %v", err)
+		return nil
+	}
+	return entries
 }
 
 // warnf logs through the runtime's logger, tolerating a Runtime built without

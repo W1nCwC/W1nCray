@@ -23,6 +23,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
+	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/state"
@@ -84,6 +85,9 @@ type Runtime struct {
 	Sup        *supervisor.Supervisor
 	Kernels    *kernelx.Ensurer
 	State      *state.Store
+	// Ops is the operations command registry (kernel_* and, later, the other
+	// operation commands). It is nil only for a Runtime built by hand.
+	Ops *opscmd.Registry
 
 	log driver.Logger
 
@@ -125,7 +129,10 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		KeysPath:     opts.ManifestKeysPath,
 		AgentVersion: opts.AgentVersion,
 		AllowHTTP:    opts.AllowHTTP,
-		Log:          log,
+		// The pid directory is how the kernel commands tell "installed" from
+		// "actually running" (kernelx.RunningVersion).
+		PIDDir: filepath.Join(opts.StateDir, "pid"),
+		Log:    log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
@@ -145,6 +152,19 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		Log:     log,
 	}
 	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log}
+	// The operations registry is built here, where the kernel manager, the
+	// supervisor and the state store are all in scope. The channels (the HTTP
+	// link and the WebSocket) install their result and event sinks in
+	// StartRemote, once they exist.
+	ops, err := opscmd.New(opscmd.Deps{
+		Kernels: kern,
+		Comp:    componentRestarter{rt: rt},
+		Log:     log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: %w", err)
+	}
+	rt.Ops = ops
 	if opts.Resume {
 		rt.resume()
 	}
