@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -32,7 +33,7 @@ func TestRealFS(t *testing.T) {
 	}
 }
 
-func TestInterfaceIPsKeepsOnlyPrivateNonLoopbackAddresses(t *testing.T) {
+func TestInterfaceIPsSplitsInterfaceAddresses(t *testing.T) {
 	swap(t, &interfaceAddrs, func() ([]net.Addr, error) {
 		return []net.Addr{
 			&net.IPNet{IP: net.ParseIP("192.168.1.5"), Mask: net.CIDRMask(24, 32)},
@@ -47,7 +48,8 @@ func TestInterfaceIPsKeepsOnlyPrivateNonLoopbackAddresses(t *testing.T) {
 
 	got := interfaceIPs()
 	// Loopback (127.0.0.1) and link-local (fe80::1) are excluded on purpose: they are
-	// the same on every host. Public addresses (8.8.8.8, 2001:db8::1) are not private.
+	// the same on every host. Global addresses configured on an interface (8.8.8.8,
+	// 2001:db8::1) are public: reading them is not a network probe.
 	want := []string{"10.0.0.1", "192.168.1.5"}
 	if len(got.Private) != len(want) {
 		t.Fatalf("private IPs = %v, want %v", got.Private, want)
@@ -57,8 +59,8 @@ func TestInterfaceIPsKeepsOnlyPrivateNonLoopbackAddresses(t *testing.T) {
 			t.Fatalf("private IPs = %v, want %v", got.Private, want)
 		}
 	}
-	if len(got.Public) != 0 {
-		t.Fatalf("public IPs = %v, want none: the agent never probes the network", got.Public)
+	if strings.Join(got.Public, ",") != "2001:db8::1,8.8.8.8" {
+		t.Fatalf("public IPs = %v, want the interface's global addresses", got.Public)
 	}
 }
 
