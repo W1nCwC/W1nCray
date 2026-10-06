@@ -777,7 +777,7 @@ t_install_panel() {
 	check "config enables the panel" grep -qx '  Panel:' "$CONF"
 	check "config has the state dir" grep -qx "  StateDir: \"$CONF_DIR/state\"" "$CONF"
 	check "config has the default port range" grep -qx '    PortRange: \[20000, 40000\]' "$CONF"
-	check "config allows xray only" grep -qx '    AllowEngines: \["xray"\]' "$CONF"
+	refute "config does not restrict the engines" grep -q 'AllowEngines' "$CONF"
 	check "config listens on all addresses" grep -qx '    AllowListen: \["0.0.0.0"\]' "$CONF"
 	check "the trailing slash is stripped from the URL" grep -qx '    URL: "https://panel.example.com"' "$CONF"
 	check "config has the machine id" grep -qx '    MachineID: 3' "$CONF"
@@ -890,7 +890,9 @@ t_install_panel_keeps_config() {
 	make_fake_bin "$W1NCRAY_ROOT/fakebin"
 	W1NCRAY_SELF="$SCRIPT"
 	mkdir -p "$CONF_DIR"
-	printf 'Nodes:\n  - ApiConfig: {ApiHost: "https://x", ApiKey: k, NodeID: 1}\n' >"$CONF"
+	# An existing config without static `Nodes:` entries: the machine-mode
+	# config still goes to config.panel.yml.new for a manual merge.
+	printf 'Log: {Level: info}\nAgent:\n  Enabled: false\n' >"$CONF"
 	before="$(cat "$CONF")"
 	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
 		--panel https://panel.example.com --machine 9 --token t --port-range 30000-31000 2>&1)"
@@ -901,6 +903,7 @@ t_install_panel_keeps_config() {
 	check ".new has the requested port range" grep -qx '    PortRange: \[30000, 31000\]' "$new"
 	check ".new has the machine id" grep -qx '    MachineID: 9' "$new"
 	check ".new points at the token file" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$new"
+	refute ".new does not restrict the engines" grep -q 'AllowEngines' "$new"
 	has "the admin is warned the config was kept" "$out" "未覆盖"
 	has "the admin is told how to merge" "$out" "合并"
 	has "the pending hint says the link is not active yet" "$out" "配置尚未生效"
@@ -915,6 +918,44 @@ t_install_panel_keeps_config() {
 	rm -f "$CONF"
 	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel 'https://panel.example.com/x#y' --machine 9 --token t >/dev/null 2>&1
 	check "a # in the URL is quoted so YAML keeps it" grep -qx '    URL: "https://panel.example.com/x#y"' "$CONF"
+}
+
+t_install_panel_static_nodes() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	mkdir -p "$CONF_DIR"
+	printf 'Nodes:\n  - ApiConfig: {ApiHost: "https://x", ApiKey: k, NodeID: 173}\n  - ApiConfig: {ApiHost: "https://y", ApiKey: k, NodeID: 119}\n  - ApiConfig: {ApiHost: "https://z", ApiKey: k, NodeID: 138}\nAgent:\n  Enabled: false\n' >"$CONF"
+	before="$(cat "$CONF")"
+	# Detection helpers.
+	check "a static Nodes block is detected" has_static_nodes "$CONF"
+	eq "the NodeIDs are read in order" "$(static_node_ids "$CONF")" "173 119 138"
+	printf 'Nodes: []\nAgent:\n  Enabled: true\n' >"$W1NCRAY_ROOT/empty.yml"
+	refute "Nodes: [] is not a static node list" has_static_nodes "$W1NCRAY_ROOT/empty.yml"
+	eq "Nodes: [] yields no NodeIDs" "$(static_node_ids "$W1NCRAY_ROOT/empty.yml")" ""
+	refute "a missing config has no static nodes" has_static_nodes "$W1NCRAY_ROOT/nope.yml"
+	printf 'Log: {Level: info}\n' >"$W1NCRAY_ROOT/plain.yml"
+	refute "a config without Nodes has no static nodes" has_static_nodes "$W1NCRAY_ROOT/plain.yml"
+
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 5 --token t 2>&1)"
+	eq "a panel install over static nodes succeeds" "$?" 0
+	eq "the static config is untouched" "$(cat "$CONF")" "$before"
+	refute "no .new config is written for static nodes" test -e "$CONF_DIR/config.panel.yml.new"
+	has "the admin is warned the config was kept" "$out" "未覆盖"
+	has "the static NodeIDs are listed" "$out" "配置里的静态节点 NodeID: 173 119 138"
+	has "the admin is told to bind them on the panel" "$out" "绑定到机器 5"
+	has "the dry-run link command is shown" "$out" "  W1nCray link --panel https://panel.example.com --machine 5 --token-file $CONF_DIR/agent.token --dry-run"
+	eq "both the dry-run and the real command are shown" \
+		"$(printf '%s\n' "$out" | grep -c 'W1nCray link --panel https://panel.example.com --machine 5 --token-file')" 2
+	has "the admin is told to drop --dry-run" "$out" "去掉 --dry-run"
+	has "the admin is told to restart" "$out" "W1nCray restart"
+	has "the admin is told no merge is needed" "$out" "无需手工合并"
+	has "the pending hint says the link is not active yet" "$out" "配置尚未生效"
+	hasnt "link is never run by the installer" "$out" "ARGS: link"
+	check "the token file is written" test -f "$CONF_DIR/agent.token"
+	has "the service still starts" "$(cat "$CALLS")" "start W1nCray"
 }
 
 t_install_without_panel_unchanged() {
@@ -966,7 +1007,7 @@ for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_veri
 	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
 	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
 	t_install_panel t_install_panel_missing_args t_install_panel_bad_id t_install_panel_http \
-	t_install_panel_token_file t_install_panel_keeps_config t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
+	t_install_panel_token_file t_install_panel_keeps_config t_install_panel_static_nodes t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
 	run "$t"
 done
 

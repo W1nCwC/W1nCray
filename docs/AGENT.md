@@ -110,7 +110,7 @@ Agent:
 | `KernelsDir` | `StateDir/kernels` | 外部内核安装目录 |
 | `Policy` | 见 §4 | 本地根信任策略 |
 
-校验：`PortRange` 必须恰好两个元素 `[lo, hi]`；`Policy.AllowEngines` 只能出现 `auto` / `xray` / `gost` / `frp` / `realm`。
+校验：`PortRange` 必须恰好两个元素 `[lo, hi]`；`Policy.AllowEngines` 只能出现 `auto` / `xray` / `gost` / `frp` / `realm`。**建议留空**：留空表示不限制引擎，面板下发的实例可选任一引擎，实际可用性由已签名清单决定（gost / frp / realm 由 agent 按需下载安装，见 §3 与 §4）。
 
 ### 机器模式节点（`MachineNodes`）
 
@@ -273,7 +273,7 @@ Agent:
 | `AllowPrivate` | `false` | 是否允许目标为私网（RFC1918、CGNAT `100.64.0.0/10`、`fec0::/10`、ULA）。**开启后环回、链路本地、云元数据等仍被拒** |
 | `AllowAnyTarget` | `false` | 是否允许 `tunnel_exit` 使用 `allow_any_target`（出口替入口去连任意地址，等于开放中继） |
 | `AllowAcceptProxyOnPublic` | `false` | 是否允许在非环回、非私网的地址上 `accept_proxy_protocol`（PROXY 头可伪造） |
-| `AllowEngines` | 空（=全部已注册/已安装） | 允许使用的引擎白名单；不在名单里的引擎显式指定会被拒，`auto` 只在名单内选 |
+| `AllowEngines` | 空（=不限制） | 允许使用的引擎白名单。**默认不限制**：留空表示面板下发的实例可选任一引擎，xray 内嵌可用，gost / frp / realm 由 agent 按需从已签名清单下载安装（可用性由清单决定，不由本字段决定）。写了名单时，不在名单里的引擎显式指定会被拒，`auto` 只在名单内选 |
 
 **目标地址「始终拒绝」**（与 `AllowPrivate` 无关，来自 `agent/validate/hosts.go`）：未指定地址、环回、链路本地、多播、`0.0.0.0/8`、`240.0.0.0/4`、云元数据地址（`169.254.169.254`、`169.254.170.2`、`100.100.100.200`、`168.63.129.16`、`192.0.0.192`、`fd00:ec2::254`），以及内嵌了以上 IPv4 的 IPv6 形式。主机名必须是 ASCII 的 LDH 名称（IDN 用 punycode），`localhost` / `*.localhost` 被拒；域名在**校验期**解析一次，解析失败或任何一个解析结果违规都拒绝（fail-closed）。内核之后还会再解析，所以存在 DNS 重绑定的时间窗，敏感场景请用字面 IP。注意 `tunnel.server`（隧道对端）也按目标规则检查：入口/桥端要连的出口/portal 若在私网，同样需要 `AllowPrivate`。
 
