@@ -50,8 +50,9 @@ if [ "$ROLLBACK_ONLY" = "1" ]; then
   guard_path "$STAGE" "the step's backup directory"
   info "restoring $PANEL_ROOT from $STAGE"
   restore_files "$PANEL_HOST" "$STAGE" "$PANEL_ROOT"
-  rsh "$PANEL_HOST" "cd $(printf '%q' "$PANEL_ROOT") && chown -R www:www . 2>/dev/null || true"
-  ok "panel files restored; restart the containers (step 20) so the old code is live again"
+  # restore_files keeps the backed-up owners; never chown the whole tree
+  # (.docker/.data/redis belongs to the redis container's user).
+  ok "panel files restored; run: docker exec $PANEL_WEB_CONTAINER php artisan octane:reload"
   ROLLBACK_HINT="already performed"
   step_end
   exit 0
@@ -74,7 +75,8 @@ printf 'free_kb=%s\n' \"\$(df -Pk . | awk 'NR==2{print \$4}')\"
 printf 'disk_used_pct=%s\n' \"\$(df -P . | awk 'NR==2{print \$5}')\"
 printf 'www_uid=%s\n' \"\$(id -u www 2>/dev/null || echo missing)\"" || die "panel checkout probe failed (is $PANEL_ROOT right?)"
 
-check_manifest_remote "$PANEL_HOST" "$PANEL_ROOT" "$MANIFEST"
+# Informational before the copy: new files are expected to be missing here.
+check_manifest_remote "$PANEL_HOST" "$PANEL_ROOT" "$MANIFEST" || true
 
 # ---------------------------------------------------------------------------
 # backup + copy
@@ -94,8 +96,9 @@ backup_files "$PANEL_HOST" "$STAGE" "$PANEL_ROOT" < <(read_manifest "$MANIFEST")
 info "streaming the files"
 tar_manifest "$PANEL_SRC" "$PANEL_HOST" "$PANEL_ROOT" < <(read_manifest "$MANIFEST")
 
-info "fixing ownership (Baota runs the panel as www)"
-rsh "$PANEL_HOST" "cd $(printf '%q' "$PANEL_ROOT") && chown -R www:www . 2>/dev/null || true; echo chown-done"
+info "fixing ownership of the copied files only (they are www:www on the host; never a recursive chown:"
+info "  .docker/.data/redis belongs to the redis container's user)"
+read_manifest "$MANIFEST" | rsh "$PANEL_HOST" "cd $(printf '%q' "$PANEL_ROOT") && while IFS= read -r f; do [ -n \"\$f\" ] && [ -f \"\$f\" ] && chown www:www \"\$f\"; done; echo chown-done"
 
 # ---------------------------------------------------------------------------
 # verify
