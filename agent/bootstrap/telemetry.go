@@ -83,16 +83,15 @@ func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
 // the kernel commands servable, and the panel must see the new list without a
 // restart.
 func (s runtimeStreams) Capabilities() []string {
-	return capabilities(s.cfg, s.rt.kernelCapable())
+	return capabilities(s.cfg, s.rt.kernelCapable(), s.rt.fileCapable())
 }
 
 // capabilities lists what this machine can really do; the panel must not offer
-// anything else (protocol ruling 1). This batch implements the telemetry
-// channel and the kernel commands: terminal, files and upgrade are still
-// deliberately absent because nothing serves them yet. xray_nodes is declared
+// anything else (protocol ruling 1). telemetry is always served; xray_nodes
 // only when the local module gate allows it (ruling 6); kernel only when the
-// kernel installer can actually serve kernel_* commands.
-func capabilities(cfg *agentcfg.Config, kernel bool) []string {
+// kernel installer can actually serve kernel_* commands; files only when the
+// managed-file layer is wired and the local layout permits it (ruling 2).
+func capabilities(cfg *agentcfg.Config, kernel, files bool) []string {
 	caps := []string{wsproto.CapTelemetry}
 	if cfg.XrayNodesEnabled() {
 		caps = append(caps, wsproto.CapXrayNodes)
@@ -100,7 +99,28 @@ func capabilities(cfg *agentcfg.Config, kernel bool) []string {
 	if kernel {
 		caps = append(caps, wsproto.CapKernel)
 	}
+	if files {
+		caps = append(caps, wsproto.CapFiles)
+	}
 	return caps
+}
+
+// fileCapable reports whether the managed-file commands can really be served on
+// this machine (ruling 1: a capability is a promise). It requires the file
+// layer to be wired, a local Files policy with at least one root, and — because
+// the panel must never overwrite the agent's own configuration — the separated
+// agent.yml layout when config.yml is part of the set. The capability is about
+// the xray files the panel manages, so the separated layout is required: with
+// the single-file layout the panel would be handed a write path to the agent's
+// own settings (ruling 2).
+func (r *Runtime) fileCapable() bool {
+	if r == nil || r.Files == nil || !r.Files.Enabled() {
+		return false
+	}
+	if r.cfg == nil || r.cfg.Files == nil || len(r.cfg.Files.Roots) == 0 {
+		return false
+	}
+	return r.Files.LayoutSeparated()
 }
 
 // kernelCapable reports whether the kernel installer can serve the kernel_*

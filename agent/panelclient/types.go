@@ -38,6 +38,11 @@ const (
 	CmdFileWrite        = "file_write"
 	CmdFileDelete       = "file_delete"
 	CmdFilesApply       = "files_apply"
+	// CmdFilesValidate stages and validates the managed files without writing
+	// or reloading anything; CmdFilesRollback restores the last good set and
+	// reloads (docs/WS-PROTOCOL.md section 7 ruling 9).
+	CmdFilesValidate = "files_validate"
+	CmdFilesRollback = "files_rollback"
 )
 
 // Command result statuses.
@@ -252,6 +257,31 @@ type ManifestResponse struct {
 	Raw         []byte // the signed manifest document (200 only)
 	ETag        string // entity tag of Raw (200 only; may be empty)
 }
+
+// BlobRequest is the query of GET /file/<sha256>. SHA256 is the content address
+// of the managed file (lowercase hex); ETag is the entity tag the agent already
+// holds for it and is sent as If-None-Match. The address *is* the content hash,
+// so a 304 can only mean "this machine already has exactly these bytes"
+// (design section 3.6).
+type BlobRequest struct {
+	SHA256 string
+	ETag   string
+}
+
+// BlobResponse is the answer of GET /file/<sha256>. NotModified is true for
+// 304: Raw and ETag are then empty and the cached blob is still current.
+type BlobResponse struct {
+	NotModified bool
+	Raw         []byte // the file content (200 only)
+	ETag        string // entity tag of Raw (200 only; may be empty)
+}
+
+// MaxBlobBytes is the largest managed-file blob the HTTP client accepts. It
+// matches the transport limit of the managed-file path (64 MiB); a bigger body
+// is refused before it is buffered in full. It is independent of
+// maxManifestBytes: the geo files are several megabytes and must not raise the
+// manifest limit.
+const MaxBlobBytes = 64 << 20 // 64 MiB
 
 // APIError is a non-2xx answer of the panel ({"error","message"} body).
 type APIError struct {

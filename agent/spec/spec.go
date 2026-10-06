@@ -51,6 +51,24 @@ type Desired struct {
 	Revision  int64       `json:"revision"`
 	Kernels   []KernelPin `json:"kernels,omitempty"`
 	Instances []Instance  `json:"instances"`
+	// Files are the managed xray files the panel wants on this machine
+	// (docs/WS-PROTOCOL.md section 7 ruling 1). The content never travels in
+	// the desired state: only the name, the size and the sha256, which the
+	// agent resolves through the blob endpoint over HTTPS. The key is only
+	// sent to an agent that declared the "files" capability, because the
+	// desired state is decoded strictly.
+	Files []FileRef `json:"files,omitempty"`
+}
+
+// FileRef is one managed file the panel wants: a fixed whitelisted name plus
+// the sha256 and size of its content. Kernel names the kernel version the file
+// belongs to when the panel knows one (informational for the agent; the file's
+// own whitelist decides where it is written).
+type FileRef struct {
+	Name   string `json:"name"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+	Kernel string `json:"kernel,omitempty"`
 }
 
 // KernelPin selects a kernel version from the signed manifest. The panel can

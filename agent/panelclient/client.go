@@ -254,6 +254,76 @@ func (c *Client) Manifest(ctx context.Context, req ManifestRequest) (ManifestRes
 	return ManifestResponse{Raw: data, ETag: resp.Header.Get("ETag")}, nil
 }
 
+// Blob fetches one managed file's content through GET /file/<sha256>. The body
+// is limited to MaxBlobBytes and is returned unparsed: the caller re-hashes it
+// and compares it with the requested sha256 before anything is written.
+//
+// The answers are:
+//   - 200: Raw and ETag are set;
+//   - 304 (If-None-Match matched): NotModified is true, the cached blob is
+//     still current;
+//   - anything else: a redacted *APIError or a transport error.
+//
+// The token is never part of the URL and every error text is redacted. A
+// sha256 that is not a plain lowercase hex digest is refused before a request
+// is built, so the panel can never make the agent fetch an arbitrary path.
+func (c *Client) Blob(ctx context.Context, req BlobRequest) (BlobResponse, error) {
+	if !ValidSHA256(req.SHA256) {
+		return BlobResponse{}, c.wrap("file", fmt.Errorf("refusing blob address %q: not a sha256 digest", req.SHA256))
+	}
+	httpReq, err := c.newRequest(ctx, http.MethodGet, "file/"+req.SHA256, nil)
+	if err != nil {
+		return BlobResponse{}, c.wrap("file", fmt.Errorf("build request: %w", err))
+	}
+	if req.ETag != "" {
+		httpReq.Header.Set("If-None-Match", req.ETag)
+	}
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return BlobResponse{}, c.wrap("file", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		return BlobResponse{NotModified: true}, nil
+	}
+
+	// Read one byte past the limit so a too-large body can be detected.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxBlobBytes+1))
+	if err != nil {
+		return BlobResponse{}, c.wrap("file", fmt.Errorf("read response: %w", err))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return BlobResponse{}, c.apiError(resp.StatusCode, data)
+	}
+	if len(data) > MaxBlobBytes {
+		return BlobResponse{}, c.wrap("file", fmt.Errorf("response body exceeds %d bytes", MaxBlobBytes))
+	}
+	etag := resp.Header.Get("ETag")
+	// The address is the content hash: an ETag that names different bytes is a
+	// broken or hostile panel, and the body must not be trusted either.
+	if etag != "" && !strings.Contains(etag, req.SHA256) {
+		return BlobResponse{}, c.wrap("file", fmt.Errorf("ETag %q does not match the requested sha256", etag))
+	}
+	return BlobResponse{Raw: data, ETag: etag}, nil
+}
+
+// ValidSHA256 reports whether s is a plain lowercase hex sha256 digest. It is
+// the only shape a blob address may have (never a path, never a name).
+func ValidSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // newRequest builds a request to an agent endpoint with the four headers every
 // call carries. The body is optional (nil for GET).
 func (c *Client) newRequest(ctx context.Context, method, endpoint string, body io.Reader) (*http.Request, error) {

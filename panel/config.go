@@ -121,6 +121,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	cfg.Agent = agent
 	cfg.agentSource = src
+	cfg.Agent.SetSource(src)
 	switch src {
 	case agentcfg.SourceAgentYML:
 		cfg.agentSourcePath = filepath.Join(filepath.Dir(path), agentcfg.FileName)

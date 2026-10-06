@@ -61,6 +61,7 @@ type API interface {
 	Report(ctx context.Context, req ReportRequest) (ReportResponse, error)
 	CommandResult(ctx context.Context, req CommandResultRequest) error
 	Manifest(ctx context.Context, req ManifestRequest) (ManifestResponse, error)
+	Blob(ctx context.Context, req BlobRequest) (BlobResponse, error)
 }
 
 var _ API = (*Client)(nil)

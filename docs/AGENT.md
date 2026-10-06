@@ -122,7 +122,7 @@ Modules:
 | `Policy` | 见 §4（本地根信任，远端无法放宽） |
 | `Panel` | 见「机器模式节点」一节 |
 | `Terminal` | `Enabled`（缺省 **true**）、`MaxSessions`（≤2）、`IdleTimeoutS`、`MaxDurationS` |
-| `Files` | `Roots`、`Unrestricted`、`AllowExec` |
+| `Files` | `Roots`、`Unrestricted`、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
@@ -471,7 +471,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 同一个命令 id 在两条通道上只会执行一次、只回一次结果。命令注册表里的类型就是白名单，**未注册的类型一律回 `failed` 且 `result.error="unsupported command"`，不执行**。`refresh` 与 `dump_state` 是内建类型（需要拉取循环与最近一次报告，仍由 `agent/panelclient` 实现），其余由 `agent/opscmd` 提供。
 
-**长命令**（当前只有 `kernel_install`；后续的 `self_update`、`files_apply` 也是）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
+**长命令**（`kernel_install`、`files_apply`；后续的 `self_update` 也是）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
 
 | type | args | 行为与结果 |
 |---|---|---|
@@ -480,6 +480,9 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 与 `xray` 一律拒绝（见下）。 |
+| `files_apply` | `{}` | 长命令。对**最近一次 desired 的 `files` 段**执行：下载 blob（按 sha256，命中缓存不重复下载）→ 暂存 → 校验 → 原子替换（先留 `last_good`）→ 重载。结果 `{status, files[], reload, applied_pending?, errors?, reason?, rolled_back?}`。 |
+| `files_validate` | `{}` | 只暂存 + 校验，**不写任何受管文件、不重载**。结果同 `files_apply`（`reload:"not_needed"`）。 |
+| `files_rollback` | `{}` | 用 `last_good` 快照恢复受管文件并重载。结果 `{status:"rolled_back", rolled_back:true, files[], reload}`。 |
 
 细节与边界：
 
@@ -492,6 +495,21 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 - **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
 - **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
 - **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
+
+### 受管文件（`files_apply` / `files_validate` / `files_rollback`）
+
+受管文件是面板可以下发的 **xray 文件**，内容走 HTTPS（`GET /api/v2/server/machine/agent/file/<sha256>`），desired 里只有 `{name, sha256, size, kernel}`（契约 §7-1/§7-9）：
+
+- **固定白名单与固定目录**：`config.yml`、`route.json`、`custom_inbound.json`、`custom_outbound.json`、`dns.json`、`geoip.dat`、`geosite.dat`，只写在 xray 配置目录。名字必须是纯文件名：`../evil`、绝对路径、`sub/route.json`、`agent.yml`、状态文件一律拒绝，命令不执行。
+- **`config.yml` 只在 `agent.yml` 分离布局下可写**（契约 §7-2）：否则该文件就是 agent 自己的配置，面板写它等于让 agent 自杀。这种情况下 agent 不声明 `files` 能力，面板也就不会下发。
+- **校验先于替换**：四个 JSON 先逐个 `core.CheckFiles`，再用**整实例预检**（`core.New` 只构造、不 `Start`，因此**不绑端口**）抓组合错误；`config.yml` 走完整 `LoadConfig`。校验不过 → 一个受管文件都不动、不重载，回 `status:"invalid"` 与带文件名/规则序号的错误。
+- **blob 完整性**：边写边算 sha256，与 desired 的 `sha256`/`size` 不符**不落缓存、不替换**；`If-None-Match` 拿到 304 而本地又没有缓存时重取一次。单文件上限默认 64 MiB（`Files.MaxBytes` 可改；设为负值 = 本机禁用 geo 下发，回显式原因而不是静默跳过）。
+- **原子替换与回滚**：替换前把当前文件快照成 `last_good`（缺失的文件记为"缺失"，回滚时删掉），替换走同目录临时文件 + `rename`。重载被拒（`LoadConfig` 失败）→ 恢复 `last_good` 并回 `status:"rolled_back"`。
+- **geo-only 变更不重载**：`geoip.dat`/`geosite.dat` 由 xray 在规则求值时按需读取，替换后回 `reload:"not_needed"`（契约 §7-9 的 `applied_pending` 只在真正发起重载时出现）。
+- **幂等**：磁盘上已是同一 `sha256` 的文件不下载、不替换、不重载（`files[].skipped=true`、`bytes=0`），并把该集合记进 `<StateDir>/filesync/applied.json`。
+- **健康判定在面板侧**：agent **不在进程内等健康**。`files_apply` 在重载发起后回 `done{applied_pending:true}`，随后由面板按 `hello`/`telemetry`（60 s 内）与 `components.xray.state=running` 判定，必要时下发 `files_rollback`（契约 §7-9）。
+- **`hint{what:"files"}`** 触发同一套同步（等价于 `files_apply`）；本机没有受管文件层时回 `error{code:"not_supported"}`，不静默忽略（契约 §7-5）。
+- **事件**：应用成功发 `event{kind:"files.applied"}`，回滚发 `event{kind:"files.rolled_back"}`（契约 §7-10，只走 WebSocket）。
 
 ## 8 常见拒绝原因与排错
 

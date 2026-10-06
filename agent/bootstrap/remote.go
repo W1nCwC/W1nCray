@@ -13,6 +13,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/filesync"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
@@ -74,8 +75,45 @@ type RemoteOptions struct {
 	// defaults and clamps it.
 	ManifestInterval time.Duration
 
+	// Reloader rebuilds the xray instance after the managed files changed. It
+	// is the panel's ReloadForAgent (bootstrap must not import panel); nil
+	// leaves the managed-file layer without a reload, so an apply that needs
+	// one is refused instead of half-applied.
+	Reloader filesync.Reloader
+	// FilesValidator pre-checks a staged managed-file set. It is the panel's
+	// validator (it owns the live core options); nil leaves the layer without a
+	// validator, so every apply is refused.
+	FilesValidator filesync.Validator
+
 	// HTTP replaces the HTTP client (tests).
 	HTTP *http.Client
+}
+
+// filesSource adapts a Runtime to filesync.Source: the managed files of the
+// desired state the reconciler last applied.
+type filesSource struct{ rt *Runtime }
+
+func (s filesSource) DesiredFiles() []spec.FileRef {
+	if s.rt == nil || s.rt.Reconciler == nil {
+		return nil
+	}
+	return s.rt.Reconciler.LastDesired().Files
+}
+
+// blobFetcher adapts the panel HTTP client to filesync.BlobFetcher. The client
+// validates the sha256, sends If-None-Match and enforces the transport limit;
+// the applier re-hashes what comes back before anything is written.
+type blobFetcher struct{ api *panelclient.Client }
+
+func (f blobFetcher) Fetch(ctx context.Context, sha string) ([]byte, bool, error) {
+	res, err := f.api.Blob(ctx, panelclient.BlobRequest{SHA256: sha})
+	if err != nil {
+		return nil, false, err
+	}
+	if res.NotModified {
+		return nil, true, nil
+	}
+	return res.Raw, false, nil
 }
 
 // remoteApplier adapts a Runtime to panelclient.Applier.
@@ -183,6 +221,22 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	if r.Ops != nil {
 		ro.Commands = r.Ops
 	}
+	// The managed-file layer (D4/D5) is completed now: its blob fetcher is this
+	// link's HTTP client and its desired-state source is this runtime. It is
+	// installed on the registry, so files_apply / files_validate /
+	// files_rollback answer "not_supported" until this point and are served
+	// from here on.
+	if r.Files != nil && r.Files.Enabled() && r.Ops != nil {
+		r.Files.applier.SetFetch(blobFetcher{api: client})
+		r.Files.applier.SetSource(filesSource{rt: r})
+		if o.Reloader != nil {
+			r.Files.applier.SetReload(o.Reloader)
+		}
+		if o.FilesValidator != nil {
+			r.Files.applier.SetValidator(o.FilesValidator)
+		}
+		r.Ops.SetFiles(r.Files)
+	}
 	// The declared capabilities travel in /config only when the WebSocket
 	// channel (which is what declares them) is running.
 	if o.WS && streams != nil {
@@ -231,6 +285,12 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		agentOpts.InstanceID = runner.InstanceID()
 		agentOpts.AgentVersion = o.AgentVersion
 		agentOpts.Commands = commands
+		// The files hint applies the managed files; nil when the local policy
+		// has no xray directory to manage (the hint then answers
+		// not_supported, ruling 5).
+		if r.Files != nil && r.Files.Enabled() {
+			agentOpts.Files = r.Files
+		}
 		// The nodes hint is always wired, so it is never silently ignored; the
 		// local module gate lives inside the hook (ruling 6).
 		agentOpts.Nodes = o.WSNodes

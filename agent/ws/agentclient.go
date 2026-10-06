@@ -67,6 +67,13 @@ type NodeToggle interface {
 	SyncXrayNodes(ctx context.Context) error
 }
 
+// FileSync applies the managed files of the last desired state (D4/D5). A nil
+// value means "not wired": a "files" hint is answered with not_supported
+// instead of being ignored (protocol ruling 5).
+type FileSync interface {
+	SyncFiles(ctx context.Context) error
+}
+
 // AgentOptions configures NewAgent.
 type AgentOptions struct {
 	// Streams supplies hello, telemetry and components. It may be nil, in
@@ -76,6 +83,8 @@ type AgentOptions struct {
 	Commands Commands
 	// Nodes is the D3 hook. It may be nil.
 	Nodes NodeToggle
+	// Files is the managed-file hook (a "files" hint). It may be nil.
+	Files FileSync
 	// Log receives the agent's events.
 	Log driver.Logger
 	// InstanceID is reported in hello.instance_id.
@@ -91,6 +100,7 @@ type Agent struct {
 	streams    Streams
 	commands   Commands
 	nodes      NodeToggle
+	files      FileSync
 	log        driver.Logger
 	instanceID string
 	version    string
@@ -119,6 +129,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		streams:    a.Streams,
 		commands:   a.Commands,
 		nodes:      a.Nodes,
+		files:      a.Files,
 		log:        a.Log,
 		instanceID: a.InstanceID,
 		version:    a.AgentVersion,
@@ -453,7 +464,10 @@ func (a *Agent) replyResult(id, status string, result any, msg string) {
 //
 // It runs in the reader goroutine: "desired" only wakes the pull loop, and
 // "nodes" must hand the pull to the node controller rather than performing a
-// long HTTP fetch inline, or the reader would stop reading.
+// long HTTP fetch inline, or the reader would stop reading. The "files" hint is
+// the exception: it is a managed-file apply (download, validate, replace,
+// reload) and the reader must not block on it, so it runs in its own goroutine
+// and reports its outcome through the event channel and the log.
 func (a *Agent) onHint(what string) {
 	switch what {
 	case "desired":
@@ -476,6 +490,27 @@ func (a *Agent) onHint(what string) {
 		if err := a.nodes.SyncXrayNodes(ctx); err != nil {
 			a.logf().Warnf("ws: xray nodes hint refused: %v", err)
 		}
+	case "files":
+		if a.files == nil {
+			return
+		}
+		a.cmdMu.Lock()
+		ctx := a.cmdCtx
+		a.cmdMu.Unlock()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		// The apply is long (up to tens of megabytes) and must not block the
+		// frame reader: a second hint arriving while one runs is dropped by the
+		// applier's own serialisation.
+		go func() {
+			if err := a.files.SyncFiles(ctx); err != nil {
+				a.logf().Warnf("ws: files hint refused: %v", err)
+				a.SendEvent("files.apply_failed", "warn", err.Error())
+				return
+			}
+			a.SendEvent("files.applied", "info", "managed files applied from the files hint")
+		}()
 	}
 }
 
