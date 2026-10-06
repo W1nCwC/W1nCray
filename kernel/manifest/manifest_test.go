@@ -168,9 +168,36 @@ func TestNoKeys(t *testing.T) {
 	if _, err := Verify(raw, VerifyOptions{Now: now}); !errors.Is(err, kernel.ErrNoTrustedKeys) {
 		t.Fatalf("got %v", err)
 	}
-	// the shipped placeholder list is empty: fail-closed
+	// an empty trust list is fail-closed (independent of what this build ships)
+	withTrustedKeysFile(t, "# no keys\n")
 	if _, err := DefaultKeys(); !errors.Is(err, kernel.ErrNoTrustedKeys) {
-		t.Fatalf("DefaultKeys on placeholder file: %v", err)
+		t.Fatalf("DefaultKeys on an empty list: %v", err)
+	}
+}
+
+// withTrustedKeysFile swaps the embedded trust list for the duration of a test.
+func withTrustedKeysFile(t *testing.T, content string) {
+	t.Helper()
+	old := trustedKeysFile
+	trustedKeysFile = content
+	t.Cleanup(func() { trustedKeysFile = old })
+}
+
+// The shipped trust root is exactly the two production keys (primary + spare).
+// Changing it is a deliberate release decision, so a change must touch this test.
+func TestShippedTrustRoot(t *testing.T) {
+	keys, err := DefaultKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"280f5d33adf21274": true, "cb1ce38570e6a8b9": true}
+	if len(keys) != len(want) {
+		t.Fatalf("shipped trust root has %d keys, want %d", len(keys), len(want))
+	}
+	for _, k := range keys {
+		if !want[k.ID] {
+			t.Fatalf("unexpected trusted key id %s", k.ID)
+		}
 	}
 }
 
@@ -185,6 +212,7 @@ func TestParseKeys(t *testing.T) {
 	}
 	old := ExtraKeys
 	defer func() { ExtraKeys = old }()
+	withTrustedKeysFile(t, "# no embedded keys here\n")
 	ExtraKeys = hex.EncodeToString(pub)
 	if ks, err := DefaultKeys(); err != nil || len(ks) != 1 {
 		t.Fatalf("ExtraKeys: %v %v", ks, err)
