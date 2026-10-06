@@ -1,0 +1,31 @@
+# compose.w1ncray-ws.yaml — compose OVERRIDE that adds the W1nCray gateway.
+#
+# Installed by scripts/deploy-v9/30-gateway-service.sh as
+#   <panel root>/compose.w1ncray-ws.yaml
+# and applied as
+#   docker compose -f compose.yaml -f compose.w1ncray-ws.yaml up -d w1ncray-ws
+#
+# The base compose file is never edited, so the rollback is "stop the service and
+# delete this file".
+#
+# It copies the production `ws-server` service of compose.yaml (verified read-only on
+# 2026-10-07): same image, host network, the whole panel tree bind-mounted at /www,
+# php entrypoint, restart on failure, depends on redis. The panel's .env already has
+# CACHE_DRIVER=redis, which the single-use browser tickets need (the gateway is not the
+# web process). The gateway binds 127.0.0.1 only; nginx proxies /w1ncray-ws to it.
+#
+# Placeholders substituted by the script:
+#   @IMAGE@  the panel image (production: ghcr.io/cedar2025/xboard:new)
+#   @PORT@   the gateway port (default 8077; verified free on the panel host)
+services:
+  w1ncray-ws:
+    image: @IMAGE@
+    volumes:
+      - ./.docker/.data/redis/:/data/
+      - ./:/www/
+    network_mode: host
+    entrypoint: ["php", "/www/artisan", "w1ncray:ws-server", "start", "--host=127.0.0.1", "--port=@PORT@"]
+    restart: on-failure
+    init: true
+    depends_on:
+      - redis
