@@ -461,3 +461,35 @@ func TestTerminalEnabledSemantics(t *testing.T) {
 		}
 	}
 }
+
+// TestSeparatedLayout covers the managed-file gate of ruling 2: config.yml is
+// only writable by the panel when the agent's own configuration lives in
+// agent.yml. The rule is read from the file that won (SetSource) and, for
+// callers that run before LoadConfig, from the file's presence.
+func TestSeparatedLayout(t *testing.T) {
+	dir, path := configPath(t)
+
+	// No agent.yml: the config.yml block is the agent's own configuration.
+	cfg := &Config{Enabled: true}
+	cfg.SetSource(SourceConfig)
+	if cfg.SeparatedLayout() {
+		t.Error("SeparatedLayout = true with the config.yml block")
+	}
+	if Separated(path) {
+		t.Error("Separated = true without an agent.yml")
+	}
+	if (&Config{}).SeparatedLayout() || ((*Config)(nil)).SeparatedLayout() {
+		t.Error("the zero value must not claim the separated layout")
+	}
+
+	// agent.yml present: it wins as a whole, so config.yml only carries the
+	// xray settings and may be managed.
+	writeFile(t, filepath.Join(dir, FileName), "Enabled: true\nStateDir: state\n")
+	cfg.SetSource(SourceAgentYML)
+	if !cfg.SeparatedLayout() {
+		t.Error("SeparatedLayout = false with agent.yml in charge")
+	}
+	if !Separated(path) {
+		t.Error("Separated = false although agent.yml exists")
+	}
+}

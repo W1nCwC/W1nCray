@@ -16,10 +16,14 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 )
 
-// FileOps is the confined file manager the file_* commands need. It is declared
-// here so this package does not import a concrete implementation and so tests
-// can substitute a fake.
-type FileOps interface {
+// FileCmdOps is the confined file manager the file_* commands need. It is
+// declared here so this package does not import a concrete implementation and
+// so tests can substitute a fake.
+//
+// It is NOT the managed-file surface (FilesOps, files_apply and friends): the
+// two features only share the "files" capability name in the contract, and
+// their implementations (agent/fileops vs agent/filesync) are unrelated.
+type FileCmdOps interface {
 	List(ctx context.Context, root, path string) ([]fileops.Entry, error)
 	Read(ctx context.Context, root, path string, offset, limit int64) (fileops.ReadResult, error)
 	Write(ctx context.Context, root, path string, data []byte, mode os.FileMode, wantSHA string) (fileops.WriteResult, error)
@@ -40,11 +44,11 @@ type fileCmds struct {
 	deps Deps
 }
 
-// registerFiles adds the file_* commands. It is called by bootstrap once the
+// registerFileCmds adds the file_* commands. It is called by bootstrap once the
 // local policy has been resolved; a machine without file roots simply never
 // registers them (the commands then answer "unsupported command", and the
 // "files" capability is not declared either).
-func registerFiles(r *Registry, d Deps) error {
+func registerFileCmds(r *Registry, d Deps) error {
 	f := &fileCmds{reg: r, deps: d}
 	for _, c := range []struct {
 		typ string
@@ -62,18 +66,19 @@ func registerFiles(r *Registry, d Deps) error {
 	return nil
 }
 
-// RegisterFiles is the additive hook bootstrap calls to make the file commands
-// exist. It refuses a nil or rootless manager: registering commands that cannot
-// serve anything would make the panel offer a feature the machine does not have
-// (protocol ruling 1).
-func RegisterFiles(r *Registry, ops FileOps) error {
+// RegisterFileCmds is the additive hook bootstrap calls to make the file_*
+// commands exist. It refuses a nil or rootless manager: registering commands
+// that cannot serve anything would make the panel offer a feature the machine
+// does not have (protocol ruling 1). It is separate from the managed-file
+// commands (files_apply and friends), which New registers itself.
+func RegisterFileCmds(r *Registry, ops FileCmdOps) error {
 	if r == nil {
 		return errors.New("opscmd: nil registry")
 	}
 	if ops == nil || len(ops.RootNames()) == 0 {
 		return errors.New("opscmd: the file commands need at least one configured root")
 	}
-	return registerFiles(r, Deps{Files: ops, Log: r.logf()})
+	return registerFileCmds(r, Deps{FileCmds: ops, Log: r.logf()})
 }
 
 // ---- args ------------------------------------------------------------------
@@ -128,11 +133,11 @@ type fileDeleteResult struct {
 
 // ---- handlers --------------------------------------------------------------
 
-func (f *fileCmds) ops() (FileOps, error) {
-	if f.deps.Files == nil {
+func (f *fileCmds) ops() (FileCmdOps, error) {
+	if f.deps.FileCmds == nil {
 		return nil, coded("not_supported", errors.New("file operations are not wired on this agent"))
 	}
-	return f.deps.Files, nil
+	return f.deps.FileCmds, nil
 }
 
 func (f *fileCmds) fileList(ctx context.Context, req Request, complete Completion) (Result, error) {

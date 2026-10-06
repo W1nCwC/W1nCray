@@ -53,6 +53,32 @@ type KernelCfg struct {
 	// Targets maps manifest target keys to upstream assets; null (or an
 	// empty value) marks the kernel unavailable on that platform.
 	Targets map[string]*TargetCfg `yaml:"targets"`
+	// Local lists builds that are already on this machine instead of in a
+	// GitHub release (release/build.sh writes dist/W1nCray-linux-<arch>.gz).
+	// Their hashes are computed from the file on disk; there is no upstream
+	// claim to cross-check, which is why they exist only for artifacts built
+	// and hashed on the machine running manifestgen.
+	Local []LocalAssetCfg `yaml:"local"`
+}
+
+// LocalAssetCfg is one build produced by the release scripts in this
+// repository, described by its path on disk.
+type LocalAssetCfg struct {
+	// File is the archive path (dist/W1nCray-linux-amd64.gz).
+	File string `yaml:"file"`
+	// Target is the manifest platform key, e.g. linux/amd64.
+	Target string `yaml:"target"`
+	// To is the installed file name; empty means run.binary.
+	To string `yaml:"to"`
+	// From is the member name. A raw gz stream has none, so it defaults to
+	// the archive's base name; tar.gz/zip builds must set it explicitly.
+	From string `yaml:"from"`
+	// Mode is the installed file mode; empty means 0755.
+	Mode string `yaml:"mode"`
+	// Archive overrides the format inferred from File's extension.
+	Archive string `yaml:"archive"`
+	// Variant is the manifest variant token (softfloat, musl-full, ...).
+	Variant string `yaml:"variant"`
 }
 
 // LicenseCfg, RunCfg and RevokedCfg mirror the manifest types with YAML keys.
@@ -120,13 +146,17 @@ func (c *Config) check() error {
 	for i := range c.Kernels {
 		k := &c.Kernels[i]
 		k.Version = strings.TrimPrefix(k.Version, "v")
-		if k.Name == "" || k.Version == "" || k.Repo == "" {
-			return fmt.Errorf("kernel #%d: name, version and repo are required", i+1)
+		if k.Name == "" || k.Version == "" {
+			return fmt.Errorf("kernel #%d: name and version are required", i+1)
 		}
-		if k.Tag == "" {
+		local := len(k.Local) > 0
+		if k.Repo == "" && !local {
+			return fmt.Errorf("%s: repo is required for GitHub-backed kernels", k.Name)
+		}
+		if k.Tag == "" && k.Repo != "" {
 			k.Tag = "v" + k.Version
 		}
-		if k.License.SourceURL == "" {
+		if k.License.SourceURL == "" && k.Repo != "" {
 			k.License.SourceURL = "https://github.com/" + k.Repo
 		}
 		if k.Channel == "" {
@@ -135,12 +165,21 @@ func (c *Config) check() error {
 		if k.MinAgent == "" {
 			k.MinAgent = c.MinAgent
 		}
-		if len(k.Targets) == 0 {
+		if len(k.Targets) == 0 && !local {
 			return fmt.Errorf("%s: no targets", k.Name)
 		}
 		for key, t := range k.Targets {
 			if t != nil && t.Asset == "" {
 				k.Targets[key] = nil // "linux/riscv64:" with no body means unavailable
+			}
+		}
+		for j := range k.Local {
+			la := &k.Local[j]
+			if la.File == "" || la.Target == "" {
+				return fmt.Errorf("%s: local #%d needs file and target", k.Name, j+1)
+			}
+			if _, dup := k.Targets[la.Target]; dup {
+				return fmt.Errorf("%s: target %s is declared both in targets and local", k.Name, la.Target)
 			}
 		}
 	}

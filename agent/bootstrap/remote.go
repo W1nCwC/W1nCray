@@ -13,9 +13,11 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/filesync"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
 	"github.com/W1nCwC/W1nCray/agent/ws"
@@ -74,8 +76,50 @@ type RemoteOptions struct {
 	// defaults and clamps it.
 	ManifestInterval time.Duration
 
+	// Reloader rebuilds the xray instance after the managed files changed. It
+	// is the panel's ReloadForAgent (bootstrap must not import panel); nil
+	// leaves the managed-file layer without a reload, so an apply that needs
+	// one is refused instead of half-applied.
+	Reloader filesync.Reloader
+	// FilesValidator pre-checks a staged managed-file set. It is the panel's
+	// validator (it owns the live core options); nil leaves the layer without a
+	// validator, so every apply is refused.
+	FilesValidator filesync.Validator
+
 	// HTTP replaces the HTTP client (tests).
 	HTTP *http.Client
+
+	// OnRestart asks the process owner to exit so the binary that a committed
+	// self_update put in place takes over. Without it the self_update command
+	// is not registered and the upgrade capability is not declared.
+	OnRestart func()
+}
+
+// filesSource adapts a Runtime to filesync.Source: the managed files of the
+// desired state the reconciler last applied.
+type filesSource struct{ rt *Runtime }
+
+func (s filesSource) DesiredFiles() []spec.FileRef {
+	if s.rt == nil || s.rt.Reconciler == nil {
+		return nil
+	}
+	return s.rt.Reconciler.LastDesired().Files
+}
+
+// blobFetcher adapts the panel HTTP client to filesync.BlobFetcher. The client
+// validates the sha256, sends If-None-Match and enforces the transport limit;
+// the applier re-hashes what comes back before anything is written.
+type blobFetcher struct{ api *panelclient.Client }
+
+func (f blobFetcher) Fetch(ctx context.Context, sha string) ([]byte, bool, error) {
+	res, err := f.api.Blob(ctx, panelclient.BlobRequest{SHA256: sha})
+	if err != nil {
+		return nil, false, err
+	}
+	if res.NotModified {
+		return nil, true, nil
+	}
+	return res.Raw, false, nil
 }
 
 // remoteApplier adapts a Runtime to panelclient.Applier.
@@ -165,6 +209,15 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		}
 	}
 
+	// Self-update start-up: a process that came out of a committed update has
+	// to prove itself. It confirms once the panel answered (OnConnected) and
+	// reports self_update.stalled when that never happens; it never rolls
+	// itself back, because a panel outage is not a broken binary (ruling 11).
+	var startup *selfupdate.Startup
+	if r.Updater != nil {
+		startup = r.Updater.BeginStartup()
+	}
+
 	ro := panelclient.RunnerOptions{
 		AgentVersion:   o.AgentVersion,
 		Engines:        r.engineNames(),
@@ -177,11 +230,35 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		// disconnect clears Connected() at once and the host comes back
 		// (design section 3.3).
 		SuppressHost: func() bool { return wsClient != nil && wsClient.Connected() },
+		OnConnected: func() {
+			if startup == nil {
+				return
+			}
+			if err := startup.Confirm(); err != nil {
+				log.Warnf("bootstrap: confirming the self-update: %v", err)
+			}
+		},
 	}
 	// The operations registry serves every command the Runner does not
 	// implement itself, over both channels (design section 2.1).
 	if r.Ops != nil {
 		ro.Commands = r.Ops
+	}
+	// The managed-file layer (D4/D5) is completed now: its blob fetcher is this
+	// link's HTTP client and its desired-state source is this runtime. It is
+	// installed on the registry, so files_apply / files_validate /
+	// files_rollback answer "not_supported" until this point and are served
+	// from here on.
+	if r.Files != nil && r.Files.Enabled() && r.Ops != nil {
+		r.Files.applier.SetFetch(blobFetcher{api: client})
+		r.Files.applier.SetSource(filesSource{rt: r})
+		if o.Reloader != nil {
+			r.Files.applier.SetReload(o.Reloader)
+		}
+		if o.FilesValidator != nil {
+			r.Files.applier.SetValidator(o.FilesValidator)
+		}
+		r.Ops.SetFiles(r.Files)
 	}
 	// The declared capabilities travel in /config only when the WebSocket
 	// channel (which is what declares them) is running.
@@ -203,6 +280,15 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		ro.Manifest = r.Kernels
 		ro.ManifestPersistPath = o.ManifestPersistPath
 		ro.ManifestInterval = o.ManifestInterval
+	}
+	// self_update is registered here, not in Boot: it needs the restart hook
+	// the process owner supplies, and a machine that cannot replace its own
+	// executable must not declare the capability. A registration failure
+	// leaves the command unregistered, which the panel sees as "unsupported".
+	if r.Ops != nil && r.Updater != nil && r.upgradeReady && o.OnRestart != nil {
+		if err := opscmd.RegisterSelfUpdate(r.Ops, r.Updater, o.OnRestart); err != nil {
+			log.Warnf("bootstrap: self_update is not available: %v", err)
+		}
 	}
 	runner, err := panelclient.NewRunner(client, remoteApplier{r}, ro)
 	if err != nil {
@@ -231,6 +317,12 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		agentOpts.InstanceID = runner.InstanceID()
 		agentOpts.AgentVersion = o.AgentVersion
 		agentOpts.Commands = commands
+		// The files hint applies the managed files; nil when the local policy
+		// has no xray directory to manage (the hint then answers
+		// not_supported, ruling 5).
+		if r.Files != nil && r.Files.Enabled() {
+			agentOpts.Files = r.Files
+		}
 		// The nodes hint is always wired, so it is never silently ignored; the
 		// local module gate lives inside the hook (ruling 6).
 		agentOpts.Nodes = o.WSNodes
@@ -265,6 +357,15 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		if r.Terminal != nil {
 			r.Terminal.SetAuditor(terminalAuditor{events: wsAgent, log: log})
 		}
+		// A rollback the respawn helper performed before this process started
+		// is reported once, now that there is a channel (ruling 10).
+		if startup != nil && r.Ops != nil {
+			if rb, ok := startup.TakeRollback(); ok {
+				msg := fmt.Sprintf("version %s was rolled back: %s", rb.Version, rb.Reason)
+				log.Warnf("bootstrap: self_update.rolled_back: %s", msg)
+				r.Ops.EmitEvent("self_update.rolled_back", "warn", msg)
+			}
+		}
 	}
 
 	// The WebSocket and the HTTP link run on separate contexts so stop can end
@@ -278,6 +379,16 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	)
 	if wsAgent != nil {
 		wsCtx, cancelWS = context.WithCancel(runCtx)
+	}
+	// A pending update that never reaches the panel is reported, never rolled
+	// back (protocol ruling 11).
+	if startup != nil {
+		go startup.WatchStalled(runCtx, func(kind, level, message string) {
+			log.Warnf("bootstrap: %s: %s", kind, message)
+			if r.Ops != nil {
+				r.Ops.EmitEvent(kind, level, message)
+			}
+		})
 	}
 
 	runnerDone := make(chan struct{})

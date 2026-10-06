@@ -54,6 +54,7 @@ func (c *Controller) deviceReporter() {
 	defer t.Stop()
 	var last string
 	var lastSent time.Time
+	var sentNonEmpty bool // the last HTTP report listed users
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -86,11 +87,12 @@ func (c *Controller) deviceReporter() {
 			if !force && time.Since(lastSent) < devicesHTTPGap {
 				continue // picked up by a later tick
 			}
-			// HTTP alive only updates the users it lists, so an empty
-			// snapshot changes nothing there: users who went offline
-			// expire on the panel after its TTL. Only the WebSocket
-			// report can remove them immediately.
-			if len(snapshot) > 0 {
+			// The panel treats an HTTP alive report as this node's full
+			// snapshot (users no longer listed are removed at once), so an
+			// emptied snapshot is sent once to clear the last users. Older
+			// panels only update the users listed and ignore the empty body;
+			// there the entries expire after the panel's TTL.
+			if len(snapshot) > 0 || sentNonEmpty {
 				ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 				err := c.api.PushAlive(ctx, snapshot)
 				cancel()
@@ -98,6 +100,7 @@ func (c *Controller) deviceReporter() {
 					c.log.Errorf("report online IPs: %v", err)
 					continue
 				}
+				sentNonEmpty = len(snapshot) > 0
 			}
 		}
 		last, lastSent = key, time.Now()

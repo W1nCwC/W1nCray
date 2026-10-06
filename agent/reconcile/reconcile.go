@@ -99,6 +99,10 @@ type Reconciler struct {
 	snapMu  sync.RWMutex
 	last    Report // outcome of the most recent Apply
 	hasLast bool
+	// desired is the desired state of the most recent Apply, kept so the
+	// managed-file commands can read its "files" section (the panel publishes
+	// the revision, then asks for it to be applied).
+	desired spec.Desired
 }
 
 // applied is an immutable record of a successfully applied desired state.
@@ -200,6 +204,19 @@ func (r *Reconciler) Last() (Report, bool) {
 	return r.last.clone(), r.hasLast
 }
 
+// LastDesired returns the desired state of the most recent Apply (the zero
+// value before the first one). It is what the managed-file commands read their
+// "files" section from; the returned slice is a copy, so a caller cannot mutate
+// the state the reconciler holds.
+func (r *Reconciler) LastDesired() spec.Desired {
+	r.snapMu.RLock()
+	defer r.snapMu.RUnlock()
+	d := r.desired
+	d.Files = append([]spec.FileRef(nil), r.desired.Files...)
+	d.Kernels = append([]spec.KernelPin(nil), r.desired.Kernels...)
+	return d
+}
+
 func (r *Reconciler) currentApplied() *applied {
 	r.snapMu.RLock()
 	defer r.snapMu.RUnlock()
@@ -223,6 +240,7 @@ func (r *Reconciler) Apply(ctx context.Context, d spec.Desired) (Report, error) 
 	scrubReport(&rep, r.secrets)
 	r.snapMu.Lock()
 	r.last, r.hasLast = rep.clone(), true
+	r.desired = d
 	r.snapMu.Unlock()
 	return rep, err
 }

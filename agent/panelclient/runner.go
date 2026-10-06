@@ -61,6 +61,7 @@ type API interface {
 	Report(ctx context.Context, req ReportRequest) (ReportResponse, error)
 	CommandResult(ctx context.Context, req CommandResultRequest) error
 	Manifest(ctx context.Context, req ManifestRequest) (ManifestResponse, error)
+	Blob(ctx context.Context, req BlobRequest) (BlobResponse, error)
 }
 
 var _ API = (*Client)(nil)
@@ -161,6 +162,10 @@ type RunnerOptions struct {
 	// success. It defaults to DefaultManifestInterval and is clamped to
 	// [MinManifestInterval, MaxManifestInterval].
 	ManifestInterval time.Duration
+	// OnConnected, when non-nil, is called exactly once, from the pull loop,
+	// after the panel answered a /config request: the link is proven. The
+	// self-update start-up watchdog uses it to confirm a committed update.
+	OnConnected func()
 }
 
 // Runner pulls the desired state, applies it, acknowledges the outcome,
@@ -189,6 +194,10 @@ type Runner struct {
 	manifest      ManifestSink
 	manifestPath  string
 	manifestEvery time.Duration
+
+	// onConnected is called once, on the first successful pull.
+	onConnected   func()
+	connectedOnce sync.Once
 
 	refresh chan struct{} // capacity 1: coalesces refresh requests
 
@@ -238,6 +247,7 @@ func NewRunner(api API, app Applier, o RunnerOptions) (*Runner, error) {
 		manifest:      o.Manifest,
 		manifestPath:  o.ManifestPersistPath,
 		manifestEvery: ClampManifestInterval(o.ManifestInterval),
+		onConnected:   o.OnConnected,
 		refresh:       make(chan struct{}, 1),
 		seen:          map[string]struct{}{},
 		inflight:      map[string]bool{},
@@ -510,6 +520,11 @@ func (r *Runner) pullOnce(ctx context.Context) error {
 	resp, err := r.api.Config(ctx, req)
 	if err != nil {
 		return err
+	}
+	if r.onConnected != nil {
+		// The panel answered: the link is proven. Called at most once, even
+		// when every later pull succeeds too.
+		r.connectedOnce.Do(r.onConnected)
 	}
 
 	if !resp.Unchanged {

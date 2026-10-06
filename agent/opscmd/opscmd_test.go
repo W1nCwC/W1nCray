@@ -86,11 +86,17 @@ func decodeFailure(t *testing.T, res json.RawMessage) failure {
 
 // TestRegistryWhitelistIsTheRegisteredTypes covers the framework contract: the
 // whitelist is exactly the registered types, and an unknown type is answered
-// with the historical "unsupported command" failure, never executed.
+// with the historical "unsupported command" failure, never executed. The file
+// commands are registered too: a registry without a file applier answers them
+// with an explicit not_supported rather than pretending the type does not
+// exist (protocol ruling 5).
 func TestRegistryWhitelistIsTheRegisteredTypes(t *testing.T) {
 	reg := mustRegistry(t, Deps{})
 	want := []string{
 		panelclient.CmdComponentRestart,
+		panelclient.CmdFilesApply,
+		panelclient.CmdFilesRollback,
+		panelclient.CmdFilesValidate,
 		panelclient.CmdKernelInstall,
 		panelclient.CmdKernelList,
 		panelclient.CmdKernelRemove,

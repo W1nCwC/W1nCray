@@ -13,11 +13,11 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 )
 
-// fakeFiles is the FileOps surface with no disk behind it. The confinement
+// fakeFileCmds is the FileCmdOps surface with no disk behind it. The confinement
 // rules themselves are covered by agent/fileops's table-driven tests; here the
 // command layer is what is under test: argument decoding, base64, size limits
 // and the error codes the panel branches on.
-type fakeFiles struct {
+type fakeFileCmds struct {
 	entries   []fileops.Entry
 	read      fileops.ReadResult
 	write     fileops.WriteResult
@@ -39,7 +39,7 @@ type fakeFiles struct {
 	roots     []string
 }
 
-func (f *fakeFiles) List(ctx context.Context, root, path string) ([]fileops.Entry, error) {
+func (f *fakeFileCmds) List(ctx context.Context, root, path string) ([]fileops.Entry, error) {
 	f.gotRoot, f.gotPath = root, path
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -47,7 +47,7 @@ func (f *fakeFiles) List(ctx context.Context, root, path string) ([]fileops.Entr
 	return f.entries, nil
 }
 
-func (f *fakeFiles) Read(ctx context.Context, root, path string, offset, limit int64) (fileops.ReadResult, error) {
+func (f *fakeFileCmds) Read(ctx context.Context, root, path string, offset, limit int64) (fileops.ReadResult, error) {
 	f.gotRoot, f.gotPath, f.gotOffset, f.gotLimit = root, path, offset, limit
 	if f.readErr != nil {
 		return fileops.ReadResult{}, f.readErr
@@ -55,7 +55,7 @@ func (f *fakeFiles) Read(ctx context.Context, root, path string, offset, limit i
 	return f.read, nil
 }
 
-func (f *fakeFiles) Write(ctx context.Context, root, path string, data []byte, mode os.FileMode, wantSHA string) (fileops.WriteResult, error) {
+func (f *fakeFileCmds) Write(ctx context.Context, root, path string, data []byte, mode os.FileMode, wantSHA string) (fileops.WriteResult, error) {
 	f.gotRoot, f.gotPath, f.gotData, f.gotMode, f.gotSHA = root, path, data, mode, wantSHA
 	if f.writeErr != nil {
 		return fileops.WriteResult{}, f.writeErr
@@ -63,7 +63,7 @@ func (f *fakeFiles) Write(ctx context.Context, root, path string, data []byte, m
 	return f.write, nil
 }
 
-func (f *fakeFiles) Delete(ctx context.Context, root, path string) error {
+func (f *fakeFileCmds) Delete(ctx context.Context, root, path string) error {
 	f.deleted = append(f.deleted, root+":"+path)
 	if f.deleteErr != nil {
 		return f.deleteErr
@@ -71,15 +71,15 @@ func (f *fakeFiles) Delete(ctx context.Context, root, path string) error {
 	return nil
 }
 
-func (f *fakeFiles) RootNames() []string {
+func (f *fakeFileCmds) RootNames() []string {
 	if f.roots == nil {
 		return []string{"xray", "state"}
 	}
 	return f.roots
 }
-func (f *fakeFiles) MaxRead() int64  { return orDefault(f.maxRead, fileops.DefaultMaxRead) }
-func (f *fakeFiles) MaxWrite() int64 { return orDefault(f.maxWrite, fileops.DefaultMaxWrite) }
-func (f *fakeFiles) Unrestricted() bool {
+func (f *fakeFileCmds) MaxRead() int64  { return orDefault(f.maxRead, fileops.DefaultMaxRead) }
+func (f *fakeFileCmds) MaxWrite() int64 { return orDefault(f.maxWrite, fileops.DefaultMaxWrite) }
+func (f *fakeFileCmds) Unrestricted() bool {
 	return false
 }
 
@@ -91,30 +91,30 @@ func orDefault(v, def int64) int64 {
 }
 
 // filesRegistry builds a registry with the file commands registered.
-func filesRegistry(t *testing.T, files FileOps) *Registry {
+func filesRegistry(t *testing.T, files FileCmdOps) *Registry {
 	t.Helper()
 	r := mustRegistry(t, Deps{})
-	if err := RegisterFiles(r, files); err != nil {
-		t.Fatalf("RegisterFiles: %v", err)
+	if err := RegisterFileCmds(r, files); err != nil {
+		t.Fatalf("RegisterFileCmds: %v", err)
 	}
 	return r
 }
 
-// TestRegisterFilesNeedsRoots covers the promise rule: a machine without a
+// TestRegisterFileCmdsNeedsRoots covers the promise rule: a machine without a
 // configured root must not expose the file commands at all.
-func TestRegisterFilesNeedsRoots(t *testing.T) {
+func TestRegisterFileCmdsNeedsRoots(t *testing.T) {
 	r := mustRegistry(t, Deps{})
-	if err := RegisterFiles(r, nil); err == nil {
-		t.Error("RegisterFiles(nil) succeeded")
+	if err := RegisterFileCmds(r, nil); err == nil {
+		t.Error("RegisterFileCmds(nil) succeeded")
 	}
-	if err := RegisterFiles(r, &fakeFiles{roots: []string{}}); err == nil {
-		t.Error("RegisterFiles without roots succeeded")
+	if err := RegisterFileCmds(r, &fakeFileCmds{roots: []string{}}); err == nil {
+		t.Error("RegisterFileCmds without roots succeeded")
 	}
 	if r.Has(panelclient.CmdFileList) {
-		t.Error("file_list is registered after a refused RegisterFiles")
+		t.Error("file_list is registered after a refused RegisterFileCmds")
 	}
-	if err := RegisterFiles(r, &fakeFiles{}); err != nil {
-		t.Fatalf("RegisterFiles with roots: %v", err)
+	if err := RegisterFileCmds(r, &fakeFileCmds{}); err != nil {
+		t.Fatalf("RegisterFileCmds with roots: %v", err)
 	}
 	for _, typ := range []string{panelclient.CmdFileList, panelclient.CmdFileRead, panelclient.CmdFileWrite, panelclient.CmdFileDelete} {
 		if !r.Has(typ) {
@@ -127,7 +127,7 @@ func TestRegisterFilesNeedsRoots(t *testing.T) {
 // the configured roots travel with the answer, and a refused path carries the
 // machine-readable code.
 func TestFileListDecodesAndReports(t *testing.T) {
-	files := &fakeFiles{entries: []fileops.Entry{{Name: "config.yml", Type: "file", Size: 12, Mode: "0644", MTime: 1700000000}}}
+	files := &fakeFileCmds{entries: []fileops.Entry{{Name: "config.yml", Type: "file", Size: 12, Mode: "0644", MTime: 1700000000}}}
 	r := filesRegistry(t, files)
 
 	status, res := r.Execute(context.Background(), panelclient.Command{Type: panelclient.CmdFileList, Args: json.RawMessage(`{"root":"xray"}`)})
@@ -172,7 +172,7 @@ func TestFileListDecodesAndReports(t *testing.T) {
 // the offset/limit reach the manager, and a limit over the local maximum is
 // refused before any read.
 func TestFileReadBase64AndLimits(t *testing.T) {
-	files := &fakeFiles{read: fileops.ReadResult{Data: []byte("hello"), Size: 5, EOF: true}}
+	files := &fakeFileCmds{read: fileops.ReadResult{Data: []byte("hello"), Size: 5, EOF: true}}
 	r := filesRegistry(t, files)
 
 	status, res := r.Execute(context.Background(), panelclient.Command{
@@ -224,7 +224,7 @@ func TestFileReadBase64AndLimits(t *testing.T) {
 // base64, the sha256 travels through, the mode is parsed, and an oversized or
 // malformed payload is refused before it reaches the manager.
 func TestFileWriteBase64HashAndMode(t *testing.T) {
-	files := &fakeFiles{write: fileops.WriteResult{Path: "/srv/xray/a.txt", SHA256: "abc", Size: 5, Created: true}}
+	files := &fakeFileCmds{write: fileops.WriteResult{Path: "/srv/xray/a.txt", SHA256: "abc", Size: 5, Created: true}}
 	r := filesRegistry(t, files)
 
 	body := base64.StdEncoding.EncodeToString([]byte("hello"))
@@ -333,7 +333,7 @@ func TestFileWriteRefusalsCarryCodes(t *testing.T) {
 	body := base64.StdEncoding.EncodeToString([]byte("x"))
 	for _, tc := range cases {
 		t.Run(tc.code, func(t *testing.T) {
-			files := &fakeFiles{writeErr: tc.err}
+			files := &fakeFileCmds{writeErr: tc.err}
 			r := filesRegistry(t, files)
 			status, res := r.Execute(context.Background(), panelclient.Command{
 				Type: panelclient.CmdFileWrite,
@@ -352,7 +352,7 @@ func TestFileWriteRefusalsCarryCodes(t *testing.T) {
 // TestFileDeleteRequiresRootAndPath covers file_delete's argument rules and the
 // not_regular mapping (a directory delete).
 func TestFileDeleteRequiresRootAndPath(t *testing.T) {
-	files := &fakeFiles{}
+	files := &fakeFileCmds{}
 	r := filesRegistry(t, files)
 
 	if status, res := r.Execute(context.Background(), panelclient.Command{

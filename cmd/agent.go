@@ -74,7 +74,13 @@ func runAgentApply(configPath, desiredFile string, out io.Writer) error {
 		ManifestPath:     cfg.Agent.ManifestPath,
 		ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 		Policy:           cfg.Agent.PolicySpec(),
-		Log:              log.StandardLogger(),
+		AgentConfig:      cfg.Agent,
+		// The managed-file layer has no blob fetcher without a panel link, so
+		// agent-apply never applies files; it still reports the same local
+		// policy as the service (the capability list is only sent over the
+		// panel link anyway).
+		Files: panel.FilesOptionsFor(cfg, configPath),
+		Log:   log.StandardLogger(),
 	}, nil)
 	if err != nil {
 		return err

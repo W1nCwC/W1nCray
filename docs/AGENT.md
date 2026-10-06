@@ -122,7 +122,7 @@ Modules:
 | `Policy` | 见 §4（本地根信任，远端无法放宽） |
 | `Panel` | 见「机器模式节点」一节 |
 | `Terminal` | `Enabled`（缺省 **true**）、`MaxSessions`（≤2）、`IdleTimeoutS`、`MaxDurationS` |
-| `Files` | `Roots`、`Unrestricted`、`AllowExec` |
+| `Files` | `Roots`、`Unrestricted`、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
@@ -462,7 +462,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 `Agent.DesiredPath` 设置后，修改该文件即自动应用（§3）。看结果：日志里的 `agent: <path>: <status> (<n> instance(s))`，失败时有具体错误。
 
-### 面板命令（`kernel_*` 与 `component_restart`）
+### 面板命令（`kernel_*`、`file_*`、`files_*` 与 `component_restart`）
 
 面板可以在两条通道上下发命令，两条通道**共用同一个命令注册表与同一个按 id 去重的空间**（`agent/opscmd`）：
 
@@ -471,7 +471,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 同一个命令 id 在两条通道上只会执行一次、只回一次结果。命令注册表里的类型就是白名单，**未注册的类型一律回 `failed` 且 `result.error="unsupported command"`，不执行**。`refresh` 与 `dump_state` 是内建类型（需要拉取循环与最近一次报告，仍由 `agent/panelclient` 实现），其余由 `agent/opscmd` 提供。
 
-**长命令**（当前只有 `kernel_install`；后续的 `self_update`、`files_apply` 也是）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
+**长命令**（`kernel_install`、`files_apply` 与 `self_update`）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
 
 | type | args | 行为与结果 |
 |---|---|---|
@@ -480,6 +480,13 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 与 `xray` 一律拒绝（见下）。 |
+| `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。 |
+| `file_read` | `{root, path, offset?, limit?}` | 回 `{data:"<base64>", size, eof}`。`limit` 不得超过本机上限（默认 128 KiB，契约 §7-8），超限回 `failed` + `result.code="too_large"`。 |
+| `file_write` | `{root, path, data:"<base64>", mode?, sha256?}` | 原子写（同目录临时文件 + `rename`）。`mode` 是八进制字符串（缺省 0644）：可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；给了 `sha256` 就先核对。 |
+| `file_delete` | `{root, path}` | 删一个**普通文件**（目录一律拒绝），回 `{path, deleted:true}`。 |
+| `files_apply` | `{}` | 长命令。对**最近一次 desired 的 `files` 段**执行：下载 blob（按 sha256，命中缓存不重复下载）→ 暂存 → 校验 → 原子替换（先留 `last_good`）→ 重载。结果 `{status, files[], reload, applied_pending?, errors?, reason?, rolled_back?}`。 |
+| `files_validate` | `{}` | 只暂存 + 校验，**不写任何受管文件、不重载**。结果同 `files_apply`（`reload:"not_needed"`）。 |
+| `files_rollback` | `{}` | 用 `last_good` 快照恢复受管文件并重载。结果 `{status:"rolled_back", rolled_back:true, files[], reload}`。 |
 
 细节与边界：
 
@@ -489,9 +496,37 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 - **`KernelEntry` 字段**：`{name, version, current, previous, path, size_bytes, installed_at, in_use}`（契约 §3）。`size_bytes` 是**清单声明**的安装体积（各文件声明大小之和），不是磁盘实测。`kernel_list` 不额外发明 `size_on_disk`/`in_use_exact` 等字段（契约里没有）。
 - **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。
 - **能力声明**：`hello.capabilities`（以及 HTTP `/config` 的 `features`）里出现 `kernel` 的条件是**内核安装器可用且已加载一份已签名清单**——没有清单时 `kernel_install` 无法解析版本，所以不做这个承诺（契约 §7-1）。
+- **`file_*` 的根与错误码**：`root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`invalid_args`。
 - **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
 - **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
 - **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
+
+### 7.1 `self_update`（agent 自升级）
+
+签名清单里名为 `agent` 的条目描述 agent 自己的版本（契约 §7-11）；`self_update {version}` 用它升级：
+
+- **长命令**：先回 `{"status":"accepted"}`，完成后再回同一 id 的 `done`/`failed`。目标版本必须出现在清单的 `agent` 条目里，并通过全部既有校验（签名、`revoked`、`min_agent`、平台 target、`archive_sha256`、成员 `sha256`/`size`）与清单声明的版本自检（`run.version_cmd`，argv 数组、不经 shell）。raw `.gz` 产物（`release/build.sh` 的 `dist/W1nCray-linux-<arch>.gz`，清单 `archive:"gz"`、恰好一个 extract 成员）与 `.tar.gz`/`.zip` 走同一条校验路径。**任何一步失败都不会写运行中的可执行文件**。
+- **原子替换**：`exe → exe.old`、已验证的暂存副本 → `exe`，然后写 `<StateDir>/update/pending.json`。任何一步失败都会把原二进制放回；`.old` 从不删除，最坏情况（助手也死了）用一条 `mv exe.old exe` 即可手工恢复，这是"不变砖"的最后一道兜底。
+- **重启**：提交后 agent 启动一个脱离会话的隐藏助手 `__respawn`，然后按原 argv 正常退出（走既有的优雅关停：停内核、关 Xray）。助手等本进程释放单实例锁后运行新二进制；连续 3 次（每次存活窗口 10 s、间隔 5 s）都起不来，就回滚到 `.old`、写 `<StateDir>/update/rollback.json`，再启动恢复后的二进制。systemd 单元是 `Restart=always`，OpenRC 用 `supervise-daemon`、procd 用 `respawn`，服务管理器是第二层保险。**注意**：systemd 默认 `KillMode=control-group` 会在主进程退出时连同 cgroup 杀掉助手，因此"助手能否存活"必须在目标机器实测；杀掉了就由服务管理器重启（新进程启动自检）兜底。
+- **确认**：新进程在第一次成功得到面板 `/config` 应答后调用 `Confirm()`，删除 `.old` 与 `pending.json`。
+- **连不上面板不回滚**：新进程起来了但 10 分钟内没连上面板，只发 `event{kind:"self_update.stalled"}`（事件是实时数据，断线不补发），**绝不自动回滚**——面板故障不是二进制坏。
+- **事件**：`self_update.started`（开始）、`self_update.rolled_back`（助手回滚后由下一次启动上报一次）、`self_update.stalled`。
+- **能力声明**：`hello.capabilities`（及 HTTP `/config` 的 `features`）出现 `upgrade` 的条件是 `self_update` 命令真的注册了：平台能替换自身 exe（Windows 一律不行）、可执行文件是常规文件且所在目录可写、有服务管理器（systemd/OpenRC/procd 的 init 文件里 `ExecStart`/`command` 指向该 exe），并且进程提供了重启钩子。不满足时命令回 `failed` + `result.code="not_supported"`，能力也不声明（契约 §7-1/§7-11）。
+### 受管文件（`files_apply` / `files_validate` / `files_rollback`）
+
+受管文件是面板可以下发的 **xray 文件**，内容走 HTTPS（`GET /api/v2/server/machine/agent/file/<sha256>`），desired 里只有 `{name, sha256, size, kernel}`（契约 §7-1/§7-9）：
+
+- **固定白名单与固定目录**：`config.yml`、`route.json`、`custom_inbound.json`、`custom_outbound.json`、`dns.json`、`geoip.dat`、`geosite.dat`，只写在 xray 配置目录。名字必须是纯文件名：`../evil`、绝对路径、`sub/route.json`、`agent.yml`、状态文件一律拒绝，命令不执行。
+- **`config.yml` 只在 `agent.yml` 分离布局下可写**（契约 §7-2）：否则该文件就是 agent 自己的配置，面板写它等于让 agent 自杀。这种情况下 agent 不声明 `files` 能力，面板也就不会下发。
+- **`files` 能力名是两个功能的交集**（契约 §3 里 `files` 只有一个名字）：面板据它决定是否在 revision 里下发 `desired.files`（受管 xray 文件），也用同一个名字决定是否提供 `file_*` 文件管理。所以只有当**两者都能服务**时才声明：受管层已接线、本地 `Files.Roots` 非空、`agent.yml` 分离布局，且 `file_*` 命令已注册。单文件布局下 `file_*` 命令仍然注册可用（`file_list` 等照常执行，直接发命令即可），但**不声明** `files`。契约目前没有任何字段能区分这两个功能（`capabilities` 是集合，`policy.files` 只有 `roots`/`unrestricted`），这是 WP-G5 与 WP-G6 合并时的保守取舍：宁可少声明，也不让面板下发本机无法应用的 `desired.files`。风险与待决项见合并报告。
+- **校验先于替换**：四个 JSON 先逐个 `core.CheckFiles`，再用**整实例预检**（`core.New` 只构造、不 `Start`，因此**不绑端口**）抓组合错误；`config.yml` 走完整 `LoadConfig`。校验不过 → 一个受管文件都不动、不重载，回 `status:"invalid"` 与带文件名/规则序号的错误。
+- **blob 完整性**：边写边算 sha256，与 desired 的 `sha256`/`size` 不符**不落缓存、不替换**；`If-None-Match` 拿到 304 而本地又没有缓存时重取一次。单文件上限默认 64 MiB（`Files.MaxBytes` 可改；设为负值 = 本机禁用 geo 下发，回显式原因而不是静默跳过）。
+- **原子替换与回滚**：替换前把当前文件快照成 `last_good`（缺失的文件记为"缺失"，回滚时删掉），替换走同目录临时文件 + `rename`。重载被拒（`LoadConfig` 失败）→ 恢复 `last_good` 并回 `status:"rolled_back"`。
+- **geo-only 变更不重载**：`geoip.dat`/`geosite.dat` 由 xray 在规则求值时按需读取，替换后回 `reload:"not_needed"`（契约 §7-9 的 `applied_pending` 只在真正发起重载时出现）。
+- **幂等**：磁盘上已是同一 `sha256` 的文件不下载、不替换、不重载（`files[].skipped=true`、`bytes=0`），并把该集合记进 `<StateDir>/filesync/applied.json`。
+- **健康判定在面板侧**：agent **不在进程内等健康**。`files_apply` 在重载发起后回 `done{applied_pending:true}`，随后由面板按 `hello`/`telemetry`（60 s 内）与 `components.xray.state=running` 判定，必要时下发 `files_rollback`（契约 §7-9）。
+- **`hint{what:"files"}`** 触发同一套同步（等价于 `files_apply`）；本机没有受管文件层时回 `error{code:"not_supported"}`，不静默忽略（契约 §7-5）。
+- **事件**：应用成功发 `event{kind:"files.applied"}`，回滚发 `event{kind:"files.rolled_back"}`（契约 §7-10，只走 WebSocket）。
 
 ## 8 常见拒绝原因与排错
 

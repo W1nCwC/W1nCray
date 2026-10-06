@@ -14,6 +14,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
+	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
@@ -83,7 +84,14 @@ func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
 // the kernel commands servable, and the panel must see the new list without a
 // restart.
 func (s runtimeStreams) Capabilities() []string {
-	return capabilities(s.cfg, s.rt.kernelCapable(), s.rt.TerminalSupported(), s.rt.filesCapable())
+	caps := capabilities(s.cfg, s.rt.kernelCapable(), s.rt.TerminalSupported(), s.rt.filesCapable())
+	// upgrade is a promise that self_update is served here: the command is
+	// registered only when the executable is replaceable in place, a service
+	// manager runs it and the process has a restart hook (protocol ruling 11).
+	if s.rt.upgradeCapable() {
+		caps = append(caps, wsproto.CapUpgrade)
+	}
+	return caps
 }
 
 // TerminalSupported reports whether this machine can really serve a terminal
@@ -95,7 +103,7 @@ func (s runtimeStreams) TerminalSupported() bool { return s.rt.TerminalSupported
 // when the local module gate allows it (ruling 6); kernel only when the kernel
 // installer can actually serve kernel_* commands; terminal only when the local
 // switch is on and the platform has a PTY (ruling 17 + design section 6.8);
-// files only when at least one managed root is configured.
+// files only when BOTH file features can be served (see filesCapable).
 func capabilities(cfg *agentcfg.Config, kernel, term, files bool) []string {
 	caps := []string{wsproto.CapTelemetry}
 	if cfg.XrayNodesEnabled() {
@@ -113,6 +121,24 @@ func capabilities(cfg *agentcfg.Config, kernel, term, files bool) []string {
 	return caps
 }
 
+// fileCapable reports whether the managed-file commands can really be served on
+// this machine (ruling 1: a capability is a promise). It requires the file
+// layer to be wired, a local Files policy with at least one root, and — because
+// the panel must never overwrite the agent's own configuration — the separated
+// agent.yml layout when config.yml is part of the set. The capability is about
+// the xray files the panel manages, so the separated layout is required: with
+// the single-file layout the panel would be handed a write path to the agent's
+// own settings (ruling 2).
+func (r *Runtime) fileCapable() bool {
+	if r == nil || r.Files == nil || !r.Files.Enabled() {
+		return false
+	}
+	if r.cfg == nil || r.cfg.Files == nil || len(r.cfg.Files.Roots) == 0 {
+		return false
+	}
+	return r.Files.LayoutSeparated()
+}
+
 // kernelCapable reports whether the kernel installer can serve the kernel_*
 // commands: an installer is wired and a signed manifest is in force. Without a
 // manifest kernel_install cannot resolve a version and the catalog is empty, so
@@ -125,6 +151,15 @@ func (r *Runtime) kernelCapable() bool {
 	return ok
 }
 
+// upgradeCapable reports whether self_update is actually served here: the
+// command is registered on the registry. Registration happens in StartRemote,
+// and only when the machine can replace its own executable and the process
+// owner supplied a restart hook, so the capability is never a promise the agent
+// cannot keep.
+func (r *Runtime) upgradeCapable() bool {
+	return r != nil && r.Ops != nil && r.Ops.Has(panelclient.CmdSelfUpdate)
+}
+
 // TerminalSupported reports whether the runtime has a live terminal manager.
 // The manager is nil when the local switch is off or the platform has no PTY,
 // so this single check covers both (WP-G6 acceptance 3).
@@ -132,11 +167,36 @@ func (r *Runtime) TerminalSupported() bool {
 	return r != nil && r.Terminal != nil && r.Terminal.Available()
 }
 
-// filesCapable reports whether the file_* commands can be served: a manager
+// filesCapable reports whether the single contract capability "files" may be
+// declared. The contract has ONE "files" name for two unrelated features:
+//
+//   - the managed xray files the panel puts in a revision (desired.files,
+//     files_apply / files_validate / files_rollback, D4/D5), and
+//   - the confined file_* commands (file_list / file_read / file_write /
+//     file_delete, D9/WP-G6).
+//
+// The panel gates the desired.files key on this capability (protocol ruling 1)
+// and the agent decodes a revision strictly, so declaring "files" when the
+// managed layer is not wired would let the panel publish a key this machine
+// cannot apply. The capability is therefore the CONJUNCTION: it is declared
+// only when the managed layer is servable (fileCapable) AND the file_*
+// commands are registered (fileCmdsCapable). In the panel's wiring the second
+// condition is implied by the first (both read cfg.Files.Roots), so this only
+// withholds the declaration where the managed layout is deliberately off.
+//
+// The contract has no field that tells the two apart (capabilities is a set,
+// policy.files carries only roots/unrestricted), so this is the conservative
+// stopgap: it never over-promises, and it is recorded in the merge report as
+// the open protocol question.
+func (r *Runtime) filesCapable() bool {
+	return r.fileCapable() && r.fileCmdsCapable()
+}
+
+// fileCmdsCapable reports whether the file_* commands can be served: a manager
 // with at least one root exists. A machine without roots must not declare the
 // capability, and the commands are not registered either.
-func (r *Runtime) filesCapable() bool {
-	return r != nil && r.Files != nil && len(r.Files.RootNames()) > 0
+func (r *Runtime) fileCmdsCapable() bool {
+	return r != nil && r.FileOps != nil && len(r.FileOps.RootNames()) > 0
 }
 
 // localPolicy maps the agent.yml local policy onto the wire type. A nil config

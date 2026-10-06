@@ -22,8 +22,10 @@ func capabilitiesOf(t *testing.T, rt *Runtime, cfg *agentcfg.Config) []string {
 // hello capability list is a promise. The local gates decide what is promised:
 // xray_nodes follows Modules.XrayNodes (ruling 6), kernel needs a usable
 // installer, terminal needs the local switch on AND a PTY on this machine
-// (ruling 17 plus design section 6.8), and files needs at least one configured
-// root. A capability must never appear for something the machine cannot serve.
+// (ruling 17 plus design section 6.8), upgrade needs a registered self_update
+// (ruling 11) and files needs both file features (managed xray files, D4/D5,
+// and the file_* commands, D9; see filesCapable). A capability must never
+// appear for something the machine cannot serve.
 func TestCapabilitiesOnlyDeclareWhatIsImplemented(t *testing.T) {
 	rt, _ := bootCycle(t, t.TempDir(), false, nil)
 
@@ -69,7 +71,7 @@ func TestCapabilitiesOnlyDeclareWhatIsImplemented(t *testing.T) {
 		t.Error("kernel declared without a signed manifest")
 	}
 	if hasCapability(got, wsproto.CapUpgrade) {
-		t.Error("upgrade is not implemented in this batch")
+		t.Error("upgrade is declared although no self_update command is registered")
 	}
 	for _, cap := range got {
 		switch cap {

@@ -115,6 +115,26 @@ func (n *stubNodes) count() int {
 	return n.calls
 }
 
+// stubFiles records the managed-file synchronisations.
+type stubFiles struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (f *stubFiles) SyncFiles(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return f.err
+}
+
+func (f *stubFiles) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 // newAgentUnderTest wires an Agent against the test server.
 func newAgentUnderTest(t *testing.T, ts *testServer, o AgentOptions, opts Options) *Agent {
 	t.Helper()
@@ -282,7 +302,8 @@ func TestHintsDispatchAndRefusals(t *testing.T) {
 	ts := newTestServer(t, "7", "secret-token")
 	cmds := &stubCommands{}
 	nodes := &stubNodes{}
-	ag := newAgentUnderTest(t, ts, AgentOptions{Commands: cmds, Nodes: nodes}, Options{})
+	files := &stubFiles{}
+	ag := newAgentUnderTest(t, ts, AgentOptions{Commands: cmds, Nodes: nodes, Files: files}, Options{})
 	cancel, _ := runAgent(t, ag)
 	defer cancel()
 
@@ -299,16 +320,20 @@ func TestHintsDispatchAndRefusals(t *testing.T) {
 	tc.sendType(t, wsproto.TypeHint, "h2", wsproto.Hint{What: "nodes"})
 	waitFor(t, func() bool { return nodes.count() == 1 }, "hint nodes did not reach the toggle")
 
-	// files and manifest are phase 2: an explicit not_supported, never silence.
+	// files: hand it to the managed-file hook (WP-G5).
 	tc.sendType(t, wsproto.TypeHint, "h3", wsproto.Hint{What: "files"})
+	waitFor(t, func() bool { return files.count() == 1 }, "hint files did not reach the managed-file hook")
+
+	// manifest is still phase 2: an explicit not_supported, never silence.
+	tc.sendType(t, wsproto.TypeHint, "h4", wsproto.Hint{What: "manifest"})
 	env := tc.recvType(t, wsproto.TypeError)
 	var body wsproto.ErrorBody
 	decodeInto(t, env, &body)
 	if body.Code != wsproto.ErrCodeNotSupported {
-		t.Errorf("hint files code = %q, want not_supported", body.Code)
+		t.Errorf("hint manifest code = %q, want not_supported", body.Code)
 	}
-	if env.ID != "h3" {
-		t.Errorf("error id = %q, want h3", env.ID)
+	if env.ID != "h4" {
+		t.Errorf("error id = %q, want h4", env.ID)
 	}
 
 	// The connection survives an error answer.

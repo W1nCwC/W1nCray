@@ -74,6 +74,9 @@ func TestCapabilitiesDeclareKernelOnlyWithAUsableInstaller(t *testing.T) {
 	if moduleOff := capabilities(&agentcfg.Config{Modules: &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)}}, true, false, false); hasCapability(moduleOff, wsproto.CapXrayNodes) {
 		t.Errorf("the local module gate must still win: %v", moduleOff)
 	}
+	if withFiles := capabilities(&agentcfg.Config{}, true, false, true); !hasCapability(withFiles, wsproto.CapFiles) {
+		t.Errorf("capabilities = %v, want files", withFiles)
+	}
 
 	// A runtime without a kernel manager can never declare it.
 	if (&Runtime{}).kernelCapable() {

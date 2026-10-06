@@ -135,12 +135,20 @@ type Deps struct {
 	Kernels KernelOps
 	// Comp serves component_restart. Nil answers it with not_supported.
 	Comp ComponentOps
-	// Files serves the file_* commands (WP-G6). Nil answers them with
-	// not_supported; RegisterFiles installs them, because a machine without a
-	// configured root must not expose the commands at all.
-	Files FileOps
-	// Events reports kernel.installed / kernel.removed (ruling 10). Nil drops
-	// them.
+	// Files serves files_apply / files_validate / files_rollback, the MANAGED
+	// xray files (D4/D5). Nil answers them with not_supported (protocol ruling
+	// 5: never silently ignored).
+	Files FilesOps
+	// FileCmds serves the file_* commands (WP-G6): file_list, file_read,
+	// file_write, file_delete, the confined file manager. It is a separate
+	// field from Files because the two features are different: Files replaces
+	// the managed xray files from the panel's revision, FileCmds browses and
+	// edits single files inside the local roots. RegisterFileCmds installs
+	// them, because a machine without a configured root must not expose the
+	// commands at all.
+	FileCmds FileCmdOps
+	// Events reports kernel.installed / kernel.removed / files.applied /
+	// files.rolled_back (ruling 10). Nil drops them.
 	Events EventSink
 	// Sink delivers the final result of long commands. It may be set later
 	// with SetSink, once the channels exist.
@@ -157,7 +165,12 @@ type Registry struct {
 	handlers map[string]Handler
 	sink     Sink
 	events   EventSink
-	log      driver.Logger
+	// files is the managed-file implementation. It can be installed after the
+	// registry exists (SetFiles), because the blob fetcher only appears once
+	// the panel link is built; until then the file commands answer
+	// "not_supported" instead of running half-wired.
+	files FilesOps
+	log   driver.Logger
 }
 
 var _ panelclient.CommandRunner = (*Registry)(nil)
@@ -178,12 +191,16 @@ func New(d Deps) (*Registry, error) {
 		handlers: map[string]Handler{},
 		sink:     d.Sink,
 		events:   d.Events,
+		files:    d.Files,
 		log:      d.Log,
 	}
 	if r.log == nil {
 		r.log = nopLog{}
 	}
 	if err := registerKernel(r, d); err != nil {
+		return nil, err
+	}
+	if err := registerFiles(r, d); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -241,6 +258,23 @@ func (r *Registry) SetEvents(e EventSink) {
 	r.mu.Lock()
 	r.events = e
 	r.mu.Unlock()
+}
+
+// SetFiles installs the managed-file implementation. bootstrap calls it once
+// the panel link exists, because the blob fetcher is the panel HTTP client. It
+// replaces a previously installed one (idempotent), so a re-link after a
+// reconnect cannot register twice.
+func (r *Registry) SetFiles(f FilesOps) {
+	r.mu.Lock()
+	r.files = f
+	r.mu.Unlock()
+}
+
+// filesOps returns the installed managed-file implementation (nil when none).
+func (r *Registry) filesOps() FilesOps {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.files
 }
 
 // Execute runs one command. It implements panelclient.CommandRunner, so the

@@ -127,7 +127,10 @@ func TestTerminalDisabledKeepsTheCapabilityOut(t *testing.T) {
 }
 
 // TestFilesCapabilityFollowsTheRoots covers the file half: no roots, no
-// commands, no capability.
+// commands, no capability. With roots the file_* commands exist; the single
+// contract capability "files" is declared only once the managed-file layer
+// (desired.files, D4/D5) is wired on top of them, because the panel gates that
+// desired key on this one name (protocol ruling 1, see filesCapable).
 func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "xray")
@@ -140,7 +143,7 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
-	if rt.Files != nil || rt.filesCapable() {
+	if rt.FileOps != nil || rt.fileCmdsCapable() || rt.filesCapable() {
 		t.Error("a runtime without roots has a file manager")
 	}
 	if hasCapability(rt.Streams(nil, &agentcfg.Config{}).Capabilities(), wsproto.CapFiles) {
@@ -153,21 +156,24 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 	}
 	_ = rt.Shutdown(context.Background())
 
-	// With a root.
+	// With a root: the confined file manager exists and its commands are
+	// registered. The managed-file layer is not configured here, so the
+	// "files" capability is still withheld (it is the promise the panel gates
+	// desired.files on).
 	rt2, err := Boot(Options{
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
-		Files:      fileops.Options{Roots: []fileops.Root{{Name: "xray", Path: root}}},
+		FileOps:    fileops.Options{Roots: []fileops.Root{{Name: "xray", Path: root}}},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
 	defer func() { _ = rt2.Shutdown(context.Background()) }()
-	if rt2.Files == nil || !rt2.filesCapable() {
+	if rt2.FileOps == nil || !rt2.fileCmdsCapable() {
 		t.Fatal("a runtime with a root has no file manager")
 	}
-	if !hasCapability(rt2.Streams(nil, &agentcfg.Config{}).Capabilities(), wsproto.CapFiles) {
-		t.Error("the files capability is missing while the manager is live")
+	if hasCapability(rt2.Streams(nil, &agentcfg.Config{}).Capabilities(), wsproto.CapFiles) {
+		t.Error("the files capability is declared without the managed-file layer")
 	}
 	for _, typ := range []string{panelclient.CmdFileList, panelclient.CmdFileRead, panelclient.CmdFileWrite, panelclient.CmdFileDelete} {
 		if !rt2.Ops.Has(typ) {
@@ -192,6 +198,32 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 	})
 	if status != panelclient.ResultFailed || !strings.Contains(string(res), "invalid_args") {
 		t.Errorf("escape read = %s %s", status, res)
+	}
+
+	// Both file features wired: the managed-file layer has a root and the
+	// separated layout, and the file_* commands have the same root. That is
+	// what the single "files" capability promises.
+	cfg3 := &agentcfg.Config{Files: &agentcfg.FilesConfig{Roots: []string{root}}}
+	rt3, err := Boot(Options{
+		StateDir:    filepath.Join(dir, "state3"),
+		KernelsDir:  filepath.Join(dir, "kernels"),
+		AgentConfig: cfg3,
+		Files: &FilesOptions{
+			ConfigDir:       root,
+			ConfigPath:      filepath.Join(dir, "config.yml"),
+			LayoutSeparated: true,
+		},
+		FileOps: fileops.Options{Roots: []fileops.Root{{Name: "xray", Path: root}}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	defer func() { _ = rt3.Shutdown(context.Background()) }()
+	if !rt3.filesCapable() {
+		t.Fatal("filesCapable is false with both file features wired")
+	}
+	if !hasCapability(rt3.Streams(nil, cfg3).Capabilities(), wsproto.CapFiles) {
+		t.Error("the files capability is missing while both file features are live")
 	}
 }
 

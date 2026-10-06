@@ -193,8 +193,14 @@ func (d *Dispatcher) handleHint(env wsproto.Envelope) {
 			return
 		}
 		d.hooks.Hint(hint.What)
-	case "files", "manifest":
-		// Phase 2 capabilities. Ruling 5 of the protocol: never silently
+	case "files":
+		if d.hooks.Hint == nil {
+			d.answerError(env.ID, wsproto.ErrCodeNotSupported, "managed files are not enabled on this machine")
+			return
+		}
+		d.hooks.Hint(hint.What)
+	case "manifest":
+		// Phase 2 capability. Ruling 5 of the protocol: never silently
 		// ignored, always an explicit answer.
 		d.answerError(env.ID, wsproto.ErrCodeNotSupported, "hint "+hint.What+" is not supported by this agent")
 	case "":
