@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -95,6 +96,15 @@ type AgentPanelConfig struct {
 	// node (ListenIP, CertConfig, ...). Missing fields fall back to the node
 	// defaults.
 	NodeController *node.Config `mapstructure:"NodeController"`
+	// NodeControllers overrides NodeController for individual machine nodes,
+	// keyed by the panel's node id (the same field layout as
+	// Nodes[].ControllerConfig). An entry that exists is used as a whole: it is
+	// never merged field by field with NodeController, so a node cannot inherit
+	// a setting by accident. It is still completed with the node defaults.
+	// Typical use: a node that needs PROXY protocol, its own certificate or a
+	// local DNS/REALITY setup, including credentials that must stay on this
+	// machine and are never sent to the panel.
+	NodeControllers map[int]*node.Config `mapstructure:"NodeControllers"`
 }
 
 // AgentPolicy maps agent/spec.Policy fields onto the config file. A zero value
@@ -223,13 +233,41 @@ func (c *Config) validate() error {
 		}
 		seen[key] = true
 
-		cc := node.DefaultConfig()
-		if n.ControllerConfig != nil {
-			merge(cc, n.ControllerConfig)
-		}
-		n.ControllerConfig = cc
+		n.ControllerConfig = controllerConfigWithDefaults(n.ControllerConfig)
 	}
 	return nil
+}
+
+// controllerConfigWithDefaults returns a fresh ControllerConfig holding src's
+// fields over the node defaults. It is the one place that completes a
+// ControllerConfig, so Nodes, the machine template and the per-node overrides
+// all get the same treatment.
+func controllerConfigWithDefaults(src *node.Config) *node.Config {
+	cc := node.DefaultConfig()
+	if src != nil {
+		merge(cc, src)
+	}
+	return cc
+}
+
+// nodeControllerIDs returns the ids of the per-node overrides, sorted.
+func (p *AgentPanelConfig) nodeControllerIDs() []int {
+	ids := make([]int, 0, len(p.NodeControllers))
+	for id := range p.NodeControllers {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+// nodeControllerIDList renders the override ids as "173, 119" (ids only, never
+// the configuration behind them).
+func (p *AgentPanelConfig) nodeControllerIDList() string {
+	parts := make([]string, len(p.NodeControllers))
+	for i, id := range p.nodeControllerIDs() {
+		parts[i] = fmt.Sprint(id)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // merge copies the set fields of src over the defaults in dst.
@@ -340,17 +378,27 @@ func (p *AgentPanelConfig) validate() error {
 		return fmt.Errorf("config: Agent.Panel.URL: %s", strings.TrimPrefix(err.Error(), "panelclient: "))
 	}
 	if p.MachineNodes {
-		cc := node.DefaultConfig()
-		if p.NodeController != nil {
-			merge(cc, p.NodeController)
+		p.NodeController = controllerConfigWithDefaults(p.NodeController)
+	}
+	// The per-node overrides are completed like the template, so a node never
+	// listens on an empty address. A bad key or an empty entry is a config
+	// error: silently ignoring it would leave the operator thinking the
+	// override applies.
+	for id, cc := range p.NodeControllers {
+		if id <= 0 {
+			return fmt.Errorf("config: Agent.Panel.NodeControllers: node id %d must be a positive number", id)
 		}
-		p.NodeController = cc
+		if cc == nil {
+			return fmt.Errorf("config: Agent.Panel.NodeControllers[%d] must not be empty", id)
+		}
+		p.NodeControllers[id] = controllerConfigWithDefaults(cc)
 	}
 	return nil
 }
 
 // machinePanel returns the panel section when machine mode is on: the panel
-// then owns the node list and every node shares NodeController.
+// then owns the node list, and each node gets NodeControllers[id] when it is
+// set, otherwise the NodeController template.
 func machinePanel(cfg *Config) *AgentPanelConfig {
 	if cfg.Agent == nil || !cfg.Agent.Enabled || cfg.Agent.Panel == nil {
 		return nil

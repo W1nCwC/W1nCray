@@ -156,12 +156,16 @@ func checkAgentPanel(w io.Writer, pc *AgentPanelConfig) error {
 
 // checkMachineNodes reports the machine-mode node list. Offline it only states
 // where the nodes come from; online it asks the panel for the list. The token
-// is never printed.
+// is never printed, and neither is anything from NodeControllers: only the
+// overridden node ids are named.
 func checkMachineNodes(w io.Writer, pc *AgentPanelConfig, online bool) error {
 	token, err := pc.ResolveToken()
 	if err != nil {
 		fmt.Fprintf(w, "  ✗ %v\n", err)
 		return err
+	}
+	if ids := pc.nodeControllerIDs(); len(ids) > 0 {
+		fmt.Fprintf(w, "  本地覆盖: 节点 %s（共 %d 个；配置与凭据只在本机使用，不会下发到面板）\n", pc.nodeControllerIDList(), len(ids))
 	}
 	if !online {
 		fmt.Fprintf(w, "  机器模式: 节点由面板下发（机器 ID %d；加 --online 可列出节点）\n", pc.MachineID)

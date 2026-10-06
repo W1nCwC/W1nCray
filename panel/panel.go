@@ -230,24 +230,54 @@ func (p *Panel) discoverMachineNodes(pc *AgentPanelConfig, certs *cert.Manager, 
 				MachineID:    pc.MachineID,
 				MachineToken: token,
 			},
-			Config: machineControllerConfig(pc.NodeController),
+			Config: machineNodeConfig(pc, mn.ID),
 			Certs:  certs,
 			Reload: p.requestReload,
 		}))
 	}
+	logUnassignedNodeControllers(pc, list)
 	log.Infof("machine %d: %d node(s) assigned by the panel", pc.MachineID, len(list))
 	return c, version, nil
 }
 
-// machineControllerConfig copies the shared ControllerConfig template so the
-// controllers never share mutable state. validate() already applied the
-// defaults to it.
-func machineControllerConfig(t *node.Config) *node.Config {
-	if t == nil {
-		return node.DefaultConfig()
+// machineNodeConfig returns the ControllerConfig of one machine node: a
+// NodeControllers[id] override wins as a whole, then the shared NodeController
+// template, then the node defaults. Both paths copy, so no two controllers
+// share mutable state.
+func machineNodeConfig(pc *AgentPanelConfig, id int) *node.Config {
+	if cc := pc.NodeControllers[id]; cc != nil {
+		return machineControllerConfig(cc)
 	}
-	c := *t
-	return &c
+	return machineControllerConfig(pc.NodeController)
+}
+
+// logUnassignedNodeControllers logs one info line per NodeControllers entry the
+// panel did not assign to this machine. A stale override is not an error: the
+// panel owns the assignment and the node may come back later.
+func logUnassignedNodeControllers(pc *AgentPanelConfig, list []xboard.MachineNode) {
+	if len(pc.NodeControllers) == 0 {
+		return
+	}
+	assigned := make(map[int]bool, len(list))
+	for _, mn := range list {
+		assigned[mn.ID] = true
+	}
+	for _, id := range pc.nodeControllerIDs() {
+		if !assigned[id] {
+			log.Infof("NodeControllers[%d] is configured but the panel did not assign that node", id)
+		}
+	}
+}
+
+// machineControllerConfig returns a fresh ControllerConfig (the shared
+// template or a per-node override) completed with the node defaults, so no two
+// controllers share the top-level struct. validate() already completed the
+// configured ones; applying the defaults again is idempotent and also covers a
+// directly built config. The copy is shallow: the controller treats the nested
+// config (CertConfig, REALITYConfigs, ...) as read-only, so sharing it cannot
+// move a change from one node to another.
+func machineControllerConfig(t *node.Config) *node.Config {
+	return controllerConfigWithDefaults(t)
 }
 
 // startMachineWatchLocked starts the node-list watcher of the running instance.
