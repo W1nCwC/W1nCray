@@ -12,8 +12,11 @@
 package kernelx
 
 import (
+	"context"
+
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/kernel/install"
+	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
 
 // List returns every installed kernel version, sorted by name then version
@@ -38,3 +41,18 @@ func (e *Ensurer) Rollback(name string) (driver.Installed, error) { return e.in.
 // Current returns the version the installer last made current, from the
 // pointer alone (no process check).
 func (e *Ensurer) Current(name string) (driver.Installed, error) { return e.in.Current(name) }
+
+// DownloadFor resolves name@version in the loaded manifest and downloads its
+// verified archive into dir. It is the exported staging path of the install
+// library, used by agent/selfupdate; the Installer itself stays private so the
+// kernel directory still has exactly one owner.
+func (e *Ensurer) DownloadFor(ctx context.Context, name, version, dir string) (manifest.Target, string, error) {
+	return e.in.DownloadFor(ctx, name, version, dir)
+}
+
+// VerifyArchiveFor verifies a downloaded archive against the manifest,
+// extracts it into dest and runs the version self-check. See
+// install.Installer.VerifyArchiveFor.
+func (e *Ensurer) VerifyArchiveFor(ctx context.Context, name, version, archivePath, dest string) (manifest.Target, string, error) {
+	return e.in.VerifyArchiveFor(ctx, name, version, archivePath, dest)
+}

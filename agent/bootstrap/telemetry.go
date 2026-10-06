@@ -14,6 +14,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
+	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
@@ -83,7 +84,14 @@ func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
 // the kernel commands servable, and the panel must see the new list without a
 // restart.
 func (s runtimeStreams) Capabilities() []string {
-	return capabilities(s.cfg, s.rt.kernelCapable())
+	caps := capabilities(s.cfg, s.rt.kernelCapable())
+	// upgrade is a promise that self_update is served here: the command is
+	// registered only when the executable is replaceable in place, a service
+	// manager runs it and the process has a restart hook (protocol ruling 11).
+	if s.rt.upgradeCapable() {
+		caps = append(caps, wsproto.CapUpgrade)
+	}
+	return caps
 }
 
 // capabilities lists what this machine can really do; the panel must not offer
@@ -113,6 +121,15 @@ func (r *Runtime) kernelCapable() bool {
 	}
 	_, ok := r.Kernels.ManifestSequence()
 	return ok
+}
+
+// upgradeCapable reports whether self_update is actually served here: the
+// command is registered on the registry. Registration happens in StartRemote,
+// and only when the machine can replace its own executable and the process
+// owner supplied a restart hook, so the capability is never a promise the agent
+// cannot keep.
+func (r *Runtime) upgradeCapable() bool {
+	return r != nil && r.Ops != nil && r.Ops.Has(panelclient.CmdSelfUpdate)
 }
 
 // localPolicy maps the agent.yml local policy onto the wire type. A nil config

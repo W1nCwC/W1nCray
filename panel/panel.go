@@ -375,6 +375,12 @@ func (p *Panel) applyAgentDesiredLocked(path string, rt *bootstrap.Runtime) {
 // package sets it from the build version; "dev" otherwise.
 var AgentVersion = "dev"
 
+// RequestRestart asks the process owner to shut down cleanly so the binary a
+// committed self_update put in place takes over. The command package sets it
+// (like AgentVersion); a nil hook means self_update is not served and the
+// upgrade capability is not declared.
+var RequestRestart func()
+
 // startRemoteLocked links the agent to the panel when it is configured. A
 // problem with the link (unreadable token file, bad options) is logged and
 // leaves the agent running on its local state. The caller must hold p.mu.
@@ -404,6 +410,10 @@ func (p *Panel) startRemoteLocked(a *AgentConfig, rt *bootstrap.Runtime) {
 		// the legacy node mode never opens a socket.
 		WS:          true,
 		AgentConfig: a,
+		// A committed self_update swaps the executable and asks this process to
+		// exit; the respawn helper (or the service manager) then starts the new
+		// binary. Without the hook the command is not registered.
+		OnRestart: RequestRestart,
 	}
 	// The panel may also serve the signed kernel manifest; the agent verifies
 	// it locally before it is used, so a compromised panel cannot push a
