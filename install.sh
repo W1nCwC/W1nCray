@@ -796,6 +796,30 @@ panel_url() {
 	printf '%s' "$_url"
 }
 
+# nodes_block FILE prints the top-level `Nodes:` block: from the `Nodes:` line
+# up to the next non-indented line (the next top-level key). A missing file
+# prints nothing.
+nodes_block() {
+	[ -f "$1" ] || return 0
+	sed -n '/^Nodes:/,/^[^[:space:]#]/p' "$1" 2>/dev/null || true
+}
+
+# has_static_nodes FILE: true when FILE still has v0.3 static nodes, i.e. a
+# top-level `Nodes:` block with at least one NodeID entry. `Nodes: []` (what
+# `W1nCray init` writes) is not a static node list.
+has_static_nodes() {
+	nodes_block "$1" | grep -q 'NodeID[[:space:]]*:'
+}
+
+# static_node_ids FILE prints the NodeIDs found in the static `Nodes:` block,
+# in order and space separated (e.g. "173 119 138"); empty when there are none.
+static_node_ids() {
+	_ids="$(nodes_block "$1" |
+		sed -n 's/.*NodeID[[:space:]]*:[[:space:]"]*\([0-9][0-9]*\).*/\1/p' |
+		tr '\n' ' ')"
+	printf '%s' "${_ids% }"
+}
+
 # panel_config DEST URL ID LO HI TOKENFILE ALLOW_HTTP writes the machine-mode
 # config. Every string value is quoted; numbers stay bare.
 panel_config() {
@@ -807,7 +831,10 @@ panel_config() {
 		printf '  Policy:\n'
 		printf '    AllowListen: ["0.0.0.0"]\n'
 		printf '    PortRange: [%s, %s]\n' "$4" "$5"
-		printf '    AllowEngines: ["xray"]\n'
+		# No AllowEngines: an empty list means "no restriction", so instances
+		# the panel pushes (gost/frp/realm included) are accepted when their
+		# signed manifest makes them available. A hard-coded ["xray"] would
+		# reject them.
 		printf '  Panel:\n'
 		printf '    Enabled: true\n'
 		printf '    URL: %s\n' "$(yaml_dq "$2")"
@@ -821,12 +848,12 @@ panel_config() {
 }
 
 # panel_hint URL ID PENDING tells the admin the machine is linked. It never
-# prints the token. PENDING=1 means the generated config was written to
-# config.panel.yml.new and still has to be merged by hand.
+# prints the token. PENDING=1 means the machine-mode config is not active yet
+# (written to config.panel.yml.new for merging, or to be applied by `link`).
 panel_hint() {
 	[ -n "$1" ] || return 0
 	if [ "${3:-0}" -eq 1 ]; then
-		yellow "已关联面板 $1（机器 ID $2），但配置尚未生效：请按上面的提示合并配置并重启服务，之后 agent 将自动领取节点与转发规则"
+		yellow "已关联面板 $1（机器 ID $2），但配置尚未生效：请按上面的提示完成接入并重启服务，之后 agent 将自动领取节点与转发规则"
 	else
 		green "已关联面板 $1（机器 ID $2），agent 将自动领取节点与转发规则"
 	fi
@@ -1020,6 +1047,23 @@ cmd_install() {
 		if [ ! -f "$CONF" ]; then
 			panel_config "$CONF" "$_panel" "$_machine" "$_panel_lo" "$_panel_hi" "$CONF_DIR/agent.token" "$_allow_http"
 			green "已生成机器模式配置 $CONF"
+		elif has_static_nodes "$CONF"; then
+			# v0.3 static nodes: `link` migrates them to the panel, so no .new
+			# file is written and nothing is merged by hand. Only guidance is
+			# printed here; link itself is never run from the installer.
+			_panel_pending=1
+			_ids="$(static_node_ids "$CONF")"
+			yellow "检测到已有配置 $CONF，未覆盖它。"
+			if [ -n "$_ids" ]; then
+				yellow "配置里的静态节点 NodeID: $_ids"
+			fi
+			yellow "机器模式下节点由面板下发：请先在面板把这些 NodeID 绑定到机器 $_machine（未绑定的节点不会生效）。"
+			yellow "绑定后先看迁移计划（不会改动配置，也不会重启服务）:"
+			yellow "  W1nCray link --panel $_panel --machine $_machine --token-file $CONF_DIR/agent.token --dry-run"
+			yellow "确认计划无误后去掉 --dry-run 执行:"
+			yellow "  W1nCray link --panel $_panel --machine $_machine --token-file $CONF_DIR/agent.token"
+			yellow "最后重启服务: W1nCray restart"
+			yellow "（未生成 $CONF_DIR/config.panel.yml.new：静态节点由 W1nCray link 迁移，无需手工合并 Agent 段）"
 		else
 			_new_conf="$CONF_DIR/config.panel.yml.new"
 			panel_config "$_new_conf" "$_panel" "$_machine" "$_panel_lo" "$_panel_hi" "$CONF_DIR/agent.token" "$_allow_http"
@@ -1318,7 +1362,8 @@ W1nCray 管理命令
   面板地址必须是 https://；仅本机回环地址（localhost / 127.x / ::1）可用明文 http://，
   非回环的 http:// 必须显式加 --allow-http（令牌会明文传输，仅限可信网络）。
   --port-range 指定允许监听的端口区间，默认 20000-40000。
-  若 config.yml 已存在则不会覆盖：新配置写到 <配置目录>/config.panel.yml.new，请手工合并。
+  若 config.yml 已存在则不会覆盖：没有静态节点时新配置写到 <配置目录>/config.panel.yml.new，请手工合并；
+  已有静态 Nodes 时按提示先在面板绑定这些节点，再用 W1nCray link ... --dry-run 迁移（link 由你手动执行）。
 EOF
 }
 
