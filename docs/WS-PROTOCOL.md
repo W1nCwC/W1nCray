@@ -132,6 +132,6 @@ A browser may hold at most one terminal session per machine; the panel enforces 
     "started but cannot reach the panel" is only reported (`self_update.stalled`), never auto-rolled back.
 12. **High-risk operations** (issuing a terminal ticket, `self_update`, writes outside managed files) require the admin to
     re-enter their password (`confirm_password`, checked server side, rate limited).
-13. **Local gates the panel can never relax:** `Terminal.Enabled` (default false), `Files.Roots`, `Files.Unrestricted`,
+13. **Local gates the panel can never relax:** `Terminal.Enabled` (**default true** by the owner's decision; a machine opts out locally with `Terminal.Enabled: false`, installer/`link` flag `--noterminal`), `Files.Roots`, `Files.Unrestricted`,
     `Files.AllowExec` (refuse writes with an exec bit), `Modules.XrayNodes`. `agent.yml` and the agent state files
     (`desired.json`, `last_good.json`) are never inside any root.

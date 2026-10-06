@@ -13,6 +13,8 @@
 8. PTY：`creack/pty`（12 个 GOARCH 已验证可编译），运行时 `Supported()` 探测失败则不声明 `terminal`；`noshell_test.go` 仅对 `agent/terminal` 包放行并写明理由；构建矩阵断言进 `release/build.sh`。
 9. `file_*` 上限 128 KiB；写可执行位默认拒绝（`Files.AllowExec`）；roots 排除 `agent.yml`、`desired.json`、`last_good.json`。
 
+17. **终端默认开启**（用户 2026-10 决定，覆盖上面第 8 条里"默认关"的任何暗示与设计文档里的 `--terminal`）：`Terminal.Enabled` 缺省为 true；机器本地关闭用 `Terminal.Enabled: false`，安装脚本/`link` 的开关是 `--noterminal`；面板在 `hello.policy.terminal=false` 时显示"该机器已在本地关闭终端"。**注意**：已部署的机器升级到带终端的版本后会默认获得终端能力；升级说明里必须写明这一点。
+
 ## 面板（PHP）
 10. 独立 Workerman 进程 `w1ncray:ws-server`，路径 `/w1ncray-ws`，**不碰**旧 `/ws`（生产老节点在用）。单进程起步（`count=1`）；连接对象进程内为权威，Redis 只放 Octane→网关的推送通道与"机器在线"标记；注册表必须有 `remove()/count()` 并在 `onClose` 调用。
 11. 命令：WS 推送**不** `markSent`；长命令先回 `accepted`；agent 按命令 id 去重。

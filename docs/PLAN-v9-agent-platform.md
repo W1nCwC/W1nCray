@@ -19,7 +19,7 @@
 | D5 白名单文件名 | 受管 xray 文件只有固定名字：`config.yml, route.json, custom_inbound.json, custom_outbound.json, dns.json, geoip.dat, geosite.dat`，目录固定为 xray 配置目录；其他路径只能走"文件操作"并受 roots 限制 | 缩小爆炸半径 |
 | D6 内核管理 | 把已存在但无人调用的 `kernel/install` 的 `List/Remove/Rollback` 暴露为命令 `kernel_*`；report 里的内核清单改结构化；不删除正在使用的版本 | Go 分析 §3、§7.2 |
 | D7 升级 | `self_update`：目标版本必须出现在**已签名清单**的 `agent` 条目（沿用同一信任根）；下载校验 → 原子替换 → 重启 → 新进程在 N 分钟内未能重连面板则自动回滚到旧二进制 | 不引入新信任根；回滚防变砖 |
-| D8 终端 | `creack/pty`（纯 Go）；独立包 `agent/terminal`；**本地开关 `Terminal.Enabled`，默认关**；安装命令/`link` 可带 `--terminal` 开启；每机 ≤ 2 会话、空闲 15 min 超时、最长 4 h；审计只记元数据（谁/何时/时长/字节数），**不记录终端内容**；浏览器侧用一次性 ticket | Go 分析 §5/§7.3：`noshell_test.go` 与 AGENT.md 的安全模型明确否定终端——这是**有意识的模型变更**，必须在文档与测试里显式记录，并把允许 shell 的代码限定在 `agent/terminal` 包 |
+| D8 终端 | `creack/pty`（纯 Go）；独立包 `agent/terminal`；**本地开关 `Terminal.Enabled`，默认开**（用户决定）；要关闭在机器本地设 `Terminal.Enabled: false`，安装命令/`link` 带 `--noterminal`；面板侧签发终端 ticket 仍须管理员重输密码；每机 ≤ 2 会话、空闲 15 min 超时、最长 4 h；审计只记元数据（谁/何时/时长/字节数），**不记录终端内容**；浏览器侧用一次性 ticket | Go 分析 §5/§7.3：`noshell_test.go` 与 AGENT.md 的安全模型明确否定终端——这是**有意识的模型变更**，必须在文档与测试里显式记录，并把允许 shell 的代码限定在 `agent/terminal` 包 |
 | D9 文件操作 | `file_*` 命令限定在本地策略 `Files.Roots`（默认：xray 配置目录、agent 状态目录）；`Files.Unrestricted` 需本地显式开启；拒绝路径穿越/符号链接逃逸/非普通文件 | 同上 |
 | D10 监控 | HostInfo + Telemetry（契约 §3）；带宽按网卡两次采样求差；面板存最新值 + 30 s 降采样历史 7 天 | Go 分析 §1：CPU/内存/磁盘已有，设备信息与带宽缺 |
 
