@@ -1,12 +1,14 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	xlog "github.com/xtls/xray-core/common/log"
@@ -22,15 +24,31 @@ import (
 // the config and every referenced JSON file with the Xray kernel; online it
 // also fetches each node from the panel and builds its inbound and rules.
 func Check(path string, online bool, w io.Writer) error {
+	_, err := CheckReport(path, online, w)
+	return err
+}
+
+// CheckReport runs exactly the same validation as Check. In addition to the
+// error Check returns it reports the individual failure items Check found: the
+// lines it prints with a "✗" (when the config cannot even be loaded, the
+// loader's error is the only item). Everything CheckReport writes to w is byte
+// for byte what Check writes, so `W1nCray check` keeps its output and exit
+// code.
+//
+// The item texts are meant to be compared between two runs of the same
+// machine: callers that diff them should normalise the volatile parts of a
+// path (temporary file names, timestamps) first.
+func CheckReport(path string, online bool, w io.Writer) ([]string, error) {
+	rec := &failureRecorder{w: w}
 	cfg, err := LoadConfig(path)
 	if err != nil {
-		return err
+		return []string{err.Error()}, err
 	}
-	fmt.Fprintf(w, "配置文件: %s（%d 个静态节点）\n", path, len(cfg.NodesConfig))
+	fmt.Fprintf(rec, "配置文件: %s（%d 个静态节点）\n", path, len(cfg.NodesConfig))
 	failed := false
 	agentOK := true
 	if cfg.Agent != nil && cfg.Agent.Enabled {
-		if err := checkAgent(w, cfg, online); err != nil {
+		if err := checkAgent(rec, cfg, online); err != nil {
 			failed, agentOK = true, false
 		}
 	}
@@ -38,7 +56,7 @@ func Check(path string, online bool, w io.Writer) error {
 	// it; offline the section just says where the nodes come from.
 	if agentOK {
 		if pc := machinePanel(cfg); pc != nil {
-			if err := checkMachineNodes(w, pc, online); err != nil {
+			if err := checkMachineNodes(rec, pc, online); err != nil {
 				failed = true
 			}
 		}
@@ -56,10 +74,10 @@ func Check(path string, online bool, w io.Writer) error {
 			cancel()
 			if err != nil {
 				failed = true
-				fmt.Fprintf(w, "  ✗ %s: %v\n", ctl.Tag(), err)
+				fmt.Fprintf(rec, "  ✗ %s: %v\n", ctl.Tag(), err)
 				continue
 			}
-			fmt.Fprintf(w, "  ✓ %s: %s\n", ctl.Tag(), summary)
+			fmt.Fprintf(rec, "  ✓ %s: %s\n", ctl.Tag(), summary)
 			ns = append(ns, ctl.NameServers()...)
 			if p := ctl.PendingPort(); p > 0 {
 				if _, taken := nodePorts[p]; !taken {
@@ -69,7 +87,7 @@ func Check(path string, online bool, w io.Writer) error {
 		}
 	}
 
-	reportLegacyTags(w, cfg, nodePorts, online)
+	reportLegacyTags(rec, cfg, nodePorts, online)
 	opts := coreOptions(cfg, ns)
 	// Keep the kernel's debug/info output out of the check report.
 	if opts.LogLevel == "debug" || opts.LogLevel == "info" {
@@ -79,21 +97,65 @@ func Check(path string, online bool, w io.Writer) error {
 	if errs := core.CheckFiles(opts); len(errs) > 0 {
 		failed = true
 		for _, e := range errs {
-			fmt.Fprintf(w, "  ✗ %v\n", e)
+			fmt.Fprintf(rec, "  ✗ %v\n", e)
 		}
 	}
 	if c, err := core.New(opts); err != nil {
 		failed = true
-		fmt.Fprintf(w, "  ✗ Xray 实例: %v\n", err)
+		fmt.Fprintf(rec, "  ✗ Xray 实例: %v\n", err)
 	} else {
 		c.Close()
-		fmt.Fprintln(w, "  ✓ Xray 实例构建成功（dns/route/自定义出入站）")
+		fmt.Fprintln(rec, "  ✓ Xray 实例构建成功（dns/route/自定义出入站）")
 	}
 	if failed {
-		return errors.New("检查未通过")
+		return rec.items(), errors.New("检查未通过")
 	}
-	fmt.Fprintln(w, "检查通过")
-	return nil
+	fmt.Fprintln(rec, "检查通过")
+	return nil, nil
+}
+
+// failureRecorder forwards everything to the wrapped writer and records the
+// lines Check marks as failures ("  ✗ …"). It is what lets CheckReport return
+// the failure items without changing a single byte of the report.
+type failureRecorder struct {
+	w    io.Writer
+	rest []byte
+	got  []string
+}
+
+func (r *failureRecorder) Write(p []byte) (int, error) {
+	n, err := r.w.Write(p)
+	if n > 0 {
+		r.rest = append(r.rest, p[:n]...)
+		for {
+			i := bytes.IndexByte(r.rest, '\n')
+			if i < 0 {
+				break
+			}
+			r.record(string(r.rest[:i]))
+			r.rest = r.rest[i+1:]
+		}
+	}
+	return n, err
+}
+
+// record keeps a failure line. The marker is a full-width "✗", exactly the one
+// every failure message in this file prints.
+func (r *failureRecorder) record(line string) {
+	s := strings.TrimSpace(line)
+	if strings.HasPrefix(s, "✗") {
+		r.got = append(r.got, s)
+	}
+}
+
+// items returns the recorded failure items. A trailing partial line (a write
+// without its final newline) is recorded too, so nothing is lost.
+func (r *failureRecorder) items() []string {
+	if len(r.rest) > 0 {
+		r.record(string(r.rest))
+		r.rest = nil
+	}
+	return r.got
 }
 
 // checkAgent reports the agent section and verifies the files it references.

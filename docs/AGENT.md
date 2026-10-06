@@ -382,6 +382,21 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 `W1nCray check [-c config.yml] [--online]` 校验配置而不提供服务。对 Agent 它只检查：`ManifestPath`、`ManifestKeysPath` 指向的文件存在（不存在算失败）；`DesiredPath` 文件存在（不存在只是警告：启动时不会应用）。**它不校验 `desired.json` 的内容**——内容是否合法只有应用时才知道（常驻服务的日志里会有 `agent: apply <path>: …`，或用 `agent-apply` 看完整报告）。启用面板时还会打印内核清单同步的开关与间隔（§3「内核清单自动同步」）；`--online` 会顺带拉取一次清单并报告 `sequence`，但不打印内容，也不代替 agent 的本地验签。
 
+### `W1nCray link`
+
+`W1nCray link --panel <URL> --machine <ID> (--token <T> | --token-file <F>) [-c config.yml] [--port-range LO-HI] [--allow-http] [--dry-run] [--ignore-api-overrides] [--skip-check]` 把 v0.3 的静态节点转成机器模式，**不重启服务**。它按文本行级改写 `config.yml`（注释与无关的键原样保留）：
+
+- 只转换 `ApiConfig.ApiHost` 的 scheme+host（含端口）与 `--panel` 一致的节点；其余节点保持静态并在报告里说明原因。
+- `ApiConfig` 里有机器模式无法表达的本地覆盖（`SpeedLimit > 0`、`DeviceLimit > 0`、`RuleListPath` 非空）时该节点不转换，除非加 `--ignore-api-overrides`。
+- 被转换的条目整块注释掉（块首是 `#LINKED-<日期> …` 回滚标记），它的 `ControllerConfig` 原样右移两格放进 `Agent.Panel.NodeControllers[<节点ID>]`（凭据仍只在本机）。
+- 没有 `Agent:` 块时追加一个完整块（`Enabled`、`StateDir`、`Policy`（`AllowListen` / `PortRange`，不写 `AllowEngines`）、`Panel`（`Enabled` / `URL` / `MachineID` / `TokenFile` / `MachineNodes` / `NodeControllers`））；已有 `Agent:` 块时一律报错，请手工合并（不会猜位置、不会覆盖）。
+- 令牌写入 `<配置目录>/agent.token`（先 `umask 077`、权限 0600、不带换行）；已存在且内容相同则跳过，内容不同则报错且不覆盖。令牌不会出现在配置、stdout、stderr 或错误里。
+- 写入前做**基线对比**：先把**原配置**（同目录临时拷贝）跑一遍完整校验，收集失败项集合 B；再把生成的新配置跑一遍，收集集合 N。只有 `N` 中**新增**的失败项（`N \ B`）才中止并**不改动任何文件**（打印新增失败项的完整文本）。若 `N ⊆ B` 且 `B` 非空则继续转换，并打印显眼的警告列出原配置**转换前就有**的问题（最多 10 条，与本次转换无关）。`B`、`N` 都为空时静默通过。失败项用 `W1nCray check` 打印的 `✗` 文本做稳定标识（剔除临时文件名/时间戳等易变部分）；除离线 `check` 外还会检查机器模式下才生效的 `NodeControllers[].CertConfig.CertMode`。
+- `--skip-check` 跳过上述写入前校验（会打印警告），生成结果直接写入。
+- 成功后备份为 `config.yml.bak-link-<时间戳>`（0600）再原子替换。
+- `--dry-run` 只打印计划（不写任何文件，包括令牌）。
+- 对已转换过的配置（有 `#LINKED-` 标记且 `Agent.Panel` 已启用）再次运行会以清晰错误退出且零改动。
+
 ### 常驻服务
 
 `Agent.DesiredPath` 设置后，修改该文件即自动应用（§3）。看结果：日志里的 `agent: <path>: <status> (<n> instance(s))`，失败时有具体错误。
