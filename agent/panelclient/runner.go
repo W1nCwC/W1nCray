@@ -59,6 +59,7 @@ type API interface {
 	Ack(ctx context.Context, req AckRequest) error
 	Report(ctx context.Context, req ReportRequest) (ReportResponse, error)
 	CommandResult(ctx context.Context, req CommandResultRequest) error
+	Manifest(ctx context.Context, req ManifestRequest) (ManifestResponse, error)
 }
 
 var _ API = (*Client)(nil)
@@ -113,6 +114,17 @@ type RunnerOptions struct {
 	// Host samples the machine load; nil uses the machine's real sampler. It
 	// may return nil when nothing is available.
 	Host func() *HostStat
+	// Manifest, when non-nil, enables the signed kernel manifest sync loop:
+	// the Runner fetches GET /manifest and hands the body to this sink, which
+	// verifies it locally. A nil sink disables the loop entirely.
+	Manifest ManifestSink
+	// ManifestPersistPath is where an accepted manifest is written (0600,
+	// temporary file + rename). Empty disables persistence.
+	ManifestPersistPath string
+	// ManifestInterval is how often the manifest is re-fetched after a
+	// success. It defaults to DefaultManifestInterval and is clamped to
+	// [MinManifestInterval, MaxManifestInterval].
+	ManifestInterval time.Duration
 }
 
 // Runner pulls the desired state, applies it, acknowledges the outcome,
@@ -132,18 +144,23 @@ type Runner struct {
 	host    func() *HostStat
 	fixedID string
 
+	manifest      ManifestSink
+	manifestPath  string
+	manifestEvery time.Duration
+
 	refresh chan struct{} // capacity 1: coalesces refresh requests
 
-	mu         sync.Mutex
-	instanceID string
-	haveRev    int64
-	haveHash   string
-	pendingAck *AckRequest
-	seq        uint64
-	secrets    []string
-	seen       map[string]struct{}
-	seenOrder  []string
-	inflight   map[string]bool
+	mu           sync.Mutex
+	instanceID   string
+	haveRev      int64
+	haveHash     string
+	pendingAck   *AckRequest
+	seq          uint64
+	secrets      []string
+	seen         map[string]struct{}
+	seenOrder    []string
+	inflight     map[string]bool
+	manifestETag string
 }
 
 type nopLog struct{}
@@ -159,21 +176,24 @@ func NewRunner(api API, app Applier, o RunnerOptions) (*Runner, error) {
 		return nil, errors.New("panelclient: runner needs an API and an Applier")
 	}
 	r := &Runner{
-		api:      api,
-		app:      app,
-		log:      o.Log,
-		clock:    o.Clock,
-		rand:     o.Rand,
-		version:  o.AgentVersion,
-		engines:  append([]string(nil), o.Engines...),
-		kernels:  o.Kernels,
-		pull:     ClampInterval(o.PullInterval),
-		report:   ClampInterval(o.ReportInterval),
-		host:     o.Host,
-		fixedID:  o.InstanceID,
-		refresh:  make(chan struct{}, 1),
-		seen:     map[string]struct{}{},
-		inflight: map[string]bool{},
+		api:           api,
+		app:           app,
+		log:           o.Log,
+		clock:         o.Clock,
+		rand:          o.Rand,
+		version:       o.AgentVersion,
+		engines:       append([]string(nil), o.Engines...),
+		kernels:       o.Kernels,
+		pull:          ClampInterval(o.PullInterval),
+		report:        ClampInterval(o.ReportInterval),
+		host:          o.Host,
+		fixedID:       o.InstanceID,
+		manifest:      o.Manifest,
+		manifestPath:  o.ManifestPersistPath,
+		manifestEvery: ClampManifestInterval(o.ManifestInterval),
+		refresh:       make(chan struct{}, 1),
+		seen:          map[string]struct{}{},
+		inflight:      map[string]bool{},
 	}
 	if r.log == nil {
 		r.log = nopLog{}
@@ -224,6 +244,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	wg.Add(2)
 	go func() { defer wg.Done(); r.pullLoop(ctx) }()
 	go func() { defer wg.Done(); r.reportLoop(ctx) }()
+	if r.manifest != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); r.manifestLoop(ctx) }()
+		r.log.Infof("panel: kernel manifest sync started (every %s)", r.manifestEvery)
+	}
 	wg.Wait()
 	r.log.Infof("panel: link stopped")
 	return ctx.Err()
@@ -244,11 +269,17 @@ func newInstanceID() string {
 
 // jitter randomises d by +/- jitterFraction.
 func (r *Runner) jitter(d time.Duration) time.Duration {
+	return r.jitterBy(d, jitterFraction)
+}
+
+// jitterBy randomises d by +/- frac. A misbehaving random source is treated as
+// the middle of the band.
+func (r *Runner) jitterBy(d time.Duration, frac float64) time.Duration {
 	f := r.rand()
 	if f < 0 || f >= 1 || math.IsNaN(f) {
 		f = 0.5
 	}
-	return time.Duration(float64(d) * (1 - jitterFraction + 2*jitterFraction*f))
+	return time.Duration(float64(d) * (1 - frac + 2*frac*f))
 }
 
 // backoff is the failure delay: 30s, doubling, capped at 5 minutes.

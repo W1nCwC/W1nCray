@@ -2,6 +2,7 @@ package panel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 
 	xlog "github.com/xtls/xray-core/common/log"
 
+	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
 	"github.com/W1nCwC/W1nCray/core"
@@ -28,7 +30,7 @@ func Check(path string, online bool, w io.Writer) error {
 	failed := false
 	agentOK := true
 	if cfg.Agent != nil && cfg.Agent.Enabled {
-		if err := checkAgent(w, cfg); err != nil {
+		if err := checkAgent(w, cfg, online); err != nil {
 			failed, agentOK = true, false
 		}
 	}
@@ -97,7 +99,7 @@ func Check(path string, online bool, w io.Writer) error {
 // checkAgent reports the agent section and verifies the files it references.
 // A missing manifest is not fatal (only the builtin xray engine runs then),
 // but a configured path that does not exist is.
-func checkAgent(w io.Writer, cfg *Config) error {
+func checkAgent(w io.Writer, cfg *Config, online bool) error {
 	a := cfg.Agent
 	fmt.Fprintf(w, "  Agent: 已启用（状态目录 %s，内核目录 %s）\n", a.StateDir, a.KernelsDir)
 	if a.ManifestPath == "" {
@@ -122,7 +124,63 @@ func checkAgent(w io.Writer, cfg *Config) error {
 			fmt.Fprintf(w, "  ✓ Agent.DesiredPath: %s\n", a.DesiredPath)
 		}
 	}
-	return checkAgentPanel(w, a.Panel)
+	if err := checkAgentPanel(w, a.Panel); err != nil {
+		return err
+	}
+	if online {
+		return checkAgentManifestOnline(w, a)
+	}
+	return nil
+}
+
+// checkAgentManifestOnline fetches the manifest the panel serves and reports
+// its sequence. It prints no document content and the token never appears in
+// the URL or the output. The signature is not checked here: the agent verifies
+// it locally before using the manifest, and "check" only reports what the panel
+// currently serves.
+func checkAgentManifestOnline(w io.Writer, a *AgentConfig) error {
+	pc := a.Panel
+	if pc == nil || !pc.Enabled || !pc.ManifestSyncEnabled() {
+		return nil
+	}
+	token, err := pc.ResolveToken()
+	if err != nil {
+		fmt.Fprintf(w, "  ✗ %v\n", err)
+		return err
+	}
+	c, err := panelclient.New(panelclient.Options{
+		BaseURL:           pc.URL,
+		MachineID:         pc.MachineID,
+		Token:             token,
+		AllowInsecureHTTP: pc.AllowInsecureHTTP,
+	})
+	if err != nil {
+		fmt.Fprintf(w, "  ✗ 内核清单: %v\n", err)
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := c.Manifest(ctx, panelclient.ManifestRequest{})
+	switch {
+	case errors.Is(err, panelclient.ErrNoManifest):
+		fmt.Fprintln(w, "  内核清单: 面板尚未发布（HTTP 404 no_manifest）")
+		return nil
+	case err != nil:
+		fmt.Fprintf(w, "  ✗ 内核清单拉取失败: %v\n", err)
+		return err
+	case res.NotModified:
+		fmt.Fprintln(w, "  内核清单: 未修改（HTTP 304）")
+		return nil
+	}
+	var env struct {
+		Sequence int64 `json:"sequence"`
+	}
+	if err := json.Unmarshal(res.Raw, &env); err != nil {
+		fmt.Fprintf(w, "  ✗ 内核清单不是合法 JSON: %v\n", err)
+		return err
+	}
+	fmt.Fprintf(w, "  ✓ 内核清单: sequence %d（%d 字节；本机验签通过后才会启用）\n", env.Sequence, len(res.Raw))
+	return nil
 }
 
 // checkAgentPanel reports the panel link section. It never connects: it
@@ -138,6 +196,15 @@ func checkAgentPanel(w io.Writer, pc *AgentPanelConfig) error {
 	if (pc.PullIntervalSec != 0 && time.Duration(pc.PullIntervalSec)*time.Second != pull) ||
 		(pc.ReportIntervalSec != 0 && time.Duration(pc.ReportIntervalSec)*time.Second != report) {
 		fmt.Fprintln(w, "  ! 间隔已被限制在 10–300 秒之内")
+	}
+	if pc.ManifestSyncEnabled() {
+		every := pc.ManifestInterval()
+		fmt.Fprintf(w, "  内核清单同步: 已启用（间隔 %s；面板下发、本机验签）\n", every)
+		if pc.ManifestIntervalSec != 0 && time.Duration(pc.ManifestIntervalSec)*time.Second != every {
+			fmt.Fprintln(w, "  ! 内核清单间隔已被限制在 300–86400 秒之内")
+		}
+	} else {
+		fmt.Fprintln(w, "  内核清单同步: 已关闭（Agent.Panel.ManifestSync=false）")
 	}
 	if pc.AllowInsecureHTTP {
 		fmt.Fprintln(w, "  ! Agent.Panel.AllowInsecureHTTP 已开启：令牌将以明文传输，仅限开发环境")

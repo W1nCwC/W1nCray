@@ -13,7 +13,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -32,6 +34,21 @@ import (
 	"github.com/W1nCwC/W1nCray/driver/realm"
 	"github.com/W1nCwC/W1nCray/driver/xray"
 )
+
+// ManifestFileName is the file the agent keeps its last verified kernel
+// manifest in, directly under the state directory. The panel sync loop writes
+// it and Boot reads it back when no explicit Agent.ManifestPath is configured.
+const ManifestFileName = "manifest.json"
+
+// PersistedManifestPath returns where the agent persists the last accepted
+// kernel manifest for the given state directory. The empty state directory
+// yields "" (nothing to persist).
+func PersistedManifestPath(stateDir string) string {
+	if stateDir == "" {
+		return ""
+	}
+	return filepath.Join(stateDir, ManifestFileName)
+}
 
 // Options carries the config-derived settings Boot needs. All paths must be
 // resolved by the caller (see panel.Config.resolvePaths).
@@ -113,6 +130,7 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
+	loadPersistedManifest(kern, opts.StateDir, opts.ManifestPath, log)
 	sup := supervisor.New(supervisor.Options{Log: log, PIDDir: filepath.Join(opts.StateDir, "pid")})
 	drivers, err := driverBuilder(c, opts.Policy, log)
 	if err != nil {
@@ -131,6 +149,39 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		rt.resume()
 	}
 	return rt, nil
+}
+
+// loadPersistedManifest restores the manifest the panel sync loop persisted in
+// a previous run, so external kernels stay available across a restart without
+// waiting for the panel. It only applies when no explicit ManifestPath is
+// configured: that file is loaded, and must be valid, by kernelx.New.
+//
+// The persisted copy goes through exactly the same verification as a manifest
+// fetched from the panel. A tampered, expired or rolled-back file is logged and
+// ignored, and Boot continues: the panel link, if any, provides a fresh one.
+func loadPersistedManifest(kern *kernelx.Ensurer, stateDir, manifestPath string, log driver.Logger) {
+	if manifestPath != "" {
+		return
+	}
+	path := PersistedManifestPath(stateDir)
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return
+	case err != nil:
+		log.Warnf("bootstrap: reading the persisted kernel manifest %s: %v", path, err)
+		return
+	}
+	if err := kern.LoadManifest(raw); err != nil {
+		log.Warnf("bootstrap: persisted kernel manifest %s was rejected: %v (continuing without it)", path, err)
+		return
+	}
+	if seq, ok := kern.ManifestSequence(); ok {
+		log.Infof("bootstrap: restored the persisted kernel manifest %s (sequence %d)", path, seq)
+	}
 }
 
 // resume re-applies the persisted last good state and records the outcome. It

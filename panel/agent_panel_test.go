@@ -2,6 +2,10 @@ package panel
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +20,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/W1nCwC/W1nCray/agent/bootstrap"
+	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
 
 const testPanelToken = "tok-panel-0123456789"
@@ -309,13 +316,15 @@ func TestCheckAgentPanelReport(t *testing.T) {
 type fakePanelServer struct {
 	srv *httptest.Server
 
-	mu      sync.Mutex
-	desired string // the "desired" JSON; "" answers unchanged
-	down    bool   // answer 503 to everything
-	counts  map[string]int
-	ack     map[string]any
-	auth    string
-	headers http.Header
+	mu       sync.Mutex
+	desired  string // the "desired" JSON; "" answers unchanged
+	down     bool   // answer 503 to everything
+	manifest string // the signed manifest body; "" answers 404 no_manifest
+	etag     string
+	counts   map[string]int
+	ack      map[string]any
+	auth     string
+	headers  http.Header
 }
 
 func newFakePanelServer(t *testing.T) *fakePanelServer {
@@ -345,6 +354,16 @@ func newFakePanelServer(t *testing.T) *fakePanelServer {
 			json.Unmarshal(raw, &m)
 			f.ack = m
 			io.WriteString(w, `{"ok":true}`)
+		case "manifest":
+			if f.manifest == "" {
+				w.WriteHeader(404)
+				io.WriteString(w, `{"error":"no_manifest"}`)
+				return
+			}
+			if f.etag != "" {
+				w.Header().Set("ETag", f.etag)
+			}
+			io.WriteString(w, f.manifest)
 		default:
 			io.WriteString(w, `{"ok":true}`)
 		}
@@ -449,4 +468,192 @@ func dialOK(addr string) bool {
 	}
 	c.Close()
 	return true
+}
+
+// ---- kernel manifest sync ----------------------------------------------------
+
+// TestAgentPanelManifestSyncConfig covers the two new knobs: the default (on,
+// 1h) and the explicit opt-out, plus the [300, 86400] clamp.
+func TestAgentPanelManifestSyncConfig(t *testing.T) {
+	load := func(t *testing.T, extra string) *AgentPanelConfig {
+		t.Helper()
+		dir := t.TempDir()
+		path := writeAgentConfig(t, dir, `    Enabled: true
+    URL: https://panel.example.com
+    MachineID: 7
+    Token: t
+`+extra)
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Agent.Panel
+	}
+
+	pc := load(t, "")
+	if !pc.ManifestSyncEnabled() {
+		t.Error("manifest sync must default to enabled")
+	}
+	if pc.ManifestSync != nil {
+		t.Errorf("ManifestSync default = %v, want unset (nil)", *pc.ManifestSync)
+	}
+	if got := pc.ManifestInterval(); got != time.Hour {
+		t.Errorf("default interval = %v, want 1h", got)
+	}
+
+	off := load(t, "    ManifestSync: false\n")
+	if off.ManifestSync == nil || *off.ManifestSync {
+		t.Fatalf("ManifestSync = %v, want false", off.ManifestSync)
+	}
+	if off.ManifestSyncEnabled() {
+		t.Error("ManifestSync: false must disable the sync")
+	}
+
+	for _, tc := range []struct {
+		sec  string
+		want time.Duration
+	}{
+		{"1", 5 * time.Minute},
+		{"300", 5 * time.Minute},
+		{"7200", 2 * time.Hour},
+		{"86400", 24 * time.Hour},
+		{"100000", 24 * time.Hour},
+	} {
+		if got := load(t, "    ManifestIntervalSec: "+tc.sec+"\n").ManifestInterval(); got != tc.want {
+			t.Errorf("ManifestIntervalSec %s = %v, want %v", tc.sec, got, tc.want)
+		}
+	}
+
+	// A negative interval is a config error, not silently clamped.
+	dir := t.TempDir()
+	path := writeAgentConfig(t, dir, `    Enabled: true
+    URL: https://panel.example.com
+    MachineID: 7
+    Token: t
+    ManifestIntervalSec: -1
+`)
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "ManifestIntervalSec") {
+		t.Errorf("negative interval: err = %v", err)
+	}
+}
+
+// TestCheckAgentPanelManifestSync checks the "check" report line.
+func TestCheckAgentPanelManifestSync(t *testing.T) {
+	pc := &AgentPanelConfig{Enabled: true, URL: "https://panel.example.com", MachineID: 7, Token: "t"}
+	var w bytes.Buffer
+	if err := checkAgentPanel(&w, pc); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(w.String(), "内核清单同步: 已启用") || !strings.Contains(w.String(), "1h0m0s") {
+		t.Errorf("report:\n%s", w.String())
+	}
+
+	off := false
+	pc.ManifestSync = &off
+	w.Reset()
+	if err := checkAgentPanel(&w, pc); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(w.String(), "已关闭") {
+		t.Errorf("report:\n%s", w.String())
+	}
+
+	pc.ManifestSync = nil
+	pc.ManifestIntervalSec = 60
+	w.Reset()
+	if err := checkAgentPanel(&w, pc); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(w.String(), "300–86400") {
+		t.Errorf("the clamp is not reported:\n%s", w.String())
+	}
+}
+
+// TestPanelLinkSyncsSignedManifest is the whole-stack proof: a panel serves a
+// signed manifest, the agent verifies it locally and persists the accepted
+// bytes under the state directory.
+func TestPanelLinkSyncsSignedManifest(t *testing.T) {
+	dir := t.TempDir()
+	keysPath := filepath.Join(dir, "keys.txt")
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keysPath, []byte(hex.EncodeToString(pub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	arch := sha256.Sum256([]byte("archive"))
+	bin := sha256.Sum256([]byte("binary"))
+	now := time.Now()
+	raw, err := manifest.Sign(&manifest.Manifest{
+		Schema: manifest.SchemaVersion, Sequence: 3,
+		IssuedAt: now.Add(-time.Hour), ExpiresAt: now.Add(24 * time.Hour),
+		Kernels: []manifest.Kernel{{
+			Name: "gost", Version: "3.3.0",
+			License: manifest.License{SPDX: "MIT"},
+			Run:     manifest.Run{Binary: "gost", VersionCmd: []string{"-V"}},
+			Targets: map[string]*manifest.Target{
+				"linux/amd64": {
+					URLs: []string{"https://example.invalid/gost.tar.gz"}, Archive: manifest.ArchiveTarGz,
+					ArchiveSHA256: hex.EncodeToString(arch[:]), ArchiveSize: 10,
+					Extract:       []manifest.Extract{{From: "gost", To: "gost", SHA256: hex.EncodeToString(bin[:]), Size: 3, Mode: "0755"}},
+					InstalledSize: 3,
+				},
+			},
+		}},
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fp := newFakePanelServer(t)
+	fp.mu.Lock()
+	fp.manifest, fp.etag = string(raw), `"seq3"`
+	fp.mu.Unlock()
+
+	stateDir := filepath.Join(dir, "state")
+	configPath := filepath.Join(dir, "config.yml")
+	body := fmt.Sprintf(`Log: {Level: warning}
+Agent:
+  Enabled: true
+  StateDir: %q
+  ManifestKeysPath: %q
+  Panel:
+    Enabled: true
+    URL: %s
+    MachineID: 7
+    Token: t
+    ManifestIntervalSec: 300
+`, stateDir, keysPath, fp.srv.URL)
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New(configPath, cfg)
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	persist := bootstrap.PersistedManifestPath(stateDir)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		got, err := os.ReadFile(persist)
+		if err == nil {
+			if !bytes.Equal(got, raw) {
+				t.Fatalf("persisted manifest differs from what the panel served")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the signed manifest was not persisted: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fp.count("manifest") == 0 {
+		t.Error("the panel never served a manifest")
+	}
 }

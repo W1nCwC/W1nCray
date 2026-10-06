@@ -114,6 +114,31 @@ func loadKeys(path string) ([]manifest.Key, error) {
 	return keys, nil
 }
 
+// LoadManifest verifies raw against the trusted keys and, only when it is
+// authentic (signature, expiry, sequence >= the highest sequence ever
+// accepted), makes it the manifest in force and persists it. On any error the
+// previously accepted manifest stays in force and nothing is written.
+//
+// It is safe for concurrent use: install.Installer serialises every public
+// method (including LoadManifest and Manifest) with its own mutex, so the
+// Ensurer needs no second lock. A manifest that fails verification is never
+// written to disk and never reaches the running instances.
+func (e *Ensurer) LoadManifest(raw []byte) error {
+	return e.in.LoadManifest(raw)
+}
+
+// ManifestSequence returns the sequence of the manifest currently in force and
+// reports whether one is loaded. It is for logging and status only; the
+// sequence is the strictly monotonic counter the installer enforces against
+// rollbacks.
+func (e *Ensurer) ManifestSequence() (int64, bool) {
+	m := e.in.Manifest()
+	if m == nil {
+		return 0, false
+	}
+	return m.Sequence, true
+}
+
 // Ensure makes the pinned kernel installed and current. An empty pin.Version
 // selects the highest version the manifest lists as available on this machine.
 func (e *Ensurer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {

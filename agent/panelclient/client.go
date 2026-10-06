@@ -27,6 +27,11 @@ const (
 	// read. Anything bigger is rejected instead of being buffered.
 	maxResponseBytes = 4 << 20 // 4 MiB
 
+	// maxManifestBytes is the largest signed manifest the client accepts. It
+	// matches the transport limit the task sets (1 MiB); a bigger body is
+	// rejected before it is buffered in full.
+	maxManifestBytes = 1 << 20 // 1 MiB
+
 	// maxRedirects is how many redirects the client follows before giving up.
 	maxRedirects = 3
 
@@ -190,6 +195,67 @@ func (c *Client) CommandResult(ctx context.Context, req CommandResultRequest) er
 	return c.post(ctx, "command-result", req, nil)
 }
 
+// Manifest fetches the signed kernel manifest through GET /manifest. The body
+// is limited to maxManifestBytes and is returned unparsed: the agent verifies
+// it locally against the keys compiled into the binary, never here.
+//
+// The answers are:
+//   - 200: Raw and ETag are set;
+//   - 304 (If-None-Match matched): NotModified is true;
+//   - 404: ErrNoManifest, the panel has not published a manifest yet;
+//   - anything else: a redacted *APIError or a transport error.
+//
+// The token is never part of the URL and every error text is redacted.
+func (c *Client) Manifest(ctx context.Context, req ManifestRequest) (ManifestResponse, error) {
+	httpReq, err := c.newRequest(ctx, http.MethodGet, "manifest", nil)
+	if err != nil {
+		return ManifestResponse{}, c.wrap("manifest", fmt.Errorf("build request: %w", err))
+	}
+	if req.ETag != "" {
+		httpReq.Header.Set("If-None-Match", req.ETag)
+	}
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return ManifestResponse{}, c.wrap("manifest", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNotModified:
+		return ManifestResponse{NotModified: true}, nil
+	case http.StatusNotFound:
+		return ManifestResponse{}, ErrNoManifest
+	}
+
+	// Read one byte past the limit so a too-large body can be detected.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
+	if err != nil {
+		return ManifestResponse{}, c.wrap("manifest", fmt.Errorf("read response: %w", err))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ManifestResponse{}, c.apiError(resp.StatusCode, data)
+	}
+	if len(data) > maxManifestBytes {
+		return ManifestResponse{}, c.wrap("manifest", fmt.Errorf("response body exceeds %d bytes", maxManifestBytes))
+	}
+	return ManifestResponse{Raw: data, ETag: resp.Header.Get("ETag")}, nil
+}
+
+// newRequest builds a request to an agent endpoint with the four headers every
+// call carries. The body is optional (nil for GET).
+func (c *Client) newRequest(ctx context.Context, method, endpoint string, body io.Reader) (*http.Request, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, method, c.baseURL+endpointPrefix+endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("X-Machine-Id", strconv.Itoa(c.machineID))
+	httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	httpReq.Header.Set("User-Agent", c.userAgent)
+	return httpReq, nil
+}
+
 // post performs one JSON POST. A nil out means the response body is ignored.
 func (c *Client) post(ctx context.Context, endpoint string, req any, out any) error {
 	body, err := json.Marshal(req)
@@ -197,15 +263,11 @@ func (c *Client) post(ctx context.Context, endpoint string, req any, out any) er
 		return c.wrap(endpoint, fmt.Errorf("encode request: %w", err))
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+endpointPrefix+endpoint, bytes.NewReader(body))
+	httpReq, err := c.newRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return c.wrap(endpoint, fmt.Errorf("build request: %w", err))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
-	httpReq.Header.Set("X-Machine-Id", strconv.Itoa(c.machineID))
-	httpReq.Header.Set("Authorization", "Bearer "+c.token)
-	httpReq.Header.Set("User-Agent", c.userAgent)
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {

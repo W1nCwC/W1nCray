@@ -104,7 +104,7 @@ Agent:
 |---|---|---|
 | `Enabled` | `false` | 总开关。只有它为 `true` 时才校验与启用本块；没有 `Nodes` 时必须启用 Agent，否则配置被判无效（`no Nodes configured and Agent.Enabled is not set`） |
 | `DesiredPath` | 空 | 期望状态 JSON 文件。设置后：启动时应用一次；之后文件被写入/创建/重命名时**去抖 500 ms 自动重新应用**，无需重载整个进程。应用失败只记日志（`agent: apply <path>: …`）并保留旧状态。未设置时 Agent 不会自己读任何文件（可用 `agent-apply` 手动应用） |
-| `ManifestPath` | 空 | 已签名的内核清单。**不设置时只有内嵌 xray 可用**，gost / frp / realm 无法安装（报「no signed kernel manifest loaded (set Agent.ManifestPath)」） |
+| `ManifestPath` | 空 | 已签名的内核清单。**不设置时只有内嵌 xray 可用**，gost / frp / realm 无法安装（报「no signed kernel manifest loaded (set Agent.ManifestPath)」）。设置后不再读取面板同步的持久化副本（见 §3「内核清单自动同步」） |
 | `ManifestKeysPath` | 空 | 额外信任的 ed25519 公钥文件（hex，每行一个），叠加在二进制内嵌公钥之上，供本地/自托管使用；生产信任根是编译时内嵌的公钥。没有任何公钥时任何清单都会被拒（fail-closed，预期行为） |
 | `StateDir` | 配置文件所在目录下的 `state` | Agent 状态目录：已应用/上次可用的期望状态、冻结记录、各驱动的私有目录、PID 目录。文件权限 0600（含 `secret`） |
 | `KernelsDir` | `StateDir/kernels` | 外部内核安装目录 |
@@ -223,6 +223,39 @@ bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.
 - 若 `config.yml` 已存在，安装**不会覆盖**：新配置写到 `<配置目录>/config.panel.yml.new`，安装以黄色警告提示如何合并，返回码仍为 0。
 - 机器模式安装时的配置检查是离线的（`check` 不带 `--online`）：面板暂时不可达不会阻止服务启动，agent 会在后台重试领取节点。
 - 安装结束会提示「已关联面板，agent 将自动领取节点与转发规则」并给出查看日志的命令；提示里不回显令牌。
+
+### 内核清单自动同步（`ManifestSync`）
+
+外部内核（gost / frp / realm）的可执行文件由一份**已签名清单**约束。清单可以由面板托管：agent 用机器令牌定时拉取，但**真伪只由 agent 本机验签决定**（内置 ed25519 公钥）。面板即使被攻破，没有私钥也下发不了恶意内核；任何验签失败的内容一律丢弃，不写盘，也不影响正在运行的实例。
+
+```yaml
+Agent:
+  Enabled: true
+  Panel:
+    Enabled: true
+    URL: https://panel.example.com
+    MachineID: 12
+    TokenFile: /etc/W1nCray/machine.token
+    ManifestSync: true          # 缺省即 true；设 false 关闭
+    ManifestIntervalSec: 3600   # 缺省 3600；范围 [300, 86400]
+```
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `ManifestSync` | `true` | 是否从面板同步内核清单。仅在 `Agent.Enabled` 且 `Agent.Panel.Enabled` 时生效；设为 `false` 时面板不会提供清单，只能靠本机 `Agent.ManifestPath` |
+| `ManifestIntervalSec` | `3600` | 同步间隔（秒），被限制在 `[300, 86400]`。成功一轮后按 ±10% 抖动等待；失败按 30 s 起指数退避（上限 5 min） |
+
+端点与协议：`GET {URL}/api/v2/server/machine/agent/manifest`，请求头 `X-Machine-Id` + `Authorization: Bearer <令牌>`（**令牌不进 URL、日志与报错**）。`200` 返回清单 JSON（带 `ETag`）；带 `If-None-Match` 且未变化返回 `304`；面板还没有清单返回 `404 {"error":"no_manifest"}`；`401` / `403` 与其它 agent 端点一致。
+
+行为：
+
+- **启动后立即拉一次**，之后按间隔轮询；循环随服务退出而结束，不会留下后台 goroutine。
+- `200`：响应体上限 **1 MiB**；交给本机验签（`install.LoadManifest`：签名、有效期、吊销、序号防回滚），**通过**才原子写入 `<StateDir>/manifest.json`（权限 0600，临时文件 + rename）并记住 `ETag`；**不通过**只记一条 warn（不含清单内容）、不写盘、不更新 `ETag`，已在用的清单继续生效。
+- `304`：清单未变，什么都不做；`404`：面板尚未发布，只记 debug；网络错误或 `5xx`：记 warn 并退避重试，不会 panic，也不影响运行中的实例。
+- **启动时**：若没有配置 `Agent.ManifestPath` 而 `<StateDir>/manifest.json` 存在，就用它作为初始清单——同样要过本机验签；验签失败（被篡改、过期、序号回退）只记 warn，agent 继续运行并等待面板同步。
+- `W1nCray check` 会打印清单同步的开关与间隔；加 `--online` 时还会实际拉取一次并报告 `sequence`（**不打印清单内容**，签名仍由 agent 在本机校验）。
+
+> 与 `Agent.ManifestPath` 的关系：`ManifestPath` 是操作者手工放置的清单，优先级更高——只要设置了它，就不再读取 `<StateDir>/manifest.json`。面板同步写入的持久化副本只在 `ManifestPath` 为空时用于下次启动。
 
 ## 4 本地策略 `Policy`
 
@@ -347,7 +380,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 ### `W1nCray check`
 
-`W1nCray check [-c config.yml] [--online]` 校验配置而不提供服务。对 Agent 它只检查：`ManifestPath`、`ManifestKeysPath` 指向的文件存在（不存在算失败）；`DesiredPath` 文件存在（不存在只是警告：启动时不会应用）。**它不校验 `desired.json` 的内容**——内容是否合法只有应用时才知道（常驻服务的日志里会有 `agent: apply <path>: …`，或用 `agent-apply` 看完整报告）。
+`W1nCray check [-c config.yml] [--online]` 校验配置而不提供服务。对 Agent 它只检查：`ManifestPath`、`ManifestKeysPath` 指向的文件存在（不存在算失败）；`DesiredPath` 文件存在（不存在只是警告：启动时不会应用）。**它不校验 `desired.json` 的内容**——内容是否合法只有应用时才知道（常驻服务的日志里会有 `agent: apply <path>: …`，或用 `agent-apply` 看完整报告）。启用面板时还会打印内核清单同步的开关与间隔（§3「内核清单自动同步」）；`--online` 会顺带拉取一次清单并报告 `sequence`，但不打印内容，也不代替 agent 的本地验签。
 
 ### 常驻服务
 
