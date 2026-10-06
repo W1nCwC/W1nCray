@@ -1,0 +1,36 @@
+{
+ "services": [
+  {
+   "name": "ex.tunnel",
+   "addr": "0.0.0.0:443",
+   "handler": {
+    "type": "relay",
+    "auth": {
+     "username": "8d58dbee4199",
+     "password": "s3cr3t-s3cr3t-s3cr3t-0123"
+    }
+   },
+   "listener": {
+    "type": "wss",
+    "tls": {
+     "certFile": "/etc/w1ncray/c.pem",
+     "keyFile": "/etc/w1ncray/k.pem"
+    },
+    "metadata": {
+     "path": "/tun"
+    }
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "10.0.0.7:5201"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  }
+ ]
+}

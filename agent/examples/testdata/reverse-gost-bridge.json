@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "gost-rev",
+      "name": "gost反向代理内网端（bridge）：主动连出，只服务声明的内网目标",
+      "enabled": true,
+      "engine": "gost",
+      "kind": "reverse_bridge",
+      "listen": { "ports": "21400" },
+      "network": ["tcp"],
+      "targets": [{ "host": "192.168.1.30", "ports": "8080" }],
+      "tunnel": {
+        "type": "wss",
+        "server": "relay.example.com:21401",
+        "host": "relay.example.com",
+        "sni": "relay.example.com",
+        "path": "/gost-rev"
+      },
+      "reverse": { "link": "gost-rev" },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

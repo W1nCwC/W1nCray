@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "lb-rr",
+      "name": "轮询负载均衡，权重3比1",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "20401" },
+      "network": ["tcp"],
+      "targets": [
+        { "host": "203.0.113.11", "ports": "443", "weight": 3 },
+        { "host": "203.0.113.12", "ports": "443", "weight": 1 }
+      ],
+      "balance": { "strategy": "round_robin" }
+    },
+    {
+      "id": "lb-random",
+      "name": "随机负载均衡，三个目标",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "20402" },
+      "network": ["tcp"],
+      "targets": [
+        { "host": "203.0.113.11", "ports": "8443" },
+        { "host": "203.0.113.12", "ports": "8443" },
+        { "host": "203.0.113.13", "ports": "8443" }
+      ],
+      "balance": { "strategy": "random" }
+    },
+    {
+      "id": "lb-failover",
+      "name": "主备切换：优先第一个目标，TCP探测失败才切换",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "20403" },
+      "network": ["tcp"],
+      "targets": [
+        { "host": "203.0.113.11", "ports": "443" },
+        { "host": "203.0.113.12", "ports": "443" }
+      ],
+      "balance": {
+        "strategy": "failover",
+        "health": { "type": "tcp", "interval_s": 5, "timeout_s": 2, "max_fails": 3 }
+      }
+    }
+  ]
+}

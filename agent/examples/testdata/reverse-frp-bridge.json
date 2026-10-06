@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "frp-nas",
+      "name": "frp反向代理内网端（bridge）：端口一一对应，向目标发送PROXY v2，TCP主动健康检查",
+      "enabled": true,
+      "engine": "frp",
+      "kind": "reverse_bridge",
+      "listen": { "ports": "20950-20951" },
+      "network": ["tcp"],
+      "targets": [{ "host": "192.168.1.20", "ports": "8080-8081" }],
+      "proxy_protocol_out": 2,
+      "balance": {
+        "strategy": "failover",
+        "health": { "type": "tcp", "interval_s": 5, "timeout_s": 2, "max_fails": 3 }
+      },
+      "tunnel": {
+        "type": "tls",
+        "server": "198.51.100.7:20959",
+        "security": "tls"
+      },
+      "reverse": { "link": "frp-nas" },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

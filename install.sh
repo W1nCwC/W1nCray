@@ -6,6 +6,17 @@
 #
 #   sh install.sh install [--lite|--full] [--prefix DIR] [--with-geo]
 #                         [--binary FILE | --url URL | --version vX.Y.Z]
+#                         [--insecure-skip-verify]
+#                         [--panel URL --machine ID (--token TOKEN | --token-file FILE)
+#                          [--allow-http] [--port-range LO-HI]]
+#
+# --panel writes a "machine mode" config: the agent links out to the panel and
+# receives its nodes and forwarding rules. The machine token is stored in
+# $CONF_DIR/agent.token (0600) and never written to config.yml or the logs.
+#
+# Release downloads are checked against SHA256SUMS and refused when the check
+# is impossible or fails; --insecure-skip-verify (or
+# W1NCRAY_INSECURE_SKIP_VERIFY=1) is the only way to skip it.
 #
 # After installation the same script is the `W1nCray` command: run it without
 # arguments for a menu, or use the shortcuts (see `W1nCray help`). XrayR files
@@ -28,6 +39,13 @@ WAIT_SWITCH="${W1NCRAY_WAIT:-5}"
 # Size needed to download, unpack and replace (KiB): gzip + binary + old binary.
 NEED_KB_LITE=90000
 NEED_KB_FULL=170000
+# Release downloads are verified against SHA256SUMS and refused otherwise.
+# Only an explicit opt-out (--insecure-skip-verify, or this variable set to 1)
+# skips the check. It never applies to --binary files, which are not checked.
+INSECURE_SKIP_VERIFY=0
+if [ "${W1NCRAY_INSECURE_SKIP_VERIFY:-}" = 1 ]; then
+	INSECURE_SKIP_VERIFY=1
+fi
 
 # ---- output ----------------------------------------------------------------
 
@@ -252,22 +270,33 @@ latest_tag() {
 }
 
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+have_sha256sum() { command -v sha256sum >/dev/null 2>&1; }
 
-# verify_sha256 FILE ASSET TAG checks FILE against the release SHA256SUMS.
+# verify_sha256 FILE ASSET TAG checks FILE against the release SHA256SUMS. It
+# fails closed: a missing sha256sum, a missing or unreadable SHA256SUMS, a
+# missing or malformed digest and a mismatch all abort the installation. The
+# only way past it is the explicit opt-out (--insecure-skip-verify or
+# W1NCRAY_INSECURE_SKIP_VERIFY=1), which skips the check altogether.
 verify_sha256() {
-	if ! command -v sha256sum >/dev/null 2>&1; then
-		yellow "未找到 sha256sum，跳过校验"
+	if [ "$INSECURE_SKIP_VERIFY" = 1 ]; then
+		red "警告: 已跳过 SHA256 校验（--insecure-skip-verify）：$2 未经验证，可能被篡改或损坏！" >&2
 		return 0
 	fi
+	have_sha256sum ||
+		die "未找到 sha256sum，无法校验下载文件的完整性。请安装 sha256sum（coreutils 或 busybox），或改用 --binary 提供本地文件；明知风险仍要继续请加 --insecure-skip-verify"
 	_sums="$(mktemp)"
-	if ! download "https://github.com/$REPO/releases/download/$3/SHA256SUMS" "$_sums" >/dev/null 2>&1; then
+	if ! download "https://github.com/$REPO/releases/download/$3/SHA256SUMS" "$_sums" >/dev/null 2>&1 || [ ! -s "$_sums" ]; then
 		rm -f "$_sums"
-		yellow "该版本没有 SHA256SUMS，跳过校验"
-		return 0
+		die "无法获取 $3 的 SHA256SUMS，拒绝安装未经校验的程序。请检查网络或版本号；明知风险仍要继续请加 --insecure-skip-verify"
 	fi
 	_want="$(awk -v n="$2" '{f=$2; sub(/^\*/, "", f); if (f == n) {print $1; exit}}' "$_sums")"
 	rm -f "$_sums"
 	[ -n "$_want" ] || die "SHA256SUMS 中没有 $2 的校验值"
+	case "$_want" in
+	*[!0-9A-Fa-f]*) die "SHA256SUMS 中 $2 的校验值不是十六进制: $_want" ;;
+	esac
+	[ "${#_want}" -eq 64 ] || die "SHA256SUMS 中 $2 的校验值长度不是 64: $_want"
+	_want="$(printf '%s' "$_want" | tr 'A-F' 'a-f')"
 	_got="$(sha256_of "$1")"
 	[ "$_want" = "$_got" ] || die "SHA256 校验失败（期望 $_want，实际 $_got）"
 	green "SHA256 校验通过: $2"
@@ -593,6 +622,19 @@ run_check() {
 	return 1
 }
 
+# run_check_offline validates the config without contacting the panel. Machine
+# mode uses it: the panel may be unreachable while the agent is being
+# installed, and the agent retries in the background, so a network hiccup must
+# not keep the service from starting.
+run_check_offline() {
+	echo
+	if "$BIN" check -c "$CONF"; then
+		return 0
+	fi
+	red "配置检查未通过，请修改 $CONF 后执行: W1nCray check"
+	return 1
+}
+
 backup_conf() {
 	if [ -d "$CONF_DIR" ]; then
 		_b="$CONF_DIR.bak.$(date +%Y%m%d-%H%M%S)"
@@ -669,11 +711,140 @@ drop_sysupgrade_entries() { # $1 = 1 to drop the config directory entry too
 	rm -f "$_tmp"
 }
 
+# ---- panel machine mode -----------------------------------------------------
+# The panel's admin page hands out a one-liner like
+#
+#   bash <(curl -fsSL .../install.sh) install --panel URL --machine ID --token T
+#
+# which installs the binary and the service and additionally writes a config
+# where the agent links out to the panel and receives its nodes. The token is
+# the only secret involved: it lives in $CONF_DIR/agent.token (0600) and is
+# referenced through Agent.Panel.TokenFile, never written into config.yml.
+
+# yaml_dq STRING prints STRING as a double-quoted YAML scalar, so a URL with
+# YAML metacharacters (#, :, quotes, backslashes) cannot break the document.
+yaml_dq() {
+	printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# is_loopback_host HOST matches what the agent's client accepts as loopback:
+# localhost, 127.0.0.0/8 and ::1.
+is_loopback_host() {
+	case "$1" in
+	localhost | "[::1]") return 0 ;;
+	127.*)
+		case "${1#127.}" in
+		'' | *[!0-9.]*) return 1 ;;
+		*) return 0 ;;
+		esac
+		;;
+	esac
+	return 1
+}
+
+# panel_url URL ALLOW_HTTP prints the URL without trailing slashes, or prints
+# an explanation to stderr and returns non-zero. It never calls die: it runs
+# inside a command substitution, where exit would only leave the subshell.
+panel_url() {
+	_url="$1"
+	_allow_http="$2"
+	while [ "${_url%/}" != "$_url" ]; do
+		_url="${_url%/}"
+	done
+	case "$_url" in
+	https://*)
+		_scheme=https
+		_host="${_url#https://}"
+		;;
+	http://*)
+		_scheme=http
+		_host="${_url#http://}"
+		;;
+	*)
+		red "错误: --panel 的地址必须以 https:// 开头（仅本机回环可用 http://）: $_url" >&2
+		return 1
+		;;
+	esac
+	[ -n "$_host" ] || {
+		red "错误: --panel 的地址缺少主机名: $_url" >&2
+		return 1
+	}
+	case "$_host" in
+	*[![:print:]]*)
+		red "错误: --panel 的地址不能包含控制字符（如换行、制表符）" >&2
+		return 1
+		;;
+	esac
+	case "$_host" in
+	*@*)
+		red "错误: --panel 的地址不能包含用户名或密码" >&2
+		return 1
+		;;
+	esac
+	if [ "$_scheme" = http ]; then
+		_hp="${_host%%/*}"
+		case "$_hp" in
+		"[::1]"*) _h="[::1]" ;;
+		*:*) _h="${_hp%:*}" ;;
+		*) _h="$_hp" ;;
+		esac
+		if ! is_loopback_host "$_h" && [ "$_allow_http" -ne 1 ]; then
+			red "错误: --panel 使用明文 http:// 且不是本机回环地址；机器令牌会以明文在网络中传输。确认网络可信后请加 --allow-http" >&2
+			return 1
+		fi
+	fi
+	printf '%s' "$_url"
+}
+
+# panel_config DEST URL ID LO HI TOKENFILE ALLOW_HTTP writes the machine-mode
+# config. Every string value is quoted; numbers stay bare.
+panel_config() {
+	{
+		printf 'Log: {Level: info}\n'
+		printf 'Agent:\n'
+		printf '  Enabled: true\n'
+		printf '  StateDir: %s\n' "$(yaml_dq "$CONF_DIR/state")"
+		printf '  Policy:\n'
+		printf '    AllowListen: ["0.0.0.0"]\n'
+		printf '    PortRange: [%s, %s]\n' "$4" "$5"
+		printf '    AllowEngines: ["xray"]\n'
+		printf '  Panel:\n'
+		printf '    Enabled: true\n'
+		printf '    URL: %s\n' "$(yaml_dq "$2")"
+		printf '    MachineID: %s\n' "$3"
+		printf '    TokenFile: %s\n' "$(yaml_dq "$6")"
+		if [ "$7" -eq 1 ]; then
+			printf '    AllowInsecureHTTP: true\n'
+		fi
+		printf '    MachineNodes: true\n'
+	} >"$1"
+}
+
+# panel_hint URL ID PENDING tells the admin the machine is linked. It never
+# prints the token. PENDING=1 means the generated config was written to
+# config.panel.yml.new and still has to be merged by hand.
+panel_hint() {
+	[ -n "$1" ] || return 0
+	if [ "${3:-0}" -eq 1 ]; then
+		yellow "已关联面板 $1（机器 ID $2），但配置尚未生效：请按上面的提示合并配置并重启服务，之后 agent 将自动领取节点与转发规则"
+	else
+		green "已关联面板 $1（机器 ID $2），agent 将自动领取节点与转发规则"
+	fi
+	yellow "查看日志：W1nCray log（实时）或 W1nCray status"
+}
+
 cmd_install() {
 	_src="latest"
 	_flavor=""
 	_prefix=""
 	_geo=""
+	_panel=""
+	_machine=""
+	_token=""
+	_token_file=""
+	_port_range=""
+	_allow_http=0
+	_panel_pending=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--binary)
@@ -713,6 +884,39 @@ cmd_install() {
 			_geo=no
 			shift
 			;;
+		--panel)
+			[ $# -ge 2 ] || die "--panel 需要面板地址"
+			_panel="$2"
+			shift 2
+			;;
+		--machine)
+			[ $# -ge 2 ] || die "--machine 需要机器 ID"
+			_machine="$2"
+			shift 2
+			;;
+		--token)
+			[ $# -ge 2 ] || die "--token 需要令牌"
+			_token="$2"
+			shift 2
+			;;
+		--token-file)
+			[ $# -ge 2 ] || die "--token-file 需要文件路径"
+			_token_file="$2"
+			shift 2
+			;;
+		--allow-http)
+			_allow_http=1
+			shift
+			;;
+		--port-range)
+			[ $# -ge 2 ] || die "--port-range 需要 LO-HI"
+			_port_range="$2"
+			shift 2
+			;;
+		--insecure-skip-verify)
+			INSECURE_SKIP_VERIFY=1
+			shift
+			;;
 		-y | --yes)
 			ASSUME_YES=1
 			shift
@@ -721,6 +925,58 @@ cmd_install() {
 		esac
 	done
 	need_root
+
+	# Machine mode (--panel): validate everything before touching the machine,
+	# so a typo cannot leave a half-configured host behind.
+	_panel_lo=20000
+	_panel_hi=40000
+	if [ -n "$_panel" ] || [ -n "$_machine" ] || [ -n "$_token" ] || [ -n "$_token_file" ]; then
+		[ -n "$_panel" ] || die "缺少 --panel：--panel、--machine 与令牌（--token 或 --token-file）必须同时提供"
+		[ -n "$_machine" ] || die "缺少 --machine：--panel、--machine 与令牌（--token 或 --token-file）必须同时提供"
+		if [ -n "$_token" ] && [ -n "$_token_file" ]; then
+			die "--token 与 --token-file 只能提供一个"
+		fi
+		if [ -z "$_token" ] && [ -z "$_token_file" ]; then
+			die "缺少令牌：请用 --token 或 --token-file 提供面板令牌"
+		fi
+
+		_machine_raw="$_machine"
+		case "$_machine" in
+		'' | *[!0-9]*) die "--machine 必须是正整数，收到: $_machine_raw" ;;
+		esac
+		_machine="$(printf '%s' "$_machine" | sed 's/^0*//')"
+		[ -n "$_machine" ] || _machine=0
+		[ "$_machine" -gt 0 ] || die "--machine 必须是正整数，收到: $_machine_raw"
+
+		case "$_port_range" in
+		'') ;;
+		*-*)
+			_panel_lo="${_port_range%%-*}"
+			_panel_hi="${_port_range#*-}"
+			case "$_panel_lo" in '' | *[!0-9]*) die "--port-range 需要 LO-HI 形式（例如 20000-40000），收到: $_port_range" ;; esac
+			case "$_panel_hi" in '' | *[!0-9]*) die "--port-range 需要 LO-HI 形式（例如 20000-40000），收到: $_port_range" ;; esac
+			if [ "$_panel_lo" -lt 1 ] || [ "$_panel_hi" -gt 65535 ] || [ "$_panel_lo" -gt "$_panel_hi" ]; then
+				die "--port-range 无效: $_port_range（需要 1-65535 且 LO <= HI）"
+			fi
+			;;
+		*) die "--port-range 需要 LO-HI 形式（例如 20000-40000），收到: $_port_range" ;;
+		esac
+
+		if [ -n "$_token_file" ]; then
+			[ -f "$_token_file" ] || die "--token-file 找不到文件: $_token_file"
+			[ -r "$_token_file" ] || die "--token-file 文件不可读: $_token_file"
+			# Read it without ever putting the secret on a command line.
+			_token="$(tr -d '[:space:]' <"$_token_file")"
+		fi
+		[ -n "$_token" ] || die "面板令牌为空：请检查 --token / --token-file 提供的内容"
+		case "$_token" in
+		*[[:space:]]*) die "面板令牌不能包含空白字符（空格、换行、制表符）" ;;
+		esac
+
+		_panel="$(panel_url "$_panel" "$_allow_http")" || exit 1
+	elif [ -n "$_port_range" ] || [ "$_allow_http" -eq 1 ]; then
+		die "--port-range 与 --allow-http 只在 --panel 机器模式下有意义"
+	fi
 
 	[ -n "$_prefix" ] && BIN_DIR="$_prefix"
 	BIN="$BIN_DIR/W1nCray"
@@ -744,7 +1000,34 @@ cmd_install() {
 	save_env
 	self_copy
 
-	if [ ! -f "$CONF" ]; then
+	# Machine mode: the token goes to its own 0600 file and never into
+	# config.yml, the logs or any subprocess argument.
+	if [ -n "$_panel" ]; then
+		_umask="$(umask)"
+		umask 077
+		# printf is a shell builtin: the secret never reaches an argv.
+		printf '%s' "$_token" >"$CONF_DIR/agent.token"
+		umask "$_umask"
+		chmod 600 "$CONF_DIR/agent.token"
+		_token=""
+		green "已保存面板令牌到 $CONF_DIR/agent.token（权限 600）"
+	fi
+
+	if [ -n "$_panel" ]; then
+		if [ -f "$XRAYR_DIR/config.yml" ]; then
+			yellow "机器模式下不迁移 XrayR 配置（$XRAYR_DIR/config.yml 未被修改）；需要静态节点可稍后执行: W1nCray migrate"
+		fi
+		if [ ! -f "$CONF" ]; then
+			panel_config "$CONF" "$_panel" "$_machine" "$_panel_lo" "$_panel_hi" "$CONF_DIR/agent.token" "$_allow_http"
+			green "已生成机器模式配置 $CONF"
+		else
+			_new_conf="$CONF_DIR/config.panel.yml.new"
+			panel_config "$_new_conf" "$_panel" "$_machine" "$_panel_lo" "$_panel_hi" "$CONF_DIR/agent.token" "$_allow_http"
+			_panel_pending=1
+			yellow "检测到已有配置 $CONF，未覆盖它。"
+			yellow "新的机器模式配置已写到 $_new_conf：请把其中的 Agent 段合并进 $CONF，然后执行 W1nCray restart"
+		fi
+	elif [ ! -f "$CONF" ]; then
 		if [ -f "$XRAYR_DIR/config.yml" ]; then
 			green "检测到 XrayR 配置，开始迁移（XrayR 文件只读，不会被修改）"
 			"$BIN" migrate --from "$XRAYR_DIR" --to "$CONF_DIR"
@@ -765,6 +1048,7 @@ cmd_install() {
 	if [ "$BACKEND" = none ]; then
 		yellow "没有检测到可用的服务管理器（systemd / OpenRC / procd），程序与配置已就位但未注册为服务。"
 		yellow "可手动前台运行: $BIN -c $CONF   （或 W1nCray run）"
+		panel_hint "$_panel" "$_machine" "$_panel_pending"
 		return 0
 	fi
 	svc install
@@ -776,10 +1060,15 @@ cmd_install() {
 	if [ "$_was_active" -eq 1 ]; then
 		svc restart W1nCray
 		green "W1nCray 已重启（升级完成）"
+		panel_hint "$_panel" "$_machine" "$_panel_pending"
 		return 0
 	fi
 	_failed=0
-	run_check || _failed=1
+	if [ -n "$_panel" ]; then
+		run_check_offline || _failed=1
+	else
+		run_check || _failed=1
+	fi
 	if xrayr_present && { svc active "$XRAYR_UNIT" || svc enabled "$XRAYR_UNIT"; }; then
 		yellow "XrayR 仍在运行/开机自启，为避免端口冲突，W1nCray 暂未启动。"
 		yellow "确认无误后执行: W1nCray switch   （失败会自动回滚到 XrayR）"
@@ -788,6 +1077,7 @@ cmd_install() {
 		svc start W1nCray
 		green "W1nCray 已启动并设为开机自启。管理命令: W1nCray（菜单）、W1nCray status、W1nCray log"
 	fi
+	panel_hint "$_panel" "$_machine" "$_panel_pending"
 }
 
 cmd_update() {
@@ -971,6 +1261,11 @@ cmd_uninstall() {
 	rm -f "$BIN" "$BIN_DIR/install.sh" "$MGR"
 	rmdir "$BIN_DIR" 2>/dev/null || true
 	drop_sysupgrade_entries "$_purge"
+	# The machine token is a secret: never leave it behind. Only the expected
+	# config directory is touched (same guard as --purge below).
+	case "$CONF_DIR" in
+	*/etc/W1nCray) rm -f "$CONF_DIR/agent.token" ;;
+	esac
 	if [ "$_purge" -eq 1 ]; then
 		case "$CONF_DIR" in
 		*/etc/W1nCray) rm -rf "$CONF_DIR" ;;
@@ -1009,6 +1304,21 @@ W1nCray 管理命令
 首次安装:
   sh install.sh install [--lite|--full] [--prefix DIR] [--with-geo]
                         [--binary 文件 | --url 地址 | --version vX.Y.Z]
+                        [--insecure-skip-verify]
+                        [--panel 面板地址 --machine 机器ID (--token 令牌 | --token-file 文件)
+                         [--allow-http] [--port-range 20000-40000]]
+
+  下载的发行包必须通过 SHA256SUMS 校验，缺少 sha256sum / SHA256SUMS 或不匹配都会拒绝安装；
+  明知风险仍要跳过时才加 --insecure-skip-verify（或设置 W1NCRAY_INSECURE_SKIP_VERIFY=1）。
+
+面板一键接入（机器模式）:
+  --panel 会同时写出机器模式配置：agent 启动后自动向面板领取本机器的节点与转发规则。
+  --panel / --machine 与令牌（--token 或 --token-file，二选一）必须同时提供。
+  令牌只写入 <配置目录>/agent.token（权限 600），不会写进 config.yml、日志或子进程参数。
+  面板地址必须是 https://；仅本机回环地址（localhost / 127.x / ::1）可用明文 http://，
+  非回环的 http:// 必须显式加 --allow-http（令牌会明文传输，仅限可信网络）。
+  --port-range 指定允许监听的端口区间，默认 20000-40000。
+  若 config.yml 已存在则不会覆盖：新配置写到 <配置目录>/config.panel.yml.new，请手工合并。
 EOF
 }
 

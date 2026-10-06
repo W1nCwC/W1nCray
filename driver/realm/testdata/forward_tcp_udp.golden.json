@@ -1,0 +1,14 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "0.0.0.0:5000",
+      "remote": "10.0.0.5:5000",
+      "network": {
+        "use_udp": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "0.0.0.0:9002",
+      "remote": "10.0.0.1:80",
+      "network": {
+        "send_proxy": true,
+        "send_proxy_version": 2
+      }
+    }
+  ]
+}

@@ -49,7 +49,9 @@
 sh install.sh install --binary ./W1nCray-linux-amd64
 ```
 
-安装参数：`--lite | --full`（版本类型）、`--prefix DIR`（安装目录，空间不足时指向外部存储）、`--with-geo`（强制下载 geo 文件）、`--version vX.Y.Z`、`--url 地址`、`--binary 文件`。
+安装参数：`--lite | --full`（版本类型）、`--prefix DIR`（安装目录，空间不足时指向外部存储）、`--with-geo`（强制下载 geo 文件）、`--version vX.Y.Z`、`--url 地址`、`--binary 文件`、`--insecure-skip-verify`。
+
+**校验失败即拒绝（fail-closed）**：从发行页下载的程序必须通过 `SHA256SUMS` 校验。缺少 `sha256sum`、取不到 `SHA256SUMS`、校验值缺失/格式错误或与文件不符，一律中止安装并保持现有程序不变。只有明知风险时才用 `--insecure-skip-verify`（或环境变量 `W1NCRAY_INSECURE_SKIP_VERIFY=1`）整体跳过校验，脚本会打印醒目警告。`--binary` 指定的本地文件不经校验。
 
 安装脚本会：
 
@@ -156,6 +158,60 @@ Xboard 开启节点 WebSocket 后（后台开关 + 运行 `ws-server`），W1nCr
 - 不想使用时设置 `ControllerConfig.DisableWebSocket: true`。
 
 面板侧要点：若 Xboard 用自定义 compose 以 `octane:start` 覆盖了启动命令，内置的 Caddy 与 ws-server 不会启动，需要单独运行 `php artisan ws-server start` 并在 Nginx 中把 `/ws` 反代到它（`proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`）。
+
+### Agent（内置内核管理）
+
+除了 Xboard 节点，W1nCray 还能以“Agent”方式运行：读取一个声明式的期望状态（`spec.Desired` JSON），在本机把转发实例落到内嵌的 xray 引擎或外部内核（gost / frp / realm）上。它与 `Nodes` 相互独立，可以只配 Agent 不配 Nodes。
+
+```yaml
+Agent:
+  Enabled: true
+  # 期望状态文件；修改后自动（去抖 500ms）重新应用，无需整机重载
+  DesiredPath: /etc/W1nCray/desired.json
+  # 已签名的内核清单；不设置时只有内嵌 xray 引擎可用
+  ManifestPath: /etc/W1nCray/manifest.json
+  # 额外信任的 ed25519 公钥（每行一个 hex），叠加在内嵌密钥之上；本地/自托管用
+  ManifestKeysPath: /etc/W1nCray/keys.txt
+  # 默认：StateDir=配置目录/state，KernelsDir=StateDir/kernels
+  StateDir: /etc/W1nCray/state
+  KernelsDir: /etc/W1nCray/state/kernels
+  # 本地根信任策略，远端下发的期望状态永远无法放宽它
+  Policy:
+    AllowListen: ["0.0.0.0"]      # 允许监听的地址，默认 ["127.0.0.1"]
+    PrivilegedPorts: false         # 是否允许 <1024 端口
+    PortRange: [20000, 40000]      # 允许的监听端口区间，0 表示不限
+    AllowPrivate: false            # 是否允许转发到私网目标
+    AllowEngines: []               # 允许的引擎，空=全部已安装
+```
+
+- **引擎**：`xray` 是内嵌内核（无需安装，`External: false`）；`gost`、`frp`、`realm` 需要从签名清单安装二进制。清单里的版本、URL、哈希都以清单为准，期望状态只能指定版本号。
+- **信任根**：内嵌公钥（`kernel/manifest/trusted_keys.txt`）是生产信任根，发布时用 `-ldflags "-X github.com/W1nCwC/W1nCray/kernel/manifest.ExtraKeys=<hex>,<hex>"` 注入。`ManifestKeysPath` 用于本地/自托管阶段补充密钥；两者都没有时，任何清单都会被拒绝（fail-closed，这是预期行为）。
+- **热载**：`DesiredPath` 变更（含 `W1nCray` 自身的重载）触发一次应用；失败会回滚到上一个可用状态，并把失败的期望状态“冻结”，直到内容变化。
+- **手动应用**：`W1nCray agent-apply -f desired.json` 应用一次并打印 JSON 报告（报告不含任何 secret）。它不注册内嵌 xray 引擎，只用于外部内核；已启动的内核在命令退出后继续运行。它与常驻服务共用同一把单实例锁（`<配置文件>.lock`）：服务正在用同一份配置运行时会直接报错退出，请先 `W1nCray stop`，避免两个进程同时改写同一个 `StateDir`。
+
+#### 面板控制（Agent.Panel）
+
+Agent 可以连接面板（W1nCBoard / Xboard），由面板下发期望状态、接收应用结果与运行状态。**始终是 Agent 主动外连面板**，面板不会连接 Agent，因此 NAT 后的设备同样可管。线上契约见 [docs/PLAN-v7-panel-control.md](docs/PLAN-v7-panel-control.md)。
+
+```yaml
+Agent:
+  Enabled: true
+  Panel:
+    Enabled: true
+    URL: https://panel.example.com     # 必须是 https（loopback 或 AllowInsecureHTTP 除外）
+    MachineID: 7                       # 面板上的机器 ID
+    TokenFile: /etc/W1nCray/panel.token  # 与 Token 二选一；相对路径相对于配置文件目录
+    # Token: xxxxxxxx                  # 不推荐：令牌会留在配置文件里
+    PullIntervalSec: 30                # 拉取期望状态的间隔，默认 30，限制在 10–300
+    ReportIntervalSec: 30              # 上报运行状态的间隔，默认 30，限制在 10–300
+    # AllowInsecureHTTP: false         # 仅开发用：允许明文 http:// 到非 loopback 主机
+```
+
+- **本地策略永远优先**：面板下发的期望状态与本地 `DesiredPath` 走同一套校验（`Agent.Policy`），越界就是 `rejected`，面板无法放宽。面板只能下发声明式期望状态，命令只有白名单：`refresh`（立即拉取）与 `dump_state`（回传已脱敏的最近报告与健康状态）。
+- **面板不可达不影响转发**：拉取/上报失败只记日志并退避重试（30 秒起、翻倍、封顶 5 分钟，带 ±20% 抖动），已经运行的实例原样继续。启用 Agent 后，重启会先从本地 `last_good` 恢复实例，再去连面板，所以面板宕机时重启也不会丢转发。
+- **每次应用都会回执**：无论 `applied` / `rejected` / `failed` / `rolled_back`，都向面板发送 ack；ack 发送失败会在下一轮重试。期望状态含未知字段或 revision 不一致时，Agent 不应用，直接回 `rejected`。
+- **令牌文件权限**：`TokenFile` 在类 Unix 系统上若 group/other 可读（`mode & 077 != 0`）会被拒绝，请 `chmod 600`。令牌不会出现在日志、错误信息或命令行里。`W1nCray check` 会离线检查这一段（读取令牌文件、校验 URL 与权限，不联网）。
+- **一台机器只配一个来源**：`Agent.Panel` 与 `Agent.DesiredPath` 同时配置时，两者都会应用，后到者生效；通常应只选其一。
 
 ### 规则与行为说明
 

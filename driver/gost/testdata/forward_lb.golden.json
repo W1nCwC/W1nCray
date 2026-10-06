@@ -1,0 +1,77 @@
+{
+ "services": [
+  {
+   "name": "lb.tcp.8443",
+   "addr": "0.0.0.0:8443",
+   "admissions": [
+    "lb.allow",
+    "lb.deny"
+   ],
+   "limiter": "lb.limit",
+   "climiter": "lb.climit",
+   "handler": {
+    "type": "tcp",
+    "metadata": {
+     "proxyProtocol": "2"
+    }
+   },
+   "listener": {
+    "type": "tcp"
+   },
+   "forwarder": {
+    "selector": {
+     "strategy": "random",
+     "maxFails": 3,
+     "failTimeout": 30000000000
+    },
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "a.example.com:443",
+      "metadata": {
+       "weight": "3"
+      }
+     },
+     {
+      "name": "t1",
+      "addr": "10.0.0.2:443"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  }
+ ],
+ "admissions": [
+  {
+   "name": "lb.allow",
+   "whitelist": true,
+   "matchers": [
+    "10.0.0.0/8"
+   ]
+  },
+  {
+   "name": "lb.deny",
+   "matchers": [
+    "10.1.2.3"
+   ]
+  }
+ ],
+ "limiters": [
+  {
+   "name": "lb.limit",
+   "limits": [
+    "$ 1000000B 2000000B"
+   ]
+  }
+ ],
+ "climiters": [
+  {
+   "name": "lb.climit",
+   "limits": [
+    "$ 50"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,12 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "127.0.0.1:8080",
+      "remote": "127.0.0.1:7443",
+      "remote_transport": "tls;sni=localhost;insecure"
+    }
+  ]
+}

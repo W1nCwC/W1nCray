@@ -79,14 +79,21 @@ func New(opts Options) *Controller {
 		host = u.Host
 	}
 	tag := fmt.Sprintf("node%d@%s", a.NodeID, host)
+	// A machine runs several nodes of the same panel host, so the host cannot
+	// tell them apart; the machine id can.
+	if a.MachineID != 0 && a.MachineToken != "" {
+		tag = fmt.Sprintf("node%d@machine%d", a.NodeID, a.MachineID)
+	}
 	timeout := time.Duration(a.Timeout) * time.Second
 	c := &Controller{
 		api: xboard.New(xboard.Config{
-			APIHost:  a.APIHost,
-			Key:      a.Key,
-			NodeID:   a.NodeID,
-			NodeType: nodeType,
-			Timeout:  timeout,
+			APIHost:      a.APIHost,
+			Key:          a.Key,
+			NodeID:       a.NodeID,
+			NodeType:     nodeType,
+			Timeout:      timeout,
+			MachineID:    a.MachineID,
+			MachineToken: a.MachineToken,
 		}),
 		apiCfg:    a,
 		cfg:       opts.Config,
@@ -219,10 +226,7 @@ func (c *Controller) Start(cr *core.Core) error {
 	go c.loop("pull", func() time.Duration { return c.interval(true) }, c.pull)
 	go c.loop("push", func() time.Duration { return c.interval(false) }, c.push)
 	go c.loop("cert", func() time.Duration { return 12 * time.Hour }, c.renewCert)
-	if !c.cfg.DisableWebSocket {
-		c.wg.Add(1)
-		go c.wsLoop()
-	}
+	c.startWS()
 	return nil
 }
 

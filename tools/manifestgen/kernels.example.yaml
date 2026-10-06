@@ -1,0 +1,127 @@
+# manifestgen build description for the W1nCray kernel manifest.
+# Targets with "null" mean: upstream ships no usable build for that platform,
+# the panel greys the kernel out there. No hashes appear here on purpose: they
+# are computed from the downloads and cross-checked by `manifestgen build`.
+# Asset names and the null/variant decisions come from the 2026-10-05
+# release listings of gost v3.3.0, realm v2.9.6, frp v0.71.0, Xray v26.3.27.
+
+sequence: 1          # must exceed the previously published manifest
+valid_days: 90
+min_agent: ""
+# Ordered transport sources tried before the upstream URL ({name} {version} {asset}):
+# mirrors:
+#   - https://mirror.example.com/kernels/{name}/{version}/{asset}
+
+kernels:
+  # ---------------------------------------------------------------- gost
+  - name: gost
+    version: "3.3.0"
+    repo: go-gost/gost
+    license: {spdx: MIT, file: LICENSE}
+    capabilities:
+      reload: api
+      stats: prometheus
+      tunnels: ws,wss,mws,tls,kcp,quic,h2,grpc
+      disrupts_on_change: unverified
+    run: {binary: gost, version_cmd: ["-V"]}
+    checksums: {asset: checksums.txt}
+    extract:
+      - {from: gost, to: gost}
+    targets:
+      linux/386:      {asset: gost_3.3.0_linux_386.tar.gz, variant: sse2}   # upstream does not set GO386=softfloat
+      linux/amd64:    {asset: gost_3.3.0_linux_amd64.tar.gz}
+      linux/arm64:    {asset: gost_3.3.0_linux_arm64.tar.gz}
+      linux/armv5:    {asset: gost_3.3.0_linux_armv5.tar.gz}
+      linux/armv6:    {asset: gost_3.3.0_linux_armv6.tar.gz}
+      linux/armv7:    {asset: gost_3.3.0_linux_armv7.tar.gz}
+      linux/loong64:  {asset: gost_3.3.0_linux_loong64.tar.gz}
+      linux/mips:     {asset: gost_3.3.0_linux_mips_softfloat.tar.gz, variant: softfloat}
+      linux/mipsle:   {asset: gost_3.3.0_linux_mipsle_softfloat.tar.gz, variant: softfloat}
+      linux/mips64:   {asset: gost_3.3.0_linux_mips64_hardfloat.tar.gz, variant: hardfloat}
+      linux/mips64le: {asset: gost_3.3.0_linux_mips64le_hardfloat.tar.gz, variant: hardfloat}
+      linux/riscv64:  {asset: gost_3.3.0_linux_riscv64.tar.gz}
+
+  # --------------------------------------------------------------- realm
+  # Only the non-slim musl builds: slim lacks PROXY protocol, LB and ws.
+  - name: realm
+    version: "2.9.6"
+    repo: zhboner/realm
+    license: {spdx: MIT, file: LICENSE}
+    capabilities:
+      reload: none
+      stats: none
+      disrupts_on_change: true
+    run: {binary: realm, version_cmd: ["-v"]}
+    extract:
+      - {from: realm, to: realm}
+    targets:
+      linux/386:      null
+      linux/amd64:    {asset: realm-x86_64-unknown-linux-musl.tar.gz, variant: musl-full}
+      linux/arm64:    {asset: realm-aarch64-unknown-linux-musl.tar.gz, variant: musl-full}
+      linux/armv5:    null
+      linux/armv6:    {asset: realm-arm-unknown-linux-musleabihf.tar.gz, variant: musl-full}
+      linux/armv7:    {asset: realm-armv7-unknown-linux-musleabihf.tar.gz, variant: musl-full}
+      linux/loong64:  null
+      linux/mips:     {asset: realm-mips-unknown-linux-musl.tar.gz, variant: "musl-full softfloat"}
+      linux/mipsle:   {asset: realm-mipsel-unknown-linux-musl.tar.gz, variant: "musl-full softfloat"}
+      linux/mips64:   {asset: realm-mips64-unknown-linux-muslabi64.tar.gz, variant: "musl-full hardfloat"}
+      linux/mips64le: {asset: realm-mips64el-unknown-linux-muslabi64.tar.gz, variant: "musl-full hardfloat"}
+      linux/riscv64:  null
+
+  # ----------------------------------------------------------------- frp
+  # frpc and frps ship in one archive; the version check runs frpc.
+  - name: frp
+    version: "0.71.0"
+    repo: fatedier/frp
+    license: {spdx: Apache-2.0, file: LICENSE}
+    capabilities:
+      reverse: true
+      proxy_protocol_in: false
+    run: {binary: frpc, version_cmd: ["-v"]}
+    checksums: {asset: frp_sha256_checksums.txt}
+    extract:
+      - {from: "{asset_base}/frpc", to: frpc}
+      - {from: "{asset_base}/frps", to: frps}
+    targets:
+      linux/386:      null
+      linux/amd64:    {asset: frp_0.71.0_linux_amd64.tar.gz}
+      linux/arm64:    {asset: frp_0.71.0_linux_arm64.tar.gz}
+      linux/armv5:    {asset: frp_0.71.0_linux_arm.tar.gz}
+      linux/armv6:    null
+      linux/armv7:    {asset: frp_0.71.0_linux_arm_hf.tar.gz}
+      linux/loong64:  {asset: frp_0.71.0_linux_loong64.tar.gz}
+      linux/mips:     {asset: frp_0.71.0_linux_mips.tar.gz, variant: softfloat}
+      linux/mipsle:   {asset: frp_0.71.0_linux_mipsle.tar.gz, variant: softfloat}
+      linux/mips64:   {asset: frp_0.71.0_linux_mips64.tar.gz, variant: hardfloat}
+      linux/mips64le: {asset: frp_0.71.0_linux_mips64le.tar.gz, variant: hardfloat}
+      linux/riscv64:  {asset: frp_0.71.0_linux_riscv64.tar.gz}
+
+  # ---------------------------------------------------------------- xray
+  # Xray is embedded in the agent; the manifest still describes its zips so a
+  # later "external xray" mode needs no new trust plumbing. The mips zips hold
+  # both `xray` (hardfloat) and `xray_softfloat`: W1nCray takes the softfloat one.
+  - name: xray
+    version: "26.3.27"
+    repo: XTLS/Xray-core
+    license: {spdx: MPL-2.0, file: LICENSE}
+    capabilities:
+      reload: hot
+      stats: counters
+      embedded: true
+    run: {binary: xray, version_cmd: ["version"]}
+    checksums: {dgst: true}
+    extract:
+      - {from: xray, to: xray}
+    targets:
+      linux/386:      {asset: Xray-linux-32.zip, variant: sse2}
+      linux/amd64:    {asset: Xray-linux-64.zip}
+      linux/arm64:    {asset: Xray-linux-arm64-v8a.zip}
+      linux/armv5:    {asset: Xray-linux-arm32-v5.zip}
+      linux/armv6:    {asset: Xray-linux-arm32-v6.zip}
+      linux/armv7:    {asset: Xray-linux-arm32-v7a.zip}
+      linux/loong64:  {asset: Xray-linux-loong64.zip}
+      linux/mips:     {asset: Xray-linux-mips32.zip, variant: softfloat, extract: [{from: xray_softfloat, to: xray}]}
+      linux/mipsle:   {asset: Xray-linux-mips32le.zip, variant: softfloat, extract: [{from: xray_softfloat, to: xray}]}
+      linux/mips64:   {asset: Xray-linux-mips64.zip, variant: hardfloat}
+      linux/mips64le: {asset: Xray-linux-mips64le.zip, variant: hardfloat}
+      linux/riscv64:  {asset: Xray-linux-riscv64.zip}

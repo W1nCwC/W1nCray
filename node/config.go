@@ -23,6 +23,12 @@ type APIConfig struct {
 	EnableVless         bool   `mapstructure:"EnableVless"`
 	VlessFlow           string `mapstructure:"VlessFlow"`
 	DisableCustomConfig bool   `mapstructure:"DisableCustomConfig"`
+
+	// Machine mode, set by the panel (Agent.Panel) and never by the node's
+	// YAML: the machine token identifies this host and the panel decides which
+	// nodes it runs. Both fields must be set.
+	MachineID    int    `mapstructure:"-"`
+	MachineToken string `mapstructure:"-"`
 }
 
 // Config is the "ControllerConfig" section of a node (XrayR compatible).

@@ -1,0 +1,85 @@
+{
+ "services": [
+  {
+   "name": "en.tcp.7000",
+   "addr": "127.0.0.1:7000",
+   "handler": {
+    "type": "tcp",
+    "chain": "en.chain"
+   },
+   "listener": {
+    "type": "tcp"
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "127.0.0.1:0"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  },
+  {
+   "name": "en.udp.7000",
+   "addr": "127.0.0.1:7000",
+   "handler": {
+    "type": "udp",
+    "chain": "en.chain"
+   },
+   "listener": {
+    "type": "udp",
+    "metadata": {
+     "ttl": "60s"
+    }
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "127.0.0.1:0"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  }
+ ],
+ "chains": [
+  {
+   "name": "en.chain",
+   "hops": [
+    {
+     "name": "en.hop",
+     "nodes": [
+      {
+       "name": "en.node",
+       "addr": "exit.example.com:443",
+       "connector": {
+        "type": "relay",
+        "auth": {
+         "username": "8d58dbee4199",
+         "password": "s3cr3t-s3cr3t-s3cr3t-0123"
+        }
+       },
+       "dialer": {
+        "type": "wss",
+        "tls": {
+         "caFile": "/etc/w1ncray/exit-ca.pem",
+         "serverName": "exit.example.com"
+        },
+        "metadata": {
+         "host": "cdn.example.com",
+         "path": "/tun"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

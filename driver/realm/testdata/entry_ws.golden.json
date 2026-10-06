@@ -1,0 +1,12 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "127.0.0.1:8080",
+      "remote": "198.51.100.7:7001",
+      "remote_transport": "ws;host=cdn.example.com;path=/ws/relay"
+    }
+  ]
+}

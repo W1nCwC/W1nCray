@@ -1,0 +1,16 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "0.0.0.0:5353",
+      "remote": "1.1.1.1:53",
+      "network": {
+        "no_tcp": true,
+        "use_udp": true,
+        "udp_timeout": 120
+      }
+    }
+  ]
+}

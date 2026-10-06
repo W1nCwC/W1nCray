@@ -181,6 +181,12 @@ func TestMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(out)
+	// The first line is the migration banner, which records the source path on
+	// purpose. Without this exemption the check below only ever worked on
+	// Windows, where the path has backslashes and from+"/" never matched.
+	if i := strings.IndexByte(text, '\n'); i >= 0 && strings.HasPrefix(text, "# Migrated from XrayR") {
+		text = text[i+1:]
+	}
 	for _, gone := range []string{"EnableVless", "VlessFlow", "DisableIVCheck", "GlobalDeviceLimitConfig", "DisableLocalREALITYConfig", "SSpanel", from + "/"} {
 		if strings.Contains(text, gone) {
 			t.Errorf("migrated config still contains %q", gone)

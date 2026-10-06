@@ -12,6 +12,22 @@ import (
 // wsReportInterval is how often node.status goes over the WebSocket.
 var wsReportInterval = 60 * time.Second
 
+// startWS starts the WebSocket loop unless the config disables it or the
+// controller runs in machine mode. Machine mode authenticates with request
+// headers, but the panel's WebSocket handshake takes the token as a URL
+// parameter, which must never happen, so machine nodes keep polling over HTTP.
+func (c *Controller) startWS() {
+	if c.cfg.DisableWebSocket {
+		return
+	}
+	if c.api.MachineMode() {
+		c.log.Debug("machine mode: websocket disabled, using HTTP polling")
+		return
+	}
+	c.wg.Add(1)
+	go c.wsLoop()
+}
+
 // wsLoop discovers the panel WebSocket through the handshake and keeps it
 // connected. HTTP polling continues meanwhile as a safety net.
 func (c *Controller) wsLoop() {

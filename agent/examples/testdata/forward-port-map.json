@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "map-all",
+      "name": "port_map逐端口指定目标，不写targets",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": {
+        "addr": "0.0.0.0",
+        "ports": "20200-20203",
+        "port_map": {
+          "20200": "203.0.113.30:22",
+          "20201": "203.0.113.31:3306",
+          "20202": "203.0.113.32:6379",
+          "20203": "203.0.113.33:5432"
+        }
+      },
+      "network": ["tcp"]
+    },
+    {
+      "id": "map-override",
+      "name": "port_map覆盖：20301改去别处，其余按targets一一映射",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": {
+        "addr": "0.0.0.0",
+        "ports": "20300-20302",
+        "port_map": { "20301": "203.0.113.41:9000" }
+      },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.40", "ports": "8000-8002" }]
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "rdp-home",
+      "name": "xray反向代理公网端（portal）：不带 targets，目的地由 bridge 决定，与bridge文件成对",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "reverse_portal",
+      "listen": { "addr": "0.0.0.0", "ports": "20900" },
+      "network": ["tcp"],
+      "tunnel": { "type": "tcp", "listen": "0.0.0.0:20901" },
+      "reverse": {
+        "link": "rdp-home",
+        "domain": "00112233445566778899aabbccddeeff"
+      },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

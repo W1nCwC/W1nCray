@@ -59,6 +59,12 @@ type Options struct {
 
 	Connection  ConnectionPolicy
 	NameServers []NameServer
+
+	// Forward, when set, prepares the instance for forwarding instances next
+	// to the nodes: the fixed policy levels LevelTCPLong..LevelTCPDefault and
+	// the per-inbound/outbound byte counters. Nil (the default) leaves the
+	// generated config exactly as it is without forwarding.
+	Forward *ForwardOptions
 }
 
 // Core is a running Xray instance plus handles to the features nodes use.
@@ -67,9 +73,22 @@ type Core struct {
 	Limiter  *limiter.Limiter
 	Rules    *RuleManager
 
+	conns *dispatcher.ConnTracker
 	ibm   inbound.Manager
 	obm   outbound.Manager
 	stats stats.Manager
+}
+
+// Conns returns the connection tracker. It tracks nothing until Watch is
+// called with an inbound tag prefix, so node inbounds cost nothing extra.
+func (c *Core) Conns() *dispatcher.ConnTracker {
+	return c.conns
+}
+
+// Stats returns the stats manager of the instance. It is the manager of the
+// "stats": {} section of the generated config, so it is never nil after New.
+func (c *Core) Stats() stats.Manager {
+	return c.stats
 }
 
 // New builds (but does not start) the Xray instance.
@@ -114,6 +133,7 @@ func New(opts Options) (*Core, error) {
 		Instance: inst,
 		Limiter:  l,
 		Rules:    rm,
+		conns:    d.Tracker(),
 		ibm:      inst.GetFeature(inbound.ManagerType()).(inbound.Manager),
 		obm:      inst.GetFeature(outbound.ManagerType()).(outbound.Manager),
 		stats:    inst.GetFeature(stats.ManagerType()).(stats.Manager),
@@ -159,19 +179,22 @@ func buildConfig(opts Options) ([]byte, *RuleManager, error) {
 	}
 
 	cp := opts.Connection
-	cfg["policy"] = map[string]any{
-		"levels": map[string]any{
-			"0": map[string]any{
-				"handshake":         cp.Handshake,
-				"connIdle":          cp.ConnIdle,
-				"uplinkOnly":        cp.UplinkOnly,
-				"downlinkOnly":      cp.DownlinkOnly,
-				"bufferSize":        cp.BufferSize,
-				"statsUserUplink":   true,
-				"statsUserDownlink": true,
-			},
+	levels := map[string]any{
+		"0": map[string]any{
+			"handshake":         cp.Handshake,
+			"connIdle":          cp.ConnIdle,
+			"uplinkOnly":        cp.UplinkOnly,
+			"downlinkOnly":      cp.DownlinkOnly,
+			"bufferSize":        cp.BufferSize,
+			"statsUserUplink":   true,
+			"statsUserDownlink": true,
 		},
 	}
+	policy := map[string]any{"levels": levels}
+	if f := opts.Forward; f != nil {
+		addForwardPolicy(policy, levels, cp, f)
+	}
+	cfg["policy"] = policy
 
 	// DNS: local file plus panel "dns" routes.
 	dns := map[string]any{}

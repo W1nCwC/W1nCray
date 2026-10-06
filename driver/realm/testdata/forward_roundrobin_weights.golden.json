@@ -1,0 +1,16 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "endpoints": [
+    {
+      "listen": "0.0.0.0:9000",
+      "remote": "10.0.0.1:80",
+      "extra_remotes": [
+        "10.0.0.2:80",
+        "lb3.example.com:8080"
+      ],
+      "balance": "roundrobin: 1, 2, 3"
+    }
+  ]
+}

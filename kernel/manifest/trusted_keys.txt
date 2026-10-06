@@ -1,0 +1,9 @@
+# W1nCray kernel-manifest trust root: ed25519 public keys, one 64-hex-digit key
+# per line ("<hex> # comment"). The matching private keys are held offline by
+# the release owner and are NOT in this repository.
+#
+#
+# Production keys generated 2026-10-06 (primary + rotation spare). The private
+# keys live outside this repository, on the release owner's machine only.
+1e22bbff0d4d334f1c6617771f0919e44ed644da11c37f4c017a7bb5d80ff362 # primary  (key id 280f5d33adf21274)
+0f50a03cc48e69c5c37f17577d162736517f2eea944193d5ea561dd66627db06 # spare    (key id cb1ce38570e6a8b9)

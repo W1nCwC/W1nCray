@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "acl-ssh",
+      "name": "来源ACL：只放行指定网段，再单独拒绝一个地址",
+      "enabled": true,
+      "engine": "xray",
+      "kind": "forward",
+      "listen": { "addr": "0.0.0.0", "ports": "20022" },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.22", "ports": "22" }],
+      "idle_profile": "tcp_long",
+      "acl": {
+        "allow": ["198.51.100.0/24", "2001:db8:100::/48"],
+        "deny": ["198.51.100.66"]
+      }
+    }
+  ]
+}

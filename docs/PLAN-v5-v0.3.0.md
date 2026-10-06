@@ -90,7 +90,7 @@
 | V3 | `check --online` 输出旧 tag → 新 tag 对照 |
 | V4 | 全量回归通过 |
 | V5 | install.sh：`dash -n`、`busybox ash -n`、`shfmt -ln posix` 通过；架构检测/服务后端选择/XrayR 探测在模拟环境中对各映射表项给出预期结果 |
-| V6 | 【已验证】在 Debian 12 测试机（测试机，与其上运行的 XrayR 隔离：`unshare -pfm` + chroot，不动宿主服务）上用**真实 rootfs** 验证：Alpine 3.20.3（OpenRC 0.54、supervise-daemon、busybox wget）与 OpenWRT 23.05.5 x86-64（procd、uclient-fetch、logd/logread）。两者均通过：安装→默认配置→检查失败时不启动；start/stop/restart；`kill -9` 后 10 秒内重生（新 PID）；enable/disable（OpenRC runlevel / `/etc/rc.d` 的 S99、K10）；日志（`/var/log/W1nCray.log` / logread）；单实例锁拒绝第二实例；switch→回滚互相切换 XrayR 服务各 3 轮；升级时服务运行中则重启；`uninstall`/`--purge`；OpenWRT 的 `sysupgrade.conf` 写入与清理 |
+| V6 | 【已验证】在 Debian 12 测试机（<test-host>，与其上运行的 XrayR 隔离：`unshare -pfm` + chroot，不动宿主服务）上用**真实 rootfs** 验证：Alpine 3.20.3（OpenRC 0.54、supervise-daemon、busybox wget）与 OpenWRT 23.05.5 x86-64（procd、uclient-fetch、logd/logread）。两者均通过：安装→默认配置→检查失败时不启动；start/stop/restart；`kill -9` 后 10 秒内重生（新 PID）；enable/disable（OpenRC runlevel / `/etc/rc.d` 的 S99、K10）；日志（`/var/log/W1nCray.log` / logread）；单实例锁拒绝第二实例；switch→回滚互相切换 XrayR 服务各 3 轮；升级时服务运行中则重启；`uninstall`/`--purge`；OpenWRT 的 `sysupgrade.conf` 写入与清理 |
 | V7 | `W1nCray`（无参数）出现菜单；status/log/check/uninstall 等快捷命令可用；未识别参数透传给程序本体 |
 | V8 | 12 个目标的完整版与 lite 版均可构建；lite 版遇到不支持的 DNS provider 时 check 在启动前报错，http/tls/file 证书不受影响 |
 | V9 | 已安装旧版用户可通过旧 install.sh 升级到新版（未压缩 amd64/arm64 资产与校验和保持可用） |
@@ -127,7 +127,7 @@
 |---|---|
 | 真实一键命令（raw 脚本 → API 取最新版 → 下载 → SHA256 校验）在 Alpine chroot（busybox wget） | 【已验证】默认 full；`update --lite` 切换为 lite，install.env 同步 |
 | 同上在 OpenWRT 23.05.5 chroot（uclient-fetch，无 curl） | 【已验证】默认 lite；`update --full` 切换；不下载 geo |
-| Debian 12 + systemd 真机（测试机 测试机，上面有运行中的 XrayR，2 个节点） | 【已验证】一键安装 → 自动迁移 → `check --online` 两个节点（shadowsocks、VLESS+REALITY）通过；XrayR 全程未改动（同一 PID、端口不变）；W1nCray 因 XrayR 在运行而未启动 |
+| Debian 12 + systemd 真机（测试机 <test-host>，上面有运行中的 XrayR，2 个节点） | 【已验证】一键安装 → 自动迁移 → `check --online` 两个节点（shadowsocks、VLESS+REALITY）通过；XrayR 全程未改动（同一 PID、端口不变）；W1nCray 因 XrayR 在运行而未启动 |
 | V9 旧脚本升级 | 【已验证（模拟）】旧脚本用 `grep "W1nCray-linux-<arch>$"` 在 SHA256SUMS 中取校验值，对新 SHA256SUMS 各只匹配 1 行（裸文件），裸文件资产保留；未在真机跑旧脚本 |
 | 发现并修复 | `W1nCray update vX.Y.Z` 被拒绝为未知参数 → 转换为 `--version`（commit 59e1513，脚本从 main 获取，无需重新发版） |
 | 未做 | 在测试机上执行 `switch`（会短暂停止运行中的 XrayR）；ARM/MIPS 真机 |

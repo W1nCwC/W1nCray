@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
@@ -119,9 +120,7 @@ func (m *Manager) obtain(cfg *Config) (certPEM, keyPEM []byte, err error) {
 			return nil, nil, errors.New("dns mode requires a DNS provider")
 		}
 		// lego DNS providers read their credentials from the environment.
-		for k, v := range cfg.DNSEnv {
-			os.Setenv(k, v)
-		}
+		applyDNSEnv(cfg.DNSEnv)
 		p, perr := newDNSProvider(cfg.Provider)
 		if perr != nil {
 			return nil, nil, fmt.Errorf("DNS provider %s: %w", cfg.Provider, perr)
@@ -151,4 +150,15 @@ func (m *Manager) obtain(cfg *Config) (certPEM, keyPEM []byte, err error) {
 		return nil, nil, fmt.Errorf("obtain certificate for %s: %w", cfg.CertDomain, err)
 	}
 	return res.Certificate, res.PrivateKey, nil
+}
+
+// applyDNSEnv exports the DNS provider credentials to the process environment.
+// The names are upper-cased: the config loader (viper) lower-cases map keys,
+// so "CLOUDFLARE_API_KEY" arrives as "cloudflare_api_key", while lego reads the
+// upper-case variable and environment names are case-sensitive on Linux. Without
+// this, DNS-01 issuance and renewal fail with "credentials missing".
+func applyDNSEnv(env map[string]string) {
+	for k, v := range env {
+		os.Setenv(strings.ToUpper(strings.TrimSpace(k)), v)
+	}
 }

@@ -2,8 +2,9 @@
 // DefaultDispatcher, created through its official config creator, wrapped with
 // per-user device limiting and rate limiting.
 //
-// Wrapping instead of forking keeps routing, sniffing, stats and FakeDNS
-// behaviour identical to the upstream kernel across Xray upgrades.
+// Wrapping instead of forking keeps routing, sniffing and stats behaviour
+// identical to the upstream kernel across Xray upgrades. The one change is
+// that route selection runs under routeguard's lock (see that package).
 package dispatcher
 
 import (
@@ -16,10 +17,16 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/outbound"
+	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 
+	"github.com/W1nCwC/W1nCray/app/routeguard"
 	"github.com/W1nCwC/W1nCray/common/limiter"
 )
 
@@ -29,13 +36,18 @@ const spliceForbidden = 3
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		inner, err := common.CreateObject(ctx, &xdispatcher.Config{})
-		if err != nil {
+		// This is the creator of xdispatcher.Config (app/dispatcher/default.go
+		// in Xray) with one difference: the router handed to the default
+		// dispatcher is wrapped by routeguard, so that route selection cannot
+		// observe a routing table that is being reloaded. Everything else is
+		// the upstream wiring. The upstream creator also looks up an optional
+		// FakeDNS engine into an unexported field; W1nCray never configures
+		// FakeDNS (it only generates the "dns" section), so none exists.
+		d := new(xdispatcher.DefaultDispatcher)
+		if err := core.RequireFeatures(ctx, func(om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager, dc dns.Client) error {
+			return d.Init(&xdispatcher.Config{}, om, routeguard.Router(router), pm, sm)
+		}); err != nil {
 			return nil, err
-		}
-		d, ok := inner.(routing.Dispatcher)
-		if !ok {
-			return nil, errors.New("upstream dispatcher does not implement routing.Dispatcher")
 		}
 		return &Dispatcher{inner: d}, nil
 	}))
@@ -45,6 +57,13 @@ func init() {
 type Dispatcher struct {
 	inner   routing.Dispatcher
 	limiter atomic.Pointer[limiter.Limiter]
+	tracker ConnTracker
+}
+
+// Tracker returns the connection tracker of this dispatcher. Nothing is
+// tracked until a tag prefix is passed to its Watch method.
+func (d *Dispatcher) Tracker() *ConnTracker {
+	return &d.tracker
 }
 
 // SetLimiter attaches the limiter. Until it is set, connections pass through.
@@ -103,9 +122,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dest net.Destination) (*trans
 	if err != nil {
 		return nil, err
 	}
+	ctx, untrack := d.tracker.track(ctx)
 	link, err := d.inner.Dispatch(ctx, dest)
 	if err != nil {
 		sess.Release()
+		if untrack != nil {
+			untrack()
+		}
 		return nil, err
 	}
 	if sess == nil {
@@ -143,6 +166,11 @@ func (d *Dispatcher) DispatchLink(ctx context.Context, dest net.Destination, lin
 	sess, err := d.admit(ctx)
 	if err != nil {
 		return err
+	}
+	// DispatchLink returns when the session is over.
+	ctx, untrack := d.tracker.track(ctx)
+	if untrack != nil {
+		defer untrack()
 	}
 	if sess != nil {
 		context.AfterFunc(ctx, sess.Release)

@@ -1,0 +1,148 @@
+{
+ "services": [
+  {
+   "name": "fw1.tcp.20000",
+   "addr": "127.0.0.1:20000",
+   "handler": {
+    "type": "tcp",
+    "metadata": {
+     "idleTimeout": "3600s"
+    }
+   },
+   "listener": {
+    "type": "tcp"
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "10.0.0.1:30000"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  },
+  {
+   "name": "fw1.tcp.20001",
+   "addr": "127.0.0.1:20001",
+   "handler": {
+    "type": "tcp",
+    "metadata": {
+     "idleTimeout": "3600s"
+    }
+   },
+   "listener": {
+    "type": "tcp"
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "192.0.2.9:4444"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  },
+  {
+   "name": "fw1.tcp.20002",
+   "addr": "127.0.0.1:20002",
+   "handler": {
+    "type": "tcp",
+    "metadata": {
+     "idleTimeout": "3600s"
+    }
+   },
+   "listener": {
+    "type": "tcp"
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "10.0.0.1:30002"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  },
+  {
+   "name": "fw1.udp.20000",
+   "addr": "127.0.0.1:20000",
+   "handler": {
+    "type": "udp"
+   },
+   "listener": {
+    "type": "udp",
+    "metadata": {
+     "ttl": "60s"
+    }
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "10.0.0.1:30000"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  },
+  {
+   "name": "fw1.udp.20001",
+   "addr": "127.0.0.1:20001",
+   "handler": {
+    "type": "udp"
+   },
+   "listener": {
+    "type": "udp",
+    "metadata": {
+     "ttl": "60s"
+    }
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "192.0.2.9:4444"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  },
+  {
+   "name": "fw1.udp.20002",
+   "addr": "127.0.0.1:20002",
+   "handler": {
+    "type": "udp"
+   },
+   "listener": {
+    "type": "udp",
+    "metadata": {
+     "ttl": "60s"
+    }
+   },
+   "forwarder": {
+    "nodes": [
+     {
+      "name": "t0",
+      "addr": "10.0.0.1:30002"
+     }
+    ]
+   },
+   "metadata": {
+    "enableStats": "true"
+   }
+  }
+ ]
+}
