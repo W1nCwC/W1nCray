@@ -43,6 +43,8 @@ type selfUpdateArgs struct {
 
 // selfUpdateResult is the final result of a successful self_update.
 type selfUpdateResult struct {
+	// From is the version that was running when the update was committed.
+	From    string `json:"from,omitempty"`
 	Version string `json:"version"`
 	Path    string `json:"path,omitempty"`
 	Restart bool   `json:"restart"`
@@ -120,7 +122,11 @@ func (c *selfUpdateCmds) selfUpdate(ctx context.Context, req Request, complete C
 			return
 		}
 		c.reg.logf().Infof("opscmd: self_update to %s committed; restarting", staged.Version)
-		complete(StatusDone, mustJSON(selfUpdateResult{Version: staged.Version, Path: staged.Path, Restart: true}), nil)
+		from := ""
+		if cv, ok := c.up.(interface{ CurrentVersion() string }); ok {
+			from = cv.CurrentVersion()
+		}
+		complete(StatusDone, mustJSON(selfUpdateResult{From: from, Version: staged.Version, Path: staged.Path, Restart: true}), nil)
 		// The result is delivered synchronously by the sink; only now is it
 		// safe to hand over to the new binary.
 		c.restart()

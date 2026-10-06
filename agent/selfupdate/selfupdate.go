@@ -138,6 +138,10 @@ type Updater struct {
 	ready         func(exePath string) error
 }
 
+// CurrentVersion is the build version of the running agent ("" when the
+// caller did not provide one). self_update reports it as `from`.
+func (u *Updater) CurrentVersion() string { return u.version }
+
 // Staged is a verified next version, ready for Commit.
 type Staged struct {
 	Version string `json:"version"`
