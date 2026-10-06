@@ -73,6 +73,20 @@ type InstanceReport struct {
 	Error string   `json:"error,omitempty"`
 }
 
+// KernelEntry is one installed kernel version, mirroring the wire type
+// wsproto.KernelEntry without making this core package import the wire
+// package. agent/panelclient converts between the two.
+type KernelEntry struct {
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Current     bool   `json:"current"`
+	Previous    bool   `json:"previous"`
+	Path        string `json:"path,omitempty"`
+	SizeBytes   int64  `json:"size_bytes,omitempty"`
+	InstalledAt int64  `json:"installed_at,omitempty"`
+	InUse       bool   `json:"in_use"`
+}
+
 // Report is the result of Apply, ready to be sent to the panel. It is JSON
 // serialisable and never contains instance secrets.
 type Report struct {
@@ -87,7 +101,12 @@ type Report struct {
 	// Kernels maps driver name to the kernel version in use ("builtin" for
 	// the embedded xray).
 	Kernels map[string]string `json:"kernels,omitempty"`
-	At      time.Time         `json:"at"`
+	// KernelEntries is the structured installed-kernel list. It is a separate
+	// field on purpose: Kernels says which version this apply selected per
+	// engine, KernelEntries says what is installed on the machine (design
+	// section 6.6). It is filled by the caller that owns the kernel manager.
+	KernelEntries []KernelEntry `json:"kernel_entries,omitempty"`
+	At            time.Time     `json:"at"`
 }
 
 func (r Report) clone() Report {
@@ -111,6 +130,7 @@ func (r Report) clone() Report {
 			c.Kernels[k] = v
 		}
 	}
+	c.KernelEntries = append([]KernelEntry(nil), r.KernelEntries...)
 	return c
 }
 

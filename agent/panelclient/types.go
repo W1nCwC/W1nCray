@@ -14,24 +14,81 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/wsproto"
 )
 
 // Schema is the version of the wire contract spoken by this package.
 const Schema = 1
 
-// Command types the agent executes (contract section 3.5). Anything else is
-// answered with a "failed" result and never executed.
+// Command types the agent executes (contract section 3.5 and
+// docs/WS-PROTOCOL.md section 4). Anything not registered is answered with a
+// "failed" result and never executed. Only refresh and dump_state are built in;
+// the others are served by agent/opscmd, which registers them.
 const (
-	CmdRefresh   = "refresh"
-	CmdDumpState = "dump_state"
+	CmdRefresh          = "refresh"
+	CmdDumpState        = "dump_state"
+	CmdKernelList       = "kernel_list"
+	CmdKernelInstall    = "kernel_install"
+	CmdKernelRemove     = "kernel_remove"
+	CmdKernelRollback   = "kernel_rollback"
+	CmdComponentRestart = "component_restart"
+	CmdSelfUpdate       = "self_update"
+	CmdFileList         = "file_list"
+	CmdFileRead         = "file_read"
+	CmdFileWrite        = "file_write"
+	CmdFileDelete       = "file_delete"
+	CmdFilesApply       = "files_apply"
 )
 
 // Command result statuses.
 const (
-	ResultDone    = "done"
-	ResultFailed  = "failed"
-	ResultExpired = "expired"
+	ResultDone     = "done"
+	ResultFailed   = "failed"
+	ResultExpired  = "expired"
+	ResultAccepted = "accepted"
 )
+
+// KernelListResult is the result of kernel_list: the installed versions and the
+// versions the signed manifest offers for this machine.
+type KernelListResult struct {
+	Kernels []wsproto.KernelEntry `json:"kernels"`
+	Catalog []KernelCatalogEntry  `json:"catalog"`
+}
+
+// KernelCatalogEntry is one kernel name of the signed manifest with every
+// version it lists.
+type KernelCatalogEntry struct {
+	Name     string   `json:"name"`
+	Versions []string `json:"versions"`
+}
+
+// KernelInstallArgs is the args of kernel_install. An empty Version selects the
+// newest version the manifest offers for this machine.
+type KernelInstallArgs struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+}
+
+// KernelRemoveArgs is the args of kernel_remove.
+type KernelRemoveArgs struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+// KernelRemoveResult is the result of a successful kernel_remove.
+type KernelRemoveResult struct {
+	FreedBytes int64 `json:"freed_bytes"`
+}
+
+// KernelRollbackArgs is the args of kernel_rollback.
+type KernelRollbackArgs struct {
+	Name string `json:"name"`
+}
+
+// ComponentRestartArgs is the args of component_restart.
+type ComponentRestartArgs struct {
+	Name string `json:"name"`
+}
 
 // Platform identifies the machine for the panel's capability greying.
 type Platform struct {
@@ -50,6 +107,10 @@ type ConfigRequest struct {
 	Platform     Platform          `json:"platform"`
 	Engines      []string          `json:"engines"`
 	Kernels      map[string]string `json:"kernels,omitempty"`
+	// KernelEntries is the structured installed-kernel list, the same shape the
+	// WebSocket hello carries in hello.kernels. The legacy Kernels map is sent
+	// alongside for one release (design section 3.3).
+	KernelEntries []wsproto.KernelEntry `json:"kernel_entries,omitempty"`
 	// Features is the same capability list the agent declared in
 	// hello.capabilities (docs/WS-PROTOCOL.md section 7 ruling 1). The panel
 	// must only put a desired key into a revision for an agent that declared
@@ -155,7 +216,9 @@ type ReportRequest struct {
 	Health          reconcile.HealthReport `json:"health"`
 	Instances       []InstanceStat         `json:"instances"`
 	Kernels         map[string]string      `json:"kernels,omitempty"`
-	Host            *HostStat              `json:"host,omitempty"`
+	// KernelEntries is the structured installed-kernel list (see ConfigRequest).
+	KernelEntries []wsproto.KernelEntry `json:"kernel_entries,omitempty"`
+	Host          *HostStat             `json:"host,omitempty"`
 }
 
 // ReportResponse is the answer of POST /report. Commands is the fast channel

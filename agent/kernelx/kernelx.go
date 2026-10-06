@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/spec"
@@ -42,6 +43,10 @@ type Options struct {
 	// AllowHTTP permits http:// kernel sources (development/self-hosted only;
 	// content hashes still apply). Never enable in production.
 	AllowHTTP bool
+	// PIDDir is the supervisor's pid directory (<StateDir>/pid). It is what
+	// lets RunningVersion tell which version is really executing. Empty
+	// disables the check: "in use" then falls back to the current pointer.
+	PIDDir string
 	// Log receives installer events.
 	Log driver.Logger
 }
@@ -49,6 +54,9 @@ type Options struct {
 // Ensurer implements reconcile.KernelEnsurer on top of an install.Installer.
 type Ensurer struct {
 	in *install.Installer
+	// pidDir and kernelsRoot resolve "which version is running" (inuse.go).
+	pidDir      string
+	kernelsRoot string
 }
 
 var _ interface {
@@ -76,7 +84,16 @@ func New(o Options) (*Ensurer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kernelx: %w", err)
 	}
-	e := &Ensurer{in: in}
+	root, err := filepath.Abs(o.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("kernelx: %w", err)
+	}
+	e := &Ensurer{
+		in:     in,
+		pidDir: o.PIDDir,
+		// install.New keeps its kernels under <Dir>/kernels (install.go:131).
+		kernelsRoot: filepath.Join(root, "kernels"),
+	}
 	if o.ManifestPath != "" {
 		raw, err := os.ReadFile(o.ManifestPath)
 		if err != nil {
@@ -206,7 +223,3 @@ func (e *Ensurer) Installed(name string) bool {
 	_, err := e.in.Current(name)
 	return err == nil
 }
-
-// Installer exposes the underlying installer for tooling (the panel's kernel
-// catalog). It is not part of the reconciler contract.
-func (e *Ensurer) Installer() *install.Installer { return e.in }

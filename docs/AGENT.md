@@ -462,6 +462,37 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 `Agent.DesiredPath` 设置后，修改该文件即自动应用（§3）。看结果：日志里的 `agent: <path>: <status> (<n> instance(s))`，失败时有具体错误。
 
+### 面板命令（`kernel_*` 与 `component_restart`）
+
+面板可以在两条通道上下发命令，两条通道**共用同一个命令注册表与同一个按 id 去重的空间**（`agent/opscmd`）：
+
+- HTTP：`POST /config` 或 `POST /report` 的响应里带 `commands`，结果回 `POST /command-result`；
+- WebSocket：`cmd {type,args,ttl_s}`，结果回 `cmd.result`（同一 `id`）。
+
+同一个命令 id 在两条通道上只会执行一次、只回一次结果。命令注册表里的类型就是白名单，**未注册的类型一律回 `failed` 且 `result.error="unsupported command"`，不执行**。`refresh` 与 `dump_state` 是内建类型（需要拉取循环与最近一次报告，仍由 `agent/panelclient` 实现），其余由 `agent/opscmd` 提供。
+
+**长命令**（当前只有 `kernel_install`；后续的 `self_update`、`files_apply` 也是）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
+
+| type | args | 行为与结果 |
+|---|---|---|
+| `kernel_list` | `{}` | 回 `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}`。`kernels` 是**已安装**的版本（事实，读内核目录）；`catalog` 只列已签名清单里**本机可用**的版本。没有加载清单时 `catalog: []`，`kernels` 照常返回。 |
+| `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。 |
+| `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
+| `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
+| `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 与 `xray` 一律拒绝（见下）。 |
+
+细节与边界：
+
+- **保留名 `agent`**：签名清单里名为 `agent` 的条目属于 `self_update`（契约 §7-11）。`kernel_install`/`kernel_remove`/`kernel_rollback` 与 `component_restart` 一律拒绝它（`failed` + `result.code="reserved_name"`）；`kernel_list` 仍会如实列出已安装的版本。
+- **`component_restart` 不能重启 agent，也不能重启内嵌 xray**：agent 不由 supervisor 管理（重启它会断掉面板连接），内嵌 xray 与 agent 同进程、没有独立进程。前者 `reserved_name`，后者 `failed` + `result.code="embedded"`。名字对应的内核进程没在跑时回 `failed`（`component "x" is not running`）。
+- **`in_use` 的判定**：优先用 supervisor 的 pid 记录（`<StateDir>/pid/*.pid`）+ 存活与 `/proc/<pid>/exe` 身份复核，把正在执行的二进制映射回 `<KernelsDir>/kernels/<name>/<version>/`；平台无法核实身份（Windows 等）或没配 pid 目录时，退化为"当前指针 = 在用"，不假装精确。回滚后进程仍执行旧版本的情况也能如实反映。
+- **`KernelEntry` 字段**：`{name, version, current, previous, path, size_bytes, installed_at, in_use}`（契约 §3）。`size_bytes` 是**清单声明**的安装体积（各文件声明大小之和），不是磁盘实测。`kernel_list` 不额外发明 `size_on_disk`/`in_use_exact` 等字段（契约里没有）。
+- **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。
+- **能力声明**：`hello.capabilities`（以及 HTTP `/config` 的 `features`）里出现 `kernel` 的条件是**内核安装器可用且已加载一份已签名清单**——没有清单时 `kernel_install` 无法解析版本，所以不做这个承诺（契约 §7-1）。
+- **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
+- **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
+- **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
+
 ## 8 常见拒绝原因与排错
 
 下列信息都是真实输出，每一条由 `agent/examples/refusals_test.go` 断言。信息前缀形如 `<实例id>: <字段>: <原因>`。
