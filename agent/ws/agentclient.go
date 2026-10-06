@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +23,12 @@ import (
 // queue. A result that cannot be delivered must not be remembered as answered,
 // so it is worth a short block (design section 3.2).
 const CommandQueueTimeout = 2 * time.Second
+
+// capabilityReconnectThrottle bounds how often a capability change may force a
+// reconnect. The set is compared against the last hello, so an unchanged set
+// never triggers; a set that keeps flapping between two values must not turn
+// into a reconnect loop either.
+const capabilityReconnectThrottle = 30 * time.Second
 
 // ErrAnswered is returned by Commands.Execute when the Agent must not answer
 // the command itself: either the implementation already delivered the result
@@ -47,6 +55,16 @@ type Streams interface {
 	// terminal session: the local switch is on and the platform has a PTY. The
 	// capability list must agree with it (protocol ruling 1).
 	TerminalSupported() bool
+}
+
+// SessionCounter is an optional extension of Streams: an implementation that
+// can report live terminal sessions. The capability watchdog uses it to defer a
+// reconnect that would interrupt a user's terminal. A Streams that does not
+// implement it is treated as having no session, which keeps the interface small
+// for fakes and for a runtime without a terminal.
+type SessionCounter interface {
+	// TerminalSessions is the number of live interactive terminal sessions.
+	TerminalSessions() int
 }
 
 // Commands is the single command entry point, shared with the HTTP Runner so
@@ -101,6 +119,10 @@ type AgentOptions struct {
 	InstanceID string
 	// AgentVersion is reported in hello.agent_version ("dev" when empty).
 	AgentVersion string
+	// Now is the clock the capability watchdog uses for its reconnect
+	// throttle; nil uses time.Now. It is injectable so a test does not have to
+	// wait 30 s.
+	Now func() time.Time
 }
 
 // Agent is the ready-to-run unit: it owns the Client and the periodic senders.
@@ -130,6 +152,21 @@ type Agent struct {
 	intMu     sync.Mutex
 	telemetry time.Duration
 	comp      time.Duration
+
+	// capMu guards sentCaps, which hello (the connect goroutine) writes and the
+	// sender reads.
+	capMu sync.Mutex
+	// sentCaps is the canonical capability set of the last hello sent. It is
+	// the reference the watchdog compares the runtime against: the panel reads
+	// capabilities from the hello of a connection, so a difference means a
+	// reconnect with a fresh hello.
+	sentCaps []string
+
+	// nowFn is the capability watchdog's clock (time.Now when nil).
+	nowFn func() time.Time
+	// lastCapReconnect is when a capability change last forced a reconnect. It
+	// is touched only by the sender goroutine.
+	lastCapReconnect time.Time
 }
 
 // NewAgent builds the client and the dispatcher. The Options are the
@@ -147,6 +184,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		wake:       make(chan struct{}, 1),
 		telemetry:  time.Duration(DefaultTelemetryIntervalS) * time.Second,
 		comp:       time.Duration(DefaultComponentsIntervalS) * time.Second,
+		nowFn:      a.Now,
 	}
 	disp := NewDispatcher(Hooks{
 		Hello:    ag.hello,
@@ -238,9 +276,123 @@ func (a *Agent) hello() wsproto.Hello {
 	// the panel does not have to dig into host_info for them (R14).
 	h.Platform = wsproto.Platform{OS: h.HostInfo.OS, Arch: h.HostInfo.Arch}
 	h.Capabilities = a.streams.Capabilities()
+	// The watchdog compares against what this hello actually carried, so an
+	// unchanged set never triggers a reconnect.
+	a.rememberCapabilities(h.Capabilities)
 	h.Policy = a.streams.Policy()
 	h.Kernels = a.streams.Kernels()
 	return h
+}
+
+// rememberCapabilities records the canonical set the last hello declared.
+func (a *Agent) rememberCapabilities(caps []string) {
+	sent := canonicalCaps(caps)
+	a.capMu.Lock()
+	a.sentCaps = sent
+	a.capMu.Unlock()
+}
+
+// checkCapabilities compares the runtime's capability set with the one the last
+// hello declared and, when they differ, ends the connection so the next hello
+// carries the new set. The protocol allows exactly one hello per connection
+// (a second is answered with unexpected_type by the panel gateway) and has no
+// "capabilities changed" frame, so a reconnect is the only honest way to
+// publish a capability that became ready after the handshake — a signed kernel
+// manifest arriving, an updater becoming ready.
+//
+// The comparison is a set: order and repetition do not matter. A set that
+// changes back and forth cannot drive more than one reconnect per
+// capabilityReconnectThrottle, and a live terminal session defers the
+// reconnect until the user's session ends.
+func (a *Agent) checkCapabilities() {
+	if a.streams == nil || !a.client.Connected() {
+		// Offline (or no runtime): the next hello is built from the current
+		// state anyway, so there is nothing to publish.
+		return
+	}
+	current := canonicalCaps(a.streams.Capabilities())
+	a.capMu.Lock()
+	sent := a.sentCaps
+	a.capMu.Unlock()
+	if equalCapabilities(current, sent) {
+		return
+	}
+	// A terminal session in flight must not be interrupted: the reconnect would
+	// kill it. The next tick re-checks, so the change is published once the
+	// session ends.
+	if a.terminalBusy() {
+		return
+	}
+	now := a.now()
+	if !a.lastCapReconnect.IsZero() && now.Sub(a.lastCapReconnect) < capabilityReconnectThrottle {
+		return
+	}
+	a.lastCapReconnect = now
+	a.logf().Infof("ws: capability set changed (%s -> %s), reconnecting with a fresh hello",
+		capabilityList(sent), capabilityList(current))
+	a.client.RequestReconnect("capabilities changed")
+}
+
+// terminalBusy reports whether a live terminal session would be interrupted by
+// a reconnect. A Streams without the optional SessionCounter is treated as
+// having none.
+func (a *Agent) terminalBusy() bool {
+	if a.streams == nil {
+		return false
+	}
+	sc, ok := a.streams.(SessionCounter)
+	if !ok || sc == nil {
+		return false
+	}
+	return sc.TerminalSessions() > 0
+}
+
+// canonicalCaps returns a sorted, duplicate-free copy of caps: hello.capabilities
+// is a set (docs/WS-PROTOCOL.md section 3), so two lists that differ only in
+// order or repetition describe the same machine.
+func canonicalCaps(caps []string) []string {
+	if len(caps) == 0 {
+		return nil
+	}
+	out := append([]string(nil), caps...)
+	sort.Strings(out)
+	n := 1
+	for i := 1; i < len(out); i++ {
+		if out[i] != out[n-1] {
+			out[n] = out[i]
+			n++
+		}
+	}
+	return out[:n]
+}
+
+// equalCapabilities compares two canonical capability sets.
+func equalCapabilities(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// capabilityList renders a set for the log line.
+func capabilityList(caps []string) string {
+	if len(caps) == 0 {
+		return "none"
+	}
+	return strings.Join(caps, ",")
+}
+
+// now is the watchdog's clock.
+func (a *Agent) now() time.Time {
+	if a.nowFn != nil {
+		return a.nowFn()
+	}
+	return time.Now()
 }
 
 // helloOK applies the negotiated cadence and wakes the sender, so the first
@@ -322,6 +474,12 @@ func (a *Agent) sender(ctx context.Context) {
 		} else if cur == "" {
 			session = ""
 		}
+
+		// The capability set is not static: a signed kernel manifest arriving
+		// or an updater becoming ready makes a capability servable after the
+		// hello. Every cadence cycle re-checks it; a change reconnects so the
+		// panel sees a hello that carries it.
+		a.checkCapabilities()
 	}
 }
 

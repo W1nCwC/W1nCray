@@ -496,6 +496,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 - **`KernelEntry` 字段**：`{name, version, current, previous, path, size_bytes, installed_at, in_use}`（契约 §3）。`size_bytes` 是**清单声明**的安装体积（各文件声明大小之和），不是磁盘实测。`kernel_list` 不额外发明 `size_on_disk`/`in_use_exact` 等字段（契约里没有）。
 - **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。
 - **能力声明**：`hello.capabilities`（以及 HTTP `/config` 的 `features`）里出现 `kernel` 的条件是**内核安装器可用且已加载一份已签名清单**——没有清单时 `kernel_install` 无法解析版本，所以不做这个承诺（契约 §7-1）。
+- **能力集合是动态的，靠重连发布**：`hello.capabilities` 只在建连时发送一次，同一连接上第二个 `hello` 是协议错误（面板回 `unexpected_type`），而能力可能在握手之后才就绪（签名清单到达、`self_update` 注册完成）。agent 在每个 telemetry/components 周期把运行时的能力集合与上次 `hello` 实际发出的集合按**集合**比较（排序、去重）：不同就干净地断开当前连接并重连一次，让新的 `hello` 携带新集合。两次这样的重连至少间隔 30 s（集合来回抖动不会变成重连风暴），且本机有活动终端会话时推迟到会话结束（重连会打断用户的 shell）。这条路径**不发送任何新帧类型**（契约 §1/§3）。
 - **`file_*` 的根与错误码**：`root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`invalid_args`。
 - **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
 - **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。

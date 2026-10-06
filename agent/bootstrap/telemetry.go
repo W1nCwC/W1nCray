@@ -98,6 +98,17 @@ func (s runtimeStreams) Capabilities() []string {
 // session: the local switch is on and a PTY exists (WP-G6 acceptance 3).
 func (s runtimeStreams) TerminalSupported() bool { return s.rt.TerminalSupported() }
 
+// TerminalSessions is the optional ws.SessionCounter extension: the number of
+// live interactive terminal sessions. The capability watchdog uses it to defer
+// a reconnect that would interrupt a user's shell until the session ends
+// (CAP-RESEND). A runtime without a terminal manager reports none.
+func (s runtimeStreams) TerminalSessions() int {
+	if s.rt == nil || s.rt.Terminal == nil {
+		return 0
+	}
+	return len(s.rt.Terminal.Sessions())
+}
+
 // capabilities lists what this machine can really do; the panel must not offer
 // anything else (protocol ruling 1). telemetry is always there; xray_nodes only
 // when the local module gate allows it (ruling 6); kernel only when the kernel
