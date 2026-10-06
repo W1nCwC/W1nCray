@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/node"
 	"github.com/W1nCwC/W1nCray/panel"
 )
@@ -364,52 +366,406 @@ func TestLinkIgnoreAPIConfigOverrides(t *testing.T) {
 	}
 }
 
-func TestLinkRefusesAnAlreadyLinkedPanel(t *testing.T) {
-	linked := linkFixture + `
-Agent:
-  Enabled: true
-  Panel:
-    Enabled: true
-    URL: https://panel.example.com
-    MachineID: 7
-    TokenFile: agent.token
-`
-	_, cfgPath := writeLinkFixture(t, linked)
-	orig, err := os.ReadFile(cfgPath)
+// topLevelKeyIn reports whether text holds a top-level "Key:" line. It tells
+// the agent.yml root apart from the "Agent: block of config.yml" text in the
+// header comment.
+func topLevelKeyIn(text, key string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, key+":") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestLinkWritesAgentYMLForANewMachine: the agent connection information no
+// longer goes into config.yml. A new machine gets a sibling agent.yml (0600),
+// config.yml is left without an Agent block, and the effective configuration
+// comes from agent.yml. The terminal defaults to ON.
+func TestLinkWritesAgentYMLForANewMachine(t *testing.T) {
+	dir, cfgPath := writeLinkFixture(t, linkFixture)
+	var out bytes.Buffer
+	if err := runLink(cfgPath, linkTestOpts(), &out); err != nil {
+		t.Fatalf("link failed: %v\n%s", err, out.String())
+	}
+
+	agentPath := filepath.Join(dir, agentcfg.FileName)
+	fi, err := os.Stat(agentPath)
+	if err != nil {
+		t.Fatalf("agent.yml: %v", err)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Errorf("agent.yml mode = %04o, want 0600", fi.Mode().Perm())
+	}
+	agentText, err := os.ReadFile(agentPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = runLink(cfgPath, linkTestOpts(), &bytes.Buffer{})
-	if err == nil {
-		t.Fatal("link overwrote an already linked config")
+	for _, want := range []string{
+		"Enabled: true",
+		"StateDir: " + yamlDQ(filepath.Join(dir, "state")),
+		`AllowListen: ["0.0.0.0"]`,
+		"PortRange: [20000, 40000]",
+		`URL: "https://panel.example.com"`,
+		"MachineID: 7",
+		"TokenFile: " + yamlDQ(filepath.Join(dir, "agent.token")),
+		"MachineNodes: true",
+	} {
+		if !strings.Contains(string(agentText), want) {
+			t.Errorf("agent.yml does not contain %q:\n%s", want, agentText)
+		}
 	}
-	if !strings.Contains(err.Error(), "拒绝覆盖") {
-		t.Errorf("error %q does not refuse to overwrite", err)
+	// agent.yml is the agent section itself: no "Agent:" wrapper, and the
+	// terminal is not disabled by default.
+	if topLevelKeyIn(string(agentText), "Agent") {
+		t.Errorf("agent.yml has an Agent: wrapper:\n%s", agentText)
 	}
-	got, _ := os.ReadFile(cfgPath)
-	if !bytes.Equal(orig, got) {
-		t.Error("the config changed although the command refused to run")
+	if topLevelKeyIn(string(agentText), "Terminal") {
+		t.Errorf("link wrote a Terminal key without --noterminal:\n%s", agentText)
+	}
+
+	cfgText, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topLevelKeyIn(string(cfgText), "Agent") {
+		t.Errorf("config.yml still has an Agent: block:\n%s", cfgText)
+	}
+
+	after, err := panel.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("the converted configuration must load: %v\n%s", err, out.String())
+	}
+	if after.AgentSource() != agentcfg.SourceAgentYML {
+		t.Errorf("agent source = %q, want %q", after.AgentSource(), agentcfg.SourceAgentYML)
+	}
+	if !after.Agent.TerminalEnabled() {
+		t.Error("the terminal must default to ON")
+	}
+	if after.Agent.Panel == nil || !after.Agent.Panel.Enabled || !after.Agent.Panel.MachineNodes {
+		t.Fatalf("Panel = %+v, want enabled machine mode", after.Agent.Panel)
+	}
+	if len(after.Agent.Panel.NodeControllers) != 3 {
+		t.Errorf("NodeControllers has %d entries, want 3", len(after.Agent.Panel.NodeControllers))
+	}
+	if !strings.Contains(out.String(), agentPath) {
+		t.Errorf("the report does not name agent.yml:\n%s", out.String())
+	}
+	// The pair link wrote passes the offline check.
+	if _, err := panel.CheckReport(cfgPath, false, io.Discard); err != nil {
+		t.Fatalf("the converted configuration does not pass check: %v", err)
 	}
 }
 
-func TestLinkRefusesAnExistingAgentWithoutPanel(t *testing.T) {
+// TestLinkMigratesAnAlreadyLinkedPanel: the old single-file layout keeps the
+// agent configuration in the Agent: block of config.yml. link migrates that
+// block to agent.yml (leaving a one-line comment behind) instead of refusing,
+// keeps the operator's local settings and replaces the panel link with the one
+// the flags describe.
+func TestLinkMigratesAnAlreadyLinkedPanel(t *testing.T) {
+	linked := linkFixture + `
+Agent:
+  Enabled: true
+  Policy:
+    MaxInstances: 5
+  Panel:
+    Enabled: true
+    URL: https://old.example.com
+    MachineID: 1
+    TokenFile: agent.token
+    PullIntervalSec: 15
+    ManifestSync: false
+`
+	dir, cfgPath := writeLinkFixture(t, linked)
+	var out bytes.Buffer
+	if err := runLink(cfgPath, linkTestOpts(), &out); err != nil {
+		t.Fatalf("link refused the old single-file layout: %v\n%s", err, out.String())
+	}
+
+	agentPath := filepath.Join(dir, agentcfg.FileName)
+	agentText, err := os.ReadFile(agentPath)
+	if err != nil {
+		t.Fatalf("agent.yml: %v", err)
+	}
+	if !strings.Contains(string(agentText), "MaxInstances: 5") {
+		t.Errorf("the migrated block lost Policy.MaxInstances:\n%s", agentText)
+	}
+	if strings.Contains(string(agentText), "old.example.com") {
+		t.Errorf("the old panel URL survived the migration:\n%s", agentText)
+	}
+	if !strings.Contains(string(agentText), `URL: "https://panel.example.com"`) {
+		t.Errorf("the new panel URL is missing:\n%s", agentText)
+	}
+	// Panel keys link does not own survive the migration inside the new Panel
+	// section (ManifestSync=false must not be silently reset to its default).
+	if !strings.Contains(string(agentText), "PullIntervalSec: 15") {
+		t.Errorf("the migrated Panel lost PullIntervalSec:\n%s", agentText)
+	}
+	if !strings.Contains(string(agentText), "ManifestSync: false") {
+		t.Errorf("the migrated Panel lost ManifestSync:\n%s", agentText)
+	}
+	if topLevelKeyIn(string(agentText), "Agent") {
+		t.Errorf("agent.yml has an Agent: wrapper:\n%s", agentText)
+	}
+
+	cfgText, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topLevelKeyIn(string(cfgText), "Agent") {
+		t.Errorf("config.yml still has an Agent: block:\n%s", cfgText)
+	}
+	if !strings.Contains(string(cfgText), "已迁移到 agent.yml") {
+		t.Errorf("config.yml does not say the block moved:\n%s", cfgText)
+	}
+
+	after, err := panel.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("the migrated configuration must load: %v\n%s", err, out.String())
+	}
+	if after.AgentSource() != agentcfg.SourceAgentYML {
+		t.Errorf("agent source = %q, want %q", after.AgentSource(), agentcfg.SourceAgentYML)
+	}
+	if after.Agent.Policy == nil || after.Agent.Policy.MaxInstances != 5 {
+		t.Errorf("Policy = %+v, want the migrated MaxInstances 5", after.Agent.Policy)
+	}
+	pc := after.Agent.Panel
+	if pc == nil || !pc.Enabled || !pc.MachineNodes || pc.MachineID != 7 {
+		t.Fatalf("Panel = %+v, want the machine 7 link", pc)
+	}
+	if pc.PullIntervalSec != 15 {
+		t.Errorf("PullIntervalSec = %d, want the migrated 15", pc.PullIntervalSec)
+	}
+	if pc.ManifestSyncEnabled() {
+		t.Error("ManifestSync=false was not preserved by the migration")
+	}
+	if pc.TokenFile != filepath.Join(dir, "agent.token") {
+		t.Errorf("TokenFile = %q, want the generated token file", pc.TokenFile)
+	}
+	if len(pc.NodeControllers) != 3 {
+		t.Errorf("NodeControllers has %d entries, want 3", len(pc.NodeControllers))
+	}
+	// The migrated pair passes the offline check.
+	if _, err := panel.CheckReport(cfgPath, false, io.Discard); err != nil {
+		t.Fatalf("the migrated configuration does not pass check: %v", err)
+	}
+}
+
+// TestLinkMigratesAnAgentBlockWithoutPanel: an Agent block that has no Panel
+// section yet is migrated too; link appends the Panel section it writes.
+func TestLinkMigratesAnAgentBlockWithoutPanel(t *testing.T) {
 	linked := linkFixture + `
 Agent:
   Enabled: true
   DesiredPath: /etc/W1nCray/desired.json
 `
-	_, cfgPath := writeLinkFixture(t, linked)
-	orig, _ := os.ReadFile(cfgPath)
-	err := runLink(cfgPath, linkTestOpts(), &bytes.Buffer{})
+	dir, cfgPath := writeLinkFixture(t, linked)
+	if err := runLink(cfgPath, linkTestOpts(), &bytes.Buffer{}); err != nil {
+		t.Fatalf("link did not migrate the Agent block: %v", err)
+	}
+	agentText, err := os.ReadFile(filepath.Join(dir, agentcfg.FileName))
+	if err != nil {
+		t.Fatalf("agent.yml: %v", err)
+	}
+	if !strings.Contains(string(agentText), "DesiredPath: /etc/W1nCray/desired.json") {
+		t.Errorf("the migrated block lost DesiredPath:\n%s", agentText)
+	}
+	after, err := panel.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Agent.DesiredPath != "/etc/W1nCray/desired.json" {
+		t.Errorf("DesiredPath = %q", after.Agent.DesiredPath)
+	}
+	if after.Agent.Panel == nil || !after.Agent.Panel.Enabled || after.Agent.Panel.MachineID != 7 {
+		t.Fatalf("Panel = %+v, want the machine 7 link", after.Agent.Panel)
+	}
+}
+
+// TestLinkRefusesToOverwriteAnExistingAgentYML: an agent.yml that is already
+// there is the live agent configuration. link refuses to replace it (and
+// changes nothing) unless --force is given.
+func TestLinkRefusesToOverwriteAnExistingAgentYML(t *testing.T) {
+	dir, cfgPath := writeLinkFixture(t, linkFixture)
+	agentPath := filepath.Join(dir, agentcfg.FileName)
+	existing := []byte("Enabled: true\nStateDir: keep-me\n")
+	if err := os.WriteFile(agentPath, existing, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origCfg, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runLink(cfgPath, linkTestOpts(), &bytes.Buffer{})
 	if err == nil {
-		t.Fatal("link guessed where to merge the Panel section")
+		t.Fatal("link overwrote an existing agent.yml")
 	}
-	if !strings.Contains(err.Error(), "手工") {
-		t.Errorf("error %q does not ask for a manual merge", err)
+	if !strings.Contains(err.Error(), "拒绝覆盖") {
+		t.Errorf("error %q does not refuse to overwrite", err)
 	}
-	got, _ := os.ReadFile(cfgPath)
-	if !bytes.Equal(orig, got) {
-		t.Error("the config changed although the command refused to run")
+	got, _ := os.ReadFile(agentPath)
+	if !bytes.Equal(got, existing) {
+		t.Error("the existing agent.yml changed")
+	}
+	if cfg, _ := os.ReadFile(cfgPath); !bytes.Equal(cfg, origCfg) {
+		t.Error("config.yml changed although the command refused to run")
+	}
+	if b, _ := filepath.Glob(agentPath + ".bak-*"); len(b) != 0 {
+		t.Errorf("a backup was written although the command refused to run: %v", b)
+	}
+}
+
+// TestLinkForceOverwritesAnExistingAgentYML: --force is the escape hatch, and
+// it backs the previous agent.yml up before replacing it.
+func TestLinkForceOverwritesAnExistingAgentYML(t *testing.T) {
+	dir, cfgPath := writeLinkFixture(t, linkFixture)
+	agentPath := filepath.Join(dir, agentcfg.FileName)
+	existing := []byte("Enabled: true\nStateDir: old-state\n")
+	if err := os.WriteFile(agentPath, existing, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := linkTestOpts()
+	opts.Force = true
+	var out bytes.Buffer
+	if err := runLink(cfgPath, opts, &out); err != nil {
+		t.Fatalf("link --force failed: %v\n%s", err, out.String())
+	}
+	backups, err := filepath.Glob(agentPath + ".bak-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("agent.yml backups = %v (%v), want exactly one", backups, err)
+	}
+	b, err := os.ReadFile(backups[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b, existing) {
+		t.Error("the backup is not the previous agent.yml")
+	}
+	got, err := os.ReadFile(agentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(got, existing) {
+		t.Error("agent.yml was not replaced")
+	}
+	if !strings.Contains(string(got), "MachineID: 7") {
+		t.Errorf("the new agent.yml does not link machine 7:\n%s", got)
+	}
+	if !strings.Contains(out.String(), agentPath) {
+		t.Errorf("the report does not name agent.yml:\n%s", out.String())
+	}
+	if _, err := panel.CheckReport(cfgPath, false, io.Discard); err != nil {
+		t.Fatalf("the rewritten configuration does not pass check: %v", err)
+	}
+}
+
+// TestLinkNoTerminal: the interactive terminal is ON by default (ruling 17);
+// only --noterminal writes the local opt-out.
+func TestLinkNoTerminal(t *testing.T) {
+	dir, cfgPath := writeLinkFixture(t, linkFixture)
+	opts := linkTestOpts()
+	opts.NoTerminal = true
+	if err := runLink(cfgPath, opts, &bytes.Buffer{}); err != nil {
+		t.Fatalf("link --noterminal failed: %v", err)
+	}
+	agentText, err := os.ReadFile(filepath.Join(dir, agentcfg.FileName))
+	if err != nil {
+		t.Fatalf("agent.yml: %v", err)
+	}
+	if !topLevelKeyIn(string(agentText), "Terminal") {
+		t.Errorf("--noterminal did not write a Terminal key:\n%s", agentText)
+	}
+	if !strings.Contains(string(agentText), "Terminal: {Enabled: false}") {
+		t.Errorf("--noterminal did not disable the terminal:\n%s", agentText)
+	}
+	after, err := panel.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Agent.TerminalEnabled() {
+		t.Error("--noterminal did not turn the terminal off")
+	}
+
+	// Migrating a config.yml Agent block that already has a Terminal section
+	// must not leave two Terminal keys behind.
+	migrated := linkFixture + `
+Agent:
+  Enabled: true
+  Terminal:
+    Enabled: true
+  Panel:
+    Enabled: true
+    URL: https://old.example.com
+    MachineID: 1
+    TokenFile: agent.token
+`
+	dir2, cfgPath2 := writeLinkFixture(t, migrated)
+	opts = linkTestOpts()
+	opts.NoTerminal = true
+	if err := runLink(cfgPath2, opts, &bytes.Buffer{}); err != nil {
+		t.Fatalf("link --noterminal on the old layout failed: %v", err)
+	}
+	agentText2, err := os.ReadFile(filepath.Join(dir2, agentcfg.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countTopLevelKey(string(agentText2), "Terminal"); n != 1 {
+		t.Errorf("agent.yml has %d Terminal keys, want 1:\n%s", n, agentText2)
+	}
+	after2, err := panel.LoadConfig(cfgPath2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after2.Agent.TerminalEnabled() {
+		t.Error("the migrated Terminal section was not overridden by --noterminal")
+	}
+}
+
+// countTopLevelKey counts the lines that start a top-level "Key:" entry.
+func countTopLevelKey(text, key string) int {
+	n := 0
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, key+":") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestLinkDryRunWritesNoAgentYML: dry-run must not create agent.yml either.
+func TestLinkDryRunWritesNoAgentYML(t *testing.T) {
+	dir, cfgPath := writeLinkFixture(t, linkFixture)
+	opts := linkTestOpts()
+	opts.DryRun = true
+	var out bytes.Buffer
+	if err := runLink(cfgPath, opts, &out); err != nil {
+		t.Fatalf("dry-run failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, agentcfg.FileName)); !os.IsNotExist(err) {
+		t.Error("dry-run wrote agent.yml")
+	}
+	if !strings.Contains(out.String(), agentcfg.FileName) {
+		t.Errorf("the dry-run report does not name agent.yml:\n%s", out.String())
+	}
+}
+
+// TestLinkKeepsEveryFileOnValidationFailure also covers agent.yml: a problem
+// the conversion introduces aborts with zero changes, so no agent.yml, backup
+// or token file may be left behind.
+func TestLinkValidationFailureWritesNoAgentYML(t *testing.T) {
+	dir, cfgPath := writeLinkFixture(t, linkFixture)
+	broken := strings.Replace(linkFixture, "CertMode: dns", "CertMode: bogus-mode", 1)
+	if err := os.WriteFile(cfgPath, []byte(broken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLink(cfgPath, linkTestOpts(), &bytes.Buffer{}); err == nil {
+		t.Fatal("link accepted the invalid conversion")
+	}
+	if _, err := os.Stat(filepath.Join(dir, agentcfg.FileName)); !os.IsNotExist(err) {
+		t.Error("agent.yml was written although validation failed")
+	}
+	if b, _ := filepath.Glob(filepath.Join(dir, ".link-*")); len(b) != 0 {
+		t.Errorf("temporary files left behind: %v", b)
 	}
 }
 
@@ -507,15 +863,21 @@ func TestLinkWritesTokenFileAndNeverLeaksIt(t *testing.T) {
 		t.Error("token file must not end with a newline")
 	}
 
-	// The token must not appear on stdout/stderr or in the config. The
-	// Cloudflare credential may only live in the config, where it already was.
+	// The token must not appear on stdout/stderr, in config.yml or in
+	// agent.yml. The Cloudflare credential may only live where it already was,
+	// in the config copies the machine needs.
 	cfgText, _ := os.ReadFile(cfgPath)
+	agentText, err := os.ReadFile(filepath.Join(dir, "agent.yml"))
+	if err != nil {
+		t.Fatalf("agent.yml: %v", err)
+	}
 	for _, where := range []struct {
 		name string
 		text string
 	}{
 		{"stdout", out.String()},
 		{"config", string(cfgText)},
+		{"agent.yml", string(agentText)},
 	} {
 		if strings.Contains(where.text, linkTestToken) {
 			t.Errorf("the token leaked into %s", where.name)
@@ -525,10 +887,14 @@ func TestLinkWritesTokenFileAndNeverLeaksIt(t *testing.T) {
 		t.Error("the Cloudflare credential leaked to stdout")
 	}
 	// The credential is allowed only where it already was: the original
-	// ControllerConfig. It now exists twice (the rollback block and the
-	// NodeControllers copy) and nowhere else.
-	if n := strings.Count(string(cfgText), linkSecret); n != 2 {
-		t.Errorf("the credential appears %d times in the config, want 2 (rollback block + NodeControllers)", n)
+	// ControllerConfig. It now exists twice, once in the commented-out
+	// rollback block of config.yml and once in the NodeControllers copy of
+	// agent.yml, and nowhere else.
+	if n := strings.Count(string(cfgText), linkSecret); n != 1 {
+		t.Errorf("the credential appears %d times in config.yml, want 1 (rollback block)", n)
+	}
+	if n := strings.Count(string(agentText), linkSecret); n != 1 {
+		t.Errorf("the credential appears %d times in agent.yml, want 1 (NodeControllers)", n)
 	}
 	if strings.Contains(string(b), linkSecret) {
 		t.Error("the Cloudflare credential leaked into the token file")
