@@ -144,4 +144,4 @@ WS 推送 hint、`restart_instance`/任意命令、面板签名、多面板、�
 ## 7. W1nCBoard 仓库约定
 
 - 起点：上游 `cedar2025/Xboard`（本地浅克隆），不是用户魔改版；魔改版的差异需要对其面板做只读检查（需用户另行同意）后再决定如何合入。
-- 位置：`C:\W1nCBoard`（独立 git 仓库，用户的 Go 项目仓库不混放）。PHP/Composer/数据库测试在 141.11.238.136 上进行（本机无 PHP/Docker，已获用户允许）。
+- 位置：`C:\W1nCBoard`（独立 git 仓库，用户的 Go 项目仓库不混放）。PHP/Composer/数据库测试在 <test-host> 上进行（本机无 PHP/Docker，已获用户允许）。
