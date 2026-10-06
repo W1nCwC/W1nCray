@@ -340,7 +340,7 @@ PANEL_HOST=root@167.253.156.95      LANDING_HOST=root@82.152.167.105
 SSH_KEY=  SSH_PORT=22  SSH_OPTS=...
 PROXY_CMD='connect.exe -S 127.0.0.1:7890 %h %p'
 PANEL_ROOT=/www/wwwroot/xboard      PANEL_CODE=/www
-PANEL_WEB_CONTAINER=xboard-web-1    PANEL_COMPOSE_FILE=docker-compose.yml
+PANEL_WEB_CONTAINER=xboard-web-1    PANEL_COMPOSE_FILE=compose.yaml
 PANEL_WS_OVERRIDE=compose.w1ncray-ws.yaml
 PANEL_NGINX_CONF=/www/server/panel/vhost/nginx/subscribe.w1nc.xyz.conf
 PANEL_NGINX_LOG=/www/wwwlogs/subscribe.w1nc.xyz.log
