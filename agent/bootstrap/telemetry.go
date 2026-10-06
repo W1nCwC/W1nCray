@@ -1,0 +1,264 @@
+// This file adapts a booted Runtime to what the WebSocket channel needs: the
+// telemetry streams (device, load, components), the local policy the panel may
+// display, and the capability list. It is in bootstrap because bootstrap is the
+// only layer that sees the reconciler, the supervisor and the kernel manager at
+// once (design section 2.11).
+
+package bootstrap
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
+	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/reconcile"
+	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/telemetry"
+	"github.com/W1nCwC/W1nCray/agent/ws"
+	"github.com/W1nCwC/W1nCray/agent/wsproto"
+)
+
+// Supervisor id prefixes used by the engine drivers. The drivers keep their
+// own ids unexported, so bootstrap recomputes them here; telemetry never sees
+// them (design section 2.11).
+const (
+	gostSupervisorID      = "gost/main" // driver/gost/state.go
+	realmSupervisorPrefix = "realm/"    // driver/realm/realm.go
+	frpSupervisorPrefix   = "frp/frp"   // driver/frp/apply.go: frps-<id> / frpc-<id>
+)
+
+// errXrayNodesDisabled is returned by the nodes hint when the local module gate
+// is off. A remote hint can never turn the module on (protocol ruling 13).
+var errXrayNodesDisabled = errors.New("xray nodes are disabled locally (Modules.XrayNodes)")
+
+// Streams adapts a booted Runtime to ws.Streams. The device and load samples
+// come from the shared Collector, the policy from the local agent.yml, and the
+// kernel list from the runtime's kernel manager. A nil Collector builds one
+// (the same runtime adapters are used either way).
+func (r *Runtime) Streams(c *telemetry.Collector, cfg *agentcfg.Config) ws.Streams {
+	if c == nil {
+		c = telemetry.New(telemetry.Options{
+			Log:        r.log,
+			Components: r.ComponentProbe(),
+		})
+	}
+	return runtimeStreams{rt: r, collector: c, cfg: cfg, caps: capabilities(cfg)}
+}
+
+// runtimeStreams implements ws.Streams on top of a booted Runtime.
+type runtimeStreams struct {
+	rt        *Runtime
+	collector *telemetry.Collector
+	cfg       *agentcfg.Config
+	caps      []string
+}
+
+var _ ws.Streams = runtimeStreams{}
+
+func (s runtimeStreams) HostInfo(ctx context.Context) wsproto.HostInfo {
+	return s.collector.HostInfo(ctx)
+}
+
+func (s runtimeStreams) Telemetry(ctx context.Context) wsproto.Telemetry {
+	return s.collector.Telemetry(ctx)
+}
+
+func (s runtimeStreams) Components(ctx context.Context) wsproto.Components {
+	return s.collector.Components(ctx)
+}
+
+// Kernels lists the installed external kernels. The embedded xray engine is not
+// a kernel and is not listed (it is a component of the agent).
+func (s runtimeStreams) Kernels() []wsproto.KernelEntry { return s.rt.installedKernels() }
+
+// Policy is the part of the LOCAL policy the panel may display. The panel can
+// never relax it (protocol ruling 13).
+func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
+
+// Capabilities returns a copy: the caller must not be able to mutate the list
+// the hello is built from.
+func (s runtimeStreams) Capabilities() []string {
+	return append([]string(nil), s.caps...)
+}
+
+// capabilities lists what this machine can really do; the panel must not offer
+// anything else (protocol ruling 1). This batch implements the telemetry
+// channel only: terminal, files, kernel and upgrade are deliberately absent
+// because nothing serves them yet. xray_nodes is declared only when the local
+// module gate allows it (ruling 6).
+func capabilities(cfg *agentcfg.Config) []string {
+	caps := []string{wsproto.CapTelemetry}
+	if cfg.XrayNodesEnabled() {
+		caps = append(caps, wsproto.CapXrayNodes)
+	}
+	return caps
+}
+
+// localPolicy maps the agent.yml local policy onto the wire type. A nil config
+// keeps the accessors' defaults (the terminal gate off for a nil receiver, no
+// file roots, the xray-nodes module on); a running agent always has a non-nil
+// Config, whose terminal default is on.
+func localPolicy(cfg *agentcfg.Config) wsproto.Policy {
+	pol := wsproto.Policy{
+		Terminal: cfg.TerminalEnabled(),
+		Modules:  wsproto.ModulePolicy{XrayNodes: cfg.XrayNodesEnabled()},
+	}
+	if cfg != nil && cfg.Files != nil {
+		pol.Files = wsproto.FilesPolicy{
+			Roots:        append([]string(nil), cfg.Files.Roots...),
+			Unrestricted: cfg.Files.Unrestricted,
+		}
+	}
+	return pol
+}
+
+// xrayNodeHint is the batch-1 xray-nodes hook: the per-node controllers land in
+// a later batch, so a "nodes" hint only pulls the desired state again and says
+// so in the log. The local module gate is enforced here: a hint can never turn
+// the module on (protocol ruling 13).
+type xrayNodeHint struct {
+	enabled bool
+	refresh func()
+	log     driver.Logger
+}
+
+func (h xrayNodeHint) SyncXrayNodes(context.Context) error {
+	if !h.enabled {
+		h.log.Warnf("bootstrap: xray nodes hint refused: Modules.XrayNodes is false on this machine")
+		return errXrayNodesDisabled
+	}
+	h.log.Infof("bootstrap: xray nodes hint: per-node controllers are not implemented yet, pulling the desired state")
+	h.refresh()
+	return nil
+}
+
+// ComponentProbe adapts a booted Runtime to telemetry.ComponentProbe.
+func (r *Runtime) ComponentProbe() telemetry.ComponentProbe { return runtimeProbe{rt: r} }
+
+type runtimeProbe struct{ rt *Runtime }
+
+var _ telemetry.ComponentProbe = runtimeProbe{}
+
+// InstalledKernels lists every installed kernel version. It reads the kernel
+// directory, so it is only called by the hello and the components cadence.
+func (p runtimeProbe) InstalledKernels() []wsproto.KernelEntry {
+	return p.rt.installedKernels()
+}
+
+// SupervisedProcesses maps the instances of the last apply onto the supervisor.
+// The reconciler reports what is running; the supervisor supplies the process
+// details. The embedded xray engine shares the agent process and therefore
+// reports no PID of its own (protocol ruling 2).
+func (p runtimeProbe) SupervisedProcesses() []telemetry.SupervisedProcess {
+	if p.rt == nil || p.rt.Reconciler == nil {
+		return nil
+	}
+	rep, ok := p.rt.Reconciler.Last()
+	if !ok {
+		return nil
+	}
+	out := make([]telemetry.SupervisedProcess, 0, len(rep.Instances))
+	for _, in := range rep.Instances {
+		if in.State != reconcile.StateRunning {
+			continue
+		}
+		sp := telemetry.SupervisedProcess{
+			InstanceID: in.ID,
+			Driver:     in.Engine,
+			Version:    kernelVersion(rep, in.Engine),
+			// The reconciler reported this instance running; the supervisor
+			// below refines it when it knows the process.
+			Running: true,
+		}
+		switch in.Engine {
+		case spec.EngineXray:
+			// Embedded: no separate process, so no supervisor id and no PID.
+		case spec.EngineGost:
+			sp.SupervisorID = gostSupervisorID
+		case spec.EngineRealm:
+			sp.SupervisorID = realmSupervisorPrefix + in.ID
+		case spec.EngineFrp:
+			sp.SupervisorID = p.frpSupervisorID(in.ID)
+		}
+		if sp.SupervisorID != "" && p.rt.Sup != nil {
+			if st := p.rt.Sup.Status(sp.SupervisorID); st.PID > 0 || st.Running || st.Restarts > 0 || !st.Since.IsZero() {
+				sp.PID, sp.Restarts, sp.Since = st.PID, st.Restarts, st.Since
+			}
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// frpSupervisorID finds the supervisor id of one frp instance. The role (portal
+// vs bridge) decides between the frps- and frpc- prefixes and is not part of
+// the report, so the supervisor's own id list is searched instead of guessing.
+func (p runtimeProbe) frpSupervisorID(instanceID string) string {
+	if p.rt.Sup == nil {
+		return ""
+	}
+	suffix := "-" + instanceID
+	for _, id := range p.rt.Sup.IDs() {
+		if strings.HasPrefix(id, frpSupervisorPrefix) && strings.HasSuffix(id, suffix) {
+			return id
+		}
+	}
+	return ""
+}
+
+// kernelVersion returns the kernel version in use by an engine. The embedded
+// engine's "builtin" marker is not a version and is left out.
+func kernelVersion(rep reconcile.Report, engine string) string {
+	v := rep.Kernels[engine]
+	if v == reconcile.BuiltinVersion {
+		return ""
+	}
+	return v
+}
+
+// installedKernels maps the kernel manager's installed versions onto the wire
+// type. A runtime without a kernel manager (or one that cannot read its
+// directory) yields nil: the contract allows an empty list.
+func (r *Runtime) installedKernels() []wsproto.KernelEntry {
+	if r.Kernels == nil {
+		return nil
+	}
+	in := r.Kernels.Installer()
+	if in == nil {
+		return nil
+	}
+	list, err := in.List()
+	if err != nil {
+		r.warnf("bootstrap: listing the installed kernels: %v", err)
+		return nil
+	}
+	out := make([]wsproto.KernelEntry, 0, len(list))
+	for _, e := range list {
+		entry := wsproto.KernelEntry{
+			Name:      e.Name,
+			Version:   e.Version,
+			Current:   e.Current,
+			Previous:  e.Previous,
+			Path:      e.Path,
+			SizeBytes: e.Size,
+			// "in use" is the version the agent made current; a running
+			// instance may still be on the previous one during a rollback.
+			InUse: e.Current,
+		}
+		if !e.InstalledAt.IsZero() {
+			entry.InstalledAt = e.InstalledAt.Unix()
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// warnf logs through the runtime's logger, tolerating a Runtime built without
+// Boot (tests).
+func (r *Runtime) warnf(format string, args ...any) {
+	if r.log != nil {
+		r.log.Warnf(format, args...)
+	}
+}

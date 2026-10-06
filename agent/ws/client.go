@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,6 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
 )
 
@@ -767,26 +767,23 @@ func drainQueue(q chan []byte) {
 
 // validateURL normalises a panel base URL and enforces the same rules as the
 // HTTP client: https (or wss) unless the host is loopback or AllowInsecureHTTP
-// is set, and never a URL that carries credentials.
+// is set, and never a URL that carries credentials. The rules themselves come
+// from panelclient.ValidateBaseURL, so HTTP and WS can never accept different
+// panels (design R9).
 //
-// No error message echoes the raw URL: an operator who mistakenly pasted the
-// token into it must not have it repeated into a log line.
-//
-// TODO(WP4): replace this body with panelclient.ValidateBaseURL once it lands,
-// so HTTP and WS share exactly one implementation (design section 6-R9). The
-// rules below are a copy of panelclient.New's checks today.
+// The shared validator only knows http/https; the ws/wss spellings are mapped
+// onto them for the check and restored afterwards. Its error text echoes the
+// URL it was given, so only the scheme://host probe (never a path, a query or
+// user info) is handed to it: an operator who pasted the token into the URL
+// must not have it repeated into a log line.
 func validateURL(raw string, allowInsecureHTTP bool) (string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return "", errors.New("ws: base URL must not be empty")
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		// url.Error carries the raw URL; unwrap it so only the reason is shown.
-		reason := err
-		if inner := errors.Unwrap(err); inner != nil {
-			reason = inner
-		}
-		return "", fmt.Errorf("ws: invalid base URL: %w", reason)
+		// url.Error carries the raw URL; never echo it.
+		return "", errors.New("ws: invalid base URL")
 	}
 	if u.Host == "" {
 		return "", errors.New("ws: base URL has no host")
@@ -796,16 +793,17 @@ func validateURL(raw string, allowInsecureHTTP bool) (string, error) {
 		// up in error messages and logs.
 		return "", errors.New("ws: base URL must not contain user info")
 	}
-	safe := u.Scheme + "://" + u.Host
+	probe := ""
 	switch u.Scheme {
 	case "https", "wss":
-		// Always acceptable.
+		probe = "https://" + u.Host
 	case "http", "ws":
-		if !allowInsecureHTTP && !isLoopbackHost(u.Hostname()) {
-			return "", fmt.Errorf("ws: base URL %s must use https (or set AllowInsecureHTTP)", safe)
-		}
+		probe = "http://" + u.Host
 	default:
-		return "", fmt.Errorf("ws: base URL %s has unsupported scheme %q", safe, u.Scheme)
+		return "", fmt.Errorf("ws: base URL has unsupported scheme %q", u.Scheme)
+	}
+	if _, err := panelclient.ValidateBaseURL(probe, allowInsecureHTTP); err != nil {
+		return "", fmt.Errorf("ws: %w", err)
 	}
 	// The scheme is kept as the operator wrote it; wsURL does the http -> ws
 	// conversion. A query string is dropped: the token travels in a header and
@@ -841,14 +839,4 @@ func wsURL(base, path string) (string, error) {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String(), nil
-}
-
-// isLoopbackHost reports whether host names the local machine.
-func isLoopbackHost(host string) bool {
-	h := strings.ToLower(strings.TrimSuffix(host, "."))
-	if h == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(h)
-	return ip != nil && ip.IsLoopback()
 }
