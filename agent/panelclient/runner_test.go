@@ -1,6 +1,7 @@
 package panelclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -77,28 +78,50 @@ func (c *fakeClock) waitsCopy() []time.Duration {
 // has arrived. It first waits for the runner to (re)arm a wait that this fire
 // will release: the runner acts, then rearms its timer, so firing before the
 // rearm would advance the clock past a timer that is registered too late (the
-// lost wakeup this harness once had). If the runner never arms one, the
-// eventually below fails the test with a clear message.
+// lost wakeup this harness once had). If the runner never arms one, the wait
+// below fails the test with the clock's state and every goroutine's stack.
 func (c *fakeClock) fire(t *testing.T, d time.Duration) {
 	t.Helper()
-	eventually(t, fmt.Sprintf("a wait of %s to be armed", d), func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		// An unreleased wait of exactly d. A released waiter is removed from
-		// pending, so a match is one the runner armed after the previous fire.
-		// Matching "any waiter due by now+d" is wrong: the report loop's longer
-		// wait would satisfy it while the pull loop has not rearmed yet.
-		for _, w := range c.pending {
-			if w.d == d {
-				return true
-			}
+	deadline := time.Now().Add(waitBudget(t, pollWait))
+	for !c.waitArmed(d) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a wait of %s to be armed; pending waits: %v; all waits: %v\n%s",
+				d, c.pendingDurations(), c.waitsCopy(), goroutineDump())
 		}
-		return false
-	})
+		time.Sleep(time.Millisecond)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
 	c.releaseReadyLocked()
+}
+
+// waitArmed reports whether an unreleased wait of exactly d is registered. A
+// released waiter is removed from pending, so a match is one the runner armed
+// after the previous fire. Matching "any waiter due by now+d" is wrong: the
+// report loop's longer wait would satisfy it while the pull loop has not
+// rearmed yet.
+func (c *fakeClock) waitArmed(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, w := range c.pending {
+		if w.d == d {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingDurations lists the waits that have not been released yet, for the
+// failure message of fire.
+func (c *fakeClock) pendingDurations() []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]time.Duration, 0, len(c.pending))
+	for _, w := range c.pending {
+		out = append(out, w.d)
+	}
+	return out
 }
 
 func (c *fakeClock) releaseReadyLocked() {
@@ -113,25 +136,100 @@ func (c *fakeClock) releaseReadyLocked() {
 	c.pending = rest
 }
 
+// How long the harness is willing to wait for a condition to hold.
+const (
+	// pollWait bounds every condition wait. The tests drive time through the
+	// fake clock, so a condition holds within microseconds of real time; the
+	// generous bound only covers a machine loaded by the race detector.
+	pollWait = 30 * time.Second
+
+	// deadlineMargin is left to the test binary's own -timeout, so a stuck test
+	// is still reported by the runtime, which dumps every goroutine itself.
+	deadlineMargin = 5 * time.Second
+
+	// runExitWait bounds how long Run may take to return after its context was
+	// cancelled.
+	runExitWait = 30 * time.Second
+
+	// leakSettleWait bounds how long a goroutine that already finished its loop
+	// may stay on the stack dump while it unwinds.
+	leakSettleWait = 10 * time.Second
+)
+
+// waitBudget returns how long a condition may take to hold: maxWait, shortened
+// so the test binary's -timeout keeps a margin to report the stuck test itself.
+// A non-positive result means there is no time left. It must never be computed
+// as t.Deadline() minus a fixed margin alone: with a custom -timeout shorter
+// than that margin every wait would fail before the condition was ever given a
+// chance.
+func waitBudget(t *testing.T, maxWait time.Duration) time.Duration {
+	t.Helper()
+	dl, ok := t.Deadline()
+	if !ok {
+		return maxWait
+	}
+	if remain := time.Until(dl) - deadlineMargin; remain < maxWait {
+		return remain
+	}
+	return maxWait
+}
+
 // eventually polls cond; the polling only synchronises with goroutines, no
 // logic depends on real time.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	// Under -race the runner's goroutines are much slower to observe the
-	// fired clock, and the gate runs every package concurrently under load,
-	// so follow the test deadline (10 minutes when the test has none).
-	deadline, hasDL := t.Deadline()
-	if hasDL {
-		deadline = deadline.Add(-60 * time.Second)
-	} else {
-		deadline = time.Now().Add(10 * time.Minute)
-	}
-	_ = hasDL
+	deadline := time.Now().Add(waitBudget(t, pollWait))
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// runnerFrame marks a goroutine that is executing Runner code. It cannot tell a
+// survivor from a loop goroutine that has already returned: such a goroutine
+// stays on the stack for a few instructions while its deferred wg.Done runs,
+// and its frame is named "(*Runner).Run.funcN". waitRunnerGoroutines samples
+// until the dump is clean instead of trusting a single reading.
+var runnerFrame = []byte("panelclient.(*Runner)")
+
+// goroutineDump returns the stacks of every goroutine, growing the buffer until
+// the runtime reports that they all fitted.
+func goroutineDump() []byte {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) || len(buf) >= 1<<26 {
+			return buf[:n]
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// waitRunnerGoroutines waits until no goroutine is executing Runner code and
+// reports whether that happened within budget. A goroutine that really survived
+// Run is blocked and never leaves, so the wait only lets a goroutine that has
+// already finished its loop disappear from the dump: the assertion keeps its
+// meaning. On failure the last dump is returned for the report.
+func waitRunnerGoroutines(budget time.Duration) ([]byte, bool) {
+	deadline := time.Now().Add(budget)
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			if !bytes.Contains(buf[:n], runnerFrame) {
+				return nil, true
+			}
+		} else if len(buf) < 1<<26 {
+			// Truncated: a survivor could have been cut off, so retry bigger.
+			buf = make([]byte, 2*len(buf))
+			continue
+		}
+		if time.Now().After(deadline) {
+			return goroutineDump(), false
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -565,20 +663,25 @@ func (h *harness) stop() {
 	if h.cancel == nil {
 		return
 	}
-	h.cancel()
+	// Clear the handle first: a second call (a test that stops explicitly and
+	// then runs the cleanup) must not wait for Run twice.
+	cancel := h.cancel
+	h.cancel = nil
+	cancel()
 	select {
 	case err := <-h.done:
 		if !errors.Is(err, context.Canceled) {
 			h.t.Errorf("Run returned %v, want context.Canceled", err)
 		}
-	case <-time.After(15 * time.Second):
-		h.t.Fatal("Run did not return after the context was cancelled")
+	case <-time.After(waitBudget(h.t, runExitWait)):
+		h.t.Fatalf("Run did not return after the context was cancelled:\n%s", goroutineDump())
 	}
-	h.cancel = nil
-	buf := make([]byte, 1<<20)
-	buf = buf[:runtime.Stack(buf, true)]
-	if strings.Contains(string(buf), "panelclient.(*Runner)") {
-		h.t.Errorf("a Runner goroutine survived Run:\n%s", buf)
+	// A loop goroutine that has just returned is still on the stack for a few
+	// instructions while its deferred wg.Done runs, so a single sample can see
+	// "(*Runner).Run.funcN" and call a finished goroutine a survivor. Wait for
+	// the dump to drain: a goroutine that really survived Run never does.
+	if dump, ok := waitRunnerGoroutines(waitBudget(h.t, leakSettleWait)); !ok {
+		h.t.Errorf("a Runner goroutine survived Run:\n%s", dump)
 	}
 }
 
@@ -1180,25 +1283,28 @@ func TestRefreshFromReportWakesAPullLoopThatIsWaiting(t *testing.T) {
 
 func TestBackoffSequenceAndReset(t *testing.T) {
 	h := newHarness(t, hopts{report: 200 * time.Second})
-	failing := true
-	var mu sync.Mutex
+	want := []time.Duration{30 * time.Second, 60 * time.Second, 120 * time.Second, 240 * time.Second, 300 * time.Second, 300 * time.Second}
+	// The panel answers by request ordinal: the initial pull and the six that
+	// the back-off fires release fail, the next two pulls (the panel has
+	// recovered) succeed, and everything after that (it broke again) fails.
+	// Deciding from n, which the server assigns before the handler runs, fixes
+	// the answer of a request before the test can observe it. A flag flipped
+	// after waitCount("config", n) is racy instead: the server counts a request
+	// before the handler reads the flag, so the flip can land between the two
+	// and change the answer of the very request whose arrival the test just saw
+	// (the "wait of 10s/5m0s to be armed" hang).
+	firstOK, lastOK := len(want)+2, len(want)+3
 	h.panel.setConfig(func(n int, req ConfigRequest) (int, string) {
-		mu.Lock()
-		defer mu.Unlock()
-		if failing {
+		if n < firstOK || n > lastOK {
 			return 503, `{"error":"unavailable","message":"try later"}`
 		}
 		return 200, unchangedBody(0, "")
 	})
-	want := []time.Duration{30 * time.Second, 60 * time.Second, 120 * time.Second, 240 * time.Second, 300 * time.Second, 300 * time.Second}
 	for i, d := range want {
 		h.panel.waitCount("config", i+1)
 		h.clock.fire(t, d)
 	}
 	h.panel.waitCount("config", len(want)+1)
-	mu.Lock()
-	failing = false
-	mu.Unlock()
 	h.clock.fire(t, 300*time.Second)
 	h.panel.waitCount("config", len(want)+2)
 	// A success resets the backoff: the next wait is the normal interval.
@@ -1206,9 +1312,6 @@ func TestBackoffSequenceAndReset(t *testing.T) {
 	h.panel.waitCount("config", len(want)+3)
 	// ... and the next failure starts again at 30s instead of continuing the
 	// old sequence.
-	mu.Lock()
-	failing = true
-	mu.Unlock()
 	h.clock.fire(t, 10*time.Second)
 	h.panel.waitCount("config", len(want)+4)
 	h.clock.fire(t, 30*time.Second)
