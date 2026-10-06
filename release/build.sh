@@ -73,7 +73,7 @@ for t in "${targets[@]}"; do
 	if [ ${#want[@]} -gt 0 ] && [[ ! " ${want[*]} " =~ " $name " ]]; then
 		continue
 	fi
-	built_archs="$built_archs $name"
+	built_archs="$built_archs $goarch"  # GOARCH, the unit of the terminal matrix (armv5..7 are all arm)
 	# The full flavor of amd64/arm64 is shipped uncompressed next to the .gz;
 	# every other architecture is gzipped in place. Check whichever exists.
 	gz="dist/W1nCray-linux-$name.gz"
@@ -102,7 +102,7 @@ for t in "${targets[@]}"; do
 		rm -f "$probe"
 		case "$goarch" in
 			amd64) want_desc="x86-64" ;;
-			386) want_desc="80386" ;;
+			386) want_desc="386" ;;  # "80386" or "i386" depending on the file database
 			arm64) want_desc="aarch64" ;;
 			arm) want_desc="arm" ;;
 			# file reports the MIPS family as "mips" (32-bit) or "mips64"
