@@ -50,8 +50,10 @@ func TestRealSampleLinux(t *testing.T) {
 	if hi.CPUThreads < hi.CPUCores {
 		t.Fatalf("cpu_threads %d < cpu_cores %d", hi.CPUThreads, hi.CPUCores)
 	}
-	if len(hi.IPs.Private) == 0 {
-		t.Fatal("no private interface address reported")
+	// A VPS carries its public address on the interface itself, so either list
+	// may hold it; what must not happen is a host with an address and neither list.
+	if len(hi.IPs.Private)+len(hi.IPs.Public) == 0 {
+		t.Fatal("no interface address reported")
 	}
 
 	if _, _, ok := netCounters(); !ok {
