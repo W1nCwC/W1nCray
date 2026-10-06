@@ -42,7 +42,7 @@ func TestClassifyIPsSplitsPrivateAndPublic(t *testing.T) {
 	if strings.Join(got.Private, ",") != "10.0.0.5,100.64.1.2,fd00::1" {
 		t.Fatalf("private = %v", got.Private)
 	}
-	if strings.Join(got.Public, ",") != "203.0.113.10,2001:db8::1" {
+	if strings.Join(got.Public, ",") != "2001:db8::1,203.0.113.10" {
 		t.Fatalf("public = %v", got.Public)
 	}
 }
