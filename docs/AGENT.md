@@ -149,6 +149,32 @@ Agent:
 - **`W1nCray check`**：离线时打印机器 ID 与「节点由面板下发」；加 `--online` 才联网，列出节点数与列表版本。
 - 机器节点的 tag 形如 `node<节点ID>@machine<机器ID>`，与静态节点的 `node<节点ID>@<主机>` 不会重名。
 
+#### 一键接入（`install.sh --panel`）
+
+面板管理页给管理员生成的一键命令形如：
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.sh) install \
+  --panel https://panel.example.com --machine 3 --token <TOKEN>
+```
+
+安装脚本在装好二进制与服务的同时，写出上面的机器模式配置（`Log` + `Agent` 段）：
+
+| 参数 | 说明 |
+|---|---|
+| `--panel URL` | 面板地址。必须 `https://`；仅本机回环（`localhost` / `127.x` / `::1`）可用明文 `http://`。末尾斜杠会被去掉 |
+| `--machine ID` | 面板上的机器 ID，必须是正整数 |
+| `--token TOKEN` / `--token-file FILE` | 二选一提供机器令牌；`--token-file` 读文件（首尾空白与换行会被去掉） |
+| `--allow-http` | 面板地址是**非回环**的 `http://` 时必须显式给出，否则拒绝安装并说明原因 |
+| `--port-range LO-HI` | `Policy.PortRange`，默认 `20000-40000` |
+
+- `--panel` / `--machine` / 令牌三者必须同时提供，缺任何一个都会以中文报错并非 0 退出；`--port-range` 与 `--allow-http` 只在 `--panel` 下有效。
+- 令牌写入 `<配置目录>/agent.token`（先 `umask 077` 再写，再 `chmod 600`，内容不带换行），生成的配置用 `Agent.Panel.TokenFile` 引用它；令牌**不会**进入 `config.yml`、日志或传给子进程的参数。`uninstall` 会一并删除 `agent.token`。
+- 加 `--allow-http` 时配置里会写 `AllowInsecureHTTP: true`（否则 `Agent.Panel` 会拒绝明文 http 的非回环地址）。
+- 若 `config.yml` 已存在，安装**不会覆盖**：新配置写到 `<配置目录>/config.panel.yml.new`，安装以黄色警告提示如何合并，返回码仍为 0。
+- 机器模式安装时的配置检查是离线的（`check` 不带 `--online`）：面板暂时不可达不会阻止服务启动，agent 会在后台重试领取节点。
+- 安装结束会提示「已关联面板，agent 将自动领取节点与转发规则」并给出查看日志的命令；提示里不回显令牌。
+
 ## 4 本地策略 `Policy`
 
 策略只能写在本机配置里，**远端或文件里的期望状态无法放宽它**。字段与默认值取自 `panel/config.go`（`AgentPolicy`）和 `agent/validate`（`NormalizePolicy`）。**默认就是拒绝**：不写 `Policy` 时，只允许监听 `127.0.0.1`、不允许 1024 以下端口、不允许私网目标、不允许任意目标、不允许公网监听接收 PROXY。

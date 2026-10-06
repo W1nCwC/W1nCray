@@ -706,8 +706,11 @@ t_uninstall_openwrt_sysupgrade() {
 
 t_uninstall_refuses_odd_paths() {
 	mock_backend
-	CONF_DIR="/home/someone/data"
+	CONF_DIR="$W1NCRAY_ROOT/home/someone/data"
+	mkdir -p "$CONF_DIR"
+	printf 'secret' >"$CONF_DIR/agent.token"
 	( cmd_uninstall --purge -y ) >/dev/null 2>&1 && fail "purged an unexpected directory" || pass "purge refuses a path that is not .../etc/W1nCray"
+	check "an unexpected config dir keeps its agent.token" test -f "$CONF_DIR/agent.token"
 }
 
 t_none_backend() {
@@ -719,6 +722,232 @@ t_none_backend() {
 	check "binary and config are still installed" test -x "$BIN"
 	has "user is told to run it by hand" "$out" "前台运行"
 	has "start explains the missing init system" "$( (cmd_start) 2>&1)" "没有检测到可用的服务管理器"
+}
+
+# ---- panel machine mode ------------------------------------------------------
+
+mode_of() { ls -l "$1" | awk '{print $1}'; }
+
+# fs_keeps_modes: true when a 0600 file really reads back as -rw-------. Git
+# Bash / MSYS reports 644 for everything, so there the mode assertion is
+# skipped; the installer's umask/chmod calls are still checked.
+fs_keeps_modes() {
+	_p="$TMPROOT/modeprobe"
+	: >"$_p"
+	chmod 600 "$_p" 2>/dev/null || return 1
+	[ "$(mode_of "$_p")" = "-rw-------" ]
+}
+
+# spy_perms: record every umask/chmod call the installer makes, then still run
+# the real thing. The logs go to $UMASK_LOG / $CHMOD_LOG.
+spy_perms() {
+	UMASK_LOG="$W1NCRAY_ROOT/umask.log"
+	CHMOD_LOG="$W1NCRAY_ROOT/chmod.log"
+	: >"$UMASK_LOG"
+	: >"$CHMOD_LOG"
+	umask() { printf 'umask %s\n' "$*" >>"$UMASK_LOG"; command umask "$@"; }
+	chmod() { printf 'chmod %s\n' "$*" >>"$CHMOD_LOG"; command chmod "$@"; }
+}
+
+t_install_panel() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	spy_perms
+	tok="panel-secret-token-42"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com/ --machine 3 --token "$tok" 2>&1)"
+	eq "a panel install succeeds" "$?" 0
+	check "binary installed" test -x "$BIN"
+	check "token file created" test -f "$CONF_DIR/agent.token"
+	has "the token is written under umask 077" "$(cat "$UMASK_LOG")" "umask 077"
+	has "the token file is chmod 600" "$(cat "$CHMOD_LOG")" "chmod 600 $CONF_DIR/agent.token"
+	if fs_keeps_modes; then
+		eq "token file mode is 0600" "$(mode_of "$CONF_DIR/agent.token")" "-rw-------"
+	else
+		pass "token file mode is 0600 (skipped: this filesystem does not store Unix modes)"
+	fi
+	eq "the token is written verbatim" "$(cat "$CONF_DIR/agent.token")" "$tok"
+	eq "the token file has no trailing newline" \
+		"$(wc -c <"$CONF_DIR/agent.token" | tr -d '[:space:]')" \
+		"$(printf '%s' "$tok" | wc -c | tr -d '[:space:]')"
+	cfg="$(cat "$CONF")"
+	check "config enables the agent" grep -qx 'Agent:' "$CONF"
+	check "config enables the panel" grep -qx '  Panel:' "$CONF"
+	check "config has the state dir" grep -qx "  StateDir: \"$CONF_DIR/state\"" "$CONF"
+	check "config has the default port range" grep -qx '    PortRange: \[20000, 40000\]' "$CONF"
+	check "config allows xray only" grep -qx '    AllowEngines: \["xray"\]' "$CONF"
+	check "config listens on all addresses" grep -qx '    AllowListen: \["0.0.0.0"\]' "$CONF"
+	check "the trailing slash is stripped from the URL" grep -qx '    URL: "https://panel.example.com"' "$CONF"
+	check "config has the machine id" grep -qx '    MachineID: 3' "$CONF"
+	check "config points at the token file" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$CONF"
+	check "config turns on machine nodes" grep -qx '    MachineNodes: true' "$CONF"
+	hasnt "config never contains the token" "$cfg" "$tok"
+	hasnt "the installer never prints the token" "$out" "$tok"
+	has "the installer reports the panel link" "$out" "已关联面板"
+	has "the installer points at the log" "$out" "查看日志"
+	has "the panel install checks the config offline" "$out" "check ok ARGS: check -c"
+	hasnt "the panel is not contacted at install time" "$out" "--online"
+	has "the service is started as usual" "$(cat "$CALLS")" "start W1nCray"
+}
+
+t_install_panel_missing_args() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--panel without --machine accepted" || pass "--panel without --machine is refused"
+	has "the refusal names --machine" "$(cat "$W1NCRAY_ROOT/out")" "--machine"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 3 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--panel without a token accepted" || pass "--panel without a token is refused"
+	has "the refusal names the token" "$(cat "$W1NCRAY_ROOT/out")" "令牌"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --machine 3 --token x ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--machine without --panel accepted" || pass "--machine without --panel is refused"
+	has "the refusal names --panel" "$(cat "$W1NCRAY_ROOT/out")" "--panel"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 3 --token a --token-file "$W1NCRAY_ROOT/x" ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "both token sources accepted" || pass "both --token and --token-file are refused"
+	has "the refusal explains the choice" "$(cat "$W1NCRAY_ROOT/out")" "只能提供一个"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --token a ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--panel without --machine (token given) accepted" || pass "a missing --machine is refused even with a token"
+	has "that refusal also names --machine" "$(cat "$W1NCRAY_ROOT/out")" "--machine"
+	# --port-range / --allow-http are meaningless without --panel.
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --port-range 20000-30000 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--port-range without --panel accepted" || pass "--port-range without --panel is refused"
+	has "the refusal explains the scope" "$(cat "$W1NCRAY_ROOT/out")" "--panel"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --allow-http ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--allow-http without --panel accepted" || pass "--allow-http without --panel is refused"
+	refute "nothing is installed after a bad invocation" test -e "$BIN"
+	refute "no token file after a bad invocation" test -e "$CONF_DIR/agent.token"
+}
+
+t_install_panel_bad_id() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	for bad in abc 0 -3 1.5 1e3; do
+		( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine "$bad" --token t ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "machine id '$bad' accepted" || pass "machine id '$bad' is refused"
+	done
+	has "the refusal says positive integer" "$(cat "$W1NCRAY_ROOT/out")" "正整数"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine "" --token t ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "an empty machine id accepted" || pass "an empty machine id is refused"
+	has "an empty machine id is reported as missing" "$(cat "$W1NCRAY_ROOT/out")" "--machine"
+	refute "nothing is installed after a bad id" test -e "$BIN"
+}
+
+t_install_panel_http() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel http://panel.example.com --machine 3 --token t ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "plain http accepted" || pass "plain http to a remote host is refused"
+	has "the refusal names --allow-http" "$(cat "$W1NCRAY_ROOT/out")" "--allow-http"
+	has "the refusal explains the plaintext risk" "$(cat "$W1NCRAY_ROOT/out")" "明文"
+	refute "nothing is installed after an http refusal" test -e "$BIN"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel http://panel.example.com --machine 3 --token t --allow-http 2>&1)"
+	eq "--allow-http installs" "$?" 0
+	check "the config records the insecure-http opt-in" grep -qx '    AllowInsecureHTTP: true' "$CONF"
+	# A loopback http panel is allowed without the opt-in.
+	rm -f "$CONF"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel http://127.0.0.1:8080 --machine 3 --token t 2>&1)"
+	eq "loopback http is allowed" "$?" 0
+	check "the loopback URL is kept" grep -qx '    URL: "http://127.0.0.1:8080"' "$CONF"
+	refute "loopback http needs no opt-in" grep -qx '    AllowInsecureHTTP: true' "$CONF"
+	# Other schemes are refused.
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel ftp://panel.example.com --machine 3 --token t ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "ftp accepted" || pass "a non-http scheme is refused"
+	has "the refusal asks for https" "$(cat "$W1NCRAY_ROOT/out")" "https://"
+}
+
+t_install_panel_token_file() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	tok="token-from-a-file-99"
+	printf '%s\n' "$tok" >"$W1NCRAY_ROOT/token.txt"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 7 --token-file "$W1NCRAY_ROOT/token.txt" 2>&1)"
+	eq "--token-file installs" "$?" 0
+	eq "the token file's content is used (newline stripped)" "$(cat "$CONF_DIR/agent.token")" "$tok"
+	eq "the copied token has no newline" \
+		"$(wc -c <"$CONF_DIR/agent.token" | tr -d '[:space:]')" \
+		"$(printf '%s' "$tok" | wc -c | tr -d '[:space:]')"
+	check "config points at the copied token" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$CONF"
+	hasnt "the config never holds the token" "$(cat "$CONF")" "$tok"
+	hasnt "the output never holds the token" "$out" "$tok"
+	# A missing token file is refused before anything is installed.
+	rm -rf "$BIN_DIR" "$CONF_DIR"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 7 --token-file "$W1NCRAY_ROOT/nope" ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a missing token file was accepted" || pass "a missing token file is refused"
+	has "the refusal names the file" "$(cat "$W1NCRAY_ROOT/out")" "--token-file"
+	refute "nothing is installed with a missing token file" test -e "$BIN"
+	# An empty token is refused too.
+	printf '\n' >"$W1NCRAY_ROOT/empty.txt"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 7 --token-file "$W1NCRAY_ROOT/empty.txt" ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "an empty token was accepted" || pass "an empty token is refused"
+	has "the refusal says the token is empty" "$(cat "$W1NCRAY_ROOT/out")" "令牌为空"
+	# A token with embedded whitespace is refused: the agent's reader would
+	# reject it, so the installer says so up front.
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 7 --token 'a b' ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a token with a space was accepted" || pass "a token with whitespace is refused"
+	has "the refusal explains the whitespace" "$(cat "$W1NCRAY_ROOT/out")" "空白"
+}
+
+t_install_panel_keeps_config() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	mkdir -p "$CONF_DIR"
+	printf 'Nodes:\n  - ApiConfig: {ApiHost: "https://x", ApiKey: k, NodeID: 1}\n' >"$CONF"
+	before="$(cat "$CONF")"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 9 --token t --port-range 30000-31000 2>&1)"
+	eq "an existing config does not fail the install" "$?" 0
+	eq "the existing config is untouched" "$(cat "$CONF")" "$before"
+	new="$CONF_DIR/config.panel.yml.new"
+	check "the new config goes to config.panel.yml.new" test -f "$new"
+	check ".new has the requested port range" grep -qx '    PortRange: \[30000, 31000\]' "$new"
+	check ".new has the machine id" grep -qx '    MachineID: 9' "$new"
+	check ".new points at the token file" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$new"
+	has "the admin is warned the config was kept" "$out" "未覆盖"
+	has "the admin is told how to merge" "$out" "合并"
+	has "the pending hint says the link is not active yet" "$out" "配置尚未生效"
+	check "the token file is written even then" test -f "$CONF_DIR/agent.token"
+	has "the service still starts" "$(cat "$CALLS")" "start W1nCray"
+	# A malformed range is refused.
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 9 --token t --port-range 40000-20000 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a backwards port range was accepted" || pass "a backwards port range is refused"
+	has "the refusal explains the range" "$(cat "$W1NCRAY_ROOT/out")" "--port-range"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 9 --token t --port-range 20000 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a range without '-' was accepted" || pass "a range without '-' is refused"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 9 --token t --port-range 0-100 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a zero port was accepted" || pass "a zero port is refused"
+	# A '#' in the URL must survive YAML quoting.
+	rm -f "$CONF"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel 'https://panel.example.com/x#y' --machine 9 --token t >/dev/null 2>&1
+	check "a # in the URL is quoted so YAML keeps it" grep -qx '    URL: "https://panel.example.com/x#y"' "$CONF"
+}
+
+t_install_without_panel_unchanged() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo 2>&1)"
+	eq "a plain install still uses init" "$(cat "$CONF")" "Nodes: []"
+	eq "the config dir holds only the old artifacts" "$(ls "$CONF_DIR" | sort | tr '\n' ' ')" "config.yml install.env "
+	eq "install.env keeps the prefix" "$(grep '^BIN_DIR=' "$ENVFILE")" "BIN_DIR=$BIN_DIR"
+	eq "install.env keeps the flavor" "$(grep '^FLAVOR=' "$ENVFILE")" "FLAVOR=full"
+	refute "no token file without --panel" test -e "$CONF_DIR/agent.token"
+	refute "no .new config without --panel" test -e "$CONF_DIR/config.panel.yml.new"
+	has "the service is started as before" "$(cat "$CALLS")" "start W1nCray"
+	has "a plain install still checks online" "$out" "--online"
+	hasnt "the output does not mention a panel link" "$out" "已关联面板"
+	# A repeat install is still a no-op upgrade that adds no files.
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	eq "a repeat install adds nothing" "$(ls "$CONF_DIR" | sort | tr '\n' ' ')" "config.yml install.env "
+}
+
+t_uninstall_removes_agent_token() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://panel.example.com --machine 1 --token t >/dev/null 2>&1
+	check "token file exists before uninstall" test -f "$CONF_DIR/agent.token"
+	cmd_uninstall -y >/dev/null 2>&1
+	refute "uninstall removes agent.token" test -e "$CONF_DIR/agent.token"
+	check "uninstall still keeps the rest of the config" test -f "$CONF"
+	refute "uninstall removed the binary" test -e "$BIN"
 }
 
 # ---- run ------------------------------------------------------------------------
@@ -735,7 +964,9 @@ run() { # name
 for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_verify_opt_out t_generated_scripts \
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
 	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
-	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend; do
+	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
+	t_install_panel t_install_panel_missing_args t_install_panel_bad_id t_install_panel_http \
+	t_install_panel_token_file t_install_panel_keeps_config t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
 	run "$t"
 done
 
