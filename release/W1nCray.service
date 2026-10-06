@@ -10,7 +10,7 @@ User=root
 WorkingDirectory=/etc/W1nCray
 ExecStart=/usr/local/W1nCray/W1nCray -c /etc/W1nCray/config.yml
 Restart=always
-RestartSec=10
+RestartSec=5
 LimitNOFILE=1048576
 Environment=XRAY_LOCATION_ASSET=/etc/W1nCray
 

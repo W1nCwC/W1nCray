@@ -415,7 +415,7 @@ User=root
 WorkingDirectory=@CONF_DIR@
 ExecStart=@BIN@ -c @CONF@
 Restart=always
-RestartSec=10
+RestartSec=5
 LimitNOFILE=1048576
 Environment=XRAY_LOCATION_ASSET=@CONF_DIR@
 
