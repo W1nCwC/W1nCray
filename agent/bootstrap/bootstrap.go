@@ -25,6 +25,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/state"
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
@@ -88,6 +89,11 @@ type Runtime struct {
 	// Ops is the operations command registry (kernel_* and, later, the other
 	// operation commands). It is nil only for a Runtime built by hand.
 	Ops *opscmd.Registry
+	// Updater replaces the agent's own binary with a version from the signed
+	// manifest (self_update). It is nil when the executable path cannot be
+	// resolved; upgradeReady is the one-time verdict of its Ready check.
+	Updater      *selfupdate.Updater
+	upgradeReady bool
 
 	log driver.Logger
 
@@ -165,10 +171,47 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 	rt.Ops = ops
+	// The self-update updater: it stages the agent's own manifest entry (the
+	// reserved kernel name "agent") through the same installer the kernel
+	// commands use, and swaps the running executable. A machine that cannot
+	// replace its executable (Windows) or is not run by a service manager
+	// never declares the upgrade capability.
+	if up, uerr := newUpdater(kern, opts.StateDir, log); uerr != nil {
+		log.Warnf("bootstrap: self-update is not available: %v", uerr)
+	} else {
+		rt.Updater = up
+		if rerr := up.Ready(); rerr != nil {
+			log.Infof("bootstrap: self-update capability withheld: %v", rerr)
+		} else {
+			rt.upgradeReady = true
+		}
+	}
 	if opts.Resume {
 		rt.resume()
 	}
 	return rt, nil
+}
+
+// newUpdater builds the self-update updater around the running executable and
+// the kernel installer. The executable is resolved (EvalSymlinks) so the swap
+// replaces the real file a service manager runs, not a symlink to it.
+func newUpdater(kern *kernelx.Ensurer, stateDir string, log driver.Logger) (*selfupdate.Updater, error) {
+	if kern == nil {
+		return nil, errors.New("no kernel installer")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolving the running executable: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return selfupdate.New(selfupdate.Options{
+		ExePath:   exe,
+		StateDir:  stateDir,
+		Installer: kern,
+		Log:       log,
+	})
 }
 
 // loadPersistedManifest restores the manifest the panel sync loop persisted in

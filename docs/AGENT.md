@@ -471,7 +471,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 同一个命令 id 在两条通道上只会执行一次、只回一次结果。命令注册表里的类型就是白名单，**未注册的类型一律回 `failed` 且 `result.error="unsupported command"`，不执行**。`refresh` 与 `dump_state` 是内建类型（需要拉取循环与最近一次报告，仍由 `agent/panelclient` 实现），其余由 `agent/opscmd` 提供。
 
-**长命令**（当前只有 `kernel_install`；后续的 `self_update`、`files_apply` 也是）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
+**长命令**（`kernel_install` 与 `self_update`；后续的 `files_apply` 也是）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
 
 | type | args | 行为与结果 |
 |---|---|---|
@@ -492,6 +492,18 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 - **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
 - **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
 - **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
+
+### 7.1 `self_update`（agent 自升级）
+
+签名清单里名为 `agent` 的条目描述 agent 自己的版本（契约 §7-11）；`self_update {version}` 用它升级：
+
+- **长命令**：先回 `{"status":"accepted"}`，完成后再回同一 id 的 `done`/`failed`。目标版本必须出现在清单的 `agent` 条目里，并通过全部既有校验（签名、`revoked`、`min_agent`、平台 target、`archive_sha256`、成员 `sha256`/`size`）与清单声明的版本自检（`run.version_cmd`，argv 数组、不经 shell）。raw `.gz` 产物（`release/build.sh` 的 `dist/W1nCray-linux-<arch>.gz`，清单 `archive:"gz"`、恰好一个 extract 成员）与 `.tar.gz`/`.zip` 走同一条校验路径。**任何一步失败都不会写运行中的可执行文件**。
+- **原子替换**：`exe → exe.old`、已验证的暂存副本 → `exe`，然后写 `<StateDir>/update/pending.json`。任何一步失败都会把原二进制放回；`.old` 从不删除，最坏情况（助手也死了）用一条 `mv exe.old exe` 即可手工恢复，这是"不变砖"的最后一道兜底。
+- **重启**：提交后 agent 启动一个脱离会话的隐藏助手 `__respawn`，然后按原 argv 正常退出（走既有的优雅关停：停内核、关 Xray）。助手等本进程释放单实例锁后运行新二进制；连续 3 次（每次存活窗口 10 s、间隔 5 s）都起不来，就回滚到 `.old`、写 `<StateDir>/update/rollback.json`，再启动恢复后的二进制。systemd 单元是 `Restart=always`，OpenRC 用 `supervise-daemon`、procd 用 `respawn`，服务管理器是第二层保险。**注意**：systemd 默认 `KillMode=control-group` 会在主进程退出时连同 cgroup 杀掉助手，因此"助手能否存活"必须在目标机器实测；杀掉了就由服务管理器重启（新进程启动自检）兜底。
+- **确认**：新进程在第一次成功得到面板 `/config` 应答后调用 `Confirm()`，删除 `.old` 与 `pending.json`。
+- **连不上面板不回滚**：新进程起来了但 10 分钟内没连上面板，只发 `event{kind:"self_update.stalled"}`（事件是实时数据，断线不补发），**绝不自动回滚**——面板故障不是二进制坏。
+- **事件**：`self_update.started`（开始）、`self_update.rolled_back`（助手回滚后由下一次启动上报一次）、`self_update.stalled`。
+- **能力声明**：`hello.capabilities`（及 HTTP `/config` 的 `features`）出现 `upgrade` 的条件是 `self_update` 命令真的注册了：平台能替换自身 exe（Windows 一律不行）、可执行文件是常规文件且所在目录可写、有服务管理器（systemd/OpenRC/procd 的 init 文件里 `ExecStart`/`command` 指向该 exe），并且进程提供了重启钩子。不满足时命令回 `failed` + `result.code="not_supported"`，能力也不声明（契约 §7-1/§7-11）。
 
 ## 8 常见拒绝原因与排错
 
