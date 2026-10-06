@@ -350,8 +350,15 @@ func randBytes(n int) []byte {
 func waitCounters(t *testing.T, h xray.Host, want map[string]uint64) {
 	t.Helper()
 	// Generous: under -race the whole pipeline is several times slower and
-	// the counters update as connections tear down.
-	deadline := time.Now().Add(30 * time.Second)
+	// the counters update as connections tear down. Follow the test deadline
+	// (the gate runs packages concurrently under load); 10 minutes if the
+	// test has none.
+	deadline, ok := t.Deadline()
+	if ok {
+		deadline = deadline.Add(-60 * time.Second)
+	} else {
+		deadline = time.Now().Add(10 * time.Minute)
+	}
 	for {
 		ok := true
 		for name, w := range want {

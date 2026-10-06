@@ -3,6 +3,7 @@
 package xray
 
 import (
+	"fmt"
 	"os"
 	"testing"
 )
