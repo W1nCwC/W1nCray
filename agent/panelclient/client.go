@@ -77,28 +77,9 @@ func New(o Options) (*Client, error) {
 	if o.Token == "" {
 		return nil, errors.New("panelclient: token must not be empty")
 	}
-
-	u, err := url.Parse(o.BaseURL)
+	baseURL, err := ValidateBaseURL(o.BaseURL, o.AllowInsecureHTTP)
 	if err != nil {
-		return nil, fmt.Errorf("panelclient: invalid base URL %q: %w", o.BaseURL, err)
-	}
-	if u.Host == "" {
-		return nil, fmt.Errorf("panelclient: base URL %q has no host", o.BaseURL)
-	}
-	if u.User != nil {
-		// Credentials belong in Options.Token; a URL with user info would also
-		// end up in error messages and logs.
-		return nil, errors.New("panelclient: base URL must not contain user info")
-	}
-	switch u.Scheme {
-	case "https":
-		// Always acceptable.
-	case "http":
-		if !o.AllowInsecureHTTP && !isLoopbackHost(u.Hostname()) {
-			return nil, fmt.Errorf("panelclient: base URL %q must use https (or set AllowInsecureHTTP)", o.BaseURL)
-		}
-	default:
-		return nil, fmt.Errorf("panelclient: base URL %q has unsupported scheme %q", o.BaseURL, u.Scheme)
+		return nil, err
 	}
 
 	httpClient := &http.Client{
@@ -120,12 +101,43 @@ func New(o Options) (*Client, error) {
 	}
 
 	return &Client{
-		baseURL:   strings.TrimRight(o.BaseURL, "/"),
+		baseURL:   baseURL,
 		machineID: o.MachineID,
 		token:     o.Token,
 		userAgent: "W1nCray-agent/" + version,
 		http:      httpClient,
 	}, nil
+}
+
+// ValidateBaseURL applies the panel URL rules and returns the normalised base
+// URL (no trailing slash): https, or http only to a loopback host or with
+// allowInsecureHTTP; a host is required and user info is refused (it would end
+// up in error messages and logs). New and the WebSocket client share it, so a
+// URL accepted by one is accepted by the other (design R9).
+func ValidateBaseURL(raw string, allowInsecureHTTP bool) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("panelclient: invalid base URL %q: %w", raw, err)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("panelclient: base URL %q has no host", raw)
+	}
+	if u.User != nil {
+		// Credentials belong in Options.Token; a URL with user info would also
+		// end up in error messages and logs.
+		return "", errors.New("panelclient: base URL must not contain user info")
+	}
+	switch u.Scheme {
+	case "https":
+		// Always acceptable.
+	case "http":
+		if !allowInsecureHTTP && !isLoopbackHost(u.Hostname()) {
+			return "", fmt.Errorf("panelclient: base URL %q must use https (or set AllowInsecureHTTP)", raw)
+		}
+	default:
+		return "", fmt.Errorf("panelclient: base URL %q has unsupported scheme %q", raw, u.Scheme)
+	}
+	return strings.TrimRight(raw, "/"), nil
 }
 
 // isLoopbackHost reports whether host names the local machine.
