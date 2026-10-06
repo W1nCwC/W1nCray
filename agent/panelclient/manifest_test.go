@@ -339,8 +339,15 @@ func TestManifestSyncStopsPromptlyWhileTheRequestHangs(t *testing.T) {
 
 func TestManifestSyncDisabledWithoutASink(t *testing.T) {
 	h := newHarness(t, hopts{})
+	// Synchronise on the loops the runner does start instead of sleeping: the
+	// pull loop has answered its first /config and both loops are parked on
+	// their timers. A manifest loop fetches before it ever waits, so one that
+	// had been started would have reached the panel by now.
 	h.panel.waitCount("config", 1)
-	time.Sleep(20 * time.Millisecond)
+	eventually(t, "both loops to wait", func() bool { return len(h.clock.waitsCopy()) >= 2 })
+	// Run joins every loop it starts, so a fetch that was still in flight is
+	// delivered before this returns.
+	h.stop()
 	if n := h.panel.count("manifest"); n != 0 {
 		t.Errorf("the manifest endpoint was called %d time(s) without a sink", n)
 	}

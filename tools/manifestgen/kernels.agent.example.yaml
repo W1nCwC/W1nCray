@@ -1,0 +1,41 @@
+# Example: the agent's own entry in the signed kernel manifest (PLAN v9 D7,
+# WS-PROTOCOL section 7 ruling 11). It is a separate file from
+# kernels.example.yaml because the agent is built and hashed on the release
+# machine (release/build.sh writes dist/W1nCray-linux-<arch>.gz) instead of
+# coming from a GitHub release, and the shipped example asserts exactly 12
+# GitHub targets per kernel.
+#
+#   bash release/build.sh v0.5.0
+#   manifestgen build -config kernels.agent.example.yaml -out unsigned.json -sequence 101
+#   manifestgen sign  -key keys/manifest-1.key -in unsigned.json -out manifest.json
+#
+# The version in run/version_regex must match what `W1nCray version` prints:
+#   W1nCray 0.5.0 (Xray-core ..., ...)
+# Replace <mirror> with the host that serves the gz files. The agent refuses a
+# version that is not listed here, so publishing the manifest is what makes an
+# update available.
+sequence: 100
+valid_days: 90
+mirrors: ["https://<mirror>/W1nCray/{version}/{asset}"]
+kernels:
+  - name: agent
+    version: "0.5.0"
+    license: {spdx: MIT}
+    capabilities: {self_update: true}
+    run:
+      binary: W1nCray
+      version_cmd: ["version"]
+      version_regex: "W1nCray ([0-9][0-9.]*)"
+    local:
+      - {file: dist/W1nCray-linux-amd64.gz,    target: linux/amd64,    to: W1nCray}
+      - {file: dist/W1nCray-linux-386.gz,      target: linux/386,      to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-arm64.gz,    target: linux/arm64,    to: W1nCray}
+      - {file: dist/W1nCray-linux-armv7.gz,    target: linux/armv7,    to: W1nCray, variant: hardfloat}
+      - {file: dist/W1nCray-linux-armv6.gz,    target: linux/armv6,    to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-armv5.gz,    target: linux/armv5,    to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mips.gz,     target: linux/mips,     to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mipsle.gz,   target: linux/mipsle,   to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mips64.gz,   target: linux/mips64,   to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mips64le.gz, target: linux/mips64le, to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-riscv64.gz,  target: linux/riscv64,  to: W1nCray}
+      - {file: dist/W1nCray-linux-loong64.gz,  target: linux/loong64,  to: W1nCray}

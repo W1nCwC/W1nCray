@@ -85,7 +85,61 @@
 
 ## 3 `Agent:` 配置块
 
-写在 `config.yml` 里（与 `Nodes` 同级，YAML）。未启用（`Enabled: false` 或整块缺省）时 Agent 完全不工作。
+agent 自己的配置可以放在两个地方：与 `config.yml` 同目录的 **`agent.yml`**（推荐），或 `config.yml` 里的 `Agent:` 块（旧布局，仍然兼容）。
+
+### `agent.yml`（独立文件，推荐）
+
+`agent.yml` 是 agent 配置的**根**（没有 `Agent:` 外层），字段名与 `config.yml` 的 `Agent:` 块完全相同。示例见 [`release/config/agent.yml.example`](../release/config/agent.yml.example)。
+
+**优先级**：同目录只要存在 `agent.yml`，就**整体以它为准**——`config.yml` 里遗留的 `Agent:` 块被完全忽略（不合并、也不报错），`W1nCray check` 会打印一行 `! … 的 Agent 段被 agent.yml 覆盖（已忽略）`。没有 `agent.yml` 时行为不变：`config.yml` 的 `Agent:` 块生效。`agent.yml` 存在但解析失败会让配置加载失败（启动失败 / 热重载放弃），所以它握有**服务能否启动的否决权**：改动前先备份，`W1nCray check` 会把它的问题放在第一屏。
+
+路径（`StateDir`、`KernelsDir`、`Panel.TokenFile`）相对**生效文件所在目录**解析；两个文件同目录时与以前完全一致。
+
+```yaml
+# /etc/W1nCray/agent.yml
+Enabled: true
+StateDir: /etc/W1nCray/state
+Policy:
+  AllowListen: ["0.0.0.0"]
+  PortRange: [20000, 40000]
+Panel:
+  Enabled: true
+  URL: https://panel.example.com
+  MachineID: 12
+  TokenFile: /etc/W1nCray/agent.token
+  MachineNodes: true
+Terminal:
+  Enabled: false # 只在本机关闭交互终端（缺省开启）
+Files:
+  Roots: []
+Modules:
+  XrayNodes: true
+```
+
+| 段 | 字段 |
+|---|---|
+| 根 | `Enabled`、`StateDir`、`ManifestPath`、`ManifestKeysPath`、`KernelsDir`、`DesiredPath`（含义同下表） |
+| `Policy` | 见 §4（本地根信任，远端无法放宽） |
+| `Panel` | 见「机器模式节点」一节 |
+| `Terminal` | `Enabled`（缺省 **true**）、`MaxSessions`（≤2）、`IdleTimeoutS`、`MaxDurationS` |
+| `Files` | `Roots`、`Unrestricted`、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
+| `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
+
+**迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
+
+- 目标目录没有 `agent.yml`：写出一份新的 `agent.yml`（**原子写**：同目录临时文件 + rename，权限 0600），`config.yml` 只保留 xray 内核的配置。
+- `config.yml` 里还有旧的 `Agent:` 块：该块被**迁移**进 `agent.yml`——本机设置（`Policy`、`DesiredPath`、`Terminal`、`Files`、`Modules` 等）原样保留（所以已经本地关闭终端的机器迁移后仍然是关闭的）；`Panel` 段按本次 `link` 的参数重写，但 link 不负责的 Panel 键（`ManifestSync`、`PullIntervalSec`、`NodeController` 模板等）同样保留，不会被悄悄改回默认值；`config.yml` 原处留一行 `# Agent: 段已迁移到 agent.yml …` 注释。迁移后的配置能通过 `W1nCray check`。
+- `agent.yml` 已经存在：**拒绝覆盖**并给出明确错误（不会动任何文件）；只有 `link --force` 才覆盖，且**先备份**为 `agent.yml.bak-<时间戳>`。
+- `--dry-run` 依然不写任何文件（`config.yml`、`agent.yml`、令牌、备份都不写）。
+- 写入前仍做「只比较本次转换**新增**的失败项」的基线校验；`--skip-check` 跳过它。
+
+**终端（D8 / RULINGS v9 第 17 条）**：交互终端**默认开启**——不写 `Terminal` 段即为开启。机器只能在**本地**关闭它：写 `Terminal: {Enabled: false}`，或在安装/关联时用 `--noterminal`（`install.sh --noterminal`、`W1nCray link --noterminal`）。面板无法远程打开或关闭它：本机状态只通过 `hello.policy` 上报，面板据此显示「该机器已在本地关闭终端」。
+
+> ⚠️ **升级提醒**：已经部署的机器升级到带终端的版本后，由于缺省是开启，会**自动获得终端能力**（面板可以申请交互会话）。不需要的机器请显式写 `Terminal: {Enabled: false}`，或用 `--noterminal` 重新关联。
+
+### `config.yml` 的 `Agent:` 块（旧布局）
+
+写在 `config.yml` 里（与 `Nodes` 同级，YAML）。未启用（`Enabled: false` 或整块缺省）时 Agent 完全不工作。同目录一旦出现 `agent.yml`，本块即被整体忽略（见上）。
 
 ```yaml
 Agent:
@@ -115,6 +169,8 @@ Agent:
 ### 机器模式节点（`MachineNodes`）
 
 在面板上把节点绑定到一台「机器」后，本机不必再逐个写 `Nodes`，只配一个机器令牌即可：W1nCray 用 `Agent.Panel` 的 `URL` / `MachineID` / `Token`（或 `TokenFile`）向面板查询这台机器名下的节点，并为每个节点自动起一个控制器。节点增删由面板决定，本机不改配置、不重启。
+
+> 下面的例子按 `config.yml` 的旧布局写；放进 `agent.yml` 时去掉 `Agent:` 这一层（`Panel:` 顶格），其余完全不变。
 
 ```yaml
 Nodes: []          # 机器模式下允许为空；静态 Nodes 与机器节点可以共存
@@ -207,7 +263,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.
   --panel https://panel.example.com --machine 3 --token <TOKEN>
 ```
 
-安装脚本在装好二进制与服务的同时，写出上面的机器模式配置（`Log` + `Agent` 段）：
+安装脚本在装好二进制与服务的同时，写出机器模式配置：`config.yml` 只写 xray 侧（`Log: {Level: info}`），agent 侧写进 `<配置目录>/agent.yml`。
 
 | 参数 | 说明 |
 |---|---|
@@ -216,11 +272,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.
 | `--token TOKEN` / `--token-file FILE` | 二选一提供机器令牌；`--token-file` 读文件（首尾空白与换行会被去掉） |
 | `--allow-http` | 面板地址是**非回环**的 `http://` 时必须显式给出，否则拒绝安装并说明原因 |
 | `--port-range LO-HI` | `Policy.PortRange`，默认 `20000-40000` |
+| `--noterminal` | 在本机关闭交互终端（终端默认开启），并透传给提示里的 `W1nCray link` 命令 |
 
-- `--panel` / `--machine` / 令牌三者必须同时提供，缺任何一个都会以中文报错并非 0 退出；`--port-range` 与 `--allow-http` 只在 `--panel` 下有效。
-- 令牌写入 `<配置目录>/agent.token`（先 `umask 077` 再写，再 `chmod 600`，内容不带换行），生成的配置用 `Agent.Panel.TokenFile` 引用它；令牌**不会**进入 `config.yml`、日志或传给子进程的参数。`uninstall` 会一并删除 `agent.token`。
-- 加 `--allow-http` 时配置里会写 `AllowInsecureHTTP: true`（否则 `Agent.Panel` 会拒绝明文 http 的非回环地址）。
-- 若 `config.yml` 已存在，安装**不会覆盖**：新配置写到 `<配置目录>/config.panel.yml.new`，安装以黄色警告提示如何合并，返回码仍为 0。
+- `--panel` / `--machine` / 令牌三者必须同时提供，缺任何一个都会以中文报错并非 0 退出；`--port-range`、`--allow-http` 与 `--noterminal` 只在 `--panel` 下有效。
+- 令牌写入 `<配置目录>/agent.token`（先 `umask 077` 再写，再 `chmod 600`，内容不带换行），生成的 `agent.yml` 用 `Panel.TokenFile` 引用它；令牌**不会**进入 `config.yml`、`agent.yml`、日志或传给子进程的参数。`uninstall` 会一并删除 `agent.token`。
+- 加 `--allow-http` 时 `agent.yml` 里会写 `AllowInsecureHTTP: true`（否则 `Agent.Panel` 会拒绝明文 http 的非回环地址）。
+- `agent.yml` 是**原子写**（同目录临时文件 + `mv`，权限 0600）；覆盖已有的 `agent.yml` 前会先备份为 `agent.yml.bak-<时间戳>`。
+- **幂等**：若 `agent.yml` 已存在且已关联面板（`Panel.Enabled: true`），安装**不覆盖**它，只以黄色提示说明；`config.yml` 已存在时同样不覆盖（只提示）。
+- 若 `config.yml` 已存在且还有静态 `Nodes`：安装不覆盖它，也不写 `agent.yml`，而是提示先在面板绑定这些节点，再手动执行 `W1nCray link …`（`link` 把静态节点与旧的 `Agent:` 段迁移到 `agent.yml`）；提示里的 `link` 命令会带上你给的 `--noterminal`。
 - 机器模式安装时的配置检查是离线的（`check` 不带 `--online`）：面板暂时不可达不会阻止服务启动，agent 会在后台重试领取节点。
 - 安装结束会提示「已关联面板，agent 将自动领取节点与转发规则」并给出查看日志的命令；提示里不回显令牌。
 
@@ -384,22 +443,98 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 ### `W1nCray link`
 
-`W1nCray link --panel <URL> --machine <ID> (--token <T> | --token-file <F>) [-c config.yml] [--port-range LO-HI] [--allow-http] [--dry-run] [--ignore-api-overrides] [--skip-check]` 把 v0.3 的静态节点转成机器模式，**不重启服务**。它按文本行级改写 `config.yml`（注释与无关的键原样保留）：
+`W1nCray link --panel <URL> --machine <ID> (--token <T> | --token-file <F>) [-c config.yml] [--port-range LO-HI] [--allow-http] [--noterminal] [--force] [--dry-run] [--ignore-api-overrides] [--skip-check]` 把 v0.3 的静态节点转成机器模式，**不重启服务**。它按文本行级改写 `config.yml`（注释与无关的键原样保留），并把 agent 配置写进同目录的 `agent.yml`：
 
 - 只转换 `ApiConfig.ApiHost` 的 scheme+host（含端口）与 `--panel` 一致的节点；其余节点保持静态并在报告里说明原因。
 - `ApiConfig` 里有机器模式无法表达的本地覆盖（`SpeedLimit > 0`、`DeviceLimit > 0`、`RuleListPath` 非空）时该节点不转换，除非加 `--ignore-api-overrides`。
-- 被转换的条目整块注释掉（块首是 `#LINKED-<日期> …` 回滚标记），它的 `ControllerConfig` 原样右移两格放进 `Agent.Panel.NodeControllers[<节点ID>]`（凭据仍只在本机）。
-- 没有 `Agent:` 块时追加一个完整块（`Enabled`、`StateDir`、`Policy`（`AllowListen` / `PortRange`，不写 `AllowEngines`）、`Panel`（`Enabled` / `URL` / `MachineID` / `TokenFile` / `MachineNodes` / `NodeControllers`））；已有 `Agent:` 块时一律报错，请手工合并（不会猜位置、不会覆盖）。
-- 令牌写入 `<配置目录>/agent.token`（先 `umask 077`、权限 0600、不带换行）；已存在且内容相同则跳过，内容不同则报错且不覆盖。令牌不会出现在配置、stdout、stderr 或错误里。
-- 写入前做**基线对比**：先把**原配置**（同目录临时拷贝）跑一遍完整校验，收集失败项集合 B；再把生成的新配置跑一遍，收集集合 N。只有 `N` 中**新增**的失败项（`N \ B`）才中止并**不改动任何文件**（打印新增失败项的完整文本）。若 `N ⊆ B` 且 `B` 非空则继续转换，并打印显眼的警告列出原配置**转换前就有**的问题（最多 10 条，与本次转换无关）。`B`、`N` 都为空时静默通过。失败项用 `W1nCray check` 打印的 `✗` 文本做稳定标识（剔除临时文件名/时间戳等易变部分）；除离线 `check` 外还会检查机器模式下才生效的 `NodeControllers[].CertConfig.CertMode`。
+- 被转换的条目整块注释掉（块首是 `#LINKED-<日期> …` 回滚标记），它的 `ControllerConfig` 原样放进 `agent.yml` 的 `Panel.NodeControllers[<节点ID>]`（凭据仍只在本机）。
+- `agent.yml`（原子写、0600）包含 `Enabled`、`StateDir`、`Policy`（`AllowListen` / `PortRange`，不写 `AllowEngines`）、`Panel`（`Enabled` / `URL` / `MachineID` / `TokenFile` / `MachineNodes` / `NodeControllers`）；`config.yml` 里不再写 `Agent:` 段。旧的 `Agent:` 块会被**迁移**进 `agent.yml`（本机设置与 link 不负责的 `Panel` 键保留，`Panel` 的连接字段按本次参数重写），原处留一行注释说明已迁出。详见 §3「`agent.yml`」。
+- `agent.yml` 已存在时**拒绝覆盖**（零改动）；`--force` 才覆盖，且先备份为 `agent.yml.bak-<时间戳>`。
+- `--noterminal` 在 `agent.yml` 里写 `Terminal: {Enabled: false}`；不加时**不写**该键，即终端保持默认开启。
+- 令牌写入 `<配置目录>/agent.token`（先 `umask 077`、权限 0600、不带换行）；已存在且内容相同则跳过，内容不同则报错且不覆盖。令牌不会出现在 `config.yml`、`agent.yml`、stdout、stderr 或错误里。
+- 写入前做**基线对比**：先把**原配置**（同目录临时拷贝）跑一遍完整校验，收集失败项集合 B；再把生成的新配置（把将要写入的 `agent.yml` 内联成 `Agent:` 块）跑一遍，收集集合 N。只有 `N` 中**新增**的失败项（`N \ B`）才中止并**不改动任何文件**（打印新增失败项的完整文本）。若 `N ⊆ B` 且 `B` 非空则继续转换，并打印显眼的警告列出原配置**转换前就有**的问题（最多 10 条，与本次转换无关）。`B`、`N` 都为空时静默通过。失败项用 `W1nCray check` 打印的 `✗` 文本做稳定标识（剔除临时文件名/时间戳等易变部分）；除离线 `check` 外还会检查机器模式下才生效的 `NodeControllers[].CertConfig.CertMode`。已有 `agent.yml` 时（`--force`）会额外单独校验将要写入的新文件。
 - `--skip-check` 跳过上述写入前校验（会打印警告），生成结果直接写入。
-- 成功后备份为 `config.yml.bak-link-<时间戳>`（0600）再原子替换。
-- `--dry-run` 只打印计划（不写任何文件，包括令牌）。
-- 对已转换过的配置（有 `#LINKED-` 标记且 `Agent.Panel` 已启用）再次运行会以清晰错误退出且零改动。
+- 成功后 `config.yml` 备份为 `config.yml.bak-link-<时间戳>`（0600）再原子替换；`agent.yml` 由原子写覆盖，原文件备份为 `agent.yml.bak-<时间戳>`。
+- `--dry-run` 只打印计划（不写任何文件，包括令牌与 `agent.yml`）。
+- 对已转换过的配置（有 `#LINKED-` 标记，或 `agent.yml` 已存在）再次运行会以清晰错误退出且零改动；需要重做时先恢复备份，或用 `--force`。
 
 ### 常驻服务
 
 `Agent.DesiredPath` 设置后，修改该文件即自动应用（§3）。看结果：日志里的 `agent: <path>: <status> (<n> instance(s))`，失败时有具体错误。
+
+### 面板命令（`kernel_*`、`file_*`、`files_*` 与 `component_restart`）
+
+面板可以在两条通道上下发命令，两条通道**共用同一个命令注册表与同一个按 id 去重的空间**（`agent/opscmd`）：
+
+- HTTP：`POST /config` 或 `POST /report` 的响应里带 `commands`，结果回 `POST /command-result`；
+- WebSocket：`cmd {type,args,ttl_s}`，结果回 `cmd.result`（同一 `id`）。
+
+同一个命令 id 在两条通道上只会执行一次、只回一次结果。命令注册表里的类型就是白名单，**未注册的类型一律回 `failed` 且 `result.error="unsupported command"`，不执行**。`refresh` 与 `dump_state` 是内建类型（需要拉取循环与最近一次报告，仍由 `agent/panelclient` 实现），其余由 `agent/opscmd` 提供。
+
+**长命令**（`kernel_install`、`files_apply` 与 `self_update`）先回 `{"status":"accepted"}`（在 `ttl_s` 内），完成后再回同一个 id 的最终 `done`/`failed`；在最终结果投出前该 id 一直算"处理中"，面板重投同一 id 不会再次执行（契约 §7-7）。
+
+| type | args | 行为与结果 |
+|---|---|---|
+| `kernel_list` | `{}` | 回 `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}`。`kernels` 是**已安装**的版本（事实，读内核目录）；`catalog` 只列已签名清单里**本机可用**的版本。没有加载清单时 `catalog: []`，`kernels` 照常返回。 |
+| `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。 |
+| `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
+| `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
+| `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 与 `xray` 一律拒绝（见下）。 |
+| `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。 |
+| `file_read` | `{root, path, offset?, limit?}` | 回 `{data:"<base64>", size, eof}`。`limit` 不得超过本机上限（默认 128 KiB，契约 §7-8），超限回 `failed` + `result.code="too_large"`。 |
+| `file_write` | `{root, path, data:"<base64>", mode?, sha256?}` | 原子写（同目录临时文件 + `rename`）。`mode` 是八进制字符串（缺省 0644）：可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；给了 `sha256` 就先核对。 |
+| `file_delete` | `{root, path}` | 删一个**普通文件**（目录一律拒绝），回 `{path, deleted:true}`。 |
+| `files_apply` | `{}` | 长命令。对**最近一次 desired 的 `files` 段**执行：下载 blob（按 sha256，命中缓存不重复下载）→ 暂存 → 校验 → 原子替换（先留 `last_good`）→ 重载。结果 `{status, files[], reload, applied_pending?, errors?, reason?, rolled_back?}`。 |
+| `files_validate` | `{}` | 只暂存 + 校验，**不写任何受管文件、不重载**。结果同 `files_apply`（`reload:"not_needed"`）。 |
+| `files_rollback` | `{}` | 用 `last_good` 快照恢复受管文件并重载。结果 `{status:"rolled_back", rolled_back:true, files[], reload}`。 |
+
+细节与边界：
+
+- **保留名 `agent`**：签名清单里名为 `agent` 的条目属于 `self_update`（契约 §7-11）。`kernel_install`/`kernel_remove`/`kernel_rollback` 与 `component_restart` 一律拒绝它（`failed` + `result.code="reserved_name"`）；`kernel_list` 仍会如实列出已安装的版本。
+- **`component_restart` 不能重启 agent，也不能重启内嵌 xray**：agent 不由 supervisor 管理（重启它会断掉面板连接），内嵌 xray 与 agent 同进程、没有独立进程。前者 `reserved_name`，后者 `failed` + `result.code="embedded"`。名字对应的内核进程没在跑时回 `failed`（`component "x" is not running`）。
+- **`in_use` 的判定**：优先用 supervisor 的 pid 记录（`<StateDir>/pid/*.pid`）+ 存活与 `/proc/<pid>/exe` 身份复核，把正在执行的二进制映射回 `<KernelsDir>/kernels/<name>/<version>/`；平台无法核实身份（Windows 等）或没配 pid 目录时，退化为"当前指针 = 在用"，不假装精确。回滚后进程仍执行旧版本的情况也能如实反映。
+- **`KernelEntry` 字段**：`{name, version, current, previous, path, size_bytes, installed_at, in_use}`（契约 §3）。`size_bytes` 是**清单声明**的安装体积（各文件声明大小之和），不是磁盘实测。`kernel_list` 不额外发明 `size_on_disk`/`in_use_exact` 等字段（契约里没有）。
+- **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。
+- **能力声明**：`hello.capabilities`（以及 HTTP `/config` 的 `features`）里出现 `kernel` 的条件是**内核安装器可用且已加载一份已签名清单**——没有清单时 `kernel_install` 无法解析版本，所以不做这个承诺（契约 §7-1）。
+- **能力集合是动态的，靠重连发布**：`hello.capabilities` 只在建连时发送一次，同一连接上第二个 `hello` 是协议错误（面板回 `unexpected_type`），而能力可能在握手之后才就绪（签名清单到达、`self_update` 注册完成）。agent 在每个 telemetry/components 周期把运行时的能力集合与上次 `hello` 实际发出的集合按**集合**比较（排序、去重）：不同就干净地断开当前连接并重连一次，让新的 `hello` 携带新集合。两次这样的重连至少间隔 30 s（集合来回抖动不会变成重连风暴），且本机有活动终端会话时推迟到会话结束（重连会打断用户的 shell）。这条路径**不发送任何新帧类型**（契约 §1/§3）。
+- **`file_*` 的根与错误码**：`root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`invalid_args`。
+- **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
+- **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
+- **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
+
+### 7.1 `self_update`（agent 自升级）
+
+签名清单里名为 `agent` 的条目描述 agent 自己的版本（契约 §7-11）；`self_update {version}` 用它升级：
+
+- **长命令**：先回 `{"status":"accepted"}`，完成后再回同一 id 的 `done`/`failed`。目标版本必须出现在清单的 `agent` 条目里，并通过全部既有校验（签名、`revoked`、`min_agent`、平台 target、`archive_sha256`、成员 `sha256`/`size`）与清单声明的版本自检（`run.version_cmd`，argv 数组、不经 shell）。raw `.gz` 产物（`release/build.sh` 的 `dist/W1nCray-linux-<arch>.gz`，清单 `archive:"gz"`、恰好一个 extract 成员）与 `.tar.gz`/`.zip` 走同一条校验路径。**任何一步失败都不会写运行中的可执行文件**。
+- **原子替换**：`exe → exe.old`、已验证的暂存副本 → `exe`，然后写 `<StateDir>/update/pending.json`。任何一步失败都会把原二进制放回；`.old` 从不删除，最坏情况（看门狗也死了）用一条 `mv exe.old exe` 即可手工恢复，这是"不变砖"的最后一道兜底。
+- **看门狗（回滚）**：提交后 agent 启动一个隐藏助手 `__watchdog`，再按原 argv 正常退出（走既有的优雅关停：停内核、关 Xray）。助手**只做看门狗，绝不自己拉起 agent**——重启是服务管理器的职责（systemd `Restart=always`、OpenRC `supervise-daemon`、procd `respawn`）。
+  - **由旧二进制的副本运行**：Commit 会把旧二进制复制到 `<StateDir>/update/watchdog/W1nCray-<旧版本>`（0755，逐字节校验 sha256 与 `exe.old` 一致），助手用这个**已知良好**的副本执行 `__watchdog`。绝不能用新二进制当自己的看门狗：新二进制正是"可能起不来"的那一个。确认或回滚后副本被清理。
+  - **判定规则**（`pending.json` 存在期间，轮询间隔默认 2 s，总预算 `Deadline` 默认 90 s）：以单实例锁 `config.yml.lock`（内容是持有锁的 agent pid）为"agent 是否活着、重启了几次"的信号。
+    - `pending.json` 消失（新进程已 `Confirm()`）→ 成功，退出并清理副本。
+    - 观测期内 agent pid 变化（重启）≥ `Attempts`（默认 3），或连续 `AliveWindow`（默认 10 s）没有任何存活 agent → **回滚**：`Updater.Rollback` 把 `.old` 原子换回 `exe`、写 `<StateDir>/update/rollback.json`、清 pending；然后若是 systemd 则 best-effort 执行 `systemctl reset-failed <unit>` 与 `systemctl restart <unit>`（unit 名取 Ready 检测到的单元文件名），其他管理器靠自身 respawn。回滚是幂等的。
+    - `Deadline` 到了 agent 仍存活且稳定但没 `Confirm`（例如连不上面板）→ **不回滚**，助手退出并保留 pending/.old 供人工处理；`self_update.stalled` 仍由新进程按既有逻辑上报（面板故障不是二进制坏，契约 §7-11）。
+  - **`AliveWindow` 必须大于服务管理器的重启间隔**（systemd `RestartSec`）：服务被停止到新进程拿到单实例锁之间的空档如果超过 `AliveWindow`，一个正常的新进程也会被误判成"长期没有存活 agent"而回滚。默认 10 s 对应 `RestartSec` ≤ 5 s；`install.sh` 目前写的是 `RestartSec=10`，两者相等会在边界上竞态，部署时应把 `RestartSec` 调小（或在 `Options.AliveWindow` 里调大）。
+- **助手如何在 systemd 下活下来**：systemd 默认 `KillMode=control-group`，服务停止/重启时同一 cgroup 的所有进程都会被杀死，`Setsid` 也逃不掉——而"主进程退出 → 服务管理器重启"正是自升级的关键时刻，看门狗必须活过它。因此在 systemd 下助手用 `systemd-run --quiet --collect --no-block --unit=w1ncray-selfupdate-<unix时间> -- <旧二进制副本> __watchdog <args>` 启动，落在**独立的 transient unit/cgroup**，服务重启不会连坐。检测条件：环境变量 `INVOCATION_ID` 非空或 `/run/systemd/system` 存在，且 `systemd-run` 可执行；不满足（OpenRC/procd/无服务管理器）或 `systemd-run` 启动失败 → 记日志并回退到 `Setsid` 方式，**升级不会因为看门狗启动方式而失败**。命令一律是 argv 数组、不经 shell。
+- **确认**：新进程在第一次成功得到面板 `/config` 应答后调用 `Confirm()`，删除 `.old` 与 `pending.json`。
+- **连不上面板不回滚**：新进程起来了但 10 分钟内没连上面板，只发 `event{kind:"self_update.stalled"}`（事件是实时数据，断线不补发），**绝不自动回滚**——面板故障不是二进制坏。
+- **事件**：`self_update.started`（开始）、`self_update.rolled_back`（看门狗回滚后由下一次启动上报一次）、`self_update.stalled`。
+- **能力声明**：`hello.capabilities`（及 HTTP `/config` 的 `features`）出现 `upgrade` 的条件是 `self_update` 命令真的注册了：平台能替换自身 exe（Windows 一律不行）、可执行文件是常规文件且所在目录可写、有服务管理器（systemd/OpenRC/procd 的 init 文件里 `ExecStart`/`command` 指向该 exe），并且进程提供了重启钩子。不满足时命令回 `failed` + `result.code="not_supported"`，能力也不声明（契约 §7-1/§7-11）。
+### 受管文件（`files_apply` / `files_validate` / `files_rollback`）
+
+受管文件是面板可以下发的 **xray 文件**，内容走 HTTPS（`GET /api/v2/server/machine/agent/file/<sha256>`），desired 里只有 `{name, sha256, size, kernel}`（契约 §7-1/§7-9）：
+
+- **固定白名单与固定目录**：`config.yml`、`route.json`、`custom_inbound.json`、`custom_outbound.json`、`dns.json`、`geoip.dat`、`geosite.dat`，只写在 xray 配置目录。名字必须是纯文件名：`../evil`、绝对路径、`sub/route.json`、`agent.yml`、状态文件一律拒绝，命令不执行。
+- **`config.yml` 只在 `agent.yml` 分离布局下可写**（契约 §7-2）：否则该文件就是 agent 自己的配置，面板写它等于让 agent 自杀。这种情况下 agent 不声明 `files` 能力，面板也就不会下发。
+- **`files` 能力名是两个功能的交集**（契约 §3 里 `files` 只有一个名字）：面板据它决定是否在 revision 里下发 `desired.files`（受管 xray 文件），也用同一个名字决定是否提供 `file_*` 文件管理。所以只有当**两者都能服务**时才声明：受管层已接线、本地 `Files.Roots` 非空、`agent.yml` 分离布局，且 `file_*` 命令已注册。单文件布局下 `file_*` 命令仍然注册可用（`file_list` 等照常执行，直接发命令即可），但**不声明** `files`。契约目前没有任何字段能区分这两个功能（`capabilities` 是集合，`policy.files` 只有 `roots`/`unrestricted`），这是 WP-G5 与 WP-G6 合并时的保守取舍：宁可少声明，也不让面板下发本机无法应用的 `desired.files`。风险与待决项见合并报告。
+- **校验先于替换**：四个 JSON 先逐个 `core.CheckFiles`，再用**整实例预检**（`core.New` 只构造、不 `Start`，因此**不绑端口**）抓组合错误；`config.yml` 走完整 `LoadConfig`。校验不过 → 一个受管文件都不动、不重载，回 `status:"invalid"` 与带文件名/规则序号的错误。
+- **blob 完整性**：边写边算 sha256，与 desired 的 `sha256`/`size` 不符**不落缓存、不替换**；`If-None-Match` 拿到 304 而本地又没有缓存时重取一次。单文件上限默认 64 MiB（`Files.MaxBytes` 可改；设为负值 = 本机禁用 geo 下发，回显式原因而不是静默跳过）。
+- **原子替换与回滚**：替换前把当前文件快照成 `last_good`（缺失的文件记为"缺失"，回滚时删掉），替换走同目录临时文件 + `rename`。重载被拒（`LoadConfig` 失败）→ 恢复 `last_good` 并回 `status:"rolled_back"`。
+- **geo-only 变更不重载**：`geoip.dat`/`geosite.dat` 由 xray 在规则求值时按需读取，替换后回 `reload:"not_needed"`（契约 §7-9 的 `applied_pending` 只在真正发起重载时出现）。
+- **幂等**：磁盘上已是同一 `sha256` 的文件不下载、不替换、不重载（`files[].skipped=true`、`bytes=0`），并把该集合记进 `<StateDir>/filesync/applied.json`。
+- **健康判定在面板侧**：agent **不在进程内等健康**。`files_apply` 在重载发起后回 `done{applied_pending:true}`，随后由面板按 `hello`/`telemetry`（60 s 内）与 `components.xray.state=running` 判定，必要时下发 `files_rollback`（契约 §7-9）。
+- **`hint{what:"files"}`** 触发同一套同步（等价于 `files_apply`）；本机没有受管文件层时回 `error{code:"not_supported"}`，不静默忽略（契约 §7-5）。
+- **事件**：应用成功发 `event{kind:"files.applied"}`，回滚发 `event{kind:"files.rolled_back"}`（契约 §7-10，只走 WebSocket）。
 
 ## 8 常见拒绝原因与排错
 
@@ -452,9 +587,23 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 5. **本地策略是根信任**，期望状态无法放宽它；默认拒绝公网监听、私网目标、任意目标、公网收 PROXY。`AllowPrivate` 打开后仍拒绝环回、链路本地、云元数据地址。
 6. **优先用字面 IP 作目标**：域名只在校验时解析一次，存在 DNS 重绑定的时间窗。
 7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
-8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。Agent 没有终端、脚本执行或任意命令通道，外部命令一律用参数数组启动。
+8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。脚本执行或任意命令通道仍然不存在，外部命令一律用参数数组启动。**交互终端是例外**：它默认开启（§3），只由本机 `Terminal.Enabled` 控制，面板不能远程打开；不需要的机器请显式关闭（`Terminal: {Enabled: false}` 或 `--noterminal`），尤其是升级后的老机器。
 
-## 10 已知限制与未决事项
+## 10 安全模型变更记录（D8：交互终端）
+
+本节是**有意识的安全模型变更**的正式记录，由 `agent/terminal/noshell_allow_test.go` 反向断言：白名单里的每个包都必须在本节里按包路径写出来，改了代码不改这里，测试就会失败。
+
+1. **变更内容**：agent 从"没有终端、没有脚本执行、没有任意命令通道"变成"有一个**本机开关控制**的交互终端"。这是本手册与 `docs/PLAN-v6-agent-forward.md`、`docs/PLAN-v7-panel-control.md` 里"不存在终端"表述的**唯一例外**，其余约束（外部命令一律 argv 数组、期望状态不含 URL/哈希、无脚本推送）逐字不变。
+2. **唯一允许起 shell 的包**：`agent/terminal`。`agent/supervisor/noshell_test.go` 的 `AllowedShellPackages` 是**包级白名单**，只有这一个条目，并附有理由；白名单之外的任何 `agent/**` 包一旦出现 `exec.Command(<shell>)`、`<shell>,"-c"`、`syscall.ForkExec/Exec`、`pty.Start*`，或 `exec.Command(<变量>)`（无法静态判定时保守报错，需 `//nolint:noshell` 显式豁免并计数），测试直接失败。
+3. **本机开关**：`Terminal.Enabled` **缺省为 true**（RULINGS v9 第 17 条）。机器只能在**本地**关闭：`agent.yml` 写 `Terminal: {Enabled: false}`，或安装/关联时用 `--noterminal`（`install.sh --noterminal`、`W1nCray link --noterminal`）。面板**无法远程打开或关闭**：本机状态只通过 `hello.policy.terminal` 上报，面板据此显示"该机器已在本地关闭终端"。
+4. **平台支持是运行时探测的**：`terminal.Supported()` 在运行时打开 `/dev/ptmx` 判断本机能否建立 PTY；不支持的平台/内核（部分 OpenWrt 无 devpts）**不声明** `terminal` 能力，`hello.capabilities` 与 `/config.features` 里都不会出现它。编译通过不等于能工作。
+5. **会话边界**：每机最多 2 个并发会话（`Terminal.MaxSessions` 上限也是 2）；空闲 15 分钟（`IdleTimeoutS`）回收；最长 4 小时（`MaxDurationS`）回收；agent 退出或面板链路关闭时 `CloseAll` 杀掉**整个进程组**，不留孤儿 shell；单个 `term.input` 帧 ≤ 64 KiB。
+6. **环境净化**：子进程只拿到固定白名单变量（`TERM/LANG/LC_ALL/LC_CTYPE/PATH/HOME/USER/LOGNAME/SHELL/TZ/PWD`），其余一律剔除——包括机器 token、任何 `Agent.*` 值、`LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT`/`BASH_ENV`/`NODE_OPTIONS`/`PYTHONPATH` 等注入面。
+7. **审计只有元数据**：`terminal.AuditEvent` 结构体里**没有任何内容字段**（编译期保证），只有会话 id、动作、时间、时长、`BytesIn`/`BytesOut`、结束原因。终端字节永远不会进入审计、日志或事件帧。
+8. **`agent/fileops` 的边界**：`file_*` 只在 `Files.Roots` 内工作（默认 xray 配置目录 + agent 状态目录），`agent.yml`、`desired.json`、`last_good.json` **永不在任何 root 内**；拒绝 `..`、绝对路径、符号链接逃逸、FIFO/设备/非常规文件、目录删除；可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；`file_read.limit` 与 `file_write` 载荷各 ≤ 128 KiB（WS 单帧 256 KiB 契约，RULINGS v9 第 9 条）。
+9. **已知限制（TOCTOU）**：`os` 包没有 `openat`，`fileops` 的"逐段 Lstat + `O_NOFOLLOW` 打开"之间存在极小的 TOCTOU 窗口。因此部署要求：**root 内不应有可被非 root 用户改写的目录**。这一条已在 `agent/fileops` 的包注释里写明。
+
+## 11 已知限制与未决事项
 
 以下是写样例和本手册时发现的、**需要代码侧决定**的不一致，均有测试或命令输出佐证；它们不影响上面样例的有效性，但会限制能写出什么：
 

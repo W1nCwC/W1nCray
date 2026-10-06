@@ -66,15 +66,35 @@ func Build(ctx context.Context, o buildOptions) (*manifest.Manifest, error) {
 }
 
 func buildKernel(ctx context.Context, o buildOptions, kc *KernelCfg) (*manifest.Kernel, error) {
-	rel, err := o.GH.release(ctx, kc.Repo, kc.Tag)
-	if err != nil {
-		return nil, err
+	// A kernel may be backed by GitHub assets, by local files, or both. The
+	// release lookup only happens when a remote target needs it, so a purely
+	// local kernel (the agent itself) needs no repository and no network.
+	needsRelease := false
+	for _, tc := range kc.Targets {
+		if tc != nil {
+			needsRelease = true
+			break
+		}
 	}
-	o.Log("%s %s: release %s has %d assets", kc.Name, kc.Version, rel.Tag, len(rel.Assets))
+	var rel *ghRelease
+	if needsRelease {
+		if o.GH == nil {
+			return nil, errors.New("no GitHub client configured for a GitHub-backed kernel")
+		}
+		var err error
+		rel, err = o.GH.release(ctx, kc.Repo, kc.Tag)
+		if err != nil {
+			return nil, err
+		}
+		o.Log("%s %s: release %s has %d assets", kc.Name, kc.Version, rel.Tag, len(rel.Assets))
+	}
 
 	// upstream checksum file, if configured
 	var sums map[string]string
 	if kc.Checksums != nil && kc.Checksums.Asset != "" {
+		if rel == nil {
+			return nil, fmt.Errorf("checksums are only available for GitHub-backed kernels")
+		}
 		a := rel.asset(kc.Checksums.Asset)
 		if a == nil {
 			return nil, fmt.Errorf("checksums asset %q not in release", kc.Checksums.Asset)
@@ -124,6 +144,15 @@ func buildKernel(ctx context.Context, o buildOptions, kc *KernelCfg) (*manifest.
 		k.Targets[key] = t
 		o.Log("%s %s: %s -> %s sha256=%s size=%d", kc.Name, kc.Version, key, tc.Asset, t.ArchiveSHA256[:16], t.ArchiveSize)
 	}
+	for i := range kc.Local {
+		la := kc.Local[i]
+		t, err := buildLocalTarget(o, kc, la)
+		if err != nil {
+			return nil, fmt.Errorf("local target %s: %w", la.Target, err)
+		}
+		k.Targets[la.Target] = t
+		o.Log("%s %s: %s -> %s (local) sha256=%s size=%d", kc.Name, kc.Version, la.Target, la.File, t.ArchiveSHA256[:16], t.ArchiveSize)
+	}
 	return k, nil
 }
 
@@ -144,6 +173,10 @@ func buildTarget(ctx context.Context, o buildOptions, kc *KernelCfg, rel *ghRele
 			format = manifest.ArchiveTarGz
 		case strings.HasSuffix(a.Name, ".zip"):
 			format = manifest.ArchiveZip
+		case strings.HasSuffix(a.Name, ".gz"):
+			// After .tar.gz on purpose: a .tar.gz must never be read as a raw
+			// gzip stream.
+			format = manifest.ArchiveGz
 		default:
 			return nil, fmt.Errorf("cannot infer archive type of %q", a.Name)
 		}
@@ -204,7 +237,7 @@ func buildTarget(ctx context.Context, o buildOptions, kc *KernelCfg, rel *ghRele
 	if len(wantFiles) == 0 {
 		return nil, errors.New("no extract list (set extract: on the kernel or the target)")
 	}
-	base := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(a.Name, ".tar.gz"), ".tgz"), ".zip")
+	base := archiveBase(a.Name)
 	var ex []manifest.Extract
 	for _, w := range wantFiles {
 		from := strings.NewReplacer("{asset_base}", base, "{version}", kc.Version).Replace(w.From)
@@ -231,6 +264,103 @@ func buildTarget(ctx context.Context, o buildOptions, kc *KernelCfg, rel *ghRele
 		t.URLs = append(t.URLs, a.URL)
 	}
 	return t, nil
+}
+
+// archiveBase is the asset name without its archive suffix; {asset_base} is
+// substituted with it and a raw gz stream's only member carries this name.
+func archiveBase(name string) string {
+	switch {
+	case strings.HasSuffix(name, ".tar.gz"):
+		return strings.TrimSuffix(name, ".tar.gz")
+	case strings.HasSuffix(name, ".tgz"):
+		return strings.TrimSuffix(name, ".tgz")
+	case strings.HasSuffix(name, ".zip"):
+		return strings.TrimSuffix(name, ".zip")
+	case strings.HasSuffix(name, ".gz"):
+		return strings.TrimSuffix(name, ".gz")
+	}
+	return name
+}
+
+// buildLocalTarget describes one build that already exists on this machine
+// (release/build.sh writes dist/W1nCray-linux-<arch>.gz). Unlike a GitHub
+// asset there is no upstream hash claim: the archive hash, the member size and
+// the member sha256 are all computed from the file. The URLs still come from
+// the mirrors template, because the manifest is what the agent downloads from.
+func buildLocalTarget(o buildOptions, kc *KernelCfg, la LocalAssetCfg) (*manifest.Target, error) {
+	fi, err := os.Stat(la.File)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", la.File)
+	}
+	format := la.Archive
+	if format == "" {
+		switch {
+		case strings.HasSuffix(la.File, ".tar.gz"), strings.HasSuffix(la.File, ".tgz"):
+			format = manifest.ArchiveTarGz
+		case strings.HasSuffix(la.File, ".zip"):
+			format = manifest.ArchiveZip
+		case strings.HasSuffix(la.File, ".gz"):
+			format = manifest.ArchiveGz
+		default:
+			return nil, fmt.Errorf("cannot infer archive type of %q", la.File)
+		}
+	}
+	asset := filepath.Base(la.File)
+	to := la.To
+	if to == "" {
+		to = kc.Run.Binary
+	}
+	if to == "" {
+		return nil, errors.New("no installed name: set local.to or run.binary")
+	}
+	from := la.From
+	if from == "" {
+		if format != manifest.ArchiveGz {
+			return nil, errors.New("a local tar.gz/zip build needs an explicit extract list (from)")
+		}
+		from = asset
+	}
+	mode := la.Mode
+	if mode == "" {
+		mode = "0755"
+	}
+	ex := []manifest.Extract{{From: from, To: to, Mode: mode}}
+	if err := hashMembers(la.File, format, ex); err != nil {
+		return nil, err
+	}
+	sum, n, err := hashLocalFile(la.File)
+	if err != nil {
+		return nil, err
+	}
+	t := &manifest.Target{
+		Variant: la.Variant, Archive: format, ArchiveSHA256: sum, ArchiveSize: n, Extract: ex,
+		InstalledSize: ex[0].Size,
+	}
+	for _, mtpl := range o.Cfg.Mirrors {
+		t.URLs = append(t.URLs, strings.NewReplacer("{name}", kc.Name, "{version}", kc.Version, "{asset}", asset).Replace(mtpl))
+	}
+	if len(t.URLs) == 0 {
+		return nil, fmt.Errorf("a local build has no upstream URL: list at least one mirror for %s@%s", kc.Name, kc.Version)
+	}
+	return t, nil
+}
+
+// hashLocalFile returns the hex sha256 and size of a file on disk.
+func hashLocalFile(path string) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
 // hashMembers fills SHA256 and Size of each wanted member by reading the
@@ -307,6 +437,29 @@ func hashMembers(archivePath, format string, ex []manifest.Extract) error {
 			if err != nil {
 				return err
 			}
+		}
+	case manifest.ArchiveGz:
+		// A raw gzip stream has exactly one member and no name: the manifest
+		// entry's "from" is the archive's base name, so it must be a plain
+		// file name.
+		if len(ex) != 1 {
+			return fmt.Errorf("a gz archive must list exactly one extract entry, got %d", len(ex))
+		}
+		if from := ex[0].From; from != path.Base(from) {
+			return fmt.Errorf("gz extract.from %q must be a plain file name", from)
+		}
+		f, err := os.Open(archivePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("not a gzip stream: %w", err)
+		}
+		defer gz.Close()
+		if err := record(ex[0].From, gz, true); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("unsupported archive %q", format)

@@ -52,6 +52,8 @@ func extractArchive(archivePath, format string, files []manifest.Extract, dest s
 		return extractTarGz(archivePath, files, dest, lim, name, version)
 	case manifest.ArchiveZip:
 		return extractZip(archivePath, files, dest, lim, name, version)
+	case manifest.ArchiveGz:
+		return extractGz(archivePath, files, dest, lim, name, version)
 	}
 	return verifyErr(name, version, "unsupported archive format %q", format)
 }
@@ -204,6 +206,27 @@ func extractZip(archivePath string, files []manifest.Extract, dest string, lim l
 	return allDone(want, done, name, version)
 }
 
+// extractGz writes the single file of a raw gzip stream. The stream carries no
+// member name, so the manifest's one extract entry names it (its "from" is the
+// archive's base name) and writeVerified applies the same size and sha256
+// checks as for tar.gz/zip members.
+func extractGz(archivePath string, files []manifest.Extract, dest string, lim limits, name, version string) error {
+	if len(files) != 1 {
+		return verifyErr(name, version, "a gz archive must list exactly one extract entry, got %d", len(files))
+	}
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return verifyErr(name, version, "not a gzip stream: %v", err)
+	}
+	defer gz.Close()
+	return writeVerified(&countingReader{r: gz, max: lim.MaxBytes}, files[0], dest, name, version)
+}
+
 func allDone(want map[string]manifest.Extract, done map[string]bool, name, version string) error {
 	for m := range want {
 		if !done[m] {
@@ -226,6 +249,15 @@ func writeVerified(r io.Reader, ex manifest.Extract, dest, name, version string)
 	if err != nil {
 		return err
 	}
+	// A member that fails its size or hash check must not be left behind: the
+	// caller may be staging an executable (agent/selfupdate), and a partial
+	// file in the staging directory must never look like a finished one.
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.Remove(target)
+		}
+	}()
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(r, ex.Size+1))
 	if cerr := out.Close(); err == nil {
@@ -246,6 +278,7 @@ func writeVerified(r io.Reader, ex manifest.Extract, dest, name, version string)
 			return err
 		}
 	}
+	keep = true
 	return nil
 }
 

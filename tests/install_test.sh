@@ -319,7 +319,8 @@ t_generated_scripts() {
 	be_systemd_install
 	u="$(cat "$W1NCRAY_ROOT/etc/systemd/system/W1nCray.service")"
 	has "systemd unit runs the binary with the config" "$u" "ExecStart=/usr/local/W1nCray/W1nCray -c /etc/W1nCray/config.yml"
-	has "systemd unit restarts on failure" "$u" "Restart=on-failure"
+	has "systemd unit restarts always (ruling 3)" "$u" "Restart=always"
+	hasnt "systemd unit no longer stops after a failure" "$u" "Restart=on-failure"
 	has "systemd unit raises the file limit" "$u" "LimitNOFILE=1048576"
 	hasnt "systemd unit has no placeholders left" "$u" "@"
 
@@ -773,17 +774,21 @@ t_install_panel() {
 		"$(wc -c <"$CONF_DIR/agent.token" | tr -d '[:space:]')" \
 		"$(printf '%s' "$tok" | wc -c | tr -d '[:space:]')"
 	cfg="$(cat "$CONF")"
-	check "config enables the agent" grep -qx 'Agent:' "$CONF"
-	check "config enables the panel" grep -qx '  Panel:' "$CONF"
-	check "config has the state dir" grep -qx "  StateDir: \"$CONF_DIR/state\"" "$CONF"
-	check "config has the default port range" grep -qx '    PortRange: \[20000, 40000\]' "$CONF"
-	refute "config does not restrict the engines" grep -q 'AllowEngines' "$CONF"
-	check "config listens on all addresses" grep -qx '    AllowListen: \["0.0.0.0"\]' "$CONF"
-	check "the trailing slash is stripped from the URL" grep -qx '    URL: "https://panel.example.com"' "$CONF"
-	check "config has the machine id" grep -qx '    MachineID: 3' "$CONF"
-	check "config points at the token file" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$CONF"
-	check "config turns on machine nodes" grep -qx '    MachineNodes: true' "$CONF"
-	hasnt "config never contains the token" "$cfg" "$tok"
+	agent="$(cat "$AGENT_CONF")"
+	refute "config.yml has no Agent block any more" grep -qx 'Agent:' "$CONF"
+	check "agent.yml enables the agent" grep -qx 'Enabled: true' "$AGENT_CONF"
+	check "agent.yml enables the panel" grep -qx 'Panel:' "$AGENT_CONF"
+	check "agent.yml has the state dir" grep -qx "StateDir: \"$CONF_DIR/state\"" "$AGENT_CONF"
+	check "agent.yml has the default port range" grep -qx '  PortRange: \[20000, 40000\]' "$AGENT_CONF"
+	refute "agent.yml does not restrict the engines" grep -q 'AllowEngines' "$AGENT_CONF"
+	check "agent.yml listens on all addresses" grep -qx '  AllowListen: \["0.0.0.0"\]' "$AGENT_CONF"
+	check "the trailing slash is stripped from the URL" grep -qx '  URL: "https://panel.example.com"' "$AGENT_CONF"
+	check "agent.yml has the machine id" grep -qx '  MachineID: 3' "$AGENT_CONF"
+	check "agent.yml points at the token file" grep -qx "  TokenFile: \"$CONF_DIR/agent.token\"" "$AGENT_CONF"
+	check "agent.yml turns on machine nodes" grep -qx '  MachineNodes: true' "$AGENT_CONF"
+	refute "agent.yml leaves the terminal at its default (ON)" grep -qx 'Terminal: {Enabled: false}' "$AGENT_CONF"
+	hasnt "config.yml never contains the token" "$cfg" "$tok"
+	hasnt "agent.yml never contains the token" "$agent" "$tok"
 	hasnt "the installer never prints the token" "$out" "$tok"
 	has "the installer reports the panel link" "$out" "已关联面板"
 	has "the installer points at the log" "$out" "查看日志"
@@ -811,6 +816,8 @@ t_install_panel_missing_args() {
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --port-range 20000-30000 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--port-range without --panel accepted" || pass "--port-range without --panel is refused"
 	has "the refusal explains the scope" "$(cat "$W1NCRAY_ROOT/out")" "--panel"
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --allow-http ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--allow-http without --panel accepted" || pass "--allow-http without --panel is refused"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --noterminal ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--noterminal without --panel accepted" || pass "--noterminal without --panel is refused"
+	has "that refusal names --noterminal too" "$(cat "$W1NCRAY_ROOT/out")" "--noterminal"
 	refute "nothing is installed after a bad invocation" test -e "$BIN"
 	refute "no token file after a bad invocation" test -e "$CONF_DIR/agent.token"
 }
@@ -840,13 +847,14 @@ t_install_panel_http() {
 	refute "nothing is installed after an http refusal" test -e "$BIN"
 	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel http://panel.example.com --machine 3 --token t --allow-http 2>&1)"
 	eq "--allow-http installs" "$?" 0
-	check "the config records the insecure-http opt-in" grep -qx '    AllowInsecureHTTP: true' "$CONF"
-	# A loopback http panel is allowed without the opt-in.
-	rm -f "$CONF"
+	check "agent.yml records the insecure-http opt-in" grep -qx '  AllowInsecureHTTP: true' "$AGENT_CONF"
+	# A loopback http panel is allowed without the opt-in. A live agent.yml is
+	# never overwritten, so the fixture is removed first.
+	rm -f "$CONF" "$AGENT_CONF"
 	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel http://127.0.0.1:8080 --machine 3 --token t 2>&1)"
 	eq "loopback http is allowed" "$?" 0
-	check "the loopback URL is kept" grep -qx '    URL: "http://127.0.0.1:8080"' "$CONF"
-	refute "loopback http needs no opt-in" grep -qx '    AllowInsecureHTTP: true' "$CONF"
+	check "the loopback URL is kept" grep -qx '  URL: "http://127.0.0.1:8080"' "$AGENT_CONF"
+	refute "loopback http needs no opt-in" grep -qx '  AllowInsecureHTTP: true' "$AGENT_CONF"
 	# Other schemes are refused.
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel ftp://panel.example.com --machine 3 --token t ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "ftp accepted" || pass "a non-http scheme is refused"
 	has "the refusal asks for https" "$(cat "$W1NCRAY_ROOT/out")" "https://"
@@ -866,8 +874,9 @@ t_install_panel_token_file() {
 	eq "the copied token has no newline" \
 		"$(wc -c <"$CONF_DIR/agent.token" | tr -d '[:space:]')" \
 		"$(printf '%s' "$tok" | wc -c | tr -d '[:space:]')"
-	check "config points at the copied token" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$CONF"
-	hasnt "the config never holds the token" "$(cat "$CONF")" "$tok"
+	check "agent.yml points at the copied token" grep -qx "  TokenFile: \"$CONF_DIR/agent.token\"" "$AGENT_CONF"
+	hasnt "config.yml never holds the token" "$(cat "$CONF")" "$tok"
+	hasnt "agent.yml never holds the token" "$(cat "$AGENT_CONF")" "$tok"
 	hasnt "the output never holds the token" "$out" "$tok"
 	# A missing token file is refused before anything is installed.
 	rm -rf "$BIN_DIR" "$CONF_DIR"
@@ -890,23 +899,26 @@ t_install_panel_keeps_config() {
 	make_fake_bin "$W1NCRAY_ROOT/fakebin"
 	W1NCRAY_SELF="$SCRIPT"
 	mkdir -p "$CONF_DIR"
-	# An existing config without static `Nodes:` entries: the machine-mode
-	# config still goes to config.panel.yml.new for a manual merge.
+	# An existing config without static `Nodes:` entries: config.yml is kept and
+	# the agent configuration is written to its own agent.yml.
 	printf 'Log: {Level: info}\nAgent:\n  Enabled: false\n' >"$CONF"
 	before="$(cat "$CONF")"
 	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
 		--panel https://panel.example.com --machine 9 --token t --port-range 30000-31000 2>&1)"
 	eq "an existing config does not fail the install" "$?" 0
 	eq "the existing config is untouched" "$(cat "$CONF")" "$before"
-	new="$CONF_DIR/config.panel.yml.new"
-	check "the new config goes to config.panel.yml.new" test -f "$new"
-	check ".new has the requested port range" grep -qx '    PortRange: \[30000, 31000\]' "$new"
-	check ".new has the machine id" grep -qx '    MachineID: 9' "$new"
-	check ".new points at the token file" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$new"
-	refute ".new does not restrict the engines" grep -q 'AllowEngines' "$new"
+	new="$AGENT_CONF"
+	check "the agent config goes to agent.yml" test -f "$new"
+	refute "no config.panel.yml.new is written any more" test -e "$CONF_DIR/config.panel.yml.new"
+	check "agent.yml has the requested port range" grep -qx '  PortRange: \[30000, 31000\]' "$new"
+	check "agent.yml has the machine id" grep -qx '  MachineID: 9' "$new"
+	check "agent.yml points at the token file" grep -qx "  TokenFile: \"$CONF_DIR/agent.token\"" "$new"
+	refute "agent.yml does not restrict the engines" grep -q 'AllowEngines' "$new"
 	has "the admin is warned the config was kept" "$out" "未覆盖"
-	has "the admin is told how to merge" "$out" "合并"
-	has "the pending hint says the link is not active yet" "$out" "配置尚未生效"
+	has "the admin is told no manual merge is needed" "$out" "无需手工合并"
+	has "the stale config.yml Agent block is called out" "$out" "会被忽略"
+	has "the panel hint says the link is active" "$out" "已关联面板"
+	hasnt "the link is no longer pending" "$out" "配置尚未生效"
 	check "the token file is written even then" test -f "$CONF_DIR/agent.token"
 	has "the service still starts" "$(cat "$CALLS")" "start W1nCray"
 	# A malformed range is refused.
@@ -914,10 +926,11 @@ t_install_panel_keeps_config() {
 	has "the refusal explains the range" "$(cat "$W1NCRAY_ROOT/out")" "--port-range"
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 9 --token t --port-range 20000 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a range without '-' was accepted" || pass "a range without '-' is refused"
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 9 --token t --port-range 0-100 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a zero port was accepted" || pass "a zero port is refused"
-	# A '#' in the URL must survive YAML quoting.
-	rm -f "$CONF"
+	# A '#' in the URL must survive YAML quoting. A live agent.yml is never
+	# overwritten, so the fixture is removed first.
+	rm -f "$CONF" "$AGENT_CONF"
 	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel 'https://panel.example.com/x#y' --machine 9 --token t >/dev/null 2>&1
-	check "a # in the URL is quoted so YAML keeps it" grep -qx '    URL: "https://panel.example.com/x#y"' "$CONF"
+	check "a # in the URL is quoted so YAML keeps it" grep -qx '  URL: "https://panel.example.com/x#y"' "$AGENT_CONF"
 }
 
 t_install_panel_static_nodes() {
@@ -956,6 +969,46 @@ t_install_panel_static_nodes() {
 	hasnt "link is never run by the installer" "$out" "ARGS: link"
 	check "the token file is written" test -f "$CONF_DIR/agent.token"
 	has "the service still starts" "$(cat "$CALLS")" "start W1nCray"
+}
+
+t_install_panel_agent_yml() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	# A fresh install with --noterminal writes the local opt-out into agent.yml.
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t --noterminal 2>&1)"
+	eq "--noterminal installs" "$?" 0
+	check "--noterminal disables the terminal in agent.yml" grep -qx 'Terminal: {Enabled: false}' "$AGENT_CONF"
+	check "agent.yml links machine 4" grep -qx '  MachineID: 4' "$AGENT_CONF"
+	# A repeat install is idempotent: a live agent.yml is not touched and no
+	# backup is made for it. --noterminal cannot be applied to a kept file, so
+	# the installer says so.
+	before="$(cat "$AGENT_CONF")"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t --noterminal 2>&1)"
+	eq "a repeat install succeeds" "$?" 0
+	eq "the live agent.yml is untouched" "$(cat "$AGENT_CONF")" "$before"
+	has "the admin is told the file was kept" "$out" "未覆盖"
+	has "the ignored --noterminal is called out" "$out" "--noterminal 未写入"
+	refute "no backup is written for a kept agent.yml" sh -c 'ls "$1".bak-* >/dev/null 2>&1' sh "$AGENT_CONF"
+	# An agent.yml that does not link to a panel is replaced, with a backup.
+	printf 'Enabled: true\nStateDir: old\n' >"$AGENT_CONF"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t >/dev/null 2>&1
+	check "the panel link replaced the stale agent.yml" grep -qx '  MachineID: 4' "$AGENT_CONF"
+	eq "the previous agent.yml was backed up" \
+		"$(ls "$AGENT_CONF".bak-* 2>/dev/null | wc -l | tr -d '[:space:]')" 1
+	check "the backup holds the previous content" grep -qx 'StateDir: old' "$AGENT_CONF".bak-*
+	# --noterminal is forwarded to the link command printed for static nodes.
+	rm -f "$AGENT_CONF" "$CONF"
+	printf 'Nodes:\n  - ApiConfig: {ApiHost: "https://x", ApiKey: k, NodeID: 173}\n' >"$CONF"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t --noterminal 2>&1)"
+	eq "a static-node install succeeds" "$?" 0
+	has "the link hint carries --noterminal" "$out" "--token-file $CONF_DIR/agent.token --noterminal --dry-run"
+	refute "no agent.yml is written for static nodes" test -e "$AGENT_CONF"
 }
 
 t_install_without_panel_unchanged() {
@@ -1007,7 +1060,7 @@ for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_veri
 	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
 	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
 	t_install_panel t_install_panel_missing_args t_install_panel_bad_id t_install_panel_http \
-	t_install_panel_token_file t_install_panel_keeps_config t_install_panel_static_nodes t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
+	t_install_panel_token_file t_install_panel_keeps_config t_install_panel_static_nodes t_install_panel_agent_yml t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
 	run "$t"
 done
 

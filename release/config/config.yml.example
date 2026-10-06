@@ -1,4 +1,7 @@
 # W1nCray 配置文件（结构与 XrayR 兼容，可直接迁移）
+#
+# 本文件只描述 xray 内核。agent 自己的配置在 agent.yml（见同目录 agent.yml.example）：
+# 只要 agent.yml 存在，它就是唯一生效的 agent 配置，本文件里遗留的 Agent: 段会被整体忽略。
 Log:
   Level: warning # 日志级别：none, error, warning, info, debug
   AccessPath: # /etc/W1nCray/access.log

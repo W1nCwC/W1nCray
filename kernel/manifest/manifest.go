@@ -23,6 +23,12 @@ const SchemaVersion = 1
 const (
 	ArchiveTarGz = "tar.gz"
 	ArchiveZip   = "zip"
+	// ArchiveGz is a raw gzip stream that holds exactly one file, the release
+	// build of a self-updating binary (release/build.sh writes
+	// dist/W1nCray-linux-<arch>.gz). It carries no member name, so a gz target
+	// lists exactly one extract entry whose "from" is the archive's own base
+	// name and whose size/sha256 describe the decompressed bytes.
+	ArchiveGz = "gz"
 )
 
 // Limits applied to everything a manifest may describe.
@@ -246,7 +252,7 @@ func (k *Kernel) hasBuild() bool {
 }
 
 func (t *Target) validate(where string, run Run) error {
-	if t.Archive != ArchiveTarGz && t.Archive != ArchiveZip {
+	if t.Archive != ArchiveTarGz && t.Archive != ArchiveZip && t.Archive != ArchiveGz {
 		return invalid("%s: archive %q unsupported", where, t.Archive)
 	}
 	if !reSHA256.MatchString(t.ArchiveSHA256) {
@@ -281,6 +287,16 @@ func (t *Target) validate(where string, run Run) error {
 	}
 	if run.Binary == "" || !tos[run.Binary] {
 		return invalid("%s: run.binary %q is not an extract target", where, run.Binary)
+	}
+	if t.Archive == ArchiveGz {
+		// A raw gzip stream has no member names: exactly one file comes out and
+		// its "from" is the archive's own base name (no directory semantics).
+		if len(t.Extract) != 1 {
+			return invalid("%s: a gz target must list exactly one extract entry, got %d", where, len(t.Extract))
+		}
+		if from := t.Extract[0].From; from != path.Base(from) {
+			return invalid("%s: gz extract.from %q must be a plain file name (the archive's base name)", where, from)
+		}
 	}
 	if t.InstalledSize < 0 || t.InstalledSize > 4*MaxExtractBytes {
 		return invalid("%s: installed_size out of range", where)

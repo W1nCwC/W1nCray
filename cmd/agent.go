@@ -74,7 +74,19 @@ func runAgentApply(configPath, desiredFile string, out io.Writer) error {
 		ManifestPath:     cfg.Agent.ManifestPath,
 		ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 		Policy:           cfg.Agent.PolicySpec(),
-		Log:              log.StandardLogger(),
+		AgentConfig:      cfg.Agent,
+		// The offline apply can commit a self_update too (the command is
+		// registered from StartRemote, so in practice it cannot), but the
+		// watchdog must still be told which lock to watch and which version it
+		// is replacing.
+		SelfVersion: version,
+		LockPath:    configPath + ".lock",
+		// The managed-file layer has no blob fetcher without a panel link, so
+		// agent-apply never applies files; it still reports the same local
+		// policy as the service (the capability list is only sent over the
+		// panel link anyway).
+		Files: panel.FilesOptionsFor(cfg, configPath),
+		Log:   log.StandardLogger(),
 	}, nil)
 	if err != nil {
 		return err

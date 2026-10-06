@@ -3,6 +3,7 @@ module github.com/W1nCwC/W1nCray
 go 1.26.0
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-acme/lego/v4 v4.35.2
 	github.com/gorilla/websocket v1.5.3

@@ -11,6 +11,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/panel"
 )
 
@@ -76,15 +77,74 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// A committed self_update asks the process to exit so the self-update
+	// watchdog (or the service manager) brings the binary that was put in place
+	// back up. The signal is the existing, graceful shutdown path: kernels are
+	// stopped and Xray is closed before this process returns.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	panel.RequestRestart = func() {
+		select {
+		case sig <- syscall.SIGTERM:
+		default:
+		}
+	}
+
+	// With a panel link the bootstrap layer owns the start-up watchdog: it has
+	// the event channel and the "the panel answered" hook. Without one there is
+	// nothing to reach, so the update is confirmed here.
+	startup := selfUpdateStartup(cfg)
+
 	p := panel.New(path, cfg)
 	if err := p.Start(); err != nil {
 		return err
 	}
+	if startup != nil {
+		if err := startup.Confirm(); err != nil {
+			log.Warnf("agent: confirming the self-update: %v", err)
+		}
+	}
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	log.Info("shutting down")
 	p.Close()
 	return nil
+}
+
+// selfUpdateStartup prepares the start-up side of a committed self_update for
+// an agent with no panel link. It returns nil when there is nothing to do
+// (agent disabled, no state directory, or a panel is configured: bootstrap
+// then owns the watchdog).
+func selfUpdateStartup(cfg *panel.Config) *selfupdate.Startup {
+	a := cfg.Agent
+	if a == nil || !a.Enabled || a.StateDir == "" {
+		return nil
+	}
+	if a.Panel != nil && a.Panel.Enabled {
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	up, err := selfupdate.New(selfupdate.Options{
+		ExePath:  exe,
+		StateDir: a.StateDir,
+		Log:      log.StandardLogger(),
+	})
+	if err != nil {
+		log.Warnf("agent: self-update start-up check skipped: %v", err)
+		return nil
+	}
+	st := up.BeginStartup()
+	if rb, ok := st.TakeRollback(); ok {
+		log.Warnf("agent: self_update.rolled_back: version %s: %s", rb.Version, rb.Reason)
+	}
+	// A local-only agent has no panel to wait for; a watchdog would report
+	// self_update.stalled against a link that was never configured.
+	return st
 }

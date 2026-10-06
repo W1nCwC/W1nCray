@@ -11,7 +11,9 @@ import (
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
+	"github.com/W1nCwC/W1nCray/agent/filesync"
 	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
 	"github.com/W1nCwC/W1nCray/core"
@@ -45,6 +47,12 @@ type Panel struct {
 	// remoteStop ends the agent's panel link (nil when it is not running).
 	remoteStop func()
 
+	// wsStop ends the agent's persistent WebSocket channel. The channel's
+	// lifecycle belongs to bootstrap.StartRemote's stop (it owns both links and
+	// ends the socket before the HTTP runner), so this field stays nil and is
+	// kept only for a future split.
+	wsStop func()
+
 	// machineCancel ends the machine-node tasks of the running instance (nil
 	// when machine mode is off or nothing runs); machineWG joins them so
 	// shutdown never returns before they stopped.
@@ -54,6 +62,14 @@ type Panel struct {
 	reloadCh chan string
 	stop     chan struct{}
 	done     chan struct{}
+
+	// reloadMu serialises the rebuilds: the config watcher, the machine-node
+	// watch and the managed-file reload (ReloadForAgent) all end in start(),
+	// and two concurrent rebuilds would race over p.core/p.nodes.
+	reloadMu sync.Mutex
+	// reloadPending remembers a reload request that arrived while one was
+	// running, so a config change during a long rebuild is not lost.
+	reloadPending string
 }
 
 // New creates a panel for the config file at path.
@@ -67,12 +83,52 @@ func New(path string, cfg *Config) *Panel {
 	}
 }
 
-// requestReload schedules a rebuild without blocking the caller.
+// requestReload schedules a rebuild without blocking the caller. A request that
+// arrives while a rebuild is already running is remembered, so a change made
+// during a long reload still takes effect.
 func (p *Panel) requestReload(reason string) {
+	p.reloadMu.Lock()
+	if p.reloadPending != "" {
+		p.reloadMu.Unlock()
+		return
+	}
+	p.reloadPending = reason
+	p.reloadMu.Unlock()
 	select {
 	case p.reloadCh <- reason:
 	default:
 	}
+}
+
+// takeReloadPending consumes the pending reason. It returns "" when nothing is
+// pending, which also releases the "one request at a time" slot.
+func (p *Panel) takeReloadPending() string {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+	r := p.reloadPending
+	p.reloadPending = ""
+	return r
+}
+
+// ReloadForAgent rebuilds the instance after the managed files were replaced
+// (agent/filesync). It is serialised with every other reload and it validates
+// the config *before* it shuts anything down: a config.yml that does not load
+// returns an error and leaves the running instance untouched (ruling 2, design
+// section 6.2).
+//
+// The rebuild itself is asynchronous: shutdown() also tears down the agent's
+// panel link, and start() retries forever, so waiting for it here would either
+// destroy the caller or never return. The panel judges health from the
+// hello/telemetry that follow (protocol ruling 9).
+func (p *Panel) ReloadForAgent(ctx context.Context, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := LoadConfig(p.path); err != nil {
+		return fmt.Errorf("reload refused, the running config is kept: %w", err)
+	}
+	p.requestReload("agent: " + reason)
+	return nil
 }
 
 // Start builds and starts everything, then watches for reload requests.
@@ -169,13 +225,33 @@ func (p *Panel) start() (err error) {
 	// The agent runs on top of the same Xray instance. A boot failure is
 	// logged, not fatal: the panel nodes keep serving.
 	if cfg.Agent != nil && cfg.Agent.Enabled {
+		// Say which file the agent's configuration came from: with two files
+		// in play, silence is exactly what makes a stale edit hard to find.
+		if src := cfg.AgentSourcePath(); src != "" {
+			log.Infof("agent: configuration from %s", src)
+		}
 		rt, err := bootstrap.Boot(bootstrap.Options{
 			StateDir:         cfg.Agent.StateDir,
 			KernelsDir:       cfg.Agent.KernelsDir,
 			ManifestPath:     cfg.Agent.ManifestPath,
 			ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 			Policy:           cfg.Agent.PolicySpec(),
-			Log:              log.StandardLogger(),
+			AgentConfig:      cfg.Agent,
+			// The build version names the watchdog copy of the previous binary
+			// a committed self_update leaves behind, and the single-instance
+			// lock is how that watchdog tells a restarted broken binary from a
+			// running agent.
+			SelfVersion: AgentVersion,
+			LockPath:    p.path + ".lock",
+			Files:       FilesOptionsFor(cfg, p.path),
+			Log:         log.StandardLogger(),
+			// The local terminal policy (D8, WP-G6). Enabled is the resolved
+			// agentcfg value: on unless the machine opted out with
+			// Terminal.Enabled: false or --noterminal.
+			Terminal: terminalOptions(cfg.Agent),
+			// The confined file operations (D9, WP-G6). No roots means no
+			// file_* commands and no "files" capability.
+			FileOps: fileOptions(p.path, cfg.Agent),
 			// After a restart the persisted last good state comes back before
 			// (and without) the panel, so a panel that is down never costs
 			// forwarding.
@@ -262,7 +338,7 @@ func logUnassignedNodeControllers(pc *AgentPanelConfig, list []xboard.MachineNod
 	for _, mn := range list {
 		assigned[mn.ID] = true
 	}
-	for _, id := range pc.nodeControllerIDs() {
+	for _, id := range pc.NodeControllerIDs() {
 		if !assigned[id] {
 			log.Infof("NodeControllers[%d] is configured but the panel did not assign that node", id)
 		}
@@ -363,6 +439,12 @@ func (p *Panel) applyAgentDesiredLocked(path string, rt *bootstrap.Runtime) {
 // package sets it from the build version; "dev" otherwise.
 var AgentVersion = "dev"
 
+// RequestRestart asks the process owner to shut down cleanly so the binary a
+// committed self_update put in place takes over. The command package sets it
+// (like AgentVersion); a nil hook means self_update is not served and the
+// upgrade capability is not declared.
+var RequestRestart func()
+
 // startRemoteLocked links the agent to the panel when it is configured. A
 // problem with the link (unreadable token file, bad options) is logged and
 // leaves the agent running on its local state. The caller must hold p.mu.
@@ -386,6 +468,22 @@ func (p *Panel) startRemoteLocked(a *AgentConfig, rt *bootstrap.Runtime) {
 		ReportInterval:    report,
 		AgentVersion:      AgentVersion,
 		Log:               log.StandardLogger(),
+		// The persistent WebSocket channel rides on the same validated link:
+		// it only exists once a token and a machine id did (design section
+		// 3.1). Without them startRemoteLocked returned above, so an agent in
+		// the legacy node mode never opens a socket.
+		WS:          true,
+		AgentConfig: a,
+		// A committed self_update swaps the executable and asks this process to
+		// exit; the self-update watchdog (or the service manager) then brings
+		// the new binary back up. Without the hook the command is not
+		// registered.
+		OnRestart: RequestRestart,
+		// The managed-file layer needs the panel side of the two operations
+		// bootstrap cannot own: the offline pre-check (the panel has the live
+		// core options) and the rebuild (ReloadForAgent).
+		FilesValidator: p.NewCoreValidator(),
+		Reloader:       filesync.ReloaderFunc(p.ReloadForAgent),
 	}
 	// The panel may also serve the signed kernel manifest; the agent verifies
 	// it locally before it is used, so a compromised panel cannot push a
@@ -416,6 +514,12 @@ func (p *Panel) shutdown() {
 	// Stop the machine-node tasks first: no discovery or watch may race the
 	// teardown below. They never take p.mu, so waiting here cannot deadlock.
 	p.stopMachineLocked()
+	// Stop the WebSocket channel before the HTTP link: WS commands and hints
+	// run through the same Runner the HTTP link stops below (design §3.6).
+	if p.wsStop != nil {
+		p.wsStop()
+		p.wsStop = nil
+	}
 	// Stop the panel link first: no apply may race the teardown below.
 	if p.remoteStop != nil {
 		p.remoteStop()
@@ -460,8 +564,11 @@ func (p *Panel) Close() {
 }
 
 // reload rebuilds everything, re-reading the config file. On a config error
-// the previous config keeps being used.
+// the previous config keeps being used. The caller must have taken the pending
+// slot (takeReloadPending); the deferred call releases it, so a request that
+// arrived during the rebuild is served next.
 func (p *Panel) reload(reason string) {
+	defer p.takeReloadPending()
 	log.Infof("reloading: %s", reason)
 	cfg, err := LoadConfig(p.path)
 	if err != nil {
@@ -529,6 +636,9 @@ func (p *Panel) watch(ready chan<- struct{}) {
 		case <-p.stop:
 			return
 		case reason := <-p.reloadCh:
+			// requestReload already reserved the pending slot; reload releases
+			// it when it is done, so a request that arrived meanwhile is served
+			// next instead of being lost.
 			p.reload(reason)
 		case ev := <-events:
 			abs, _ := filepath.Abs(ev.Name)
@@ -537,7 +647,9 @@ func (p *Panel) watch(ready chan<- struct{}) {
 					desiredDebounce = time.After(500 * time.Millisecond)
 				}
 			} else if watched[abs] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
-				debounce = time.After(2 * time.Second)
+				if debounce == nil {
+					debounce = time.After(2 * time.Second)
+				}
 			}
 		case err := <-errs:
 			log.Warnf("config watcher: %v", err)
@@ -546,7 +658,10 @@ func (p *Panel) watch(ready chan<- struct{}) {
 			p.applyAgentDesired()
 		case <-debounce:
 			debounce = nil
-			p.reload("config file changed")
+			// Through requestReload, not straight into reload: a rebuild may be
+			// running (a long reload, or ReloadForAgent), and two concurrent
+			// rebuilds would race over p.core and p.nodes.
+			p.requestReload("config file changed")
 		}
 	}
 }
@@ -589,6 +704,10 @@ func (p *Panel) watchedFiles() []string {
 	if p.cfg.Agent != nil && p.cfg.Agent.DesiredPath != "" {
 		files = append(files, p.cfg.Agent.DesiredPath)
 	}
+	// agent.yml is watched even before it exists: creating it switches the
+	// agent to the separated layout and must take effect without a restart
+	// (D1). The watcher registers the directory, so the create event arrives.
+	files = append(files, filepath.Join(filepath.Dir(p.path), agentcfg.FileName))
 	return files
 }
 
@@ -607,6 +726,35 @@ func certDir(path string, cfg *Config) string {
 		return cfg.CertDir
 	}
 	return filepath.Join(filepath.Dir(path), "cert")
+}
+
+// FilesOptionsFor translates the local Files policy into the managed-file
+// layer's options (D4/D5). configPath is the live config.yml: the xray
+// configuration directory is where the four JSON files and the two geo
+// databases live, so that is the only place a managed file is written.
+// config.yml is only manageable when the machine uses the agent.yml layout
+// (ruling 2): otherwise that file is the agent's own configuration and a remote
+// write would overwrite it.
+//
+// The command package (agent-apply) uses it too, so the offline run reports the
+// same local policy as the running service.
+func FilesOptionsFor(cfg *Config, configPath string) *bootstrap.FilesOptions {
+	if cfg == nil || cfg.Agent == nil {
+		return nil
+	}
+	a := cfg.Agent
+	var maxBytes, maxGeo int64
+	if a.Files != nil {
+		maxBytes, maxGeo = a.Files.MaxBytes, a.Files.MaxGeoBytes
+	}
+	return &bootstrap.FilesOptions{
+		ConfigDir:       filepath.Dir(configPath),
+		ConfigPath:      configPath,
+		StateDir:        filepath.Join(a.StateDir, "filesync"),
+		MaxBytes:        maxBytes,
+		MaxGeoBytes:     maxGeo,
+		LayoutSeparated: a.SeparatedLayout(),
+	}
 }
 
 func coreOptions(cfg *Config, ns []core.NameServer) core.Options {

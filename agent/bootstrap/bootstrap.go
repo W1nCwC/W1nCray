@@ -21,12 +21,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/fileops"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
+	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/state"
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
+	"github.com/W1nCwC/W1nCray/agent/terminal"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/corehost"
 	"github.com/W1nCwC/W1nCray/driver/frp"
@@ -65,10 +70,33 @@ type Options struct {
 	ManifestKeysPath string
 	// Policy is the local root-of-trust policy.
 	Policy spec.Policy
+	// AgentConfig is the local agent configuration the capability list and the
+	// local gates are read from (agent.yml). Nil means the defaults of a zero
+	// Config.
+	AgentConfig *agentcfg.Config
+	// Files is the local managed-file policy (D4/D5). Nil (or an empty
+	// ConfigDir) turns the managed-file commands off on this machine.
+	Files *FilesOptions
 	// AgentVersion is compared with a kernel's min_agent ("" skips).
 	AgentVersion string
+	// SelfVersion is the build version of this process. It names the
+	// known-good copy of the previous binary that the self-update watchdog
+	// runs (update/watchdog/W1nCray-<version>).
+	SelfVersion string
+	// LockPath is the single-instance lock file of the running config
+	// (<config>.lock). The self-update watchdog reads the agent pid from it to
+	// tell "the new version is up" from "a broken binary is restart-looping".
+	LockPath string
 	// AllowHTTP permits http:// kernel sources (development only).
 	AllowHTTP bool
+	// Terminal is the local terminal policy (D8). Enabled is the resolved
+	// agentcfg value: on unless the machine opted out. A machine without a PTY
+	// gets no manager, so it never declares the capability.
+	Terminal terminal.Options
+	// FileOps is the local confined file-operation policy (D9/WP-G6). No roots
+	// means no file_* commands and no "files" capability. It is distinct from
+	// Files, the managed xray files the panel replaces (D4/D5).
+	FileOps fileops.Options
 	// Log receives driver, supervisor, kernel and reconciler events.
 	Log driver.Logger
 	// Resume makes Boot re-apply the persisted last good state before it
@@ -84,6 +112,28 @@ type Runtime struct {
 	Sup        *supervisor.Supervisor
 	Kernels    *kernelx.Ensurer
 	State      *state.Store
+	// Ops is the operations command registry (kernel_* and, later, the other
+	// operation commands). It is nil only for a Runtime built by hand.
+	Ops *opscmd.Registry
+	// Terminal is the interactive terminal manager (D8/WP-G6). It is nil when
+	// the local switch is off or the platform has no PTY, and the "terminal"
+	// capability is then not declared.
+	Terminal *terminal.Manager
+	// Updater replaces the agent's own binary with a version from the signed
+	// manifest (self_update). It is nil when the executable path cannot be
+	// resolved; upgradeReady is the one-time verdict of its Ready check.
+	Updater      *selfupdate.Updater
+	upgradeReady bool
+	// Files is the managed-file layer (D4/D5); nil when the local policy or the
+	// configuration has no xray directory to manage.
+	Files *FilesRuntime
+	// FileOps is the confined file manager (D9/WP-G6): the file_* commands. It
+	// is nil when no root is configured, and the "files" capability is then not
+	// declared.
+	FileOps *fileops.Ops
+	// cfg is the local agent configuration the capability list and the policy
+	// gates are read from (nil means the defaults).
+	cfg *agentcfg.Config
 
 	log driver.Logger
 
@@ -125,7 +175,10 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		KeysPath:     opts.ManifestKeysPath,
 		AgentVersion: opts.AgentVersion,
 		AllowHTTP:    opts.AllowHTTP,
-		Log:          log,
+		// The pid directory is how the kernel commands tell "installed" from
+		// "actually running" (kernelx.RunningVersion).
+		PIDDir: filepath.Join(opts.StateDir, "pid"),
+		Log:    log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
@@ -144,11 +197,89 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		State:   st,
 		Log:     log,
 	}
-	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log}
+	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log, cfg: opts.AgentConfig}
+	// The interactive terminal (D8) exists only when the local switch is on and
+	// this machine can really create a PTY. A nil manager is what makes the
+	// dispatcher answer term.error{terminal_disabled} and keeps the capability
+	// out of hello.capabilities.
+	rt.Terminal = newTerminalManager(opts.Terminal, log)
+	// The file operations (D9) exist only when at least one root is configured;
+	// a machine without roots must not advertise the commands. They are the
+	// file_* commands, not the managed xray files (D4/D5, rt.Files below).
+	fileOps, err := newFileOps(opts.FileOps, log)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: file operations: %w", err)
+	}
+	rt.FileOps = fileOps
+	// The managed-file layer (D4/D5). It is built here because the xray
+	// configuration directory and the state directory are known now; the blob
+	// fetcher and the validator are installed by the panel link (StartRemote)
+	// and by the panel itself.
+	rt.Files = newFilesRuntime(opts)
+	// The operations registry is built here, where the kernel manager, the
+	// supervisor and the state store are all in scope. The channels (the HTTP
+	// link and the WebSocket) install their result and event sinks in
+	// StartRemote, once they exist.
+	ops, err := opscmd.New(opscmd.Deps{
+		Kernels: kern,
+		Comp:    componentRestarter{rt: rt},
+		Log:     log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: %w", err)
+	}
+	// The file_* commands are additive: RegisterFileCmds refuses a manager
+	// without roots, so a machine with no file policy simply does not have
+	// them.
+	if fileOps != nil {
+		if err := opscmd.RegisterFileCmds(ops, fileOps); err != nil {
+			return nil, fmt.Errorf("bootstrap: %w", err)
+		}
+	}
+	rt.Ops = ops
+	// The self-update updater: it stages the agent's own manifest entry (the
+	// reserved kernel name "agent") through the same installer the kernel
+	// commands use, and swaps the running executable. A machine that cannot
+	// replace its executable (Windows) or is not run by a service manager
+	// never declares the upgrade capability.
+	if up, uerr := newUpdater(kern, opts, log); uerr != nil {
+		log.Warnf("bootstrap: self-update is not available: %v", uerr)
+	} else {
+		rt.Updater = up
+		if rerr := up.Ready(); rerr != nil {
+			log.Infof("bootstrap: self-update capability withheld: %v", rerr)
+		} else {
+			rt.upgradeReady = true
+		}
+	}
 	if opts.Resume {
 		rt.resume()
 	}
 	return rt, nil
+}
+
+// newUpdater builds the self-update updater around the running executable and
+// the kernel installer. The executable is resolved (EvalSymlinks) so the swap
+// replaces the real file a service manager runs, not a symlink to it.
+func newUpdater(kern *kernelx.Ensurer, opts Options, log driver.Logger) (*selfupdate.Updater, error) {
+	if kern == nil {
+		return nil, errors.New("no kernel installer")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolving the running executable: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return selfupdate.New(selfupdate.Options{
+		ExePath:      exe,
+		StateDir:     opts.StateDir,
+		LockPath:     opts.LockPath,
+		AgentVersion: opts.SelfVersion,
+		Installer:    kern,
+		Log:          log,
+	})
 }
 
 // loadPersistedManifest restores the manifest the panel sync loop persisted in
@@ -258,11 +389,23 @@ func (r *Runtime) ApplyFile(path string) (reconcile.Report, error) {
 // state (applying an empty desired state would erase them), so the next start
 // can resume where this one stopped. A stop error is logged and does not
 // prevent the supervisor from stopping.
+//
+// The interactive terminal is closed first: CloseAll kills every session's
+// process group, so the agent never leaves an orphaned shell behind (WP-G6
+// acceptance 4).
 func (r *Runtime) Shutdown(ctx context.Context) error {
+	if r.Terminal != nil {
+		r.Terminal.CloseAll(terminal.ReasonAgentShutdown)
+	}
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	if err := r.Reconciler.Stop(stopCtx); err != nil {
-		r.log.Warnf("bootstrap: stopping instances during shutdown: %v", err)
+	if r.Reconciler != nil {
+		if err := r.Reconciler.Stop(stopCtx); err != nil {
+			r.log.Warnf("bootstrap: stopping instances during shutdown: %v", err)
+		}
 	}
 	cancel()
+	if r.Sup == nil {
+		return nil
+	}
 	return r.Sup.Shutdown(ctx)
 }

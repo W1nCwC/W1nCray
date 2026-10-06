@@ -1,0 +1,81 @@
+# W1nCray agent 配置示例（复制为 /etc/W1nCray/agent.yml）
+#
+# 这个文件是 agent 自己的配置。只要它存在，它就是唯一生效的 agent 配置：
+# config.yml 里遗留的 Agent: 段会被整体忽略（W1nCray check 会提示）。
+# 两个文件的字段名完全相同，路径（StateDir / TokenFile 等）相对本文件所在目录解析。
+#
+# 权限建议 600；W1nCray link 与 install.sh 会「临时文件 + 原子替换」写入，
+# 并在覆盖前备份为 agent.yml.bak-<时间戳>。写坏这个文件会让服务启动失败，
+# 所以改之前先备份。
+
+Enabled: true
+
+# agent 的状态目录（desired.json、last_good.json、kernels/ 等）。
+# 相对路径相对本文件所在目录；默认是本文件同级的 state/。
+StateDir: /etc/W1nCray/state
+
+# 签名的内核清单。留空时只有内嵌的 xray 引擎可用（没有外部内核可安装）。
+ManifestPath:
+# 额外的受信 ed25519 公钥文件（每行一个十六进制），一般用构建时的 ldflags 注入。
+ManifestKeysPath:
+# 外部内核安装目录。留空 = StateDir/kernels。
+KernelsDir:
+# 本地 desired 状态文件（可选；接面板时一般不用）。
+DesiredPath:
+
+# 本机策略：面板（远端）永远不能放宽这里的限制。
+Policy:
+  MaxInstances: 0 # 0 = 默认
+  MaxPortsPerInstance: 0 # 0 = 默认
+  AllowListen: ["0.0.0.0"] # 允许监听的地址；只在本机测试时用 ["127.0.0.1", "::1"]
+  PrivilegedPorts: false # 是否允许监听 1024 以下的端口
+  PortRange: [20000, 40000] # 分配端口时使用的区间 [lo, hi]
+  DenyPorts: [] # 永远不分配的端口
+  DenyCIDRs: [] # 出站目标黑名单
+  AllowPrivate: false # 是否允许出站访问内网地址
+  AllowAnyTarget: false # 是否允许任意出站目标（默认按策略收紧）
+  AllowAcceptProxyOnPublic: false # 公网入站是否接受 PROXY protocol
+  AllowEngines: [] # 留空 = 不限制；非空时只允许列出的引擎（xray/gost/frp/realm）
+
+# 面板链路（agent 主动连出去；面板不连 agent）。
+Panel:
+  Enabled: true
+  URL: https://panel.example.com # 必须 https，除非是回环地址
+  MachineID: 1 # 面板上的机器 ID
+  # 机器令牌只放在独立文件里（0600）；Token 与 TokenFile 二选一，推荐 TokenFile。
+  TokenFile: /etc/W1nCray/agent.token
+  # Token: ""                  # 直接把令牌写进配置（不推荐）
+  PullIntervalSec: 30 # 10–300
+  ReportIntervalSec: 30 # 10–300
+  ManifestSync: true # 从面板同步签名内核清单（默认开）
+  ManifestIntervalSec: 3600 # 300–86400
+  AllowInsecureHTTP: false # 仅开发：允许非回环的明文 http://
+  MachineNodes: true # 节点列表由面板下发（机器模式）
+  # 每个机器节点的 ControllerConfig，键是面板节点 ID，与 Nodes[].ControllerConfig 同构。
+  # 条目存在即整体生效（不会与 NodeController 逐字段合并），本机凭据不会下发到面板。
+  NodeControllers: {}
+  # NodeController: {}         # 所有机器节点共用的模板
+
+# ---- 终端（D8；RULINGS v9 第 17 条）-----------------------------------------
+# 交互终端默认开启：不写 Terminal 段即为开启，面板无法远程打开或关闭。
+# 只在本机关闭：
+#   Terminal: {Enabled: false}
+# 安装/关联时也可以直接用 install.sh --noterminal / W1nCray link --noterminal。
+# 注意：已部署的机器升级到带终端的版本后会默认获得终端能力；不需要请显式关闭。
+Terminal:
+  Enabled: true # true（或缺省）= 开启；false = 本机关闭
+  MaxSessions: 2 # 0 = 默认 2，最多 2
+  IdleTimeoutS: 900 # 空闲 15 分钟断开
+  MaxDurationS: 14400 # 单次会话最长 4 小时
+
+# ---- 文件操作（D9）-----------------------------------------------------------
+# 面板只能在这些根目录内读写。agent.yml、state/desired.json 与 state/last_good.json
+# 永远不可达。留空 = 默认（xray 配置目录 + StateDir）。
+Files:
+  Roots: []
+  Unrestricted: false # true = 不限制根目录（不推荐）
+  AllowExec: false # true = 允许写可执行位（默认拒绝）
+
+# ---- 模块开关（D3）-----------------------------------------------------------
+Modules:
+  XrayNodes: true # false = 本机永不启动节点控制器（面板 hint 也无法打开）

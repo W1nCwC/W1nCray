@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	xlog "github.com/xtls/xray-core/common/log"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
@@ -40,8 +42,15 @@ func Check(path string, online bool, w io.Writer) error {
 // path (temporary file names, timestamps) first.
 func CheckReport(path string, online bool, w io.Writer) ([]string, error) {
 	rec := &failureRecorder{w: w}
+	// agent.yml is reported first: it takes part in LoadConfig, so a broken one
+	// stops the service from starting and must be on the first screen (R5).
+	ymlErr := checkAgentYML(rec, path)
 	cfg, err := LoadConfig(path)
 	if err != nil {
+		if ymlErr != nil {
+			// The failing file was already named on the first screen.
+			return rec.items(), err
+		}
 		return []string{err.Error()}, err
 	}
 	fmt.Fprintf(rec, "配置文件: %s（%d 个静态节点）\n", path, len(cfg.NodesConfig))
@@ -158,12 +167,45 @@ func (r *failureRecorder) items() []string {
 	return r.got
 }
 
+// checkAgentYML reports agent.yml before anything else. The file is part of
+// LoadConfig, so a broken one stops the service from starting: its parse error
+// belongs on the first screen, and the operator must also be able to see that
+// it is the file in charge (design R5, ruling 1). It prints nothing for the old
+// single-file layout, so existing reports are unchanged.
+func checkAgentYML(w io.Writer, configPath string) error {
+	path := filepath.Join(filepath.Dir(configPath), agentcfg.FileName)
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	fmt.Fprintf(w, "  agent.yml: %s\n", path)
+	cfg, err := agentcfg.Load(path)
+	if err != nil {
+		fmt.Fprintf(w, "  ✗ agent.yml 解析失败（agent 将无法启动）: %v\n", err)
+		return err
+	}
+	if cfg == nil {
+		return nil
+	}
+	// config.yml may still carry the old Agent block; it is ignored as a whole.
+	// A config.yml that does not load is reported by LoadConfig below, so the
+	// hint is simply skipped here.
+	if other, err := loadConfigFile(configPath); err == nil && other.Agent != nil {
+		fmt.Fprintf(w, "  ! %s 的 Agent 段被 agent.yml 覆盖（已忽略）\n", configPath)
+	}
+	fmt.Fprintf(w, "  ✓ agent.yml 已解析（生效来源 %s）\n", path)
+	return nil
+}
+
 // checkAgent reports the agent section and verifies the files it references.
 // A missing manifest is not fatal (only the builtin xray engine runs then),
 // but a configured path that does not exist is.
 func checkAgent(w io.Writer, cfg *Config, online bool) error {
 	a := cfg.Agent
-	fmt.Fprintf(w, "  Agent: 已启用（状态目录 %s，内核目录 %s）\n", a.StateDir, a.KernelsDir)
+	source := cfg.AgentSourcePath()
+	if source == "" {
+		source = "未知"
+	}
+	fmt.Fprintf(w, "  Agent: 已启用（来源 %s，状态目录 %s，内核目录 %s）\n", source, a.StateDir, a.KernelsDir)
 	if a.ManifestPath == "" {
 		fmt.Fprintln(w, "  ! Agent.ManifestPath 未设置：仅内嵌 xray 引擎可用")
 	} else if _, err := os.Stat(a.ManifestPath); err != nil {
@@ -293,8 +335,8 @@ func checkMachineNodes(w io.Writer, pc *AgentPanelConfig, online bool) error {
 		fmt.Fprintf(w, "  ✗ %v\n", err)
 		return err
 	}
-	if ids := pc.nodeControllerIDs(); len(ids) > 0 {
-		fmt.Fprintf(w, "  本地覆盖: 节点 %s（共 %d 个；配置与凭据只在本机使用，不会下发到面板）\n", pc.nodeControllerIDList(), len(ids))
+	if ids := pc.NodeControllerIDs(); len(ids) > 0 {
+		fmt.Fprintf(w, "  本地覆盖: 节点 %s（共 %d 个；配置与凭据只在本机使用，不会下发到面板）\n", pc.NodeControllerIDList(), len(ids))
 	}
 	if !online {
 		fmt.Fprintf(w, "  机器模式: 节点由面板下发（机器 ID %d；加 --online 可列出节点）\n", pc.MachineID)

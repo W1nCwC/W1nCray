@@ -136,10 +136,10 @@ func TestNodeControllersOverrideSelection(t *testing.T) {
 // TestNodeControllerIDList: the report helper lists ids only, sorted.
 func TestNodeControllerIDList(t *testing.T) {
 	pc := &AgentPanelConfig{NodeControllers: map[int]*node.Config{138: {}, 173: {}, 5: {}}}
-	if got := pc.nodeControllerIDList(); got != "5, 138, 173" {
-		t.Errorf("nodeControllerIDList() = %q, want %q", got, "5, 138, 173")
+	if got := pc.NodeControllerIDList(); got != "5, 138, 173" {
+		t.Errorf("NodeControllerIDList() = %q, want %q", got, "5, 138, 173")
 	}
-	if got := (&AgentPanelConfig{}).nodeControllerIDList(); got != "" {
+	if got := (&AgentPanelConfig{}).NodeControllerIDList(); got != "" {
 		t.Errorf("empty overrides = %q, want empty", got)
 	}
 }
@@ -190,7 +190,7 @@ func TestNodeControllersValidation(t *testing.T) {
 			Enabled: true, URL: "http://127.0.0.1:8080", MachineID: 9, Token: "t", MachineNodes: true,
 			NodeControllers: map[int]*node.Config{-1: {}},
 		}
-		if err := pc.validate(); err == nil || !strings.Contains(err.Error(), "positive number") {
+		if err := pc.Validate(); err == nil || !strings.Contains(err.Error(), "positive number") {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -199,7 +199,7 @@ func TestNodeControllersValidation(t *testing.T) {
 			Enabled: true, URL: "http://127.0.0.1:8080", MachineID: 9, Token: "t", MachineNodes: true,
 			NodeControllers: map[int]*node.Config{173: nil},
 		}
-		err := pc.validate()
+		err := pc.Validate()
 		if err == nil || !strings.Contains(err.Error(), "must not be empty") {
 			t.Fatalf("err = %v", err)
 		}

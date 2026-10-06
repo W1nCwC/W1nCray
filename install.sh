@@ -28,6 +28,9 @@ REPO="${W1NCRAY_REPO:-W1nCwC/W1nCray}"
 ROOT="${W1NCRAY_ROOT:-}"
 CONF_DIR="$ROOT/etc/W1nCray"
 CONF="$CONF_DIR/config.yml"
+# The agent's own configuration (D1). It wins as a whole over any Agent: block
+# left in config.yml, so the installer writes it here and never into config.yml.
+AGENT_CONF="$CONF_DIR/agent.yml"
 ENVFILE="$CONF_DIR/install.env"
 XRAYR_DIR="${XRAYR_DIR:-$ROOT/etc/XrayR}"
 XRAYR_UNIT="XrayR"
@@ -411,8 +414,8 @@ Type=simple
 User=root
 WorkingDirectory=@CONF_DIR@
 ExecStart=@BIN@ -c @CONF@
-Restart=on-failure
-RestartSec=10
+Restart=always
+RestartSec=5
 LimitNOFILE=1048576
 Environment=XRAY_LOCATION_ASSET=@CONF_DIR@
 
@@ -820,31 +823,79 @@ static_node_ids() {
 	printf '%s' "${_ids% }"
 }
 
-# panel_config DEST URL ID LO HI TOKENFILE ALLOW_HTTP writes the machine-mode
-# config. Every string value is quoted; numbers stay bare.
+# panel_config DEST writes the xray side of the machine-mode config. The agent's
+# own configuration lives in agent.yml (agent_config below); config.yml never
+# carries an Agent: block any more (D1, ruling 1).
 panel_config() {
 	{
 		printf 'Log: {Level: info}\n'
-		printf 'Agent:\n'
-		printf '  Enabled: true\n'
-		printf '  StateDir: %s\n' "$(yaml_dq "$CONF_DIR/state")"
-		printf '  Policy:\n'
-		printf '    AllowListen: ["0.0.0.0"]\n'
-		printf '    PortRange: [%s, %s]\n' "$4" "$5"
+	} >"$1"
+}
+
+# agent_config DEST URL ID LO HI TOKENFILE ALLOW_HTTP NOTERMINAL writes agent.yml.
+# It is atomic (temporary file + mv in the same directory) and an existing
+# agent.yml is backed up first: the file takes part in LoadConfig, so a
+# half-written one would keep the service from starting.
+agent_config() {
+	_dest="$1"
+	_tmp="$(mktemp "$CONF_DIR/.agent.yml.XXXXXX")" || die "无法在 $CONF_DIR 创建临时文件"
+	{
+		printf '# W1nCray agent configuration (agent.yml).\n'
+		printf '# This file wins as a whole over the Agent: block of config.yml, which is ignored.\n'
+		printf '# The interactive terminal is ON by default; Terminal: {Enabled: false} turns it off locally.\n'
+		printf 'Enabled: true\n'
+		printf 'StateDir: %s\n' "$(yaml_dq "$CONF_DIR/state")"
+		printf 'Policy:\n'
+		printf '  AllowListen: ["0.0.0.0"]\n'
+		printf '  PortRange: [%s, %s]\n' "$4" "$5"
 		# No AllowEngines: an empty list means "no restriction", so instances
 		# the panel pushes (gost/frp/realm included) are accepted when their
 		# signed manifest makes them available. A hard-coded ["xray"] would
 		# reject them.
-		printf '  Panel:\n'
-		printf '    Enabled: true\n'
-		printf '    URL: %s\n' "$(yaml_dq "$2")"
-		printf '    MachineID: %s\n' "$3"
-		printf '    TokenFile: %s\n' "$(yaml_dq "$6")"
-		if [ "$7" -eq 1 ]; then
-			printf '    AllowInsecureHTTP: true\n'
+		if [ "$8" -eq 1 ]; then
+			printf 'Terminal: {Enabled: false}\n'
 		fi
-		printf '    MachineNodes: true\n'
-	} >"$1"
+		printf 'Panel:\n'
+		printf '  Enabled: true\n'
+		printf '  URL: %s\n' "$(yaml_dq "$2")"
+		printf '  MachineID: %s\n' "$3"
+		printf '  TokenFile: %s\n' "$(yaml_dq "$6")"
+		if [ "$7" -eq 1 ]; then
+			printf '  AllowInsecureHTTP: true\n'
+		fi
+		printf '  MachineNodes: true\n'
+	} >"$_tmp" || {
+		rm -f "$_tmp"
+		die "写入 agent.yml 失败"
+	}
+	chmod 600 "$_tmp" 2>/dev/null || true
+	if [ -f "$_dest" ]; then
+		_bak="$_dest.bak-$(date +%Y%m%d-%H%M%S)"
+		_i=1
+		while [ -e "$_bak" ]; do
+			_bak="$_dest.bak-$(date +%Y%m%d-%H%M%S)-$_i"
+			_i=$((_i + 1))
+		done
+		cp "$_dest" "$_bak" || {
+			rm -f "$_tmp"
+			die "备份 $_dest 失败"
+		}
+		chmod 600 "$_bak" 2>/dev/null || true
+		green "已备份原有 agent.yml 到 $_bak"
+	fi
+	mv "$_tmp" "$_dest" || {
+		rm -f "$_tmp"
+		die "替换 $_dest 失败"
+	}
+}
+
+# agent_panel_linked FILE: true when FILE is an agent.yml that already links to
+# a panel (a top-level Panel: block with Enabled: true). Such a file is live
+# configuration and is never overwritten by the installer.
+agent_panel_linked() {
+	[ -f "$1" ] || return 1
+	sed -n '/^Panel:/,/^[^[:space:]#]/p' "$1" 2>/dev/null |
+		grep -q '^[[:space:]]*Enabled:[[:space:]]*true'
 }
 
 # panel_hint URL ID PENDING tells the admin the machine is linked. It never
@@ -871,6 +922,7 @@ cmd_install() {
 	_token_file=""
 	_port_range=""
 	_allow_http=0
+	_noterminal=0
 	_panel_pending=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -933,6 +985,10 @@ cmd_install() {
 			;;
 		--allow-http)
 			_allow_http=1
+			shift
+			;;
+		--noterminal)
+			_noterminal=1
 			shift
 			;;
 		--port-range)
@@ -1001,9 +1057,12 @@ cmd_install() {
 		esac
 
 		_panel="$(panel_url "$_panel" "$_allow_http")" || exit 1
-	elif [ -n "$_port_range" ] || [ "$_allow_http" -eq 1 ]; then
-		die "--port-range 与 --allow-http 只在 --panel 机器模式下有意义"
+	elif [ -n "$_port_range" ] || [ "$_allow_http" -eq 1 ] || [ "$_noterminal" -eq 1 ]; then
+		die "--port-range、--allow-http 与 --noterminal 只在 --panel 机器模式下有意义"
 	fi
+	# The flag is forwarded to the `W1nCray link` command the installer prints.
+	_noterminal_arg=""
+	[ "$_noterminal" -eq 1 ] && _noterminal_arg=" --noterminal"
 
 	[ -n "$_prefix" ] && BIN_DIR="$_prefix"
 	BIN="$BIN_DIR/W1nCray"
@@ -1045,12 +1104,23 @@ cmd_install() {
 			yellow "机器模式下不迁移 XrayR 配置（$XRAYR_DIR/config.yml 未被修改）；需要静态节点可稍后执行: W1nCray migrate"
 		fi
 		if [ ! -f "$CONF" ]; then
-			panel_config "$CONF" "$_panel" "$_machine" "$_panel_lo" "$_panel_hi" "$CONF_DIR/agent.token" "$_allow_http"
+			panel_config "$CONF"
 			green "已生成机器模式配置 $CONF"
-		elif has_static_nodes "$CONF"; then
-			# v0.3 static nodes: `link` migrates them to the panel, so no .new
-			# file is written and nothing is merged by hand. Only guidance is
-			# printed here; link itself is never run from the installer.
+		fi
+		if agent_panel_linked "$AGENT_CONF"; then
+			# A live agent.yml is never replaced: the operator's link would be
+			# lost. Re-linking is an explicit step (link --force backs it up).
+			_panel_pending=1
+			yellow "检测到已有 agent 配置 $AGENT_CONF（已关联面板），未覆盖它。"
+			if [ "$_noterminal" -eq 1 ]; then
+				yellow "（--noterminal 未写入：请在 $AGENT_CONF 里手工加 Terminal: {Enabled: false}，或用 W1nCray link --force --noterminal ...）"
+			fi
+			yellow "如需重新关联，请先备份并删除该文件，或执行 W1nCray link --force ...（link 会先备份）"
+		elif [ -f "$CONF" ] && has_static_nodes "$CONF"; then
+			# v0.3 static nodes: `link` migrates them (and any old Agent: block)
+			# to agent.yml, so no .new file is written and nothing is merged by
+			# hand. Only guidance is printed here; link itself is never run from
+			# the installer.
 			_panel_pending=1
 			_ids="$(static_node_ids "$CONF")"
 			yellow "检测到已有配置 $CONF，未覆盖它。"
@@ -1059,17 +1129,20 @@ cmd_install() {
 			fi
 			yellow "机器模式下节点由面板下发：请先在面板把这些 NodeID 绑定到机器 $_machine（未绑定的节点不会生效）。"
 			yellow "绑定后先看迁移计划（不会改动配置，也不会重启服务）:"
-			yellow "  W1nCray link --panel $_panel --machine $_machine --token-file $CONF_DIR/agent.token --dry-run"
+			yellow "  W1nCray link --panel $_panel --machine $_machine --token-file $CONF_DIR/agent.token$_noterminal_arg --dry-run"
 			yellow "确认计划无误后去掉 --dry-run 执行:"
-			yellow "  W1nCray link --panel $_panel --machine $_machine --token-file $CONF_DIR/agent.token"
+			yellow "  W1nCray link --panel $_panel --machine $_machine --token-file $CONF_DIR/agent.token$_noterminal_arg"
 			yellow "最后重启服务: W1nCray restart"
-			yellow "（未生成 $CONF_DIR/config.panel.yml.new：静态节点由 W1nCray link 迁移，无需手工合并 Agent 段）"
+			yellow "（agent 配置写入 $AGENT_CONF：静态节点与旧的 Agent 段都由 W1nCray link 迁移，无需手工合并）"
 		else
-			_new_conf="$CONF_DIR/config.panel.yml.new"
-			panel_config "$_new_conf" "$_panel" "$_machine" "$_panel_lo" "$_panel_hi" "$CONF_DIR/agent.token" "$_allow_http"
-			_panel_pending=1
-			yellow "检测到已有配置 $CONF，未覆盖它。"
-			yellow "新的机器模式配置已写到 $_new_conf：请把其中的 Agent 段合并进 $CONF，然后执行 W1nCray restart"
+			if [ -f "$CONF" ]; then
+				yellow "检测到已有配置 $CONF，未覆盖它（agent 配置写入 $AGENT_CONF）。"
+				if grep -q '^Agent:' "$CONF" 2>/dev/null; then
+					yellow "注意：$CONF 里还有旧的 Agent: 段；agent.yml 生效后它会被忽略（需要时用 W1nCray link 迁移）。"
+				fi
+			fi
+			agent_config "$AGENT_CONF" "$_panel" "$_machine" "$_panel_lo" "$_panel_hi" "$CONF_DIR/agent.token" "$_allow_http" "$_noterminal"
+			green "已生成 agent 配置 $AGENT_CONF（agent 配置与 config.yml 分离，无需手工合并）"
 		fi
 	elif [ ! -f "$CONF" ]; then
 		if [ -f "$XRAYR_DIR/config.yml" ]; then
@@ -1350,20 +1423,23 @@ W1nCray 管理命令
                         [--binary 文件 | --url 地址 | --version vX.Y.Z]
                         [--insecure-skip-verify]
                         [--panel 面板地址 --machine 机器ID (--token 令牌 | --token-file 文件)
-                         [--allow-http] [--port-range 20000-40000]]
+                         [--allow-http] [--port-range 20000-40000] [--noterminal]]
 
   下载的发行包必须通过 SHA256SUMS 校验，缺少 sha256sum / SHA256SUMS 或不匹配都会拒绝安装；
   明知风险仍要跳过时才加 --insecure-skip-verify（或设置 W1NCRAY_INSECURE_SKIP_VERIFY=1）。
 
 面板一键接入（机器模式）:
-  --panel 会同时写出机器模式配置：agent 启动后自动向面板领取本机器的节点与转发规则。
+  --panel 会写出 agent 配置：agent 启动后自动向面板领取本机器的节点与转发规则。
   --panel / --machine 与令牌（--token 或 --token-file，二选一）必须同时提供。
-  令牌只写入 <配置目录>/agent.token（权限 600），不会写进 config.yml、日志或子进程参数。
+  令牌只写入 <配置目录>/agent.token（权限 600），不会写进 config.yml、agent.yml、日志或子进程参数。
+  agent 自己的配置写在 <配置目录>/agent.yml（它整体覆盖 config.yml 里遗留的 Agent: 段）：
+  config.yml 只保留 xray 内核的配置。已有的 agent.yml 若已关联面板则不会被覆盖（重复安装幂等）。
   面板地址必须是 https://；仅本机回环地址（localhost / 127.x / ::1）可用明文 http://，
   非回环的 http:// 必须显式加 --allow-http（令牌会明文传输，仅限可信网络）。
   --port-range 指定允许监听的端口区间，默认 20000-40000。
-  若 config.yml 已存在则不会覆盖：没有静态节点时新配置写到 <配置目录>/config.panel.yml.new，请手工合并；
-  已有静态 Nodes 时按提示先在面板绑定这些节点，再用 W1nCray link ... --dry-run 迁移（link 由你手动执行）。
+  --noterminal 在本机关闭交互终端（终端默认开启）；它同时透传给提示里的 W1nCray link 命令。
+  已有静态 Nodes 时按提示先在面板绑定这些节点，再用 W1nCray link ... --dry-run 迁移
+  （link 把静态节点与旧的 Agent: 段迁移到 agent.yml，由你手动执行）。
 EOF
 }
 

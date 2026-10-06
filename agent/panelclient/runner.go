@@ -28,6 +28,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/wsproto"
 )
 
 // Timing defaults and limits.
@@ -60,9 +61,21 @@ type API interface {
 	Report(ctx context.Context, req ReportRequest) (ReportResponse, error)
 	CommandResult(ctx context.Context, req CommandResultRequest) error
 	Manifest(ctx context.Context, req ManifestRequest) (ManifestResponse, error)
+	Blob(ctx context.Context, req BlobRequest) (BlobResponse, error)
 }
 
 var _ API = (*Client)(nil)
+
+// CommandRunner executes the non-trivial command types (kernel_*, self_update,
+// file_*, files_apply). The Runner owns the whitelist's built-in types
+// (refresh, dump_state), the expiry check and the id de-duplication; it hands
+// everything else to this interface, which answers "unsupported command" for a
+// type it does not know. A nil runner leaves every other type answered with
+// "unsupported command", exactly like before the operations framework existed
+// (design section 2.1).
+type CommandRunner interface {
+	Execute(ctx context.Context, c Command) (status string, result json.RawMessage)
+}
 
 // Applier is what the Runner needs from the agent runtime (a
 // *reconcile.Reconciler behind a thin adapter in production).
@@ -99,6 +112,14 @@ type RunnerOptions struct {
 	// Kernels returns the installed external kernels by name and version; it
 	// is called on every pull and may be nil.
 	Kernels func() map[string]string
+	// KernelsList returns the structured installed-kernel list sent as
+	// "kernel_entries" in /config, /report and the ack report (design section
+	// 3.3). It is optional; a failure or an empty list omits the field and
+	// never blocks the pull or the report.
+	KernelsList func() ([]wsproto.KernelEntry, error)
+	// Commands executes the command types the Runner does not implement
+	// itself. It may be nil (unsupported command, as before).
+	Commands CommandRunner
 	// PullInterval and ReportInterval default to 30s and are clamped to
 	// [MinInterval, MaxInterval].
 	PullInterval   time.Duration
@@ -114,6 +135,22 @@ type RunnerOptions struct {
 	// Host samples the machine load; nil uses the machine's real sampler. It
 	// may return nil when nothing is available.
 	Host func() *HostStat
+	// SuppressHost, when non-nil, is consulted before every report: a true
+	// result omits the host payload. The WebSocket telemetry channel carries
+	// the same numbers, and two writers would interleave on the panel
+	// (docs/WS-PROTOCOL.md section 3, design section 3.3). A nil function
+	// never suppresses.
+	SuppressHost func() bool
+	// Features is the capability list sent in /config; it must be exactly the
+	// list the agent declared in hello.capabilities (ruling 1). Nil sends no
+	// "features" key.
+	Features []string
+	// FeaturesFunc, when set, is called for every pull and takes precedence
+	// over Features. The capability list can change while the agent runs (a
+	// signed manifest arriving later is what makes the kernel commands
+	// servable), and the panel must always see the list the current hello
+	// declares. An empty result sends no "features" key.
+	FeaturesFunc func() []string
 	// Manifest, when non-nil, enables the signed kernel manifest sync loop:
 	// the Runner fetches GET /manifest and hands the body to this sink, which
 	// verifies it locally. A nil sink disables the loop entirely.
@@ -125,6 +162,10 @@ type RunnerOptions struct {
 	// success. It defaults to DefaultManifestInterval and is clamped to
 	// [MinManifestInterval, MaxManifestInterval].
 	ManifestInterval time.Duration
+	// OnConnected, when non-nil, is called exactly once, from the pull loop,
+	// after the panel answered a /config request: the link is proven. The
+	// self-update start-up watchdog uses it to confirm a committed update.
+	OnConnected func()
 }
 
 // Runner pulls the desired state, applies it, acknowledges the outcome,
@@ -136,17 +177,27 @@ type Runner struct {
 	clock Clock
 	rand  func() float64
 
-	version string
-	engines []string
-	kernels func() map[string]string
-	pull    time.Duration
-	report  time.Duration
-	host    func() *HostStat
-	fixedID string
+	version       string
+	engines       []string
+	kernels       func() map[string]string
+	kernelEntries func() ([]wsproto.KernelEntry, error)
+	commands      CommandRunner
+	pull          time.Duration
+	report        time.Duration
+	host          func() *HostStat
+	// suppressHost is consulted on every report; features travels in /config.
+	suppressHost func() bool
+	features     []string
+	featuresFunc func() []string
+	fixedID      string
 
 	manifest      ManifestSink
 	manifestPath  string
 	manifestEvery time.Duration
+
+	// onConnected is called once, on the first successful pull.
+	onConnected   func()
+	connectedOnce sync.Once
 
 	refresh chan struct{} // capacity 1: coalesces refresh requests
 
@@ -184,13 +235,19 @@ func NewRunner(api API, app Applier, o RunnerOptions) (*Runner, error) {
 		version:       o.AgentVersion,
 		engines:       append([]string(nil), o.Engines...),
 		kernels:       o.Kernels,
+		kernelEntries: o.KernelsList,
+		commands:      o.Commands,
 		pull:          ClampInterval(o.PullInterval),
 		report:        ClampInterval(o.ReportInterval),
 		host:          o.Host,
+		suppressHost:  o.SuppressHost,
+		features:      append([]string(nil), o.Features...),
+		featuresFunc:  o.FeaturesFunc,
 		fixedID:       o.InstanceID,
 		manifest:      o.Manifest,
 		manifestPath:  o.ManifestPersistPath,
 		manifestEvery: ClampManifestInterval(o.ManifestInterval),
+		onConnected:   o.OnConnected,
 		refresh:       make(chan struct{}, 1),
 		seen:          map[string]struct{}{},
 		inflight:      map[string]bool{},
@@ -264,6 +321,11 @@ func newInstanceID() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// NewInstanceID returns the random id the Runner uses for one run. It is
+// exported so a caller that also opens the WebSocket channel can report the
+// same instance id in hello.instance_id as the HTTP link.
+func NewInstanceID() string { return newInstanceID() }
 
 // ---- loops -----------------------------------------------------------------
 
@@ -385,6 +447,44 @@ func (r *Runner) have() (int64, string) {
 	return r.haveRev, r.haveHash
 }
 
+// kernelEntryList collects the structured kernel list, or nil when it is
+// unavailable. A collection failure is a missing field, never a failed pull or
+// report (design section 3.3).
+func (r *Runner) kernelEntryList() []wsproto.KernelEntry {
+	if r.kernelEntries == nil {
+		return nil
+	}
+	list, err := r.kernelEntries()
+	if err != nil {
+		r.log.Debugf("panel: cannot collect the structured kernel list: %v", err)
+		return nil
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	return list
+}
+
+// reconcileKernelEntries converts the wire kernel entries into the local mirror
+// type the reconciler's report uses, so agent/reconcile needs no wire import
+// (design section 2.1).
+func reconcileKernelEntries(in []wsproto.KernelEntry) []reconcile.KernelEntry {
+	out := make([]reconcile.KernelEntry, len(in))
+	for i, e := range in {
+		out[i] = reconcile.KernelEntry{
+			Name:        e.Name,
+			Version:     e.Version,
+			Current:     e.Current,
+			Previous:    e.Previous,
+			Path:        e.Path,
+			SizeBytes:   e.SizeBytes,
+			InstalledAt: e.InstalledAt,
+			InUse:       e.InUse,
+		}
+	}
+	return out
+}
+
 // pullOnce is one POST /config round, including the apply and the ack.
 func (r *Runner) pullOnce(ctx context.Context) error {
 	// An outcome the panel has not seen yet goes first: it is the freshest
@@ -403,12 +503,28 @@ func (r *Runner) pullOnce(ctx context.Context) error {
 		Platform:     Platform{OS: runtime.GOOS, Arch: runtime.GOARCH},
 		Engines:      append([]string{}, r.engines...),
 	}
+	if r.featuresFunc != nil {
+		// Recomputed every pull: a capability that appears while the agent
+		// runs (the kernel installer gets a signed manifest) must reach the
+		// panel without a restart.
+		if f := r.featuresFunc(); len(f) > 0 {
+			req.Features = append([]string{}, f...)
+		}
+	} else if len(r.features) > 0 {
+		req.Features = append([]string{}, r.features...)
+	}
 	if r.kernels != nil {
 		req.Kernels = r.kernels()
 	}
+	req.KernelEntries = r.kernelEntryList()
 	resp, err := r.api.Config(ctx, req)
 	if err != nil {
 		return err
+	}
+	if r.onConnected != nil {
+		// The panel answered: the link is proven. Called at most once, even
+		// when every later pull succeeds too.
+		r.connectedOnce.Do(r.onConnected)
 	}
 
 	if !resp.Unchanged {
@@ -470,6 +586,12 @@ func (r *Runner) applyResponse(ctx context.Context, resp ConfigResponse) error {
 	}
 	if rep.Instances == nil {
 		rep.Instances = []reconcile.InstanceReport{}
+	}
+	// The ack carries the same structured kernel list as /report, so a panel
+	// that just applied a revision sees what is installed without waiting for
+	// the next report.
+	if entries := r.kernelEntryList(); len(entries) > 0 {
+		rep.KernelEntries = reconcileKernelEntries(entries)
 	}
 	rep = scrubReport(rep, secrets)
 
@@ -565,11 +687,17 @@ func (r *Runner) reportOnce(ctx context.Context) error {
 		AppliedHash:     hash,
 		Health:          health,
 		Instances:       mergeInstances(last, hasLast, counters),
-		Host:            r.host(),
+	}
+	// While the WebSocket telemetry channel is up it carries the load; the
+	// HTTP report then omits "host" entirely so the panel has one writer at a
+	// time (design section 3.3). A disconnected WebSocket restores it at once.
+	if r.suppressHost == nil || !r.suppressHost() {
+		req.Host = r.host()
 	}
 	if hasLast && len(last.Kernels) > 0 {
 		req.Kernels = last.Kernels
 	}
+	req.KernelEntries = r.kernelEntryList()
 	resp, err := r.api.Report(ctx, req)
 	if err != nil {
 		return err
@@ -630,26 +758,135 @@ func (r *Runner) handleCommands(ctx context.Context, cmds []Command) {
 	}
 }
 
+// ErrCommandAnswered is returned by ExecuteCommand for a command id that was
+// already handled (on either channel): the caller must not answer it again, or
+// the panel would see two results for one command id (ruling 7).
+var ErrCommandAnswered = errors.New("panelclient: command already answered")
+
+// ExecuteCommand runs one whitelisted command and returns its result without
+// sending it: the caller delivers the result and then calls MarkAnswered. It is
+// the single entry point shared by the HTTP command lists and the WebSocket cmd
+// frames, so the whitelist, the expiry check and the id de-duplication exist
+// exactly once (design section 3.4).
+//
+// expiresAt is an absolute unix second (0 = no expiry). ErrCommandAnswered
+// means the id was already executed and must not be executed or answered again.
+func (r *Runner) ExecuteCommand(ctx context.Context, id, typ string, args json.RawMessage, expiresAt int64) (string, json.RawMessage, error) {
+	if id == "" {
+		// A command without an id cannot be de-duplicated or answered.
+		return "", nil, ErrCommandAnswered
+	}
+	r.mu.Lock()
+	if _, dup := r.seen[id]; dup || r.inflight[id] {
+		r.mu.Unlock()
+		return "", nil, ErrCommandAnswered
+	}
+	r.inflight[id] = true
+	r.mu.Unlock()
+
+	// The slot is released here for a command that finished inline, and by
+	// MarkAnswered/ReleaseCommand for a long one. The deferred release also
+	// covers a handler that panics, so a crash cannot wedge an id forever.
+	keepInflight := false
+	defer func() {
+		if keepInflight {
+			return
+		}
+		r.mu.Lock()
+		delete(r.inflight, id)
+		r.mu.Unlock()
+	}()
+
+	status, result := r.execute(ctx, Command{ID: id, Type: typ, Args: args, ExpiresAt: expiresAt})
+	if status == ResultAccepted {
+		// A long command owns the id until its final result is delivered: the
+		// accepted answer and the final one share the id, and a redelivery in
+		// between must not run the command twice (design section 3.1 point 5).
+		// MarkAnswered (or ReleaseCommand) clears the slot.
+		keepInflight = true
+	}
+	return status, result, nil
+}
+
+// MarkAnswered records that the result of id reached the panel, so a
+// redelivery on either channel is ignored. It also releases the in-flight slot
+// a long command held. A result that could not be delivered must not be
+// marked: the panel is expected to send the command again.
+func (r *Runner) MarkAnswered(id string) {
+	r.mu.Lock()
+	delete(r.inflight, id)
+	r.mu.Unlock()
+	r.remember(id)
+}
+
+// ReleaseCommand forgets an in-flight id without remembering it, so a
+// redelivery runs the command again. The channels call it when a result they
+// were meant to deliver could not be sent (a long command's final result in
+// particular): keeping the slot would make the panel's redelivery a no-op and
+// leave the command unanswered forever.
+func (r *Runner) ReleaseCommand(id string) {
+	r.mu.Lock()
+	delete(r.inflight, id)
+	r.mu.Unlock()
+}
+
+// DeliverResult sends the final result of a long command (one that already
+// answered "accepted" over the same or the other channel) and remembers the
+// id. A delivery that fails releases the id so the panel's redelivery runs the
+// command again.
+func (r *Runner) DeliverResult(ctx context.Context, id, status string, result json.RawMessage) error {
+	err := r.api.CommandResult(ctx, CommandResultRequest{
+		Schema:     Schema,
+		InstanceID: r.id(),
+		ID:         id,
+		Status:     status,
+		Result:     result,
+	})
+	if err != nil {
+		r.ReleaseCommand(id)
+		return err
+	}
+	r.MarkAnswered(id)
+	return nil
+}
+
+// RequestRefresh wakes the pull loop, so the desired state is pulled now
+// instead of at the end of the interval (the "refresh" command and the
+// "desired" hint).
+func (r *Runner) RequestRefresh() {
+	select {
+	case r.refresh <- struct{}{}:
+	default: // a refresh is already pending
+	}
+}
+
+// InstanceID returns the id this link uses: the configured one before Run, the
+// generated one once it is running ("" when neither exists yet). The WebSocket
+// hello reports the same id, so both channels identify one agent run.
+func (r *Runner) InstanceID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.instanceID != "" {
+		return r.instanceID
+	}
+	return r.fixedID
+}
+
 func (r *Runner) runCommand(ctx context.Context, c Command) {
 	if c.ID == "" {
 		r.log.Warnf("panel: ignoring a command without an id")
 		return
 	}
-	r.mu.Lock()
-	if _, dup := r.seen[c.ID]; dup || r.inflight[c.ID] {
-		r.mu.Unlock()
+	status, result, err := r.ExecuteCommand(ctx, c.ID, c.Type, c.Args, c.ExpiresAt)
+	if errors.Is(err, ErrCommandAnswered) {
+		// Already executed (or unanswerable): never execute or answer twice.
 		return
 	}
-	r.inflight[c.ID] = true
-	r.mu.Unlock()
-	defer func() {
-		r.mu.Lock()
-		delete(r.inflight, c.ID)
-		r.mu.Unlock()
-	}()
-
-	status, result := r.execute(ctx, c)
-	err := r.api.CommandResult(ctx, CommandResultRequest{
+	if err != nil {
+		r.log.Warnf("panel: command %q not executed: %v", c.ID, err)
+		return
+	}
+	err = r.api.CommandResult(ctx, CommandResultRequest{
 		Schema:     Schema,
 		InstanceID: r.id(),
 		ID:         c.ID,
@@ -660,7 +897,12 @@ func (r *Runner) runCommand(ctx context.Context, c Command) {
 		r.log.Warnf("panel: result of command %q not delivered: %v", c.ID, err)
 		return
 	}
-	r.remember(c.ID)
+	if status == ResultAccepted {
+		// Only the accepted half is on the wire: the id stays in flight until
+		// the final result of the long command is delivered.
+		return
+	}
+	r.MarkAnswered(c.ID)
 }
 
 // execute runs one command and returns its status and result.
@@ -671,18 +913,21 @@ func (r *Runner) execute(ctx context.Context, c Command) (string, json.RawMessag
 	}
 	switch c.Type {
 	case CmdRefresh:
-		select {
-		case r.refresh <- struct{}{}:
-		default: // a refresh is already pending
-		}
+		r.RequestRefresh()
 		rev, _ := r.have()
 		return ResultDone, mustJSON(map[string]int64{"revision": rev})
 	case CmdDumpState:
 		return ResultDone, r.dumpState(ctx)
-	default:
-		r.log.Warnf("panel: refusing unsupported command type %q", c.Type)
-		return ResultFailed, mustJSON(map[string]string{"error": "unsupported command"})
 	}
+	// Everything else is the operations registry's business: it holds the
+	// whitelist of the types it serves and answers "unsupported command" for
+	// the rest (design section 2.1). Without a registry the answer is the same
+	// as before the registry existed.
+	if r.commands != nil {
+		return r.commands.Execute(ctx, c)
+	}
+	r.log.Warnf("panel: refusing unsupported command type %q", c.Type)
+	return ResultFailed, mustJSON(map[string]string{"error": "unsupported command"})
 }
 
 // dumpState is the result of the dump_state command: the last report and the
