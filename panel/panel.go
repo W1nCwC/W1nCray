@@ -60,7 +60,11 @@ func (p *Panel) Start() error {
 	if err := p.start(); err != nil {
 		return err
 	}
-	go p.watch()
+	ready := make(chan struct{})
+	go p.watch(ready)
+	// Returning before the directory watches exist would lose a config change
+	// made right after Start (the watcher registers asynchronously).
+	<-ready
 	return nil
 }
 
@@ -269,8 +273,11 @@ func (p *Panel) reload(reason string) {
 }
 
 // watch handles reload requests from nodes and changes of the config files.
-func (p *Panel) watch() {
+func (p *Panel) watch(ready chan<- struct{}) {
 	defer close(p.done)
+	var readyOnce sync.Once
+	signalReady := func() { readyOnce.Do(func() { close(ready) }) }
+	defer signalReady()
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Warnf("config watcher unavailable: %v", err)
@@ -288,6 +295,7 @@ func (p *Panel) watch() {
 			_ = w.Add(filepath.Dir(abs))
 		}
 	}
+	signalReady()
 	var events chan fsnotify.Event
 	var errs chan error
 	if w != nil {

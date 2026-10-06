@@ -29,7 +29,8 @@ const (
 // ---- fake clock --------------------------------------------------------------
 
 type waiter struct {
-	at time.Time // the fake instant it fires
+	d  time.Duration // the duration it was registered with
+	at time.Time     // the fake instant it fires
 	ch chan time.Time
 }
 
@@ -59,7 +60,7 @@ func (c *fakeClock) set(t time.Time) {
 func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	w := &waiter{at: c.now.Add(d), ch: make(chan time.Time, 1)}
+	w := &waiter{d: d, at: c.now.Add(d), ch: make(chan time.Time, 1)}
 	c.waits = append(c.waits, d)
 	c.pending = append(c.pending, w)
 	c.releaseReadyLocked()
@@ -80,12 +81,15 @@ func (c *fakeClock) waitsCopy() []time.Duration {
 // eventually below fails the test with a clear message.
 func (c *fakeClock) fire(t *testing.T, d time.Duration) {
 	t.Helper()
-	eventually(t, fmt.Sprintf("a wait of %s (or less, due now after the fire) to be armed", d), func() bool {
+	eventually(t, fmt.Sprintf("a wait of %s to be armed", d), func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		limit := c.now.Add(d)
+		// An unreleased wait of exactly d. A released waiter is removed from
+		// pending, so a match is one the runner armed after the previous fire.
+		// Matching "any waiter due by now+d" is wrong: the report loop's longer
+		// wait would satisfy it while the pull loop has not rearmed yet.
 		for _, w := range c.pending {
-			if !w.at.After(limit) {
+			if w.d == d {
 				return true
 			}
 		}
