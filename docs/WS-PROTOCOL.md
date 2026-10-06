@@ -102,3 +102,36 @@ A browser may hold at most one terminal session per machine; the panel enforces 
 - A downsampled `telemetry` history (one row / 30 s / machine, 7 days, pruned by a scheduled job).
 - Audit rows (never the terminal bytes): session start/stop (who, machine, ip, duration, byte counts), every file
   write/delete (path, sha256, size), every kernel install/remove, every `self_update`.
+
+
+## 7 Rulings v1.1 (from the implementation-design review; these override anything above that disagrees)
+1. **Capability gating.** The agent's `hello.capabilities` is the feature list. The HTTP `config` request carries the same
+   list as `features`. The panel puts a new `desired` key (`files`, later others) into a revision **only for an agent that
+   declared the matching capability**: the agent decodes desired strictly, so an unknown key would reject the whole revision.
+   Phase 1 adds no desired key.
+2. **`telemetry.conns` may be `null`** (not readable on this platform); `components` of the embedded engine (`xray`) carry
+   no `pid/cpu_pct/rss` (it shares the agent process).
+3. **No replay.** `telemetry`/`components` are live data: nothing is queued while disconnected, nothing is resent on reconnect.
+4. **`cpu_cores`** = physical cores, **`cpu_threads`** = logical CPUs.
+5. **`hint` for something the agent does not support** is answered with `error{code:"not_supported"}`, never silently ignored.
+6. **`policy.modules.xray_nodes` is a LOCAL gate** (agent.yml, default on). The panel asks for nodes with `hint{what:"nodes"}`;
+   the agent then pulls the machine's node list: empty = stop all node controllers, otherwise start those (per node, no full reload).
+7. **Long commands** answer immediately with `cmd.result{status:"accepted"}` (within `ttl_s`), then a final `done|failed`.
+   The panel keeps the command `pending` until the final result; the WS push never marks it `sent` (HTTP fallback may deliver
+   the same command again: the agent de-duplicates by command id).
+8. **Size limits:** `file_read.limit` and `file_write` payload are each **≤ 128 KiB raw** (fits the 256 KiB frame after base64).
+   Anything larger goes through the managed-files blob download over HTTPS.
+9. **New commands:** `files_validate {}` (stage + `core.CheckFiles`/`LoadConfig`, no write, no reload) and
+   `files_rollback {}` (restore the last good managed files and reload). `files_apply` answers `accepted`, then
+   `done{applied_pending:true}` once the reload was initiated; the **panel** judges health (a `hello`/`telemetry` within 60 s and
+   `components.xray.state=running`) and sends `files_rollback` otherwise.
+10. **Events:** `self_update.started|rolled_back|stalled`, `kernel.installed|removed`, `files.applied|rolled_back`.
+11. **Self-update lives in the signed manifest as a `kernels` entry named `agent`** (reserved name: `kernel_install/remove/rollback`
+    refuse it, the panel's kernel list hides it; only `self_update` uses it). It reuses all manifest validation and revocation.
+    "New process cannot start" is handled by a watchdog on the host (service manager `Restart=always` + a start-up self-check),
+    "started but cannot reach the panel" is only reported (`self_update.stalled`), never auto-rolled back.
+12. **High-risk operations** (issuing a terminal ticket, `self_update`, writes outside managed files) require the admin to
+    re-enter their password (`confirm_password`, checked server side, rate limited).
+13. **Local gates the panel can never relax:** `Terminal.Enabled` (default false), `Files.Roots`, `Files.Unrestricted`,
+    `Files.AllowExec` (refuse writes with an exec bit), `Modules.XrayNodes`. `agent.yml` and the agent state files
+    (`desired.json`, `last_good.json`) are never inside any root.

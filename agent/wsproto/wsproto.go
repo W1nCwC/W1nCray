@@ -136,7 +136,7 @@ type Telemetry struct {
 	Swap    Usage     `json:"swap"`
 	Disks   []DiskUse `json:"disks"`
 	Net     Net       `json:"net"`
-	Conns   Conns     `json:"conns"`
+	Conns   *Conns    `json:"conns"` // null when unreadable on this platform
 	Procs   int       `json:"procs"`
 	UptimeS int64     `json:"uptime_s"`
 }
@@ -229,7 +229,7 @@ type Cmd struct {
 
 // CmdResult answers a Cmd (same envelope id).
 type CmdResult struct {
-	Status string `json:"status"` // done | failed
+	Status string `json:"status"` // accepted | done | failed
 	Result any    `json:"result,omitempty"`
 	Error  string `json:"error,omitempty"`
 }
