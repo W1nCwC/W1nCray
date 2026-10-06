@@ -25,7 +25,7 @@ kernels:
     run:
       binary: W1nCray
       version_cmd: ["version"]
-      version_regex: "W1nCray ([0-9][0-9.]*)"
+      version_regex: "W1nCray v?([0-9][0-9.]*)"
     local:
       - {file: dist/W1nCray-linux-amd64.gz,    target: linux/amd64,    to: W1nCray}
       - {file: dist/W1nCray-linux-386.gz,      target: linux/386,      to: W1nCray, variant: softfloat}
