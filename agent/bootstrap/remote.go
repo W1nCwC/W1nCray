@@ -36,6 +36,17 @@ type RemoteOptions struct {
 	// desired state, a secret or the token.
 	Log driver.Logger
 
+	// ManifestSync enables the signed kernel manifest sync loop: the link
+	// fetches GET /manifest and the runtime's kernel Ensurer verifies it
+	// locally before it is used.
+	ManifestSync bool
+	// ManifestPersistPath is where an accepted manifest is persisted
+	// (see bootstrap.PersistedManifestPath). Empty disables persistence.
+	ManifestPersistPath string
+	// ManifestInterval is how often the manifest is re-fetched; the runner
+	// defaults and clamps it.
+	ManifestInterval time.Duration
+
 	// HTTP replaces the HTTP client (tests).
 	HTTP *http.Client
 }
@@ -81,14 +92,22 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	if log == nil {
 		log = r.log
 	}
-	runner, err := panelclient.NewRunner(client, remoteApplier{r}, panelclient.RunnerOptions{
+	ro := panelclient.RunnerOptions{
 		AgentVersion:   o.AgentVersion,
 		Engines:        r.engineNames(),
 		Kernels:        r.externalKernels,
 		PullInterval:   o.PullInterval,
 		ReportInterval: o.ReportInterval,
 		Log:            log,
-	})
+	}
+	// The kernel Ensurer is the local trust root of the manifest sync: the
+	// panel's bytes are only accepted after its signature check.
+	if o.ManifestSync && r.Kernels != nil {
+		ro.Manifest = r.Kernels
+		ro.ManifestPersistPath = o.ManifestPersistPath
+		ro.ManifestInterval = o.ManifestInterval
+	}
+	runner, err := panelclient.NewRunner(client, remoteApplier{r}, ro)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: panel link: %w", err)
 	}

@@ -188,7 +188,7 @@ func (p *Panel) start() (err error) {
 			if cfg.Agent.DesiredPath != "" {
 				p.applyAgentDesiredLocked(cfg.Agent.DesiredPath, rt)
 			}
-			p.startRemoteLocked(cfg.Agent.Panel, rt)
+			p.startRemoteLocked(cfg.Agent, rt)
 		}
 	}
 	// Watch the machine's node list so a node added or removed on the panel is
@@ -366,17 +366,18 @@ var AgentVersion = "dev"
 // startRemoteLocked links the agent to the panel when it is configured. A
 // problem with the link (unreadable token file, bad options) is logged and
 // leaves the agent running on its local state. The caller must hold p.mu.
-func (p *Panel) startRemoteLocked(pc *AgentPanelConfig, rt *bootstrap.Runtime) {
-	if pc == nil || !pc.Enabled {
+func (p *Panel) startRemoteLocked(a *AgentConfig, rt *bootstrap.Runtime) {
+	if a == nil || a.Panel == nil || !a.Panel.Enabled {
 		return
 	}
+	pc := a.Panel
 	token, err := pc.ResolveToken()
 	if err != nil {
 		log.Errorf("agent: panel link not started: %v", err)
 		return
 	}
 	pull, report := pc.Intervals()
-	stop, err := rt.StartRemote(context.Background(), bootstrap.RemoteOptions{
+	o := bootstrap.RemoteOptions{
 		URL:               pc.URL,
 		MachineID:         pc.MachineID,
 		Token:             token,
@@ -385,13 +386,25 @@ func (p *Panel) startRemoteLocked(pc *AgentPanelConfig, rt *bootstrap.Runtime) {
 		ReportInterval:    report,
 		AgentVersion:      AgentVersion,
 		Log:               log.StandardLogger(),
-	})
+	}
+	// The panel may also serve the signed kernel manifest; the agent verifies
+	// it locally before it is used, so a compromised panel cannot push a
+	// malicious kernel.
+	if pc.ManifestSyncEnabled() {
+		o.ManifestSync = true
+		o.ManifestPersistPath = bootstrap.PersistedManifestPath(a.StateDir)
+		o.ManifestInterval = pc.ManifestInterval()
+	}
+	stop, err := rt.StartRemote(context.Background(), o)
 	if err != nil {
 		log.Errorf("agent: panel link not started: %v", err)
 		return
 	}
 	p.remoteStop = stop
 	log.Infof("agent: linked to the panel %s as machine %d", pc.URL, pc.MachineID)
+	if o.ManifestSync {
+		log.Infof("agent: kernel manifest sync enabled (every %s, persisted to %s)", o.ManifestInterval, o.ManifestPersistPath)
+	}
 }
 
 func (p *Panel) shutdown() {

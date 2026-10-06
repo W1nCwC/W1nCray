@@ -247,14 +247,15 @@ type panelSrv struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu      sync.Mutex
-	calls   []call
-	config  func(n int, req ConfigRequest) (int, string)
-	ack     func(n int, req AckRequest) int
-	report  func(n int, req ReportRequest) (int, string)
-	cmdRes  func(req CommandResultRequest) int
-	counts  map[string]int
-	hanging chan struct{} // when non-nil, every request blocks until it is closed
+	mu       sync.Mutex
+	calls    []call
+	config   func(n int, req ConfigRequest) (int, string)
+	ack      func(n int, req AckRequest) int
+	report   func(n int, req ReportRequest) (int, string)
+	cmdRes   func(req CommandResultRequest) int
+	manifest func(n int, req *http.Request) (status int, body, etag string)
+	counts   map[string]int
+	hanging  chan struct{} // when non-nil, every request blocks until it is closed
 }
 
 func newPanel(t *testing.T) *panelSrv {
@@ -320,6 +321,20 @@ func (p *panelSrv) serve(w http.ResponseWriter, r *http.Request) {
 		if f != nil {
 			status = f(req)
 		}
+	case "manifest":
+		p.mu.Lock()
+		f := p.manifest
+		p.mu.Unlock()
+		if f == nil {
+			// No manifest published: the contract's 404 answer.
+			status, body = 404, `{"error":"no_manifest"}`
+			break
+		}
+		var etag string
+		status, body, etag = f(n, r)
+		if etag != "" {
+			w.Header().Set("ETag", etag)
+		}
 	}
 	if status >= 300 && ep != "config" && ep != "report" && body == `{"ok":true}` {
 		body = `{"error":"nope","message":"refused"}`
@@ -345,6 +360,14 @@ func (p *panelSrv) setReport(f func(n int, req ReportRequest) (int, string)) {
 func (p *panelSrv) setCmdResult(f func(req CommandResultRequest) int) {
 	p.mu.Lock()
 	p.cmdRes = f
+	p.mu.Unlock()
+}
+
+// setManifest programs the GET /manifest answer. A nil handler answers the
+// contract's 404 no_manifest.
+func (p *panelSrv) setManifest(f func(n int, req *http.Request) (status int, body, etag string)) {
+	p.mu.Lock()
+	p.manifest = f
 	p.mu.Unlock()
 }
 
@@ -470,6 +493,12 @@ type hopts struct {
 	instanceID   string
 	host         func() *HostStat
 	noStart      bool
+
+	// manifest sync (disabled when manifest is nil).
+	manifest         ManifestSink
+	manifestPath     string
+	manifestInterval time.Duration
+	manifestAnswer   func(n int, req *http.Request) (status int, body, etag string)
 }
 
 // newHarness builds a Runner against a fresh contract server. By default the
@@ -494,17 +523,23 @@ func newHarness(t *testing.T, o hopts) *harness {
 		o.instanceID = runnerID
 	}
 	client := newClient(t, h.panel.srv)
+	if o.manifestAnswer != nil {
+		h.panel.setManifest(o.manifestAnswer)
+	}
 	r, err := NewRunner(client, h.app, RunnerOptions{
-		AgentVersion:   "1.2.3",
-		Engines:        []string{"gost", "realm", "xray"},
-		Kernels:        func() map[string]string { return map[string]string{"gost": "3.3.0"} },
-		PullInterval:   o.pull,
-		ReportInterval: o.report,
-		Log:            h.log,
-		Clock:          h.clock,
-		Rand:           o.rand,
-		InstanceID:     o.instanceID,
-		Host:           o.host,
+		AgentVersion:        "1.2.3",
+		Engines:             []string{"gost", "realm", "xray"},
+		Kernels:             func() map[string]string { return map[string]string{"gost": "3.3.0"} },
+		PullInterval:        o.pull,
+		ReportInterval:      o.report,
+		Log:                 h.log,
+		Clock:               h.clock,
+		Rand:                o.rand,
+		InstanceID:          o.instanceID,
+		Host:                o.host,
+		Manifest:            o.manifest,
+		ManifestPersistPath: o.manifestPath,
+		ManifestInterval:    o.manifestInterval,
 	})
 	if err != nil {
 		t.Fatal(err)

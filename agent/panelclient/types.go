@@ -170,6 +170,21 @@ type CommandResultRequest struct {
 	Result     json.RawMessage `json:"result,omitempty"`
 }
 
+// ManifestRequest is the query of GET /manifest. ETag is the entity tag of the
+// manifest the agent already accepted ("" for the first fetch); it is sent as
+// If-None-Match so an unchanged manifest answers 304.
+type ManifestRequest struct {
+	ETag string
+}
+
+// ManifestResponse is the answer of GET /manifest. NotModified is true for 304:
+// Raw and ETag are then empty and the stored manifest is still current.
+type ManifestResponse struct {
+	NotModified bool
+	Raw         []byte // the signed manifest document (200 only)
+	ETag        string // entity tag of Raw (200 only; may be empty)
+}
+
 // APIError is a non-2xx answer of the panel ({"error","message"} body).
 type APIError struct {
 	Status  int

@@ -84,6 +84,15 @@ type AgentPanelConfig struct {
 	// [10, 300] seconds.
 	PullIntervalSec   int `mapstructure:"PullIntervalSec"`
 	ReportIntervalSec int `mapstructure:"ReportIntervalSec"`
+	// ManifestSync enables the signed kernel manifest sync: the agent fetches
+	// GET /manifest from the panel and its local Ensurer verifies the
+	// signature before the manifest is used. Nil means the default (enabled
+	// whenever Panel.Enabled); set it to false to keep the panel from
+	// supplying the kernel manifest.
+	ManifestSync *bool `mapstructure:"ManifestSync"`
+	// ManifestIntervalSec is how often the manifest is re-fetched. Default
+	// 3600; clamped to [300, 86400] seconds.
+	ManifestIntervalSec int `mapstructure:"ManifestIntervalSec"`
 	// AllowInsecureHTTP permits plain http:// to a non-loopback host
 	// (development only).
 	AllowInsecureHTTP bool `mapstructure:"AllowInsecureHTTP"`
@@ -345,6 +354,19 @@ func (p *AgentPanelConfig) Intervals() (pull, report time.Duration) {
 		panelclient.ClampInterval(time.Duration(p.ReportIntervalSec) * time.Second)
 }
 
+// ManifestSyncEnabled reports whether the agent syncs the signed kernel
+// manifest from the panel. The default is on (a nil pointer), so an operator
+// has to opt out explicitly with ManifestSync: false.
+func (p *AgentPanelConfig) ManifestSyncEnabled() bool {
+	return p != nil && (p.ManifestSync == nil || *p.ManifestSync)
+}
+
+// ManifestInterval returns the manifest poll interval, defaulted (1h) and
+// clamped to [5m, 24h].
+func (p *AgentPanelConfig) ManifestInterval() time.Duration {
+	return panelclient.ClampManifestInterval(time.Duration(p.ManifestIntervalSec) * time.Second)
+}
+
 // validate checks the panel section without touching the network or the token
 // file (ResolveToken reads it when the link starts, and "W1nCray check" reads
 // it to report problems early).
@@ -366,6 +388,9 @@ func (p *AgentPanelConfig) validate() error {
 	}
 	if p.PullIntervalSec < 0 || p.ReportIntervalSec < 0 {
 		return fmt.Errorf("config: Agent.Panel.PullIntervalSec and ReportIntervalSec must not be negative")
+	}
+	if p.ManifestIntervalSec < 0 {
+		return fmt.Errorf("config: Agent.Panel.ManifestIntervalSec must not be negative")
 	}
 	// The client enforces the URL rules (https, no user info, loopback
 	// exception); a placeholder token lets it check the URL alone.
