@@ -139,6 +139,7 @@ Agent:
 |---|---|---|
 | `MachineNodes` | `false` | 打开机器模式。要求 `Agent.Enabled` 与 `Agent.Panel.Enabled`，否则配置被判无效（`MachineNodes requires Agent.Panel.Enabled` / `Agent.Panel.Enabled requires Agent.Enabled`） |
 | `NodeController` | 节点默认值（`ListenIP: 0.0.0.0`、`SendIP: 0.0.0.0`、`DNSType: AsIs`） | 机器节点共用的 `ControllerConfig`（`ListenIP`、`CertConfig`、`DisableWebSocket` …）。只写想覆盖的字段，其余回落到 `node.DefaultConfig()` |
+| `NodeControllers` | 空 | 按**面板节点 ID** 的本地覆盖（见下节），键是面板分配的节点 ID，值是一份完整的 `ControllerConfig` |
 
 行为与边界：
 
@@ -146,8 +147,56 @@ Agent:
 - **发现失败不影响静态节点**：面板不可达或令牌错误时，静态 `Nodes` 照常启动，只记一条 warn（`machine nodes: … (static nodes keep running; retrying)`），并在后台延时 30 s 通过重载机制重试。
 - **节点变化自动生效**：启动后每 60 s 查询一次节点列表的 `version`，变化即触发一次整体重载（`reloading: machine nodes changed`）：新增的节点被拉起，移除的节点被关闭。
 - **机器节点不启用 WebSocket**：面板 WS 握手会把令牌放进 URL，违反「令牌不进 URL」，所以机器节点只走 HTTP 轮询（debug 日志 `machine mode: websocket disabled, using HTTP polling`）。
-- **`W1nCray check`**：离线时打印机器 ID 与「节点由面板下发」；加 `--online` 才联网，列出节点数与列表版本。
+- **`W1nCray check`**：离线时打印机器 ID 与「节点由面板下发」；加 `--online` 才联网，列出节点数与列表版本。有本地覆盖时还会列出被覆盖的节点 ID（只有 ID，没有任何内容）。
 - 机器节点的 tag 形如 `node<节点ID>@machine<机器ID>`，与静态节点的 `node<节点ID>@<主机>` 不会重名。
+
+#### 按节点本地覆盖（`NodeControllers`）
+
+同一台机器上的三个节点，本地配置往往并不相同：有的要 PROXY protocol，有的要自己的证书，有的要 DNS/REALITY。`NodeControllers` 按**面板节点 ID** 覆盖 `NodeController`：键是面板分配给节点的 ID，值是一份完整的 `ControllerConfig`（字段与 `Nodes[].ControllerConfig` 完全相同）。选择规则是「要么整份覆盖，要么回落」，绝不逐字段合并，避免隐式继承出意外：
+
+| 情况 | 使用的配置 |
+|---|---|
+| `NodeControllers[id]` 存在 | **整体**使用它（不与 `NodeController` 逐字段合并） |
+| 没有该 id | `NodeController` 模板 |
+| 两者都没有 | `node.DefaultConfig()`（`ListenIP`/`SendIP: 0.0.0.0`、`DNSType: AsIs`） |
+
+被使用的配置都会先补全节点默认值（与 `NodeController` 走同一套逻辑），所以只写想改的字段即可。校验：键必须是正整数（`node id <id> must be a positive number`），值不能为 nil（`NodeControllers[<id>] must not be empty`）。
+
+```yaml
+Agent:
+  Enabled: true
+  Panel:
+    Enabled: true
+    URL: https://panel.example.com
+    MachineID: 12
+    TokenFile: /etc/W1nCray/machine.token
+    MachineNodes: true
+    NodeControllers:
+      # 119：不写。没有 NodeController 模板时，它就是纯 node.DefaultConfig()
+      173:                      # PROXY protocol + DNS 申请证书（Cloudflare 凭据只留本机）
+        EnableProxyProtocol: true
+        CertConfig:
+          CertMode: dns
+          CertDomain: node173.example.com
+          Provider: cloudflare
+          DNSEnv:
+            CF_DNS_API_TOKEN: "<只在 173 上填写；不要提交到仓库，也不要发给面板>"
+      138:                      # DNS 解析 + 本机 REALITY 参数
+        EnableDNS: true
+        DNSType: UseIPv4
+        EnableREALITY: true
+        REALITYConfigs:
+          Show: false
+          Dest: www.microsoft.com:443
+          ServerNames: [www.microsoft.com]
+          PrivateKey: "<只在 138 上填写>"
+          ShortIds: [""]
+```
+
+- **凭据留在本机**：`NodeControllers` 只在本机读取。面板只下发「这台机器有哪些节点」和每个节点的用户定义，从不接收本机的证书、DNS 凭据或 REALITY 私钥；`W1nCray check` 也只列被覆盖的节点 ID，不打印其中任何内容。
+- **覆盖是整份替换**：模板里的设置不会自动带进来。例如模板设了 `DisableWebSocket: true`，某节点想改回默认行为，就在它的覆盖里显式写 `DisableWebSocket: false`。
+- **面板没分配的覆盖不是错误**：`NodeControllers` 里写了、但面板当前没有分配给这台机器的节点 ID，只记一条 info 日志（`NodeControllers[<id>] is configured but the panel did not assign that node`）；节点以后可能再分配回来。
+- **空值不会变成覆盖**：YAML 里的 `173:`（没有内容）与 `173: {}` 都会被解析器直接丢掉，不会生成一份「空覆盖」；所以想让某个节点不继承模板，必须至少显式写一个字段（例如 `DisableWebSocket: false`）。
 
 #### 一键接入（`install.sh --panel`）
 
