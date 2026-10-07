@@ -42,6 +42,17 @@ type KernelEnsurer interface {
 	Available(name string) (ok bool, reason string)
 }
 
+// Firewall opens the WAN ports of the instances that listen publicly. It is
+// declared here so this package does not import agent/fwopen. A nil Firewall
+// means "this machine does not manage its firewall": every instance is then
+// reported with firewall_open false.
+type Firewall interface {
+	// Sync makes the firewall match the given instances and returns, per
+	// instance id, whether that instance's public ports are open. It must only
+	// touch the rules it owns.
+	Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, error)
+}
+
 // Defaults for the optional Reconciler fields.
 const (
 	DefaultHealthWindow    = 3 * time.Second
@@ -62,6 +73,11 @@ type Reconciler struct {
 	// State persists the desired and last good state and gives each driver its
 	// private directory. Required.
 	State *state.Store
+	// Firewall opens the public ports of the instances after every apply. Nil
+	// on a machine where the agent does not manage the firewall (everywhere but
+	// OpenWrt, or when the local switch is off); instances then report
+	// firewall_open false.
+	Firewall Firewall
 	// Ports is the port ledger; a fresh one is created if nil.
 	Ports *portledger.Ledger
 	Log   driver.Logger
@@ -460,6 +476,14 @@ func (r *Reconciler) apply(ctx context.Context, d spec.Desired) (Report, error) 
 
 	if failure != "" {
 		out := r.fail(ctx, rep, plans, touched, errDriver, rts, prevClaims, failedInst, failure, hash)
+		// The machine runs the last good state again (or nothing), so the
+		// firewall must follow it. A failure here is a warning like the one on
+		// the success path: the report says which instances are not opened.
+		var prev []spec.Instance
+		if cur := r.currentApplied(); cur != nil {
+			prev = cur.desired.Instances
+		}
+		r.syncFirewall(ctx, prev, &out)
 		base := ErrRolledBack
 		if out.Status == StatusPartial {
 			base = ErrPartial
@@ -475,6 +499,7 @@ func (r *Reconciler) apply(ctx context.Context, d spec.Desired) (Report, error) 
 	fillPorts(&rep, plans)
 	rep.Status = StatusApplied
 	rep.Message = fmt.Sprintf("applied %d instance(s)", len(plans))
+	r.syncFirewall(ctx, d.Instances, &rep)
 	if err := r.State.SaveLastGood(d, plan.engines); err != nil {
 		r.logf("warn", "cannot persist last_good: %v", err)
 		rep.Message += "; warning: last good state could not be saved: " + err.Error()
@@ -496,6 +521,53 @@ func (r *Reconciler) apply(ctx context.Context, d spec.Desired) (Report, error) 
 	r.snapMu.Unlock()
 	r.logf("info", "applied revision %d (%s): %d instance(s) on %d engine(s)", d.Revision, shortHash(hash), len(plans), len(names))
 	return rep, nil
+}
+
+// syncFirewall reconciles the firewall with the instances that are actually
+// running after an apply step and records the per-instance outcome in rep. A
+// failure is a warning, never a rollback: the instances are running and local
+// forwarding works, so tearing them down would make the machine worse. The
+// affected instances then report firewall_open false.
+func (r *Reconciler) syncFirewall(ctx context.Context, instances []spec.Instance, rep *Report) {
+	if r.Firewall == nil {
+		return
+	}
+	open, err := r.Firewall.Sync(ctx, instances)
+	if err != nil {
+		r.logf("warn", "firewall: %v", err)
+		if rep.Message != "" {
+			rep.Message += "; "
+		}
+		rep.Message += "firewall rules could not be applied: " + err.Error()
+		return
+	}
+	for i := range rep.Instances {
+		rep.Instances[i].FirewallOpen = open[rep.Instances[i].ID]
+	}
+}
+
+// ReconcileFirewall re-applies the firewall rules of the last applied state.
+// Boot calls it once at start-up so a machine that has no state to resume (or
+// whose state file was removed by hand) still drops the rules a previous run
+// left behind. It is a no-op without a Firewall.
+func (r *Reconciler) ReconcileFirewall(ctx context.Context) error {
+	if r == nil || r.Firewall == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.init(); err != nil {
+		return err
+	}
+	var instances []spec.Instance
+	if cur := r.currentApplied(); cur != nil {
+		instances = cur.desired.Instances
+	}
+	if _, err := r.Firewall.Sync(ctx, instances); err != nil {
+		r.logf("warn", "firewall: %v", err)
+		return err
+	}
+	return nil
 }
 
 // wasRunning reports whether the last applied state ran this instance on that

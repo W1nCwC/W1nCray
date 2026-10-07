@@ -78,7 +78,12 @@ func (s runtimeStreams) Kernels() []wsproto.KernelEntry { return s.rt.installedK
 
 // Policy is the part of the LOCAL policy the panel may display. The panel can
 // never relax it (protocol ruling 13).
-func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg) }
+func (s runtimeStreams) Policy() wsproto.Policy { return localPolicy(s.cfg, s.openWrtPlatform()) }
+
+// openWrtPlatform reports the platform fact the policy report needs. A runtime
+// built without Boot (tests) is treated as non-OpenWrt, which is the
+// conservative answer: the firewall automation is reported off.
+func (s runtimeStreams) openWrtPlatform() bool { return s.rt != nil && s.rt.openWrt }
 
 // Capabilities returns a copy: the caller must not be able to mutate the list
 // the hello is built from. It is computed on every call, because the list can
@@ -224,11 +229,13 @@ func (r *Runtime) fileCmdsCapable() bool {
 // Config, whose terminal default is on. Files.Unrestricted is reported as the
 // EFFECTIVE value (agentcfg resolves "not written" against the terminal gate
 // and ResolveLocalPolicy materialises it), so the panel never has to redo the
-// three-state rule.
-func localPolicy(cfg *agentcfg.Config) wsproto.Policy {
+// three-state rule. openWrt is the detected platform, which decides the
+// effective Firewall.AutoOpen default.
+func localPolicy(cfg *agentcfg.Config, openWrt bool) wsproto.Policy {
 	pol := wsproto.Policy{
 		Terminal: cfg.TerminalEnabled(),
 		Modules:  wsproto.ModulePolicy{XrayNodes: cfg.XrayNodesEnabled()},
+		Firewall: wsproto.FirewallPolicy{AutoOpen: cfg.FirewallAutoOpen(openWrt)},
 	}
 	if cfg != nil && cfg.Files != nil {
 		pol.Files = wsproto.FilesPolicy{

@@ -24,10 +24,10 @@
   "message": "applied 2 instance(s)",
   "instances": [
     { "id": "auto-simple", "state": "running", "engine": "xray", "requested_engine": "auto",
-      "config_hash": "a7758ab0…", "ports": ["tcp 0.0.0.0:21300"] },
+      "config_hash": "a7758ab0…", "ports": ["tcp 0.0.0.0:21300"], "firewall_open": true },
     { "id": "auto-iphash", "state": "running", "engine": "realm", "requested_engine": "auto",
       "considered": { "xray": "balance strategy \"iphash\" is not supported" },
-      "config_hash": "c9d4789f…", "ports": ["tcp 0.0.0.0:21301"] }
+      "config_hash": "c9d4789f…", "ports": ["tcp 0.0.0.0:21301"], "firewall_open": true }
   ],
   "kernels": { "realm": "<已安装版本>", "xray": "builtin" },
   "at": "…"
@@ -116,6 +116,8 @@ Files:
   Roots: []
 Modules:
   XrayNodes: true
+Firewall:
+  AutoOpen: true # 仅 OpenWrt：为对外监听的实例自动放行 WAN 端口（缺省即开启）
 ```
 
 | 段 | 字段 |
@@ -126,6 +128,7 @@ Modules:
 | `Terminal` | `Enabled`（缺省 **true**）、`MaxSessions`（≤2）、`IdleTimeoutS`、`MaxDurationS` |
 | `Files` | `Roots`、`Unrestricted`（**三态**，见下）、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
+| `Firewall` | `AutoOpen`（**三态**，见「路由器防火墙自动放行」：OpenWrt 上缺省 true，其它系统恒为 false） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
 
@@ -147,6 +150,39 @@ Modules:
 - **显式 `false`**：永远受 `Roots` 限制，即使终端开着。
 
 `W1nCray check` 会报出**有效值**（`hello.policy.files.unrestricted`），面板据此显示与组装命令。**不受限模式**下路径必须是绝对路径（`Resolve` 忽略 `root` 参数），因此面板应传 `root: ""` + 绝对 `path`；`Roots` 仍照常上报，只是不再参与路径解析（它们是给面板的快捷入口）。**受限模式**的约定不变：`root` 是本机命名的 root 名（`xray`/`state`/…），`path` 是相对路径。不受限模式下即使 `Roots` 为空，`file_*` 命令与 `files` 能力照样提供。
+
+### 路由器防火墙自动放行（OpenWrt，D2）
+
+OpenWrt 系（OpenWrt / ImmortalWrt / iStoreOS / KWRT）默认拒绝 WAN 入站，所以在路由器上监听的转发端口，从外网连不上。agent 在 **OpenWrt** 上会为每个对外监听的实例维护一条 UCI 防火墙规则。这个开关是**本机**的，面板无法打开或关闭：
+
+```yaml
+Firewall:
+  AutoOpen: true # OpenWrt 上缺省即 true；false = 本机完全不碰防火墙
+```
+
+| 情况 | `hello.policy.firewall.auto_open` | 行为 |
+|---|---|---|
+| OpenWrt，未写 `Firewall` 段 | `true` | 自动放行（缺省） |
+| OpenWrt，`AutoOpen: false` | `false` | 完全不动防火墙 |
+| 其它系统 | `false` | 本期不实现（agent 从不碰防火墙） |
+
+每个实例一条规则，section 名固定、可识别：
+
+```
+config rule 'w1ncray_<实例id>'
+	option name 'W1nCray <实例名>'
+	option src 'wan'
+	option proto 'tcp'          # 或 'tcp udp'，按实例的 network
+	option dest_port '8443'     # 端口范围写成 '20000-20009'
+	option target 'ACCEPT'
+```
+
+- **只动自己的规则**：agent 只读、建、改、删 section 名以 `w1ncray_` 开头的规则；用户自己的规则、zone、defaults 一律不碰。
+- **UCI section 名**只允许 `[A-Za-z0-9_]`（`-` 会被 uci 以 `Invalid argument` 拒绝），所以实例 id 里的 `-` 写成 `_d`、`_` 写成 `__`（可逆、不冲突）：id `d2-fwd2` 的 section 是 `w1ncray_d2_dfwd2`，id `d2fwd1` 是 `w1ncray_d2fwd1`。
+- **只放行对外监听的实例**：`forward` / `tunnel_entry` / `reverse_portal` 用 `listen.addr`，`tunnel_exit` 用 `tunnel.listen`；`listen.addr` 是回环（`127.0.0.1` / `::1`）的实例、`enabled: false` 的实例、以及 `reverse_bridge`（它只主动连出，公网端口属于 portal 实例）都不放行。
+- **同步**：每次应用成功后按当前实例集合对账——新增，端口或 proto 变化即更新，实例删除即删除；agent 启动时再对账一次，删除遗留的 `w1ncray_*` 规则。有改动时先 `uci commit firewall` 再重载：OpenWrt ≥ 22.03 用 `fw4 reload`，21.02（fw3/iptables）用 `/etc/init.d/firewall reload`。没有改动就不 commit、不重载。
+- **失败不拆实例**：防火墙命令失败只记一条 warn，实例继续运行（本机转发仍然可用），对应实例的 `firewall_open` 为 `false`；不会因为防火墙失败回滚正在运行的实例。
+- **状态上报**：实例状态里新增 `firewall_open`（`/ack` 的 `report.instances[]` 与 `/report` 的 `instances[]`）。它只在 agent 确实放行了该实例的公网端口时为 `true`；机器不由 agent 管理防火墙时恒为 `false`，面板要结合 `hello.policy.firewall.auto_open` 解读。
 
 ### `config.yml` 的 `Agent:` 块（旧布局）
 
@@ -608,6 +644,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 6. **优先用字面 IP 作目标**：域名只在校验时解析一次，存在 DNS 重绑定的时间窗。
 7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
 8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。脚本执行或任意命令通道仍然不存在，外部命令一律用参数数组启动。**交互终端是例外**：它默认开启（§3），只由本机 `Terminal.Enabled` 控制，面板不能远程打开；不需要的机器请显式关闭（`Terminal: {Enabled: false}` 或 `--noterminal`），尤其是升级后的老机器。
+9. **OpenWrt 上 agent 会写防火墙**（D2）：仅当平台是 OpenWrt 且本机 `Firewall.AutoOpen` 生效为 true 时，agent 为对外监听的实例写入/删除 `w1ncray_*` 规则并 `uci commit firewall` + 重载。它只碰自己前缀的 section，绝不改用户的规则、zone 与 defaults；`Firewall: {AutoOpen: false}` 在本机关闭它，其它系统上它恒为关闭。规则是 UCI 配置，重启后仍在。
 
 ## 10 安全模型变更记录（D8：交互终端）
 

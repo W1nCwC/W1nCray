@@ -717,7 +717,7 @@ func mergeInstances(last reconcile.Report, hasLast bool, counters []driver.Count
 	used := map[string]bool{}
 	if hasLast {
 		for _, in := range last.Instances {
-			st := InstanceStat{ID: in.ID, State: in.State, Engine: in.Engine}
+			st := InstanceStat{ID: in.ID, State: in.State, Engine: in.Engine, FirewallOpen: in.FirewallOpen}
 			if c, ok := byID[in.ID]; ok {
 				st.setCounter(c)
 				used[in.ID] = true

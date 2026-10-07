@@ -1,0 +1,482 @@
+// Package fwopen keeps the WAN side of an OpenWrt router reachable: it
+// maintains one UCI firewall rule per forwarding instance that listens on a
+// non-loopback address.
+//
+// It exists because the stock OpenWrt firewall rejects WAN input (PLAN v11
+// §4.3): an instance that listens on 0.0.0.0 is reachable from the LAN but not
+// from the internet until a rule opens the port. fwopen owns exactly one
+// namespace: every section it writes is named "<SectionPrefix><instance>", and
+// the reconcile removes every section with that prefix that no instance claims.
+// The user's rules, zones and defaults are never touched.
+//
+// The rules are UCI firewall sections, so they survive a reboot and are visible
+// in the same place as every other OpenWrt rule:
+//
+//	config rule 'w1ncray_fwd1'
+//		option name 'W1nCray fwd1'
+//		option src 'wan'
+//		option proto 'tcp udp'
+//		option dest_port '20000-20009'
+//		option target 'ACCEPT'
+//
+// After a change the package commits the firewall configuration and reloads it
+// ("fw4 reload" on OpenWrt >= 22.03, "/etc/init.d/firewall reload" on the fw3
+// systems of 21.02 and older).
+package fwopen
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/netip"
+	"os"
+	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/portledger"
+	"github.com/W1nCwC/W1nCray/agent/spec"
+)
+
+// SectionPrefix names every firewall section the agent owns. It is the whole
+// boundary of this package: only sections whose name starts with it are read,
+// changed or deleted.
+const SectionPrefix = "w1ncray_"
+
+// fw3InitScript is the reload entry point of the iptables-based fw3 firewall
+// (OpenWrt 21.02 and older). Newer releases ship the nftables-based fw4 binary.
+const fw3InitScript = "/etc/init.d/firewall"
+
+// commandTimeout bounds one uci/fw4 invocation. A hung uci must not hold the
+// reconciler (and therefore every apply) forever.
+const commandTimeout = 20 * time.Second
+
+// Executor runs the external commands fwopen needs. It is an interface so the
+// unit tests can pin the exact command sequence without a router.
+type Executor interface {
+	// Run executes name with args and returns its combined output.
+	Run(ctx context.Context, name string, args ...string) (string, error)
+}
+
+// Manager maintains the agent's firewall sections. The zero value is not
+// usable; build one with New. It is safe for concurrent use.
+type Manager struct {
+	openWrt  bool
+	autoOpen bool
+	exec     Executor
+	// reload is the argv of the firewall reload command (nil when neither fw4
+	// nor the fw3 init script was found).
+	reload []string
+	log    driver.Logger
+
+	mu sync.Mutex
+}
+
+// Options configures a Manager.
+type Options struct {
+	// OpenWrt is the detected platform: only OpenWrt has the UCI firewall this
+	// package drives. Everywhere else Enabled is false and Sync is a no-op.
+	OpenWrt bool
+	// AutoOpen is the local switch (agent.yml Firewall.AutoOpen, defaulted per
+	// platform). False keeps the agent's hands off the firewall.
+	AutoOpen bool
+	// Exec overrides the command runner (tests).
+	Exec Executor
+	// Reload overrides the firewall reload argv (tests). Empty means the
+	// default: "fw4 reload" when fw4 exists, else the fw3 init script.
+	Reload []string
+	// Log receives one line per failed command; nil logs nothing.
+	Log driver.Logger
+}
+
+// New builds a Manager. It never fails: a machine where neither reload command
+// exists (for example a container with an OpenWrt release file) reports the
+// error when it is first used.
+func New(o Options) *Manager {
+	m := &Manager{
+		openWrt:  o.OpenWrt,
+		autoOpen: o.AutoOpen,
+		exec:     o.Exec,
+		reload:   append([]string(nil), o.Reload...),
+		log:      o.Log,
+	}
+	if m.exec == nil {
+		m.exec = execExecutor{}
+	}
+	if m.log == nil {
+		m.log = nopLog{}
+	}
+	if len(m.reload) == 0 {
+		m.reload = defaultReload()
+	}
+	return m
+}
+
+// Enabled reports whether this machine manages its firewall at all: only on
+// OpenWrt, and only when the local switch is on.
+func (m *Manager) Enabled() bool { return m != nil && m.openWrt && m.autoOpen }
+
+// rule is one desired firewall section.
+type rule struct {
+	instance string // instance id, for the report
+	section  string // UCI section name ("w1ncray_<id>")
+	name     string // UCI "name" option ("W1nCray <instance name>")
+	proto    string // "tcp", "udp" or "tcp udp"
+	destPort string // "8443" or "20000-20009"
+}
+
+// fields is the option set of a rule, in the order it is written. src and
+// target are constant: the rule accepts WAN input for this instance only.
+func (r rule) fields() [][2]string {
+	return [][2]string{
+		{"name", r.name},
+		{"src", "wan"},
+		{"proto", r.proto},
+		{"dest_port", r.destPort},
+		{"target", "ACCEPT"},
+	}
+}
+
+// Sync makes the firewall sections match the public listeners of instances and
+// returns, per instance id, whether its ports are open. It is a no-op on a
+// machine where Enabled is false (the result is then empty).
+//
+// The section of an instance whose ports are open is reported true even when
+// nothing had to change. A failure leaves the reported map unusable: the caller
+// must treat every instance as not opened.
+func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, error) {
+	open := map[string]bool{}
+	if !m.Enabled() {
+		return open, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	want := desiredRules(instances)
+	wantBySection := make(map[string]rule, len(want))
+	for _, r := range want {
+		wantBySection[r.section] = r
+	}
+	have, err := m.show(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	changed := false
+	// Deterministic order: sorted by section, so the command sequence of a test
+	// (and of two identical applies) never depends on map iteration.
+	for _, r := range want {
+		cur, exists := have[r.section]
+		switch {
+		case !exists || cur["__type"] != "rule":
+			if exists {
+				// A section of the wrong type cannot be turned into a rule;
+				// remove it first so the recreate cannot fail halfway.
+				if _, err := m.run(ctx, "uci", "delete", "firewall."+r.section); err != nil {
+					return nil, err
+				}
+			}
+			if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"=rule"); err != nil {
+				return nil, err
+			}
+			for _, kv := range r.fields() {
+				if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"."+kv[0]+"="+kv[1]); err != nil {
+					return nil, err
+				}
+			}
+			changed = true
+		default:
+			for _, kv := range r.fields() {
+				if cur[kv[0]] == kv[1] {
+					continue
+				}
+				if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"."+kv[0]+"="+kv[1]); err != nil {
+					return nil, err
+				}
+				changed = true
+			}
+		}
+		open[r.instance] = true
+	}
+
+	var stale []string
+	for section := range have {
+		if _, ok := wantBySection[section]; !ok {
+			stale = append(stale, section)
+		}
+	}
+	sort.Strings(stale)
+	for _, section := range stale {
+		if _, err := m.run(ctx, "uci", "delete", "firewall."+section); err != nil {
+			return nil, err
+		}
+		changed = true
+	}
+
+	if !changed {
+		return open, nil
+	}
+	if _, err := m.run(ctx, "uci", "commit", "firewall"); err != nil {
+		return nil, err
+	}
+	if err := m.reloadFirewall(ctx); err != nil {
+		return nil, err
+	}
+	m.log.Infof("fwopen: firewall updated (%d rule(s) open, %d removed)", len(want), len(stale))
+	return open, nil
+}
+
+// show reads the firewall configuration and returns the agent-owned sections,
+// keyed by section name. The special key "__type" carries the section type
+// ("rule", "zone", ...). Only sections named with SectionPrefix are returned.
+func (m *Manager) show(ctx context.Context) (map[string]map[string]string, error) {
+	out, err := m.run(ctx, "uci", "show", "firewall")
+	if err != nil {
+		return nil, err
+	}
+	return parseShow(out), nil
+}
+
+// parseShow parses "uci show firewall" output. It keeps the lines whose section
+// name carries SectionPrefix; everything else belongs to the user.
+//
+//	<sec>=<type>
+//	<sec>.<option>=<value>
+func parseShow(out string) map[string]map[string]string {
+	sections := map[string]map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimPrefix(key, "firewall.")
+		if key == line {
+			continue // not a firewall section line
+		}
+		section, option, hasOption := strings.Cut(key, ".")
+		if !strings.HasPrefix(section, SectionPrefix) {
+			continue
+		}
+		if sections[section] == nil {
+			sections[section] = map[string]string{}
+		}
+		if !hasOption {
+			sections[section]["__type"] = value
+			continue
+		}
+		sections[section][option] = unquote(value)
+	}
+	return sections
+}
+
+// unquote strips the single quotes "uci show" prints around a value. Values the
+// agent writes never contain a quote (an instance name cannot), so a simple
+// outer-quote strip is exact for them and best effort for a hand-written one.
+func unquote(s string) string {
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// desiredRules extracts the firewall rule of every instance that accepts user
+// traffic on a non-loopback address. Instances without such a listener produce
+// no rule: a disabled instance, a loopback-only listener, and a reverse_bridge
+// (it dials out; the public port belongs to the portal instance).
+func desiredRules(instances []spec.Instance) []rule {
+	var out []rule
+	seen := map[string]bool{}
+	for _, in := range instances {
+		if !in.Enabled {
+			continue
+		}
+		_, ports, ok := publicListener(in)
+		if !ok {
+			continue
+		}
+		lo, hi, err := portledger.ParsePorts(ports)
+		if err != nil {
+			continue // the validator rejects this long before we run
+		}
+		dest := strconv.Itoa(lo)
+		if hi != lo {
+			dest = strconv.Itoa(lo) + "-" + strconv.Itoa(hi)
+		}
+		section := SectionPrefix + sectionID(in.ID)
+		if seen[section] {
+			// Two instance ids cannot collide (sectionID is injective), but a
+			// defensive skip keeps a future bug from writing one rule twice.
+			continue
+		}
+		seen[section] = true
+		out = append(out, rule{
+			instance: in.ID,
+			section:  section,
+			name:     "W1nCray " + displayName(in),
+			proto:    protos(in.Network),
+			destPort: dest,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].section < out[j].section })
+	return out
+}
+
+// publicListener returns the address and port spec an instance listens on for
+// user traffic, and false when it has none or it is loopback-only.
+func publicListener(in spec.Instance) (addr, ports string, ok bool) {
+	switch in.Kind {
+	case spec.KindForward, spec.KindTunnelEntry, spec.KindReversePortal:
+		if in.Listen == nil {
+			return "", "", false
+		}
+		addr, ports = in.Listen.Addr, in.Listen.Ports
+	case spec.KindTunnelExit:
+		// A tunnel exit has no Listen; the tunnel accepts on Tunnel.Listen.
+		if in.Tunnel == nil {
+			return "", "", false
+		}
+		host, port, err := net.SplitHostPort(in.Tunnel.Listen)
+		if err != nil {
+			return "", "", false
+		}
+		addr, ports = host, port
+	default:
+		// reverse_bridge (and anything new): no local user-facing listener.
+		return "", "", false
+	}
+	if addr == "" || isLoopback(addr) {
+		return "", "", false
+	}
+	return addr, ports, true
+}
+
+// isLoopback reports whether addr is a loopback address. An address that does
+// not parse is treated as loopback (never opened): the desired state is
+// validated before this runs, so the conservative answer is the safe one.
+func isLoopback(addr string) bool {
+	a, err := netip.ParseAddr(strings.TrimSpace(addr))
+	if err != nil {
+		return true
+	}
+	return a.Unmap().IsLoopback()
+}
+
+// protos renders the instance's network list as the UCI proto value. An empty
+// or unknown list falls back to TCP, which is the desired-state default.
+func protos(network []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, n := range network {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n != "tcp" && n != "udp" {
+			continue
+		}
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		out = []string{"tcp"}
+	}
+	sort.Strings(out)
+	return strings.Join(out, " ")
+}
+
+// displayName is the instance name shown in the rule ("W1nCray <name>"). An
+// instance without a name falls back to its id.
+func displayName(in spec.Instance) string {
+	if in.Name != "" {
+		return in.Name
+	}
+	return in.ID
+}
+
+// sectionID encodes an instance id into a UCI section name. UCI section names
+// may only contain [A-Za-z0-9_] (a "-" is rejected with "uci: Invalid
+// argument"), while an instance id may contain "-" and "_". The encoding is
+// injective, so two different ids can never share a section:
+//
+//	"_" -> "__"   (a literal underscore)
+//	"-" -> "_d"   (a dash)
+//
+// Every other byte of a valid id is already allowed and is copied as is.
+func sectionID(id string) string {
+	var b strings.Builder
+	b.Grow(len(id) + 4)
+	for i := 0; i < len(id); i++ {
+		switch id[i] {
+		case '_':
+			b.WriteString("__")
+		case '-':
+			b.WriteString("_d")
+		default:
+			b.WriteByte(id[i])
+		}
+	}
+	return b.String()
+}
+
+// reloadFirewall reloads the firewall after a commit.
+func (m *Manager) reloadFirewall(ctx context.Context) error {
+	if len(m.reload) == 0 {
+		return fmt.Errorf("fwopen: no firewall reload command found (%s or fw4)", fw3InitScript)
+	}
+	_, err := m.run(ctx, m.reload[0], m.reload[1:]...)
+	return err
+}
+
+// defaultReload resolves the reload command of the running system.
+func defaultReload() []string {
+	_, fw4 := exec.LookPath("fw4")
+	_, err := os.Stat(fw3InitScript)
+	return resolveReload(fw4 == nil, err == nil)
+}
+
+// resolveReload is defaultReload with its two probes injected.
+func resolveReload(hasFw4, hasFw3Init bool) []string {
+	switch {
+	case hasFw4:
+		return []string{"fw4", "reload"}
+	case hasFw3Init:
+		return []string{fw3InitScript, "reload"}
+	default:
+		return nil
+	}
+}
+
+// run executes one command through the executor.
+func (m *Manager) run(ctx context.Context, name string, args ...string) (string, error) {
+	return m.exec.Run(ctx, name, args...)
+}
+
+// execExecutor runs the real uci/fw4 binaries.
+type execExecutor struct{}
+
+func (execExecutor) Run(ctx context.Context, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput() //nolint:noshell -- uci/fw4 with an argv array, never a shell
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return string(out), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, msg)
+		}
+		return string(out), fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return string(out), nil
+}
+
+// nopLog is the default logger.
+type nopLog struct{}
+
+func (nopLog) Debugf(string, ...any) {}
+func (nopLog) Infof(string, ...any)  {}
+func (nopLog) Warnf(string, ...any)  {}
+func (nopLog) Errorf(string, ...any) {}
