@@ -10,6 +10,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,11 +20,31 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
+	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/kernelx"
 	"github.com/W1nCwC/W1nCray/agent/selinux"
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 	"github.com/W1nCwC/W1nCray/agentd"
+	"github.com/W1nCwC/W1nCray/kernel/install"
+	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
+
+// xrayBinaryName is the installed file name of the Xray kernel, and the name
+// its manifest entry uses (run.binary in tools/manifestgen/examples/v11.yaml).
+const xrayBinaryName = "W1nCray-xray"
+
+// xrayKernelRun is the version self-check of the Xray kernel. It mirrors the
+// manifest entry exactly, so a local install (--file) and a manifest install
+// agree on what version the binary reports:
+//
+//	W1nCray-xray v0.6.0 (Xray-core 26.3.27)  ->  0.6.0
+var xrayKernelRun = manifest.Run{
+	Binary:       xrayBinaryName,
+	VersionCmd:   []string{"version"},
+	VersionRegex: `W1nCray-xray v?([0-9][0-9.]*)`,
+}
 
 func init() {
 	rootCmd.AddCommand(xrayCmd())
@@ -53,15 +74,18 @@ func xrayCmd() *cobra.Command {
 	return c
 }
 
-// xrayManager builds the service manager from the machine's configuration.
-func xrayManager() (*xraysvc.Manager, error) {
+// xrayManager builds the service manager and the kernel installer from the
+// machine's configuration. The installer is returned too: the local install
+// path (--file) needs it, and it is the same object the manager uses, so the
+// kernel directory still has exactly one owner.
+func xrayManager() (*xraysvc.Manager, *kernelx.Ensurer, error) {
 	path, err := findConfig()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cfg, err := agentd.LoadConfig(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	stateDir, kernelsDir := "", ""
 	manifest, keys := "", ""
@@ -87,11 +111,11 @@ func xrayManager() (*xraysvc.Manager, error) {
 	}
 	kern, err := bootstrap.KernelInstaller(o)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sup := supervisor.New(supervisor.Options{Log: o.Log, PIDDir: filepath.Join(stateDir, "pid"), Labeler: o.Labeler})
 	mgr, _, err := bootstrap.XrayManager(o, kern, sup)
-	return mgr, err
+	return mgr, kern, err
 }
 
 func xrayStatusCmd() *cobra.Command {
@@ -100,7 +124,7 @@ func xrayStatusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Print the Xray kernel service status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := xrayManager()
+			mgr, _, err := xrayManager()
 			if err != nil {
 				return err
 			}
@@ -139,7 +163,7 @@ func xrayStartCmd() *cobra.Command {
 		Use:   "start",
 		Short: "Start the Xray kernel service (the kernel must be installed)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := xrayManager()
+			mgr, _, err := xrayManager()
 			if err != nil {
 				return err
 			}
@@ -157,7 +181,7 @@ func xrayStopCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the Xray kernel service",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := xrayManager()
+			mgr, _, err := xrayManager()
 			if err != nil {
 				return err
 			}
@@ -175,7 +199,7 @@ func xrayRestartCmd() *cobra.Command {
 		Use:   "restart",
 		Short: "Restart the Xray kernel service",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := xrayManager()
+			mgr, _, err := xrayManager()
 			if err != nil {
 				return err
 			}
@@ -188,15 +212,56 @@ func xrayRestartCmd() *cobra.Command {
 	}
 }
 
+// xrayLocalInstaller is the kernel-installer surface the --file path needs.
+// *kernelx.Ensurer implements it; the interface exists so the command's local
+// install can be tested without a running service manager.
+type xrayLocalInstaller interface {
+	InstallLocal(ctx context.Context, li install.LocalInstall) (driver.Installed, error)
+}
+
 func xrayInstallCmd() *cobra.Command {
-	return &cobra.Command{
+	var (
+		file string
+		sha  string
+	)
+	c := &cobra.Command{
 		Use:   "install [version]",
 		Short: "Install the Xray kernel (newest manifest version by default) and start its service",
-		Args:  cobra.MaximumNArgs(1),
+		Long: "Install the Xray kernel and start its service.\n" +
+			"Without flags the newest version of the signed manifest is installed.\n" +
+			"With --file (and the required --sha256) a build already on this machine is\n" +
+			"installed instead: the file may be a W1nCray-xray binary or its .gz release\n" +
+			"asset. This is what install.sh uses on machines that cannot reach the panel,\n" +
+			"and it produces exactly the same kernel directory entry as a manifest install,\n" +
+			"so list, upgrade, rollback and remove all recognise it.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := xrayManager()
+			// Validate the flag combination before touching any configuration.
+			switch {
+			case file != "" && len(args) == 1:
+				return fmt.Errorf("--file 与版本号参数不能同时使用（本地安装的版本由程序自身报告）")
+			case file != "" && sha == "":
+				return fmt.Errorf("--file 需要 --sha256 <hex>（发行版 SHA256SUMS 里的校验值）")
+			case file == "" && sha != "":
+				return fmt.Errorf("--sha256 只能与 --file 一起使用")
+			}
+			mgr, kern, err := xrayManager()
 			if err != nil {
 				return err
+			}
+			if file != "" {
+				if err := xrayInstallLocal(cmd.Context(), kern, file, sha); err != nil {
+					return err
+				}
+				// The kernel is in place; the service manager points the
+				// service at it and starts it (same path as a manifest
+				// install's activate step).
+				if err := mgr.Start(cmd.Context()); err != nil {
+					return fmt.Errorf("%w（内核已安装，可执行 `W1nCray xray start` 重试）", err)
+				}
+				st, _ := mgr.Status(cmd.Context())
+				fmt.Printf("%s 已安装并运行（版本 %s，backend %s）\n", xraysvc.ServiceName, st.Version, st.Backend)
+				return nil
 			}
 			version := ""
 			if len(args) == 1 {
@@ -210,6 +275,26 @@ func xrayInstallCmd() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().StringVar(&file, "file", "", "install this local W1nCray-xray binary or .gz asset instead of a manifest version")
+	c.Flags().StringVar(&sha, "sha256", "", "hex sha256 of --file (required with --file)")
+	return c
+}
+
+// xrayInstallLocal installs a local build into the kernel directory. It is
+// separate from the command so it can be tested with a fake installer.
+func xrayInstallLocal(ctx context.Context, kern xrayLocalInstaller, file, sha string) error {
+	inst, err := kern.InstallLocal(ctx, install.LocalInstall{
+		Name:          xrayapi.KernelName,
+		Archive:       file,
+		ArchiveSHA256: sha,
+		To:            xrayBinaryName,
+		Run:           xrayKernelRun,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("已安装 Xray 内核 %s（%s）\n", inst.Version, inst.Path)
+	return nil
 }
 
 func xrayRemoveCmd() *cobra.Command {
@@ -217,7 +302,7 @@ func xrayRemoveCmd() *cobra.Command {
 		Use:   "remove",
 		Short: "Stop and remove the Xray kernel service and files (config.yml is kept)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr, err := xrayManager()
+			mgr, _, err := xrayManager()
 			if err != nil {
 				return err
 			}

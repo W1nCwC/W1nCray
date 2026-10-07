@@ -24,6 +24,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/fileops"
+	"github.com/W1nCwC/W1nCray/agent/fwopen"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
@@ -39,6 +40,7 @@ import (
 	"github.com/W1nCwC/W1nCray/driver/frp"
 	"github.com/W1nCwC/W1nCray/driver/gost"
 	"github.com/W1nCwC/W1nCray/driver/realm"
+	"github.com/W1nCwC/W1nCray/kernel/platform"
 )
 
 // ManifestFileName is the file the agent keeps its last verified kernel
@@ -165,6 +167,9 @@ type Runtime struct {
 	// cfg is the local agent configuration the capability list and the policy
 	// gates are read from (nil means the defaults).
 	cfg *agentcfg.Config
+	// openWrt is the detected platform fact (PLAN v11 §4.3). It gates the
+	// OpenWrt firewall automation and is reported in hello.policy.firewall.
+	openWrt bool
 
 	log driver.Logger
 
@@ -233,13 +238,17 @@ func Boot(opts Options) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
+	// The platform facts are read once: the OpenWrt firewall automation and the
+	// hello.policy report both need them (PLAN v11 §4.3).
+	plat := platform.Detect()
 	rec := &reconcile.Reconciler{
-		Drivers: drivers,
-		Kernels: kern,
-		Sup:     sup,
-		Policy:  opts.Policy,
-		State:   st,
-		Log:     log,
+		Drivers:  drivers,
+		Kernels:  kern,
+		Sup:      sup,
+		Policy:   opts.Policy,
+		State:    st,
+		Log:      log,
+		Firewall: newFirewall(opts, plat.OpenWrt, log),
 	}
 	rt := &Runtime{
 		Reconciler:  rec,
@@ -248,6 +257,7 @@ func Boot(opts Options) (*Runtime, error) {
 		State:       st,
 		log:         log,
 		cfg:         opts.AgentConfig,
+		openWrt:     plat.OpenWrt,
 		Xray:        opts.Xray,
 		XrayManager: xrayMgr,
 		xrayNeeded:  opts.XrayNeeded,
@@ -312,6 +322,14 @@ func Boot(opts Options) (*Runtime, error) {
 	}
 	if opts.Resume {
 		rt.resume()
+		// The start-up firewall reconcile (PLAN v11 §4.3). A successful resume
+		// already synced the rules inside its apply; this second pass is a
+		// no-op then, and on a machine with no state to resume it removes the
+		// w1ncray_* rules a previous run left behind. agent-apply (Resume
+		// false) skips it and syncs when it applies its desired state.
+		if err := rt.Reconciler.ReconcileFirewall(context.Background()); err != nil {
+			log.Warnf("bootstrap: firewall reconcile: %v", err)
+		}
 	}
 	// The start-up migration (PLAN v11 §2.6): when the configuration needs the
 	// Xray kernel, its service is brought up. It must wait for a pending
@@ -500,6 +518,17 @@ func (r *Runtime) ResumeReport() (rep reconcile.Report, ok bool) {
 	r.resumeMu.Lock()
 	defer r.resumeMu.Unlock()
 	return r.resumeRep, r.resumeOK
+}
+
+// newFirewall builds the OpenWrt firewall manager the reconciler drives, or
+// nil when this machine does not manage its firewall: everywhere but OpenWrt,
+// and on OpenWrt with Firewall.AutoOpen turned off locally. A nil Firewall is
+// what makes every instance report firewall_open false.
+func newFirewall(opts Options, openWrt bool, log driver.Logger) reconcile.Firewall {
+	if !openWrt || !opts.AgentConfig.FirewallAutoOpen(openWrt) {
+		return nil
+	}
+	return fwopen.New(fwopen.Options{OpenWrt: true, AutoOpen: true, Log: log})
 }
 
 // buildDrivers is the production driver registry. The Xray forwarding engine

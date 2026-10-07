@@ -79,3 +79,14 @@ Files:
 # ---- 模块开关（D3）-----------------------------------------------------------
 Modules:
   XrayNodes: true # false = 本机永不启动节点控制器（面板 hint 也无法打开）
+
+# ---- 路由器防火墙自动放行（D2；仅 OpenWrt）-----------------------------------
+# OpenWrt 系默认拒绝 WAN 入站，转发实例监听的端口从外网连不上。在 OpenWrt 上
+# agent 为每个对外监听的实例维护一条 UCI 规则（section 名固定为
+# w1ncray_<实例id>，只碰自己前缀的规则），有改动时 uci commit firewall 并重载
+# （fw4 reload / 21.02 的 /etc/init.d/firewall reload）。
+# 缺省（不写这一段）在 OpenWrt 上是开启；其它系统上恒为关闭（本期只实现 OpenWrt）。
+# 本机关闭：
+#   Firewall: {AutoOpen: false}
+Firewall:
+  AutoOpen: true

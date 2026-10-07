@@ -46,6 +46,7 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `usage: manifestgen <command> [flags]
   keygen  -out FILE                 generate an ed25519 key pair (FILE 0600, FILE.pub)
   build   -config FILE -out FILE    resolve upstream releases into an unsigned manifest
+                                     [-kernels a,b] builds only those kernel names
   sign    -key FILE -in FILE -out FILE
   verify  -in FILE -pub HEX|FILE [-pub ...]
 `)
@@ -144,6 +145,7 @@ func cmdBuild(args []string, stdout, stderr io.Writer) error {
 	out := fs.String("out", "", "unsigned manifest to write")
 	cache := fs.String("cache", "", "download cache directory (default: ./.manifestgen-cache)")
 	seq := fs.Int64("sequence", 0, "override the config's sequence")
+	kernels := fs.String("kernels", "", "comma-separated kernel names to build (default: every kernel in the config)")
 	api := fs.String("api-base", "https://api.github.com", "GitHub API base URL (tests)")
 	nowFlag := fs.String("now", "", "issue time, RFC 3339 (default: now)")
 	if err := fs.Parse(args); err != nil {
@@ -155,6 +157,11 @@ func cmdBuild(args []string, stdout, stderr io.Writer) error {
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		return err
+	}
+	if *kernels != "" {
+		if err := filterKernels(cfg, *kernels); err != nil {
+			return err
+		}
 	}
 	if *seq != 0 {
 		cfg.Sequence = *seq
@@ -186,6 +193,43 @@ func cmdBuild(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "wrote unsigned manifest %s (sequence %d, %d kernels)\n", *out, m.Sequence, len(m.Kernels))
+	return nil
+}
+
+// filterKernels keeps only the named kernels, in config order. It lets a
+// release owner re-publish one entry (the agent or the Xray kernel, after a
+// rebuild) from the same config without re-downloading every upstream kernel;
+// the WP-X3 acceptance uses it on examples/v11.yaml. An unknown name is an
+// error rather than a silently empty manifest.
+func filterKernels(cfg *Config, names string) error {
+	want := map[string]bool{}
+	for _, n := range strings.Split(names, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			want[n] = true
+		}
+	}
+	if len(want) == 0 {
+		return errors.New("-kernels: no kernel name given")
+	}
+	var kept []KernelCfg
+	found := map[string]bool{}
+	for _, k := range cfg.Kernels {
+		if want[k.Name] {
+			kept = append(kept, k)
+			found[k.Name] = true
+		}
+	}
+	var missing []string
+	for n := range want {
+		if !found[n] {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("-kernels: not in the config: %s", strings.Join(missing, ", "))
+	}
+	cfg.Kernels = kept
 	return nil
 }
 

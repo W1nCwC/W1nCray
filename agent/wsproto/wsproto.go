@@ -106,11 +106,22 @@ type Policy struct {
 	Terminal bool         `json:"terminal"`
 	Files    FilesPolicy  `json:"files"`
 	Modules  ModulePolicy `json:"modules"`
+	// Firewall reports whether the agent opens the WAN ports of the instances
+	// it runs (PLAN v11 D2). It is only ever true on OpenWrt with the local
+	// Firewall.AutoOpen switch on; the panel must read an instance's
+	// firewall_open against it, because false there also means "this machine
+	// does not manage its firewall".
+	Firewall FirewallPolicy `json:"firewall"`
 	// Instances is the local instance policy (agent.yml Policy). The panel
 	// uses it to pick ports inside the permitted range and to explain a
 	// listen address the machine will refuse (PLAN v10 WP-D); the agent still
 	// enforces it on every apply.
 	Instances *InstancePolicy `json:"instances,omitempty"`
+}
+
+// FirewallPolicy mirrors the effective local firewall automation switch.
+type FirewallPolicy struct {
+	AutoOpen bool `json:"auto_open"`
 }
 
 // InstancePolicy mirrors spec.Policy for display and planning.

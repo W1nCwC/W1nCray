@@ -97,6 +97,10 @@ kernels:
       linux/riscv64:  {asset: frp_0.71.0_linux_riscv64.tar.gz}
 
   # ---------------------------------------------------------------- xray
+  # v10 example only: it describes the upstream XTLS/Xray-core zips the single
+  # v0.5 program embedded. From v11 the manifest's "xray" kernel is our own
+  # W1nCray-xray program (see examples/v11.yaml), and the agent installs it as
+  # a service; nothing links the upstream binary any more.
   # Xray is embedded in the agent; the manifest still describes its zips so a
   # later "external xray" mode needs no new trust plumbing. The mips zips hold
   # both `xray` (hardfloat) and `xray_softfloat`: W1nCray takes the softfloat one.

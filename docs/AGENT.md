@@ -24,10 +24,10 @@
   "message": "applied 2 instance(s)",
   "instances": [
     { "id": "auto-simple", "state": "running", "engine": "xray", "requested_engine": "auto",
-      "config_hash": "a7758ab0…", "ports": ["tcp 0.0.0.0:21300"] },
+      "config_hash": "a7758ab0…", "ports": ["tcp 0.0.0.0:21300"], "firewall_open": true },
     { "id": "auto-iphash", "state": "running", "engine": "realm", "requested_engine": "auto",
       "considered": { "xray": "balance strategy \"iphash\" is not supported" },
-      "config_hash": "c9d4789f…", "ports": ["tcp 0.0.0.0:21301"] }
+      "config_hash": "c9d4789f…", "ports": ["tcp 0.0.0.0:21301"], "firewall_open": true }
   ],
   "kernels": { "realm": "<已安装版本>", "xray": "builtin" },
   "at": "…"
@@ -116,6 +116,8 @@ Files:
   Roots: []
 Modules:
   XrayNodes: true
+Firewall:
+  AutoOpen: true # 仅 OpenWrt：为对外监听的实例自动放行 WAN 端口（缺省即开启）
 ```
 
 | 段 | 字段 |
@@ -126,6 +128,7 @@ Modules:
 | `Terminal` | `Enabled`（缺省 **true**）、`MaxSessions`（≤2）、`IdleTimeoutS`、`MaxDurationS` |
 | `Files` | `Roots`、`Unrestricted`（**三态**，见下）、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
+| `Firewall` | `AutoOpen`（**三态**，见「路由器防火墙自动放行」：OpenWrt 上缺省 true，其它系统恒为 false） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
 
@@ -147,6 +150,39 @@ Modules:
 - **显式 `false`**：永远受 `Roots` 限制，即使终端开着。
 
 `W1nCray check` 会报出**有效值**（`hello.policy.files.unrestricted`），面板据此显示与组装命令。**不受限模式**下路径必须是绝对路径（`Resolve` 忽略 `root` 参数），因此面板应传 `root: ""` + 绝对 `path`；`Roots` 仍照常上报，只是不再参与路径解析（它们是给面板的快捷入口）。**受限模式**的约定不变：`root` 是本机命名的 root 名（`xray`/`state`/…），`path` 是相对路径。不受限模式下即使 `Roots` 为空，`file_*` 命令与 `files` 能力照样提供。
+
+### 路由器防火墙自动放行（OpenWrt，D2）
+
+OpenWrt 系（OpenWrt / ImmortalWrt / iStoreOS / KWRT）默认拒绝 WAN 入站，所以在路由器上监听的转发端口，从外网连不上。agent 在 **OpenWrt** 上会为每个对外监听的实例维护一条 UCI 防火墙规则。这个开关是**本机**的，面板无法打开或关闭：
+
+```yaml
+Firewall:
+  AutoOpen: true # OpenWrt 上缺省即 true；false = 本机完全不碰防火墙
+```
+
+| 情况 | `hello.policy.firewall.auto_open` | 行为 |
+|---|---|---|
+| OpenWrt，未写 `Firewall` 段 | `true` | 自动放行（缺省） |
+| OpenWrt，`AutoOpen: false` | `false` | 完全不动防火墙 |
+| 其它系统 | `false` | 本期不实现（agent 从不碰防火墙） |
+
+每个实例一条规则，section 名固定、可识别：
+
+```
+config rule 'w1ncray_<实例id>'
+	option name 'W1nCray <实例名>'
+	option src 'wan'
+	option proto 'tcp'          # 或 'tcp udp'，按实例的 network
+	option dest_port '8443'     # 端口范围写成 '20000-20009'
+	option target 'ACCEPT'
+```
+
+- **只动自己的规则**：agent 只读、建、改、删 section 名以 `w1ncray_` 开头的规则；用户自己的规则、zone、defaults 一律不碰。
+- **UCI section 名**只允许 `[A-Za-z0-9_]`（`-` 会被 uci 以 `Invalid argument` 拒绝），所以实例 id 里的 `-` 写成 `_d`、`_` 写成 `__`（可逆、不冲突）：id `d2-fwd2` 的 section 是 `w1ncray_d2_dfwd2`，id `d2fwd1` 是 `w1ncray_d2fwd1`。
+- **只放行对外监听的实例**：`forward` / `tunnel_entry` / `reverse_portal` 用 `listen.addr`，`tunnel_exit` 用 `tunnel.listen`；`listen.addr` 是回环（`127.0.0.1` / `::1`）的实例、`enabled: false` 的实例、以及 `reverse_bridge`（它只主动连出，公网端口属于 portal 实例）都不放行。
+- **同步**：每次应用成功后按当前实例集合对账——新增，端口或 proto 变化即更新，实例删除即删除；agent 启动时再对账一次，删除遗留的 `w1ncray_*` 规则。有改动时先 `uci commit firewall` 再重载：OpenWrt ≥ 22.03 用 `fw4 reload`，21.02（fw3/iptables）用 `/etc/init.d/firewall reload`。没有改动就不 commit、不重载。
+- **失败不拆实例**：防火墙命令失败只记一条 warn，实例继续运行（本机转发仍然可用），对应实例的 `firewall_open` 为 `false`；不会因为防火墙失败回滚正在运行的实例。
+- **状态上报**：实例状态里新增 `firewall_open`（`/ack` 的 `report.instances[]` 与 `/report` 的 `instances[]`）。它只在 agent 确实放行了该实例的公网端口时为 `true`；机器不由 agent 管理防火墙时恒为 `false`，面板要结合 `hello.policy.firewall.auto_open` 解读。
 
 ### `config.yml` 的 `Agent:` 块（旧布局）
 
@@ -608,6 +644,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 6. **优先用字面 IP 作目标**：域名只在校验时解析一次，存在 DNS 重绑定的时间窗。
 7. **隧道要有认证和加密**：样例不使用 `allowInsecure` 之类的不验证选项，也不使用 `security: none`。自签证书必须配指纹（xray），其余用公共 CA 证书，或把私有 CA 作为 `tunnel.cert.cert_file` 信任锚交给入口 / bridge。frp 的 bridge 不配信任锚时不校验 portal 证书，对抗主动中间人的场景请配信任锚，或用 xray / gost。
 8. 外部内核只从**已签名清单**安装，哈希校验失败一律拒绝（fail-closed）；期望状态无法指定 URL 或哈希。脚本执行或任意命令通道仍然不存在，外部命令一律用参数数组启动。**交互终端是例外**：它默认开启（§3），只由本机 `Terminal.Enabled` 控制，面板不能远程打开；不需要的机器请显式关闭（`Terminal: {Enabled: false}` 或 `--noterminal`），尤其是升级后的老机器。
+9. **OpenWrt 上 agent 会写防火墙**（D2）：仅当平台是 OpenWrt 且本机 `Firewall.AutoOpen` 生效为 true 时，agent 为对外监听的实例写入/删除 `w1ncray_*` 规则并 `uci commit firewall` + 重载。它只碰自己前缀的 section，绝不改用户的规则、zone 与 defaults；`Firewall: {AutoOpen: false}` 在本机关闭它，其它系统上它恒为关闭。规则是 UCI 配置，重启后仍在。
 
 ## 10 安全模型变更记录（D8：交互终端）
 
@@ -691,6 +728,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `W1nCray link` / `link --split` / `migrate` | 与 v10 相同；写入前的离线检查改为调用外部内核（见下） |
 | `W1nCray agent-apply -f desired.json` | 只支持外部引擎（gost / frp / realm）；`engine: xray` 被拒绝 |
 | `W1nCray xray status\|start\|stop\|restart\|install [version]\|remove` | 本机管理 Xray 内核服务，调用与面板路径**同一套** `agent/xraysvc`（见 §13.5） |
+| `W1nCray xray install --file <文件或 .gz> --sha256 <hex>` | 离线安装本地 Xray 内核构建（见 §13.8.3） |
 
 `link` / `link --split` 的**写入前校验**需要 Xray 侧的检查：加 `--xray-bin <路径>`，或在 `W1nCray` 同目录 / `PATH` 找到 `W1nCray-xray` 时，会执行 `<W1nCray-xray> check -c <配置>` 并把输出里以 `✗` 开头的行当作失败项参与基线比较；找不到内核时**跳过该检查并打印说明**（agent 侧仍会校验机器模式的证书模式等问题）。
 
@@ -830,8 +868,68 @@ type=AVC msg=audit(...): avc:  denied  { create } for  pid=... comm="W1nCray-xra
 1. **状态套接字搬出配置目录**（§13.4）：`/run/W1nCray/xray.sock`。`/run/W1nCray` 是 `var_run_t`，不是配置树的一部分；systemd 用 `RuntimeDirectory=` 创建，OpenRC / procd 的 init 脚本创建，agent 的 fallback 后端与内核自己也会创建。
 2. **内核二进制标为 `bin_t`**（`agent/selinux`）：`bin_t` 让 systemd 把进程放进 `unconfined_service_t`（与 agent 同域）。有 `semanage` 时对内核树加一条持久 fcontext 规则（`<KernelsDir>/kernels(/.*)?` → `bin_t`）再 `restorecon -R -F`；没有 `semanage` 时退回 `chcon -R -t bin_t`；两个工具都没有时只记一条警告——缺工具绝不能让安装失败（服务随后会以可读的错误报出来）。
 
-打标签的时机：`kernelx` 在 `Ensure`（安装/升级）与 `Rollback` 成功后给整棵树打标签（尽力而为，只记日志）；`xraysvc` 在写服务文件、启动之前再确认一次（这里失败即中止启动）；`supervisor` 在每次启动 gost/realm/frp 子进程前确认该二进制（同一进程内按路径去重，已被整棵树覆盖的二进制直接跳过，所以不会为每个版本堆积 fcontext 规则）。`install.sh` 在安装时也做一次（`selinux_prepare`，卸载时 `selinux_forget` 删掉规则）。
+打标签的时机：`kernelx` 在 `Ensure`（安装/升级）、`Rollback` 与 `InstallLocal`（本地文件安装，§13.8.3）成功后给整棵树打标签（尽力而为，只记日志）；`xraysvc` 在写服务文件、启动之前再确认一次（这里失败即中止启动）；`supervisor` 在每次启动 gost/realm/frp 子进程前确认该二进制（同一进程内按路径去重，已被整棵树覆盖的二进制直接跳过，所以不会为每个版本堆积 fcontext 规则）。`install.sh` 在安装时也做一次（`selinux_prepare`，卸载时 `selinux_forget` 删掉规则）。
 
 SELinux 关闭时这些路径全是空操作（`agent/selinux` 先读 `/sys/fs/selinux/enforce`）；因此非 SELinux 机器与 Windows 不受影响。
+
+### 13.8 发布产物与清单条目（WP-X3）
+
+#### 13.8.1 `release/build.sh` 的产物
+
+`bash release/build.sh [vX.Y.Z] [arch ...]` 为 12 个架构各产出两个程序，同一个版本号注入两个程序（agent 的 `cmd.version`、内核的 `xraynode.Version`）：
+
+| 产物 | 程序 | 构建标签 |
+|---|---|---|
+| `W1nCray-linux-<arch>.gz` | agent | `fallbackroots`（内置备用根证书；agent 不含 DNS/ACME，约 12 MB） |
+| `W1nCray-linux-<arch>-lite.gz` | agent | 与上一行**同内容**的副本，仅为兼容 v11 之前的安装脚本（它们按 `-lite` 名字取 OpenWrt 资产）而保留 |
+| `W1nCray-linux-amd64\|arm64` | agent | 裸文件，供 v0.3.0 之前的安装脚本升级 |
+| `W1nCray-xray-linux-<arch>.gz` | Xray 内核 | 无（full） |
+| `W1nCray-xray-linux-<arch>-lite.gz` | Xray 内核 | `dnslite,fallbackroots`（OpenWrt） |
+
+`SHA256SUMS` 覆盖以上全部产物。构建矩阵断言除原有的架构/PTY 检查外，还对每个产物做 `file(1)` 架构检查、在本机架构上执行 `version` 自检（交叉架构跳过并注明），并用 `go version -m` 检查 **agent 产物不含 `github.com/xtls/xray-core`**、内核产物必须含它。
+
+#### 13.8.2 清单条目（`tools/manifestgen/examples/v11.yaml`）
+
+agent 与 Xray 内核都是本地构建（`local:` 条目从 `dist/` 计算哈希，需要一个 mirror 提供下载地址），上游 gost/realm/frp 仍从各自 GitHub Release 取：
+
+```yaml
+  - name: xray
+    version: "0.6.0"
+    run:
+      binary: W1nCray-xray
+      version_cmd: ["version"]
+      version_regex: "W1nCray-xray v?([0-9][0-9.]*)"   # 从 "W1nCray-xray v0.6.0 (Xray-core 26.3.27)" 取 0.6.0
+    mirrors: ["https://<mirror>/W1nCray-xray/{version}/{asset}"]
+    local:
+      - {file: dist/W1nCray-xray-linux-amd64.gz,      target: linux/amd64,         to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-amd64-lite.gz, target: linux/amd64+openwrt, to: W1nCray-xray, variant: fallbackroots}
+      # ... 其余架构相同：full -> linux/<arch>，lite -> linux/<arch>+openwrt
+```
+
+- 资产是**单文件 raw gz**（与 agent 条目相同的解包方式：`archive: gz`，`extract.from` 默认取归档基名）。
+- `min_agent` 故意留空：0.5.x agent 必须能先安装 Xray 内核（§2.6 的迁移顺序），所以内核条目不能要求 0.6。
+- `manifestgen build -kernels xray` 只重建选定的内核条目，便于 agent/内核重新构建后单独发布，而不必重新下载全部上游资产。
+- 第二个 Xray 版本（升级/回滚测试用）在示例里是**注释掉的占位条目**：本仓库没有旧构建，`release/build.sh` 只产出当前版本；用旧 tag 构建到 `dist/old/` 后取消注释即可。不要把它指向当前 `dist/` 文件——内核自检会发现版本不符。
+
+#### 13.8.3 本地文件安装（`W1nCray xray install --file`）
+
+`W1nCray xray install --file <W1nCray-xray 文件或 .gz> --sha256 <hex>` 用于 install.sh 的迁移和离线环境：
+
+1. 校验文件的 sha256（必填，缺失或不是 64 位十六进制即拒绝）；
+2. 解包（gzip 魔数判断，裸文件也接受）到内核目录的暂存区，执行 `version` 自检得到版本；
+3. 用**与按清单安装完全相同**的 `commit` 写入 `<kernels>/xray/<版本>/` 与 `.installed.json`、`current`/`previous` 指针，因此 `kernel_list`、升级、回滚、卸载都能识别它；
+4. 复用 `agent/xraysvc` 写服务并启动（与面板路径同一套实现）；安装成功后与按清单安装一样给内核树打 SELinux `bin_t` 标签（§13.7，尽力而为），启动前 `xraysvc` 再确认一次，所以本地安装的 Xray 内核与清单安装的走完全相同的 SELinux 与 `/run/W1nCray/xray.sock` 路径。
+
+`install.sh` 的 `update` 在检测到「0.5.x 及以前的单一程序 + 配置里有 Xray 节点」时自动执行这一串步骤（见 §13.9）。
+
+### 13.9 install.sh 的三条路径（v11）
+
+| 路径 | 行为 |
+|---|---|
+| `install`（全新） | 只安装 agent（`W1nCray` 程序 + `W1nCray` 服务），**不安装 Xray 内核**；结束时提示「Xray 内核将在面板绑定节点时自动安装，或执行 `W1nCray xray install`」。`--panel URL --machine ID --token TOKEN` 一键接入保持不变。 |
+| `update`（升级） | 已是 v11 agent：只更新 agent。0.5.x 及以前的**单一程序**且配置需要 Xray（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真）：先下载 agent 与对应架构的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序 **停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...` → 启动 agent**，并打印中断时长提示。下载在停止服务之前完成。 |
+| `uninstall` | 停止并删除 `W1nCray` 服务后，调用 `W1nCray xray remove` 停止并删除 `W1nCray-xray` 服务与内核文件（失败时脚本按当前后端自己删除 unit/init 脚本）；是否保留配置目录与原来一致（`--purge` 才删除）。 |
+
+管理菜单新增 14–19（Xray 内核 状态/启动/停止/重启/安装/卸载），快捷命令 `W1nCray xray ...` 直接透传给程序本体（带 `-c <配置>`）。
 
 

@@ -64,3 +64,22 @@ func (e *Ensurer) DownloadFor(ctx context.Context, name, version, dir string) (m
 func (e *Ensurer) VerifyArchiveFor(ctx context.Context, name, version, archivePath, dest string) (manifest.Target, string, error) {
 	return e.in.VerifyArchiveFor(ctx, name, version, archivePath, dest)
 }
+
+// InstallLocal installs a kernel from a file already on this machine, without
+// a signed manifest, pinning the bytes with the operator-supplied sha256 (see
+// install.Installer.InstallLocal). The result is indistinguishable from a
+// manifest install, so list/upgrade/rollback/remove all work on it.
+//
+// Like Ensure and Rollback it labels the kernel tree for SELinux afterwards
+// (best effort), so the local-file path — install.sh's pre-v11 migration and
+// `W1nCray xray install --file` — gets the same bin_t label a manifest install
+// does. The labeler is idempotent, and xraysvc labels again (fatal) before it
+// starts the service.
+func (e *Ensurer) InstallLocal(ctx context.Context, li install.LocalInstall) (driver.Installed, error) {
+	inst, err := e.in.InstallLocal(ctx, li)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(ctx)
+	return inst, nil
+}
