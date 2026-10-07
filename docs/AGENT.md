@@ -944,7 +944,7 @@ agent 与 Xray 内核都是本地构建（`local:` 条目从 `dist/` 计算哈�
 | 路径 | 行为 |
 |---|---|
 | `install`（全新） | 只安装 agent（`W1nCray` 程序 + `W1nCray` 服务），**不安装 Xray 内核**；结束时提示「Xray 内核将在面板绑定节点时自动安装，或执行 `W1nCray xray install`」。`--panel URL --machine ID --token TOKEN` 一键接入保持不变。 |
-| `update`（升级） | 已是 v11 agent：只更新 agent。0.5.x 及以前的**单一程序**且配置需要 Xray（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真）：先下载 agent 与对应架构的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序 **停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...` → 启动 agent**，并打印中断时长提示。下载在停止服务之前完成。 |
+| `update`（升级） | 已是 v11 agent：只更新 agent。0.5.x 及以前的**单一程序**且配置需要 Xray（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真）：先下载 agent 与对应架构的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序 **停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...` → 启动 agent**，并打印中断时长提示。下载在停止服务之前完成。停止服务前先把旧程序与旧服务文件备份到 `<BIN>.pre-v11` 与 `<unit>.pre-v11`（R1-11）：`xray install --file` 失败时自动把两者恢复回去并重新启动旧服务，再报错退出（提示机器已恢复到原版本）；迁移成功或恢复成功后删除这两个备份。没有服务管理器（`BACKEND=none`）时不尝试安装内核，备份保留并在提示里给出路径。 |
 | `uninstall` | 停止并删除 `W1nCray` 服务后，调用 `W1nCray xray remove` 停止并删除 `W1nCray-xray` 服务与内核文件（失败时脚本按当前后端自己删除 unit/init 脚本）；是否保留配置目录与原来一致（`--purge` 才删除）。 |
 
 管理菜单新增 14–19（Xray 内核 状态/启动/停止/重启/安装/卸载），快捷命令 `W1nCray xray ...` 直接透传给程序本体（带 `-c <配置>`）。
