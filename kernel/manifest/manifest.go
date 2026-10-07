@@ -134,9 +134,9 @@ var (
 	// reTarget is the manifest platform key: "linux/amd64", "linux/armv7", ...
 	// The only accepted suffix is "+openwrt" (platform.OpenWrtSuffix), which
 	// selects the OpenWrt-specific build of a kernel.
-	reTarget  = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}(?:\+openwrt)?$`)
-	reSHA256  = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	reFile    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
+	reTarget = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}(?:\+openwrt)?$`)
+	reSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	reFile   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
 )
 
 // reservedNames are file names the installer uses inside a version directory.

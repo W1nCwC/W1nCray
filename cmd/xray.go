@@ -15,8 +15,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/spf13/cobra"
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
 	"github.com/W1nCwC/W1nCray/agent/supervisor"

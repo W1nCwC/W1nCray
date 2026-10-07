@@ -201,6 +201,29 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		st.State = StateNotInstalled
 		return st, nil
 	}
+	// The kernel's own status endpoint is the truth when it answers: it says
+	// whether the Xray instance is really serving. When it does not answer, the
+	// init system decides: a service that is not up is "stopped" (or "failed"
+	// when the init system says so), and a service the init system still calls
+	// active is "running" (the endpoint may simply not be ready yet).
+	//
+	// The agent backend is the exception: the child belongs to this process's
+	// supervisor, which is the only authority on whether it is running (a
+	// leftover socket from a previous agent run must not be believed).
+	if m.opts.Status != nil && m.backend.managedBy() == "service" {
+		sctx, cancel := context.WithTimeout(ctx, m.opts.StatusTimeout)
+		ks, kerr := m.opts.Status.Status(sctx)
+		cancel()
+		if kerr == nil {
+			if ks.Running {
+				st.State = StateRunning
+			} else {
+				st.State = StateFailed
+				st.Error = ks.LastError
+			}
+			return st, nil
+		}
+	}
 	state, err := m.backend.active(ctx)
 	if err != nil {
 		st.State = StateFailed

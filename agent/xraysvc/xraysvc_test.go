@@ -570,6 +570,37 @@ func TestRemoveKeepsConfiguration(t *testing.T) {
 	}
 }
 
+// TestStatusPrefersTheKernelEndpoint covers the state mapping: the kernel's own
+// endpoint decides when it answers, and the init system decides when it does
+// not.
+func TestStatusPrefersTheKernelEndpoint(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	f.installFake(t, "1.0.0")
+	unitDir := filepath.Join(f.root, "etc", "systemd", "system")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, ServiceName+".service"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	f.status.setRunning(true)
+	if st, _ := f.manager.Status(ctx); st.State != StateRunning {
+		t.Fatalf("endpoint running -> %q, want running", st.State)
+	}
+	f.status.setRunning(false)
+	if st, _ := f.manager.Status(ctx); st.State != StateFailed {
+		t.Fatalf("endpoint reachable but not running -> %q, want failed", st.State)
+	}
+	f.status.mu.Lock()
+	f.status.err = errors.New("dial unix: connection refused")
+	f.status.mu.Unlock()
+	if st, _ := f.manager.Status(ctx); st.State != StateStopped {
+		t.Fatalf("unreachable endpoint with a stopped service -> %q, want stopped", st.State)
+	}
+}
+
 func TestStatusNotInstalled(t *testing.T) {
 	f := newFixture(t, "run/systemd/system/")
 	st, err := f.manager.Status(context.Background())
