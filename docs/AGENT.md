@@ -615,3 +615,36 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 5. **xray 的 `cert.mode: file` / `panel` 在内置装配里不可用**（`bootstrap.buildDrivers` 没配证书目录和面板证书源），xray TLS 隧道目前只能 `self` + `tls_pin`。
 6. `W1nCray check` 不校验 `desired.json` 内容，也没有 dry-run 命令。
 7. 面板下发（`Agent.Panel` 的期望状态与「机器模式节点」，见 §3）已实现；多机批量配置仍属后续阶段。
+
+## 12 重载语义（xray 与 agent 解耦）
+
+常驻服务是**单进程**：同一个 `W1nCray` 里跑着 xray core、Xboard 节点控制器和 agent（终端、supervisor、gost/frp/realm 实例、面板链接）。本节说明配置变更时**谁被重建、谁继续跑**（WP-A）。
+
+### 12.1 变更分类
+
+| 变化的文件 | 结果 |
+|---|---|
+| `agent.yml` | **只重启 agent**：旧 Runtime 关停（终端会话结束、gost/frp/realm 实例停止、面板链接断开），再 Boot 新 Runtime 并从持久化的 last good state 恢复实例、重连面板。**xray core 与节点控制器不重建**。 |
+| `config.yml`、`route.json`、`dns.json`、`custom_inbound.json`、`custom_outbound.json`、节点 `RuleListPath`、机器节点列表 | **只重建 xray**：新 core 与新节点控制器起来，agent 完全不动。 |
+| `config.yml` 的 `Agent:` 块 | `config.yml` 属于 xray 文件，所以**先重建 xray**；若比较后 agent 配置也变了，**再重启 agent**。 |
+| `desired.json` | 不是重载：走期望状态应用（只增删实例，不重建任何东西）。 |
+| `files_apply` / `files_*` 触发的重载（`ReloadForAgent`） | **只重建 xray**，agent 与其链接保持，所以 `applied_pending` 能在同一连接上回报。 |
+| `self_update` | **仍然重启整个进程**（新二进制由看门狗/服务管理器拉起），xray 与 agent 一起重启。 |
+
+判断依据是「哪个被监听文件触发了变更」加上「重新加载后的 `cfg.Agent` 与旧值比较」：`agent.yml` 单独变化且生效的 agent 配置确实不同 → 只重启 agent；`agent.yml` 只被 touch（生效配置不变）→ 什么都不重启；其它文件变化 → 重建 xray。
+
+### 12.2 xray 重建时 agent 的状态
+
+- **不调用 `Runtime.Shutdown`、不断开面板链接、不关终端**：`panel.shutdown()` 只在进程退出（`Close()`）时走。
+- **agent 实例只按引擎分类处理**：`engine=xray` 的实例在新 core 上重新创建（`Runtime.ReattachXray`）；`gost` / `frp` / `realm` 的实例、它们的子进程与已建立连接**完全不动**。
+- **xray 引擎的实例会有一次短暂重建**：旧 core 关闭时它上面的入站/出站随之消失，随后在新 core 上重建（端口重新绑定）。这是「重建 core」的固有代价，其它引擎不受影响。
+- **旧 core 关闭前先 `Swap(nil)`**：agent 的 xray host（`corehost.Swappable`）先被摘除，驱动的调用会以明确错误（`corehost.ErrNoCore`）失败，绝不触碰已关闭的 core；新 core 就绪后再 `Swap(新 core)` 并重建实例。
+- **锁顺序**：`panel.mu` → `Reconciler.mu`（`DetachXray` / `ReattachXray` 在 `Reconciler.mu` 下完成 host 替换，所以不会与并发的期望状态应用交错）。反向永不发生，因此不会死锁。
+- **重建窗口内的期望状态应用**：xray core 尚未就绪的极短窗口里落地的应用会看到「没有 core 的 xray 引擎」而失败并按既有逻辑回滚；窗口只包含本地端口绑定，通常在一秒以内。
+
+### 12.3 agent 启停
+
+- `Agent.Enabled` 从 true 变 false：**停 agent**（终端、实例、面板链接全部结束），xray 照常运行。
+- 从 false 变 true：**启动 agent**（`Boot` + 面板链接），xray 照常运行。
+- agent 只在进程生命周期内 Boot 一次；之后的重载要么不动它，要么（agent.yml / Agent 配置变化时）整体重启它。
+

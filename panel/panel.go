@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
 	"github.com/W1nCwC/W1nCray/core"
+	"github.com/W1nCwC/W1nCray/corehost"
 	"github.com/W1nCwC/W1nCray/node"
 )
 
@@ -33,6 +35,15 @@ var (
 // machineRequestTimeout bounds one machine-node request.
 const machineRequestTimeout = 60 * time.Second
 
+// reloadRequest is one queued rebuild. files names the watched files whose
+// change triggered it; an empty list means the request did not come from the
+// config watcher (a node controller, the machine watch or the managed-file
+// reload), which always rebuilds xray.
+type reloadRequest struct {
+	reason string
+	files  []string
+}
+
 // Panel owns the Xray instance and the node controllers.
 type Panel struct {
 	path string
@@ -43,6 +54,12 @@ type Panel struct {
 	nodes   []*node.Controller
 	agent   *bootstrap.Runtime
 	running bool
+
+	// host is the replaceable xray host the agent's xray engine is built on.
+	// It is created with the first agent boot and survives every xray rebuild:
+	// ReattachXray swaps in the new core and recreates the engine=xray
+	// instances on it, so an xray change never restarts the agent.
+	host *corehost.Swappable
 
 	// remoteStop ends the agent's panel link (nil when it is not running).
 	remoteStop func()
@@ -57,19 +74,19 @@ type Panel struct {
 	// when machine mode is off or nothing runs); machineWG joins them so
 	// shutdown never returns before they stopped.
 	machineCancel context.CancelFunc
-	machineWG     sync.WaitGroup
+	machineWG     *sync.WaitGroup
 
-	reloadCh chan string
+	reloadCh chan struct{}
 	stop     chan struct{}
 	done     chan struct{}
 
-	// reloadMu serialises the rebuilds: the config watcher, the machine-node
-	// watch and the managed-file reload (ReloadForAgent) all end in start(),
-	// and two concurrent rebuilds would race over p.core/p.nodes.
-	reloadMu sync.Mutex
-	// reloadPending remembers a reload request that arrived while one was
-	// running, so a config change during a long rebuild is not lost.
-	reloadPending string
+	// reloadMu guards the rebuild queue. reloadPending is the request to serve
+	// next (a request that arrives while one is pending is merged into it) and
+	// reloadRunning is true while reload is executing one, so a request that
+	// arrives during a long rebuild is remembered instead of being lost.
+	reloadMu      sync.Mutex
+	reloadPending *reloadRequest
+	reloadRunning bool
 }
 
 // New creates a panel for the config file at path.
@@ -77,49 +94,105 @@ func New(path string, cfg *Config) *Panel {
 	return &Panel{
 		path:     path,
 		cfg:      cfg,
-		reloadCh: make(chan string, 1),
+		reloadCh: make(chan struct{}, 1),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
 }
 
-// requestReload schedules a rebuild without blocking the caller. A request that
-// arrives while a rebuild is already running is remembered, so a change made
-// during a long reload still takes effect.
+// requestReload schedules a rebuild without blocking the caller. It is the node
+// controller callback (node.Options.Reload) and is used for every event that is
+// not a watched-file change; such a request always rebuilds xray.
 func (p *Panel) requestReload(reason string) {
+	p.enqueueReload(reloadRequest{reason: reason})
+}
+
+// requestReloadFiles schedules a rebuild triggered by a change of the named
+// watched files. The file list is what lets reload tell an agent.yml-only edit
+// (agent restart) from an xray edit (core rebuild).
+func (p *Panel) requestReloadFiles(reason string, files []string) {
+	p.enqueueReload(reloadRequest{reason: reason, files: files})
+}
+
+// enqueueReload queues a rebuild. A request that arrives while one is pending
+// is merged into it (the first reason wins, but a non-file request keeps the
+// rebuild an xray change); a request that arrives while a rebuild is running is
+// remembered and served by the running reload's loop. The channel is only a
+// wake-up signal.
+func (p *Panel) enqueueReload(req reloadRequest) {
 	p.reloadMu.Lock()
-	if p.reloadPending != "" {
-		p.reloadMu.Unlock()
-		return
+	if p.reloadPending == nil {
+		r := req
+		p.reloadPending = &r
+	} else if p.reloadPending.files != nil && req.files != nil {
+		p.reloadPending.files = mergeFiles(p.reloadPending.files, req.files)
+	} else {
+		// A request without a file list (a node, the machine watch, a managed
+		// file reload) is always an xray change.
+		p.reloadPending.files = nil
 	}
-	p.reloadPending = reason
+	wake := !p.reloadRunning
 	p.reloadMu.Unlock()
-	select {
-	case p.reloadCh <- reason:
-	default:
+	if wake {
+		select {
+		case p.reloadCh <- struct{}{}:
+		default:
+		}
 	}
 }
 
-// takeReloadPending consumes the pending reason. It returns "" when nothing is
-// pending, which also releases the "one request at a time" slot.
-func (p *Panel) takeReloadPending() string {
+// takeReload returns the next pending request and marks a rebuild as running.
+// ok is false for a spurious wake-up (nothing pending).
+func (p *Panel) takeReload() (reloadRequest, bool) {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
-	r := p.reloadPending
-	p.reloadPending = ""
-	return r
+	if p.reloadPending == nil {
+		return reloadRequest{}, false
+	}
+	req := *p.reloadPending
+	p.reloadPending = nil
+	p.reloadRunning = true
+	return req, true
 }
 
-// ReloadForAgent rebuilds the instance after the managed files were replaced
-// (agent/filesync). It is serialised with every other reload and it validates
-// the config *before* it shuts anything down: a config.yml that does not load
-// returns an error and leaves the running instance untouched (ruling 2, design
-// section 6.2).
+// finishReload releases the "running" mark.
+func (p *Panel) finishReload() {
+	p.reloadMu.Lock()
+	p.reloadRunning = false
+	p.reloadMu.Unlock()
+}
+
+// mergeFiles returns the union of two watched-file lists, keeping the order and
+// dropping duplicates.
+func mergeFiles(a, b []string) []string {
+	out := append([]string(nil), a...)
+	seen := make(map[string]bool, len(out)+len(b))
+	for _, f := range out {
+		seen[f] = true
+	}
+	for _, f := range b {
+		if !seen[f] {
+			out = append(out, f)
+			seen[f] = true
+		}
+	}
+	return out
+}
+
+// ReloadForAgent rebuilds the xray instance after the managed files were
+// replaced (agent/filesync). It is serialised with every other reload and it
+// validates the config *before* it shuts anything down: a config.yml that does
+// not load returns an error and leaves the running instance untouched (ruling 2,
+// design section 6.2).
 //
-// The rebuild itself is asynchronous: shutdown() also tears down the agent's
-// panel link, and start() retries forever, so waiting for it here would either
-// destroy the caller or never return. The panel judges health from the
-// hello/telemetry that follow (protocol ruling 9).
+// Only xray is rebuilt: the agent (its terminals, its supervisor, its external
+// kernels and its panel link) keeps running, so the applied-pending answer can
+// be reported on the same link (WP-A).
+//
+// The rebuild itself is asynchronous: rebuildXray retries a failed start
+// forever, so waiting for it here would either destroy the caller or never
+// return. The panel judges health from the hello/telemetry that follow
+// (protocol ruling 9).
 func (p *Panel) ReloadForAgent(ctx context.Context, reason string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -144,10 +217,29 @@ func (p *Panel) Start() error {
 	return nil
 }
 
-func (p *Panel) start() (err error) {
+func (p *Panel) start() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cfg := p.cfg
+	return p.startLocked()
+}
+
+// startLocked starts the xray core with its node controllers and, on the first
+// start, boots the agent. The caller must hold p.mu.
+func (p *Panel) startLocked() error {
+	if err := p.startXrayLocked(p.cfg); err != nil {
+		return err
+	}
+	p.running = true
+	p.startAgentLocked(p.cfg)
+	log.Infof("W1nCray started with %d node(s)", len(p.nodes))
+	return nil
+}
+
+// startXrayLocked builds and starts an xray core with its node controllers and
+// machine-node tasks from cfg. On success the panel's core, nodes and machine
+// task fields are replaced; the agent is not touched. The caller must hold
+// p.mu.
+func (p *Panel) startXrayLocked(cfg *Config) (err error) {
 	setLogLevel(cfg.LogConfig.Level)
 
 	certs := cert.NewManager(certDir(p.path, cfg))
@@ -168,14 +260,15 @@ func (p *Panel) start() (err error) {
 	var machine *xboard.Client
 	var machineVersion string
 	var machineCtx context.Context
+	var machineCancel context.CancelFunc
+	var machineWG sync.WaitGroup
 	if pc := machinePanel(cfg); pc != nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		p.machineCancel = cancel
-		machineCtx = ctx
+		machineCtx, machineCancel = ctx, cancel
 		c, version, derr := p.discoverMachineNodes(pc, certs, &nodes)
 		if derr != nil {
 			log.Warnf("machine nodes: %v (static nodes keep running; retrying)", derr)
-			p.scheduleMachineRetry(ctx, "machine node discovery failed")
+			p.scheduleMachineRetry(ctx, &machineWG, "machine node discovery failed")
 		} else {
 			machine, machineVersion = c, version
 		}
@@ -183,8 +276,9 @@ func (p *Panel) start() (err error) {
 	// A start that fails after this point must not leave the machine tasks
 	// behind: the next start would otherwise start a second set.
 	defer func() {
-		if err != nil {
-			p.stopMachineLocked()
+		if err != nil && machineCancel != nil {
+			machineCancel()
+			machineWG.Wait()
 		}
 	}()
 
@@ -209,72 +303,155 @@ func (p *Panel) start() (err error) {
 		ns = append(ns, n.NameServers()...)
 	}
 
-	cr, err := core.New(coreOptions(cfg, ns))
-	if err != nil {
-		return err
+	cr, cerr := core.New(coreOptions(cfg, ns))
+	if cerr != nil {
+		return cerr
 	}
-	if err := cr.Start(); err != nil {
+	if serr := cr.Start(); serr != nil {
 		cr.Close()
-		return fmt.Errorf("start xray: %w", err)
+		return fmt.Errorf("start xray: %w", serr)
 	}
 	for _, n := range nodes {
 		if err := n.Start(cr); err != nil {
 			log.WithField("node", n.Tag()).Errorf("start: %v", err)
 		}
 	}
-	// The agent runs on top of the same Xray instance. A boot failure is
-	// logged, not fatal: the panel nodes keep serving.
-	if cfg.Agent != nil && cfg.Agent.Enabled {
-		// Say which file the agent's configuration came from: with two files
-		// in play, silence is exactly what makes a stale edit hard to find.
-		if src := cfg.AgentSourcePath(); src != "" {
-			log.Infof("agent: configuration from %s", src)
-		}
-		rt, err := bootstrap.Boot(bootstrap.Options{
-			StateDir:         cfg.Agent.StateDir,
-			KernelsDir:       cfg.Agent.KernelsDir,
-			ManifestPath:     cfg.Agent.ManifestPath,
-			ManifestKeysPath: cfg.Agent.ManifestKeysPath,
-			Policy:           cfg.Agent.PolicySpec(),
-			AgentConfig:      cfg.Agent,
-			// The build version names the watchdog copy of the previous binary
-			// a committed self_update leaves behind, and the single-instance
-			// lock is how that watchdog tells a restarted broken binary from a
-			// running agent.
-			SelfVersion: AgentVersion,
-			LockPath:    p.path + ".lock",
-			Files:       FilesOptionsFor(cfg, p.path),
-			Log:         log.StandardLogger(),
-			// The local terminal policy (D8, WP-G6). Enabled is the resolved
-			// agentcfg value: on unless the machine opted out with
-			// Terminal.Enabled: false or --noterminal.
-			Terminal: terminalOptions(cfg.Agent),
-			// The confined file operations (D9, WP-G6). No roots means no
-			// file_* commands and no "files" capability.
-			FileOps: fileOptions(p.path, cfg.Agent),
-			// After a restart the persisted last good state comes back before
-			// (and without) the panel, so a panel that is down never costs
-			// forwarding.
-			Resume: true,
-		}, cr)
-		if err != nil {
-			log.Errorf("agent: boot: %v", err)
-		} else {
-			p.agent = rt
-			if cfg.Agent.DesiredPath != "" {
-				p.applyAgentDesiredLocked(cfg.Agent.DesiredPath, rt)
-			}
-			p.startRemoteLocked(cfg.Agent, rt)
-		}
-	}
 	// Watch the machine's node list so a node added or removed on the panel is
 	// picked up without a config change.
 	if machine != nil {
-		p.startMachineWatchLocked(machineCtx, machine, machineVersion)
+		p.startMachineWatch(machineCtx, &machineWG, machine, machineVersion)
 	}
-	p.core, p.nodes, p.running = cr, nodes, true
-	log.Infof("W1nCray started with %d node(s)", len(nodes))
+	p.core, p.nodes = cr, nodes
+	p.machineCancel, p.machineWG = machineCancel, &machineWG
 	return nil
+}
+
+// startAgentLocked boots the agent when it is enabled and not running yet, on
+// the panel's current core. A boot failure is logged, not fatal: the panel
+// nodes keep serving. The caller must hold p.mu.
+func (p *Panel) startAgentLocked(cfg *Config) {
+	if p.agent != nil || cfg.Agent == nil || !cfg.Agent.Enabled || p.core == nil {
+		return
+	}
+	if p.host == nil {
+		p.host = corehost.NewSwappable()
+	}
+	// The agent's xray engine runs on the current core. No Runtime exists yet
+	// (or the old one was stopped), so the swap cannot race an Apply.
+	p.host.Swap(p.core)
+	// Say which file the agent's configuration came from: with two files in
+	// play, silence is exactly what makes a stale edit hard to find.
+	if src := cfg.AgentSourcePath(); src != "" {
+		log.Infof("agent: configuration from %s", src)
+	}
+	rt, err := bootstrap.Boot(bootstrap.Options{
+		StateDir:         cfg.Agent.StateDir,
+		KernelsDir:       cfg.Agent.KernelsDir,
+		ManifestPath:     cfg.Agent.ManifestPath,
+		ManifestKeysPath: cfg.Agent.ManifestKeysPath,
+		Policy:           cfg.Agent.PolicySpec(),
+		AgentConfig:      cfg.Agent,
+		// The build version names the watchdog copy of the previous binary
+		// a committed self_update leaves behind, and the single-instance
+		// lock is how that watchdog tells a restarted broken binary from a
+		// running agent.
+		SelfVersion: AgentVersion,
+		LockPath:    p.path + ".lock",
+		Files:       FilesOptionsFor(cfg, p.path),
+		Log:         log.StandardLogger(),
+		// The local terminal policy (D8, WP-G6). Enabled is the resolved
+		// agentcfg value: on unless the machine opted out with
+		// Terminal.Enabled: false or --noterminal.
+		Terminal: terminalOptions(cfg.Agent),
+		// The confined file operations (D9, WP-G6). No roots means no
+		// file_* commands and no "files" capability.
+		FileOps: fileOptions(p.path, cfg.Agent),
+		// After a restart the persisted last good state comes back before
+		// (and without) the panel, so a panel that is down never costs
+		// forwarding.
+		Resume: true,
+	}, p.host)
+	if err != nil {
+		log.Errorf("agent: boot: %v", err)
+		return
+	}
+	p.agent = rt
+	if cfg.Agent.DesiredPath != "" {
+		p.applyAgentDesiredLocked(cfg.Agent.DesiredPath, rt)
+	}
+	p.startRemoteLocked(cfg.Agent, rt)
+}
+
+// stopAgentLocked ends the agent and its panel link. It is what an agent.yml
+// change and a process exit use; an xray rebuild never calls it. The caller
+// must hold p.mu.
+func (p *Panel) stopAgentLocked() {
+	// Stop the WebSocket channel before the HTTP link: WS commands and hints
+	// run through the same Runner the HTTP link stops below (design §3.6).
+	if p.wsStop != nil {
+		p.wsStop()
+		p.wsStop = nil
+	}
+	// Stop the panel link first: no apply may race the teardown below.
+	if p.remoteStop != nil {
+		p.remoteStop()
+		p.remoteStop = nil
+	}
+	if p.agent == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := p.agent.Shutdown(ctx); err != nil {
+		log.Errorf("agent: shutdown: %v", err)
+	}
+	cancel()
+	p.agent = nil
+}
+
+// stopXrayLocked stops the machine tasks, the node controllers and the xray
+// core. The caller must hold p.mu.
+func (p *Panel) stopXrayLocked() {
+	// Stop the machine-node tasks first: no discovery or watch may race the
+	// teardown below. They never take p.mu, so waiting here cannot deadlock.
+	p.stopMachineLocked()
+	var wg sync.WaitGroup
+	for _, n := range p.nodes {
+		wg.Add(1)
+		go func(n *node.Controller) {
+			defer wg.Done()
+			n.Close()
+		}(n)
+	}
+	wg.Wait()
+	// Closing the instance does not end accepted connections; abort the
+	// tracked ones (none unless a tag prefix is watched) so that a rebuild does
+	// not leave sessions of the old instance behind.
+	if p.core != nil {
+		if n := p.core.Conns().KillAll(); n > 0 {
+			log.Infof("aborted %d tracked connection(s)", n)
+		}
+		if err := p.core.Close(); err != nil {
+			log.Errorf("close xray: %v", err)
+		}
+	}
+	p.nodes, p.core, p.running = nil, nil, false
+}
+
+// reattachXrayLocked recreates the agent's engine=xray instances on the core
+// that is now running, leaving every other engine alone. The caller must hold
+// p.mu.
+func (p *Panel) reattachXrayLocked() {
+	if p.agent == nil || p.core == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rep, err := p.agent.ReattachXray(ctx, p.core)
+	if err != nil {
+		log.Errorf("agent: reattach xray: %v", err)
+		return
+	}
+	log.Infof("agent: xray reattached: %s (%d instance(s))", rep.Status, len(rep.Instances))
 }
 
 // discoverMachineNodes asks the panel which nodes this machine runs and appends
@@ -356,12 +533,12 @@ func machineControllerConfig(t *node.Config) *node.Config {
 	return controllerConfigWithDefaults(t)
 }
 
-// startMachineWatchLocked starts the node-list watcher of the running instance.
-// The caller must hold p.mu.
-func (p *Panel) startMachineWatchLocked(ctx context.Context, c *xboard.Client, version string) {
-	p.machineWG.Add(1)
+// startMachineWatch starts the node-list watcher of a new instance. wg is the
+// wait group of the instance the watcher belongs to.
+func (p *Panel) startMachineWatch(ctx context.Context, wg *sync.WaitGroup, c *xboard.Client, version string) {
+	wg.Add(1)
 	go func() {
-		defer p.machineWG.Done()
+		defer wg.Done()
 		p.machineWatch(ctx, c, version)
 	}()
 }
@@ -398,11 +575,12 @@ func (p *Panel) machineWatch(ctx context.Context, c *xboard.Client, version stri
 
 // scheduleMachineRetry asks for a reload after machineRetryDelay, so a failed
 // discovery is retried without blocking the running nodes. The goroutine ends
-// with the instance context or after it fired. The caller must hold p.mu.
-func (p *Panel) scheduleMachineRetry(ctx context.Context, reason string) {
-	p.machineWG.Add(1)
+// with the instance context or after it fired. wg is the wait group of the
+// instance the retry belongs to.
+func (p *Panel) scheduleMachineRetry(ctx context.Context, wg *sync.WaitGroup, reason string) {
+	wg.Add(1)
 	go func() {
-		defer p.machineWG.Done()
+		defer wg.Done()
 		t := time.NewTimer(machineRetryDelay)
 		defer t.Stop()
 		select {
@@ -420,8 +598,10 @@ func (p *Panel) stopMachineLocked() {
 		return
 	}
 	p.machineCancel()
-	p.machineWG.Wait()
-	p.machineCancel = nil
+	if p.machineWG != nil {
+		p.machineWG.Wait()
+	}
+	p.machineCancel, p.machineWG = nil, nil
 }
 
 // applyAgentDesiredLocked applies a desired-state file and logs the outcome.
@@ -505,55 +685,19 @@ func (p *Panel) startRemoteLocked(a *AgentConfig, rt *bootstrap.Runtime) {
 	}
 }
 
+// shutdown stops everything, agent included. It is the process-exit path
+// (Close): an xray rebuild no longer goes through it, so a config change never
+// ends the agent's terminals, its supervisor or its external kernels.
 func (p *Panel) shutdown() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.running {
+	if !p.running && p.agent == nil {
 		return
 	}
-	// Stop the machine-node tasks first: no discovery or watch may race the
-	// teardown below. They never take p.mu, so waiting here cannot deadlock.
-	p.stopMachineLocked()
-	// Stop the WebSocket channel before the HTTP link: WS commands and hints
-	// run through the same Runner the HTTP link stops below (design §3.6).
-	if p.wsStop != nil {
-		p.wsStop()
-		p.wsStop = nil
-	}
-	// Stop the panel link first: no apply may race the teardown below.
-	if p.remoteStop != nil {
-		p.remoteStop()
-		p.remoteStop = nil
-	}
-	var wg sync.WaitGroup
-	for _, n := range p.nodes {
-		wg.Add(1)
-		go func(n *node.Controller) {
-			defer wg.Done()
-			n.Close()
-		}(n)
-	}
-	wg.Wait()
-	// The agent's kernels may live in the Xray instance, so stop them before
-	// closing it.
-	if p.agent != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := p.agent.Shutdown(ctx); err != nil {
-			log.Errorf("agent: shutdown: %v", err)
-		}
-		cancel()
-		p.agent = nil
-	}
-	// Closing the instance does not end accepted connections; abort the
-	// tracked ones (none unless a tag prefix is watched) so that a reload does
-	// not leave sessions of the old instance behind.
-	if n := p.core.Conns().KillAll(); n > 0 {
-		log.Infof("aborted %d tracked connection(s)", n)
-	}
-	if err := p.core.Close(); err != nil {
-		log.Errorf("close xray: %v", err)
-	}
-	p.nodes, p.core, p.running = nil, nil, false
+	// The agent's kernels may live in the Xray instance, so stop it before
+	// closing the core.
+	p.stopAgentLocked()
+	p.stopXrayLocked()
 }
 
 // Close stops everything.
@@ -563,34 +707,163 @@ func (p *Panel) Close() {
 	p.shutdown()
 }
 
-// reload rebuilds everything, re-reading the config file. On a config error
-// the previous config keeps being used. The caller must have taken the pending
-// slot (takeReloadPending); the deferred call releases it, so a request that
-// arrived during the rebuild is served next.
-func (p *Panel) reload(reason string) {
-	defer p.takeReloadPending()
+// reload serves queued rebuild requests. It keeps taking requests until none is
+// pending, so a request that arrived during a long rebuild is served next
+// instead of being lost.
+func (p *Panel) reload() {
+	for {
+		req, ok := p.takeReload()
+		if !ok {
+			return
+		}
+		p.applyReload(req)
+		p.finishReload()
+	}
+}
+
+// applyReload carries out one rebuild. An agent.yml-only change restarts the
+// agent and leaves xray running; every other watched file (and every request
+// that did not come from the watcher) rebuilds the xray core and its node
+// controllers, keeping the agent alive and reattaching only its xray engine.
+func (p *Panel) applyReload(req reloadRequest) {
+	reason := req.reason
+	if reason == "" {
+		reason = "config file changed"
+	}
 	log.Infof("reloading: %s", reason)
 	cfg, err := LoadConfig(p.path)
 	if err != nil {
 		log.Errorf("reload aborted, keeping the running config: %v", err)
 		return
 	}
-	p.shutdown()
+
 	p.mu.Lock()
-	p.cfg = cfg
+	old := p.cfg
 	p.mu.Unlock()
-	for {
-		err := p.start()
-		if err == nil {
+
+	if isAgentYMLOnly(req.files, p.path) {
+		if sameAgentConfig(old, cfg) {
+			// The agent.yml change did not change the effective agent
+			// configuration (a touch, or an edit that resolved to the same
+			// values): nothing to restart.
+			p.mu.Lock()
+			p.cfg = cfg
+			p.mu.Unlock()
+			log.Infof("reload: agent.yml changed but the agent configuration is unchanged")
 			return
 		}
-		log.Errorf("restart failed: %v; retrying in 10s", err)
+		p.restartAgent(cfg)
+		return
+	}
+	p.rebuildXray(cfg, !sameAgentConfig(old, cfg))
+}
+
+// restartAgent restarts the agent with cfg and leaves xray untouched. It is the
+// agent.yml-only path: the old Runtime owns the terminals, the supervisor, the
+// external kernels and the panel link, so they all end here, while the xray
+// core keeps running and is handed to the new Runtime.
+func (p *Panel) restartAgent(cfg *Config) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stopAgentLocked()
+	p.cfg = cfg
+	if p.running {
+		p.startAgentLocked(cfg)
+	}
+}
+
+// rebuildXray replaces the xray core and its node controllers with ones built
+// from cfg. The agent is not shut down: its xray engine is detached from the
+// old core before it is closed and reattached to the new one afterwards, while
+// its terminals, its supervisor, its panel link and the instances of the other
+// engines keep running. restartAgent restarts the agent too when the change
+// touched the agent configuration; the new Runtime resumes the persisted state
+// on the new core.
+func (p *Panel) rebuildXray(cfg *Config, restartAgent bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	select {
+	case <-p.stop:
+		return
+	default:
+	}
+
+	if !p.running {
+		// Nothing is running (a previous start failed, or Close raced the
+		// reload): start from scratch with the new configuration.
+		p.stopAgentLocked()
+		p.cfg = cfg
+		if err := p.startLocked(); err != nil {
+			log.Errorf("restart failed: %v", err)
+		}
+		return
+	}
+
+	// Take the xray engine off the core that is about to be closed: from here
+	// on its calls fail cleanly instead of reaching a closed instance, and no
+	// Apply can be in flight while the core is replaced.
+	if p.agent != nil {
+		p.agent.DetachXray()
+	}
+	p.stopXrayLocked()
+	p.cfg = cfg
+	for {
+		if err := p.startXrayLocked(cfg); err == nil {
+			break
+		} else {
+			log.Errorf("xray restart failed: %v; retrying in 10s", err)
+		}
 		select {
 		case <-p.stop:
 			return
 		case <-time.After(10 * time.Second):
 		}
 	}
+	p.running = true
+	if restartAgent {
+		p.stopAgentLocked()
+	}
+	if p.agent == nil {
+		p.startAgentLocked(cfg)
+	} else {
+		p.reattachXrayLocked()
+	}
+}
+
+// isAgentYMLOnly reports whether every changed watched file is agent.yml. Such
+// a change restarts the agent and leaves the xray core alone; any other watched
+// file (config.yml, route/dns/custom_*, a rule list) rebuilds xray. The file
+// names are absolute, as the watcher produces them.
+func isAgentYMLOnly(files []string, configPath string) bool {
+	if len(files) == 0 {
+		return false
+	}
+	agentYML, err := filepath.Abs(filepath.Join(filepath.Dir(configPath), agentcfg.FileName))
+	if err != nil {
+		return false
+	}
+	for _, f := range files {
+		if f != agentYML {
+			return false
+		}
+	}
+	return true
+}
+
+// sameAgentConfig reports whether two loaded configs describe the same agent
+// configuration. It is what tells an agent-only edit from a change that also
+// affects xray: the agent half is compared as a whole, with its paths already
+// resolved by LoadConfig.
+func sameAgentConfig(a, b *Config) bool {
+	return reflect.DeepEqual(agentOf(a), agentOf(b))
+}
+
+func agentOf(c *Config) *AgentConfig {
+	if c == nil {
+		return nil
+	}
+	return c.Agent
 }
 
 // watch handles reload requests from nodes and changes of the config files.
@@ -630,16 +903,16 @@ func (p *Panel) watch(ready chan<- struct{}) {
 	}
 
 	var debounce <-chan time.Time
+	var debounceFiles []string
 	var desiredDebounce <-chan time.Time
 	for {
 		select {
 		case <-p.stop:
 			return
-		case reason := <-p.reloadCh:
-			// requestReload already reserved the pending slot; reload releases
-			// it when it is done, so a request that arrived meanwhile is served
-			// next instead of being lost.
-			p.reload(reason)
+		case <-p.reloadCh:
+			// requestReload already queued the request; reload serves it and
+			// any request that arrived meanwhile.
+			p.reload()
 		case ev := <-events:
 			abs, _ := filepath.Abs(ev.Name)
 			if desiredAbs != "" && abs == desiredAbs {
@@ -647,6 +920,9 @@ func (p *Panel) watch(ready chan<- struct{}) {
 					desiredDebounce = time.After(500 * time.Millisecond)
 				}
 			} else if watched[abs] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+				// Remember which file changed: an agent.yml-only edit restarts
+				// the agent, everything else rebuilds xray.
+				debounceFiles = mergeFiles(debounceFiles, []string{abs})
 				if debounce == nil {
 					debounce = time.After(2 * time.Second)
 				}
@@ -658,10 +934,12 @@ func (p *Panel) watch(ready chan<- struct{}) {
 			p.applyAgentDesired()
 		case <-debounce:
 			debounce = nil
+			files := debounceFiles
+			debounceFiles = nil
 			// Through requestReload, not straight into reload: a rebuild may be
 			// running (a long reload, or ReloadForAgent), and two concurrent
 			// rebuilds would race over p.core and p.nodes.
-			p.requestReload("config file changed")
+			p.requestReloadFiles("config file changed", files)
 		}
 	}
 }

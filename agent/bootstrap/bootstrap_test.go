@@ -20,7 +20,6 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/portledger"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
-	"github.com/W1nCwC/W1nCray/core"
 )
 
 // ---- fake driver ---------------------------------------------------------
@@ -245,7 +244,7 @@ func dialOK(addr string) bool {
 func TestBootApplyFileReportShutdown(t *testing.T) {
 	fd := newFakeDriver()
 	orig := driverBuilder
-	driverBuilder = func(c *core.Core, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
+	driverBuilder = func(_ XrayHost, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
 		return map[string]driver.Driver{spec.EngineGost: fd}, nil
 	}
 	t.Cleanup(func() { driverBuilder = orig })
@@ -335,7 +334,7 @@ func (l *recLog) warnText() string {
 func useFake(t *testing.T, fd *fakeDriver) {
 	t.Helper()
 	orig := driverBuilder
-	driverBuilder = func(c *core.Core, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
+	driverBuilder = func(_ XrayHost, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
 		return map[string]driver.Driver{spec.EngineGost: fd}, nil
 	}
 	t.Cleanup(func() { driverBuilder = orig })
