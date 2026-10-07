@@ -135,7 +135,7 @@ func (r *ruleSet) resolveOutbound(tag string) (string, bool) {
 // build assembles the node rules (see core.RuleManager for ordering).
 func (r *ruleSet) build(cfg *Config, routes []xboard.Route, customRoutes []json.RawMessage, localRules []string) *core.NodeRules {
 	nr := &core.NodeRules{}
-	if cfg.blockPrivateIP() {
+	if cfg.BlocksPrivateIP() {
 		nr.Head = append(nr.Head, rule(map[string]any{"inboundTag": []string{r.inTag}, "ip": privateCIDRs, "outboundTag": core.BlockTag}))
 	}
 

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/W1nCwC/W1nCray/node"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 // writeFile writes a file and fails the test on error.
@@ -470,7 +470,7 @@ func TestControllerConfigWithDefaults(t *testing.T) {
 	if cc == nil || cc.ListenIP == "" {
 		t.Fatalf("defaults = %+v", cc)
 	}
-	src := &node.Config{ListenIP: "127.0.0.1", UpdatePeriodic: 30}
+	src := &nodecfg.Config{ListenIP: "127.0.0.1", UpdatePeriodic: 30}
 	cc = ControllerConfigWithDefaults(src)
 	if cc == src || cc.ListenIP != "127.0.0.1" || cc.UpdatePeriodic != 30 {
 		t.Fatalf("override = %+v", cc)

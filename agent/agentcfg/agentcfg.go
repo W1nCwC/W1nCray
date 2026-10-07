@@ -20,7 +20,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/spec"
-	"github.com/W1nCwC/W1nCray/node"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 // FileName is the conventional name looked for next to config.yml.
@@ -136,7 +136,7 @@ type PanelConfig struct {
 	// NodeController is the ControllerConfig template shared by every machine
 	// node (ListenIP, CertConfig, ...). Missing fields fall back to the node
 	// defaults.
-	NodeController *node.Config `mapstructure:"NodeController"`
+	NodeController *nodecfg.Config `mapstructure:"NodeController"`
 	// NodeControllers overrides NodeController for individual machine nodes,
 	// keyed by the panel's node id (the same field layout as
 	// Nodes[].ControllerConfig). An entry that exists is used as a whole: it is
@@ -145,7 +145,7 @@ type PanelConfig struct {
 	// Typical use: a node that needs PROXY protocol, its own certificate or a
 	// local DNS/REALITY setup, including credentials that must stay on this
 	// machine and are never sent to the panel.
-	NodeControllers map[int]*node.Config `mapstructure:"NodeControllers"`
+	NodeControllers map[int]*nodecfg.Config `mapstructure:"NodeControllers"`
 }
 
 // Policy maps agent/spec.Policy fields onto the config file. A zero value
@@ -659,27 +659,8 @@ func (p *PanelConfig) Validate() error {
 // fields over the node defaults. It is the one place that completes a
 // ControllerConfig, so Nodes, the machine template and the per-node overrides
 // all get the same treatment.
-func ControllerConfigWithDefaults(src *node.Config) *node.Config {
-	cc := node.DefaultConfig()
-	if src != nil {
-		merge(cc, src)
-	}
-	return cc
-}
-
-// merge copies the set fields of src over the defaults in dst.
-func merge(dst, src *node.Config) {
-	defaults := *dst
-	*dst = *src
-	if dst.ListenIP == "" {
-		dst.ListenIP = defaults.ListenIP
-	}
-	if dst.SendIP == "" {
-		dst.SendIP = defaults.SendIP
-	}
-	if dst.DNSType == "" {
-		dst.DNSType = defaults.DNSType
-	}
+func ControllerConfigWithDefaults(src *nodecfg.Config) *nodecfg.Config {
+	return nodecfg.ControllerConfigWithDefaults(src)
 }
 
 // ResolveToken returns the machine token: Token as is, or the contents of

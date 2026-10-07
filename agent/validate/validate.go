@@ -61,6 +61,11 @@ type Options struct {
 	Resolver Resolver
 	// ResolveTimeout bounds each lookup; zero means 3 seconds.
 	ResolveTimeout time.Duration
+	// Engines overrides the engine names this validator accepts. It exists for
+	// the engine-agnostic tests (the reconciler and the documentation samples
+	// drive their own drivers by name); production leaves it nil, and then
+	// "xray" is refused with the removal message below.
+	Engines []string
 }
 
 var (
@@ -337,8 +342,18 @@ var gostTLSTypes = []string{"tls", "wss", "grpc"}
 
 func (x *inst) engine() {
 	e := x.in.Engine
-	if !contains(engines, e) {
-		x.err("engine", "unknown engine %q (want auto, xray, gost, frp or realm)", e)
+	known := engines
+	if len(x.v.opts.Engines) > 0 {
+		known = x.v.opts.Engines
+	}
+	if !contains(known, e) {
+		x.err("engine", "unknown engine %q (want auto, gost, frp or realm)", e)
+		return
+	}
+	if e == spec.EngineXray && !contains(x.v.opts.Engines, spec.EngineXray) {
+		// PLAN v11 §2.5: forwarding no longer supports the embedded xray
+		// engine. The Xray instance is the separate W1nCray-xray program.
+		x.err("engine", "xray 转发引擎已移除，请使用 gost 或 realm")
 		return
 	}
 	if e != spec.EngineAuto && len(x.v.p.AllowEngines) > 0 && !contains(x.v.p.AllowEngines, e) {
@@ -347,16 +362,15 @@ func (x *inst) engine() {
 	if t := x.in.Tunnel; t != nil {
 		switch t.Security {
 		case "vless_enc":
-			if e != spec.EngineXray && e != spec.EngineAuto {
-				x.err("tunnel.security", "vless_enc is only supported by the xray engine")
-			}
+			// vless_enc existed for the embedded xray engine only.
+			x.err("tunnel.security", "vless_enc 已随 xray 转发引擎移除，请改用 tls / tls_pin / tls_self")
 		case "tls_self":
 			// Both engines that accept tls_self derive the certificate from
 			// the secret; realm verifies against the public roots only, so it
 			// can never accept one.
 			switch e {
 			case spec.EngineRealm:
-				x.err("tunnel.security", "tls_self is not supported by the realm engine (realm cannot verify a self-signed certificate); use gost or xray")
+				x.err("tunnel.security", "tls_self is not supported by the realm engine (realm cannot verify a self-signed certificate); use gost")
 			case spec.EngineGost:
 				if !contains(gostTLSTypes, t.Type) {
 					x.err("tunnel.security", "tls_self needs a TLS carrier on the gost engine (%s), not %q", strings.Join(gostTLSTypes, ", "), t.Type)

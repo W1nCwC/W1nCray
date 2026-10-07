@@ -50,7 +50,15 @@ func (fakeResolver) LookupNetIP(_ context.Context, _, _ string) ([]netip.Addr, e
 	return []netip.Addr{netip.MustParseAddr("203.0.113.250")}, nil
 }
 
-func validateOpts() validate.Options { return validate.Options{Resolver: fakeResolver{}} }
+// sampleEngines keeps the documented samples runnable by name: the samples
+// still cover the xray forwarding engine (PLAN v11 §2.5 removed it from the
+// agent binary, but driver/xray is kept as the rendering fixture the manual's
+// samples are checked against).
+var sampleEngines = []string{spec.EngineAuto, spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
+
+func validateOpts() validate.Options {
+	return validate.Options{Resolver: fakeResolver{}, Engines: sampleEngines}
+}
 
 // realDrivers builds the same engine set as bootstrap.buildDrivers (xray with
 // the local policy and no certificate roots, the others with zero options),
@@ -106,7 +114,7 @@ func TestCoverage(t *testing.T) {
 		"forward-tcp", "forward-udp", "forward-tcp-udp", "forward-port-range", "forward-port-map",
 		"forward-balance", "forward-acl", "forward-gost-limits",
 		"proxy-send", "proxy-accept", "proxy-passthrough",
-		"tunnel-vless-enc-entry", "tunnel-vless-enc-exit", "tunnel-tls-pin-entry", "tunnel-tls-pin-exit",
+		"tunnel-tls-pin-entry", "tunnel-tls-pin-exit",
 		"reverse-frp-portal", "reverse-frp-bridge", "reverse-gost-portal", "reverse-gost-bridge",
 		"reverse-xray-portal", "reverse-xray-bridge",
 		"realm-relay", "realm-wss-entry", "realm-wss-exit", "gost-wss-entry", "gost-wss-exit",
@@ -663,33 +671,31 @@ func TestLocalPolicyNeeds(t *testing.T) {
 
 // policyNeeds is the table docs/AGENT.md prints.
 var policyNeeds = map[string]string{
-	"engine-auto":            "listen",
-	"forward-acl":            "listen",
-	"forward-balance":        "listen",
-	"forward-gost-limits":    "listen",
-	"forward-port-map":       "listen",
-	"forward-port-range":     "listen",
-	"forward-tcp":            "listen",
-	"forward-tcp-udp":        "listen",
-	"forward-udp":            "listen",
-	"gost-wss-entry":         "listen",
-	"gost-wss-exit":          "listen",
-	"proxy-accept":           "default",
-	"proxy-passthrough":      "default",
-	"proxy-send":             "listen",
-	"realm-relay":            "listen",
-	"realm-wss-entry":        "listen",
-	"realm-wss-exit":         "listen",
-	"reverse-frp-bridge":     "private",
-	"reverse-frp-portal":     "listen",
-	"reverse-gost-bridge":    "private",
-	"reverse-gost-portal":    "listen",
-	"reverse-xray-bridge":    "private",
-	"reverse-xray-portal":    "listen",
-	"tunnel-tls-pin-entry":   "listen",
-	"tunnel-tls-pin-exit":    "listen",
-	"tunnel-vless-enc-entry": "listen",
-	"tunnel-vless-enc-exit":  "listen",
+	"engine-auto":          "listen",
+	"forward-acl":          "listen",
+	"forward-balance":      "listen",
+	"forward-gost-limits":  "listen",
+	"forward-port-map":     "listen",
+	"forward-port-range":   "listen",
+	"forward-tcp":          "listen",
+	"forward-tcp-udp":      "listen",
+	"forward-udp":          "listen",
+	"gost-wss-entry":       "listen",
+	"gost-wss-exit":        "listen",
+	"proxy-accept":         "default",
+	"proxy-passthrough":    "default",
+	"proxy-send":           "listen",
+	"realm-relay":          "listen",
+	"realm-wss-entry":      "listen",
+	"realm-wss-exit":       "listen",
+	"reverse-frp-bridge":   "private",
+	"reverse-frp-portal":   "listen",
+	"reverse-gost-bridge":  "private",
+	"reverse-gost-portal":  "listen",
+	"reverse-xray-bridge":  "private",
+	"reverse-xray-portal":  "listen",
+	"tunnel-tls-pin-entry": "listen",
+	"tunnel-tls-pin-exit":  "listen",
 }
 
 // TestHealthSamples: the two samples that carry a balance.health section run

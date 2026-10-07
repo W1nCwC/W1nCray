@@ -16,6 +16,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/filesync"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 )
 
 // FilesOptions is the local policy of the managed-file layer, translated from
@@ -67,17 +68,15 @@ func newFilesRuntime(o Options) *FilesRuntime {
 		MaxBytes:        f.MaxBytes,
 		MaxGeoBytes:     f.MaxGeoBytes,
 		// Fetch, Validate, Reload and Source are installed later: the fetcher
-		// is the panel HTTP client and the validator/reloader belong to the
-		// panel. The placeholders keep the applier constructible and make an
-		// unwired call fail with a clear message instead of a nil panic.
+		// is the panel HTTP client. The validator is the Xray kernel when it
+		// is installed (Options.Xray) and a nil-safe refusal otherwise, so an
+		// unwired call fails with a clear message instead of a nil panic.
 		Fetch: filesync.BlobFetcherFunc(func(context.Context, string) ([]byte, bool, error) {
 			return nil, false, errors.New("filesync: the panel link is not up yet")
 		}),
-		Validate: filesync.ValidatorFunc(func(context.Context, string, []filesync.FileRef) []error {
-			return []error{errors.New("filesync: no validator is wired")}
-		}),
-		Source: filesync.SourceFunc(func() []spec.FileRef { return nil }),
-		Log:    o.Log,
+		Validate: filesValidator(o.Xray),
+		Source:   filesync.SourceFunc(func() []spec.FileRef { return nil }),
+		Log:      o.Log,
 	})
 	if err != nil {
 		// A bad state directory is a configuration problem; the caller logs it
@@ -88,6 +87,51 @@ func newFilesRuntime(o Options) *FilesRuntime {
 		return nil
 	}
 	return &FilesRuntime{applier: applier, cfg: o.AgentConfig}
+}
+
+// filesValidator returns the managed-file validator: the Xray kernel service
+// when it is installed, and a nil-safe refusal otherwise. A machine without the
+// kernel must answer with an explicit reason instead of half-applying a file
+// set no running instance would pick up.
+func filesValidator(svc xrayapi.Service) filesync.Validator {
+	if svc == nil {
+		return filesync.ValidatorFunc(func(context.Context, string, []filesync.FileRef) []error {
+			return []error{errors.New("Xray 内核未安装")}
+		})
+	}
+	return xrayValidator{svc: svc}
+}
+
+// xrayValidator adapts the Xray kernel service to the managed-file validator:
+// the kernel pre-checks a staged file set with its own configuration loader.
+type xrayValidator struct{ svc xrayapi.Service }
+
+// ValidateStaged asks the kernel to check the staged files and flattens its
+// JSON error list into the validator's []error.
+func (v xrayValidator) ValidateStaged(ctx context.Context, dir string, files []filesync.FileRef) []error {
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	res, err := v.svc.CheckStaged(ctx, dir, names)
+	if err != nil {
+		return []error{err}
+	}
+	if res.OK {
+		return nil
+	}
+	errs := make([]error, 0, len(res.Errors))
+	for _, e := range res.Errors {
+		if e.File == "" {
+			errs = append(errs, errors.New(e.Message))
+			continue
+		}
+		errs = append(errs, fmt.Errorf("%s: %s", e.File, e.Message))
+	}
+	if len(errs) == 0 {
+		errs = append(errs, errors.New("the Xray kernel refused the staged files"))
+	}
+	return errs
 }
 
 // applierOrNil returns the applier, or an error when the managed-file layer is
