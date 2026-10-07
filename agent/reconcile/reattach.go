@@ -14,8 +14,9 @@ import (
 // must not be touched.
 //
 // It is declared here, like KernelEnsurer, so this package does not import the
-// driver packages that implement it (driver/xray). A driver without it cannot
-// be reattached and Reattach reports an error instead.
+// driver packages that implement it. The in-process xray engine (driver/xray,
+// deleted in v11 D5) was the only implementer; no built-in driver has a
+// replaceable host any more, so Reattach reports an error for every engine.
 type reattacher interface {
 	Reattach(ctx context.Context, rt driver.Runtime) error
 }

@@ -14,7 +14,7 @@
     },
     {
       "id": "auto-iphash",
-      "name": "engine为auto：iphash哈希只有gost与realm支持，xray不行",
+      "name": "engine为auto：iphash哈希由gost与realm支持",
       "enabled": true,
       "engine": "auto",
       "kind": "forward",

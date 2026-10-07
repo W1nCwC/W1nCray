@@ -5,14 +5,14 @@
 // without exchanging anything but the secret, which is what lets a panel that
 // cannot run x509 itself still pin or trust the peer.
 //
-// The package was moved out of driver/xray unchanged: the KDF salt and every
-// label are frozen, so a certificate (and therefore a pin) computed before the
+// The package was moved out of the (since deleted) driver/xray unchanged: the
+// KDF salt and every label are frozen, so a certificate computed before the
 // move is byte-for-byte the one computed now. tlsself.TestDerivationIsFrozen
 // pins that with values recorded from the pre-move implementation.
 //
-// It lives in agent/tlsself rather than under driver/: the xray and gost
-// drivers both need it, and so does the offline sample/acceptance suite in
-// agent/examples, which verifies the pin a sample declares.
+// It lives in agent/tlsself rather than under driver/: the gost driver needs
+// it, and the derivation is an engine-independent, frozen contract (the removed
+// xray driver derived the same certificate).
 package tlsself
 
 import (

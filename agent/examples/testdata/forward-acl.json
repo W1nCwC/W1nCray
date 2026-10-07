@@ -6,7 +6,7 @@
       "id": "acl-ssh",
       "name": "来源ACL：只放行指定网段，再单独拒绝一个地址",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": { "addr": "0.0.0.0", "ports": "20022" },
       "network": ["tcp"],

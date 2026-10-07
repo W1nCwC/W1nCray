@@ -19,9 +19,9 @@
 //     either entirely before or entirely after a change, never in between.
 //
 // The guard is package level on purpose: a process has exactly one Core, and
-// all writers (core.RuleManager, core.Core, the corehost wrappers) must share
-// the lock the dispatcher's readers use without any wiring between them. Two
-// instances in one process (tests) merely serialize against each other.
+// all writers (core.RuleManager, core.Core and the wrappers built on them) must
+// share the lock the dispatcher's readers use without any wiring between them.
+// Two instances in one process (tests) merely serialize against each other.
 //
 // # Lock order and re-entrancy
 //

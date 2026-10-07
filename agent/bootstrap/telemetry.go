@@ -316,8 +316,6 @@ func (p runtimeProbe) SupervisedProcesses() []telemetry.SupervisedProcess {
 			Running: true,
 		}
 		switch in.Engine {
-		case spec.EngineXray:
-			// Embedded: no separate process, so no supervisor id and no PID.
 		case spec.EngineGost:
 			sp.SupervisorID = gostSupervisorID
 		case spec.EngineRealm:

@@ -6,7 +6,7 @@
       "id": "dns-53",
       "name": "UDP直连转发：本机20053转到203.0.113.53:53",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": { "addr": "0.0.0.0", "ports": "20053" },
       "network": ["udp"],
