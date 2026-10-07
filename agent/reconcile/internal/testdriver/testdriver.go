@@ -315,6 +315,26 @@ func (f *Fake) Rollback(ctx context.Context, rt driver.Runtime) error {
 	return nil
 }
 
+// Reattach implements the reconciler's reattach capability: it forgets the
+// running instances (their host is gone) and starts them again from the last
+// applied set.
+func (f *Fake) Reattach(ctx context.Context, rt driver.Runtime) error {
+	f.record("reattach")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	next := map[string]*running{}
+	for id, r := range f.current {
+		closeAll(r)
+		run, err := f.start(r.r)
+		if err != nil {
+			return err
+		}
+		next[id] = run
+	}
+	f.current = next
+	return nil
+}
+
 // Stop implements driver.Driver.
 func (f *Fake) Stop(ctx context.Context, rt driver.Runtime, ids ...string) error {
 	f.record("stop:" + strings.Join(ids, ","))

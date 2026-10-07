@@ -595,6 +595,37 @@ func (d *Driver) Rollback(ctx context.Context, rt driver.Runtime) error {
 	return nil
 }
 
+// Reattach recreates every instance the driver currently runs on the host it
+// now points at. It is the optional reattach capability the reconciler uses
+// when the embedded core was replaced (agent/reconcile.Reattach). The previous
+// host is gone, so the live handles are dropped without touching it and the
+// applied set is brought up again: outbounds first, then the routing table,
+// then the inbounds, bridges and health checks.
+//
+// Instances that were not running stay not running. The persisted set is
+// rewritten (it is the same set, so the rollback target is preserved) so a
+// later Rollback keeps working.
+func (d *Driver) Reattach(ctx context.Context, rt driver.Runtime) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	wants := make(map[string]*want, len(d.state.inst))
+	for id, l := range d.state.inst {
+		w := l.want
+		wants[id] = &w
+	}
+	// Forget the old handles first: their host is gone and RemoveInbound on a
+	// closed core must never happen.
+	d.state = newState()
+	if len(wants) == 0 {
+		return nil
+	}
+	if _, err := d.reconcile(ctx, rt, wants); err != nil {
+		return fmt.Errorf("xray reattach: %w", err)
+	}
+	d.persist(rt, wants, false)
+	return nil
+}
+
 // ------------------------------------------------------------------ stop, stats, health
 
 // Stop removes the given instances (all when ids is empty).

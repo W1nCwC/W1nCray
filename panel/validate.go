@@ -18,31 +18,49 @@ import (
 // paths, the DNS name servers of the running nodes, and the config loader for
 // config.yml.
 type CoreValidator struct {
-	// base is the live instance's core options. The validator overrides the
-	// four JSON paths with their staged copies.
-	base core.Options
+	// base returns the live instance's core options. The validator overrides
+	// the four JSON paths with their staged copies. It is read per validation:
+	// the agent (and so this validator) outlives xray rebuilds, and each
+	// rebuild publishes the options of the instance it built (see
+	// Panel.publishCoreOptionsLocked).
+	base func() core.Options
 	// configPath is the live config.yml, needed to pre-check a staged
 	// config.yml with the full LoadConfig.
 	configPath string
 }
 
-// NewCoreValidator builds the validator for one panel. The options are read
-// once, at construction: a validation must see the configuration the running
-// instance was built from, not a half-updated one.
+// NewCoreValidator builds the validator for one panel. A validation must see
+// the configuration the running instance was built from, not a half-updated
+// one: the options are a snapshot taken when an xray instance finished
+// starting, read without p.mu (a validation runs inside a files_apply, which
+// the agent shutdown under p.mu may be waiting for).
 //
-// The caller must hold p.mu (start() builds it while it owns the lock), so this
-// helper must not take it again.
+// The caller must hold p.mu, so this helper must not take it again.
 func (p *Panel) NewCoreValidator() *CoreValidator {
-	cfg := p.cfg
+	p.publishCoreOptionsLocked()
+	return &CoreValidator{base: p.liveCoreOptions, configPath: p.path}
+}
+
+// publishCoreOptionsLocked stores the core options of the running instance
+// (p.cfg and the name servers of p.nodes). The caller holds p.mu.
+func (p *Panel) publishCoreOptionsLocked() {
 	var opts core.Options
-	if cfg != nil {
+	if p.cfg != nil {
 		var ns []core.NameServer
 		for _, n := range p.nodes {
 			ns = append(ns, n.NameServers()...)
 		}
-		opts = coreOptions(cfg, ns)
+		opts = coreOptions(p.cfg, ns)
 	}
-	return &CoreValidator{base: opts, configPath: p.path}
+	p.coreOpts.Store(&opts)
+}
+
+// liveCoreOptions returns the last published options (zero before the first).
+func (p *Panel) liveCoreOptions() core.Options {
+	if o := p.coreOpts.Load(); o != nil {
+		return *o
+	}
+	return core.Options{}
 }
 
 var _ filesync.Validator = (*CoreValidator)(nil)
@@ -55,7 +73,7 @@ func (v *CoreValidator) ValidateStaged(ctx context.Context, dir string, files []
 	if err := ctx.Err(); err != nil {
 		return []error{err}
 	}
-	opts := v.base
+	opts := v.base()
 	staged := map[string]string{}
 	for _, f := range files {
 		if err := filesync.CheckName(f.Name); err != nil {

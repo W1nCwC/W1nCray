@@ -33,7 +33,6 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
 	"github.com/W1nCwC/W1nCray/agent/terminal"
 	"github.com/W1nCwC/W1nCray/core"
-	"github.com/W1nCwC/W1nCray/corehost"
 	"github.com/W1nCwC/W1nCray/driver/frp"
 	"github.com/W1nCwC/W1nCray/driver/gost"
 	"github.com/W1nCwC/W1nCray/driver/realm"
@@ -106,6 +105,18 @@ type Options struct {
 	Resume bool
 }
 
+// XrayHost is the replaceable host of the agent's xray engine: the driver/xray
+// Host plus Swap, which installs the core the engine runs on. The panel builds
+// one (corehost.Swappable) and hands it to Boot once; an xray rebuild then only
+// swaps the core and calls ReattachXray, so the agent — its terminals, its
+// supervisor, its panel link and the instances of the other engines — never
+// restarts for an xray change.
+type XrayHost interface {
+	xray.Host
+	// Swap installs c as the core the engine runs on (nil detaches it).
+	Swap(c *core.Core)
+}
+
 // Runtime is a booted agent. It owns the supervisor and the reconciler.
 type Runtime struct {
 	Reconciler *reconcile.Reconciler
@@ -134,6 +145,10 @@ type Runtime struct {
 	// cfg is the local agent configuration the capability list and the policy
 	// gates are read from (nil means the defaults).
 	cfg *agentcfg.Config
+	// host is the replaceable xray host the xray engine was built with (nil
+	// when the agent runs without the embedded core, as agent-apply does).
+	// ReattachXray swaps a new core into it.
+	host XrayHost
 
 	log driver.Logger
 
@@ -150,14 +165,15 @@ func (nopLog) Warnf(string, ...any)  {}
 func (nopLog) Errorf(string, ...any) {}
 
 // driverBuilder builds the engine registry. It is a package variable so tests
-// can substitute fakes without a running core.Core; production code never
+// can substitute fakes without a running xray core; production code never
 // changes it.
 var driverBuilder = buildDrivers
 
-// Boot builds and starts the agent. c is the running Xray instance; when it is
-// nil the xray engine is not registered (the other engines still work), which
-// is what the offline "agent-apply" command uses.
-func Boot(opts Options, c *core.Core) (*Runtime, error) {
+// Boot builds and starts the agent. host is the replaceable xray host the xray
+// engine is built on; when it is nil the xray engine is not registered (the
+// other engines still work), which is what the offline "agent-apply" command
+// uses.
+func Boot(opts Options, host XrayHost) (*Runtime, error) {
 	log := opts.Log
 	if log == nil {
 		log = nopLog{}
@@ -185,7 +201,7 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 	}
 	loadPersistedManifest(kern, opts.StateDir, opts.ManifestPath, log)
 	sup := supervisor.New(supervisor.Options{Log: log, PIDDir: filepath.Join(opts.StateDir, "pid")})
-	drivers, err := driverBuilder(c, opts.Policy, log)
+	drivers, err := driverBuilder(host, opts.Policy, log)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
@@ -197,7 +213,7 @@ func Boot(opts Options, c *core.Core) (*Runtime, error) {
 		State:   st,
 		Log:     log,
 	}
-	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log, cfg: opts.AgentConfig}
+	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log, cfg: opts.AgentConfig, host: host}
 	// The interactive terminal (D8) exists only when the local switch is on and
 	// this machine can really create a PTY. A nil manager is what makes the
 	// dispatcher answer term.error{terminal_disabled} and keeps the capability
@@ -348,19 +364,38 @@ func (r *Runtime) ResumeReport() (rep reconcile.Report, ok bool) {
 }
 
 // buildDrivers is the production driver registry.
-func buildDrivers(c *core.Core, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
+func buildDrivers(host XrayHost, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
 	m := map[string]driver.Driver{}
-	if c != nil {
-		h, err := corehost.New(c)
-		if err != nil {
-			return nil, err
-		}
-		m[spec.EngineXray] = xray.New(h, xray.Options{Policy: &pol})
+	if host != nil {
+		m[spec.EngineXray] = xray.New(host, xray.Options{Policy: &pol})
 	}
 	m[spec.EngineGost] = gost.New(gost.Options{})
 	m[spec.EngineFrp] = frp.New()
 	m[spec.EngineRealm] = realm.New(realm.Options{})
 	return m, nil
+}
+
+// DetachXray takes the running core away from the agent's xray engine without
+// touching the other engines: from here on every call of the xray driver fails
+// with corehost.ErrNoCore instead of reaching a core that is being closed. The
+// driver keeps its instance list, so ReattachXray brings the instances back.
+func (r *Runtime) DetachXray() {
+	if r.host == nil {
+		return
+	}
+	r.Reconciler.DetachHost(func() { r.host.Swap(nil) })
+}
+
+// ReattachXray installs c as the core of the agent's xray engine and recreates
+// every engine=xray instance on it. The instances of the other engines, the
+// terminals, the supervisor and the panel link keep running untouched. The
+// swap and the rebuild run under the reconciler's lock, so no Apply can observe
+// a half-attached core.
+func (r *Runtime) ReattachXray(ctx context.Context, c *core.Core) (reconcile.Report, error) {
+	if r.host == nil {
+		return reconcile.Report{}, errors.New("bootstrap: no xray host is attached")
+	}
+	return r.Reconciler.Reattach(ctx, spec.EngineXray, func() { r.host.Swap(c) })
 }
 
 // Apply makes d the running state and returns the report.
