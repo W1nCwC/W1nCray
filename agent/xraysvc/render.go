@@ -6,11 +6,19 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 )
 
 // systemdUnit renders the systemd unit of the Xray kernel. The ExecStart names
 // the kernel binary of the current version and the "run -c" subcommand
 // explicitly, so the unit never depends on the program's default action.
+//
+// RuntimeDirectory=W1nCray makes systemd create /run/W1nCray (mode 0755) before
+// the service starts and remove it after it stops; that is where the kernel
+// publishes its status socket, away from the etc_t configuration directory
+// (agent/selinux explains why a socket under /etc/W1nCray cannot be created by
+// this service's domain).
 func systemdUnit(bin, configPath, configDir string) string {
 	return fmt.Sprintf(`[Unit]
 Description=W1nCray Xray kernel
@@ -26,10 +34,12 @@ Restart=always
 RestartSec=5
 LimitNOFILE=1048576
 Environment=XRAY_LOCATION_ASSET=%s
+RuntimeDirectory=%s
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
-`, configDir, bin, configPath, configDir)
+`, configDir, bin, configPath, configDir, xrayapi.RuntimeDirName)
 }
 
 // openrcScript renders the OpenRC init script (Alpine), with supervise-daemon
@@ -64,13 +74,16 @@ depend() {
 }
 
 start_pre() {
+	# The status socket lives in the runtime directory; systemd creates it with
+	# RuntimeDirectory=, OpenRC has to do it here.
+	mkdir -p /run/%s
 	# Keep the log from growing without bound.
 	if [ -f "$output_log" ] && [ "$(wc -c <"$output_log")" -gt 10485760 ]; then
 		: >"$output_log"
 	fi
 	return 0
 }
-`, ServiceName, bin, configPath, configDir, ServiceName, ServiceName, configDir)
+`, ServiceName, bin, configPath, configDir, ServiceName, ServiceName, configDir, xrayapi.RuntimeDirName)
 }
 
 // procdScript renders the procd init script (OpenWrt), exactly like
@@ -89,6 +102,9 @@ START=99
 STOP=10
 
 start_service() {
+	# The status socket lives in the runtime directory; procd has no equivalent
+	# of systemd's RuntimeDirectory=, so create it here.
+	mkdir -p /run/%s
 	procd_open_instance
 	procd_set_param command "%s" run -c "%s"
 	procd_set_param env %s
@@ -100,7 +116,7 @@ start_service() {
 	procd_set_param term_timeout 10
 	procd_close_instance
 }
-`, bin, configPath, env)
+`, xrayapi.RuntimeDirName, bin, configPath, env)
 }
 
 // gomemLimit returns the GOMEMLIMIT setting for a router with less than 1 GiB

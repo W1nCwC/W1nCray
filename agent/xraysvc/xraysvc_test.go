@@ -123,12 +123,16 @@ type fakeRunner struct {
 	mu      sync.Mutex
 	calls   []string
 	active  bool
+	order   *[]string
 	respond func(name string, args []string) ([]byte, error)
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
+	if f.order != nil {
+		*f.order = append(*f.order, name+" "+strings.Join(args, " "))
+	}
 	respond := f.respond
 	if respond == nil && name == "systemctl" && len(args) > 0 {
 		switch args[0] {
@@ -156,6 +160,30 @@ func (f *fakeRunner) seq() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.calls...)
+}
+
+// fakeLabeler records the SELinux labelling calls the manager makes.
+type fakeLabeler struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+	order *[]string
+}
+
+func (f *fakeLabeler) LabelKernels(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.order != nil {
+		*f.order = append(*f.order, "label")
+	}
+	return f.err
+}
+
+func (f *fakeLabeler) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 // fakeSup is the agent supervisor for the fallback backend.
@@ -229,6 +257,8 @@ type fixture struct {
 	status  *fakeStatus
 	run     *fakeRunner
 	sup     *fakeSup
+	label   *fakeLabeler
+	order   *[]string
 	config  string
 	manager *Manager
 }
@@ -240,12 +270,15 @@ func newFixture(t *testing.T, markers ...string) *fixture {
 	if err := os.WriteFile(config, []byte("Log: {Level: warning}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	order := &[]string{}
 	f := &fixture{
 		root:   root,
 		kern:   &fakeKernels{curErr: errors.New("not installed")},
 		status: &fakeStatus{running: true},
-		run:    &fakeRunner{},
+		run:    &fakeRunner{order: order},
 		sup:    &fakeSup{},
+		label:  &fakeLabeler{order: order},
+		order:  order,
 		config: config,
 	}
 	m, err := New(Options{
@@ -255,6 +288,7 @@ func newFixture(t *testing.T, markers ...string) *fixture {
 		StateDir:       filepath.Join(root, "state"),
 		Status:         f.status,
 		Sup:            f.sup,
+		Labeler:        f.label,
 		Runner:         f.run,
 		HealthTimeout:  100 * time.Millisecond,
 		HealthInterval: time.Millisecond,
@@ -333,6 +367,9 @@ func TestSystemdInstall(t *testing.T) {
 		"RestartSec=5",
 		"LimitNOFILE=1048576",
 		"WorkingDirectory=" + filepath.Dir(f.config),
+		// The status socket lives in the runtime directory, not in /etc.
+		"RuntimeDirectory=W1nCray",
+		"RuntimeDirectoryMode=0755",
 	} {
 		if !strings.Contains(unit, want) {
 			t.Errorf("unit lacks %q:\n%s", want, unit)
@@ -368,6 +405,57 @@ func TestSystemdInstall(t *testing.T) {
 	}
 }
 
+// TestInstallLabelsTheKernelBeforeStartingIt is the SELinux requirement: the
+// kernel tree carries bin_t before the service starts, otherwise the process
+// runs in init_t and cannot bind its status socket (agent/selinux).
+func TestInstallLabelsTheKernelBeforeStartingIt(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	bin := installedKernel(t, f.root, "1.0.0")
+	f.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		return driver.Installed{Path: bin, Version: "1.0.0"}, nil
+	}
+	if err := f.manager.Install(context.Background(), "1.0.0"); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if f.label.count() == 0 {
+		t.Fatal("Install did not label the kernel tree")
+	}
+	order := *f.order
+	firstStart := -1
+	for i, s := range order {
+		if s == "systemctl start "+ServiceName {
+			firstStart = i
+			break
+		}
+	}
+	if firstStart < 0 {
+		t.Fatalf("the service was never started: %v", order)
+	}
+	for i, s := range order {
+		if s == "label" && i > firstStart {
+			t.Fatalf("the kernel was labelled after the service started: %v", order)
+		}
+	}
+}
+
+// TestLabelFailureStopsTheStart: when the label cannot be applied the manager
+// must not start a kernel that SELinux will kill.
+func TestLabelFailureStopsTheStart(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	bin := installedKernel(t, f.root, "1.0.0")
+	f.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		return driver.Installed{Path: bin, Version: "1.0.0"}, nil
+	}
+	f.label.err = errors.New("semanage: no such file")
+	err := f.manager.Install(context.Background(), "1.0.0")
+	if err == nil || !strings.Contains(err.Error(), "SELinux") {
+		t.Fatalf("Install error = %v, want a labelling failure", err)
+	}
+	if got := f.run.seq(); contains(got, "systemctl start "+ServiceName) {
+		t.Fatalf("the service was started despite the labelling failure: %v", got)
+	}
+}
+
 func TestOpenRCInstall(t *testing.T) {
 	f := newFixture(t, "sbin/openrc-run")
 	bin := installedKernel(t, f.root, "1.0.0")
@@ -389,6 +477,7 @@ func TestOpenRCInstall(t *testing.T) {
 		`command="` + bin + `"`,
 		`command_args="run -c ` + f.config + `"`,
 		`rc_ulimit="-n 1048576"`,
+		"mkdir -p /run/W1nCray",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("script lacks %q:\n%s", want, script)
@@ -437,6 +526,7 @@ func TestProcdInstallAndSysupgradeDedupe(t *testing.T) {
 		"USE_PROCD=1",
 		`procd_set_param command "` + bin + `" run -c "` + f.config + `"`,
 		"procd_set_param respawn",
+		"mkdir -p /run/W1nCray",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("script lacks %q:\n%s", want, script)

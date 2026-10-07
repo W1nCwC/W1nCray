@@ -725,8 +725,10 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 `W1nCray-xray run` 在本机提供只读状态接口：
 
-- Unix 系统：`<config 目录>/xray.sock`（Unix 套接字，权限 0600）。
+- Unix 系统：`/run/W1nCray/xray.sock`（Unix 套接字，权限 0600；目录可用 `W1NCRAY_RUNTIME_DIR` 覆盖，测试与非 root 开发用它）。
 - Windows：`127.0.0.1` 上的随机端口，端口写入 `<config 目录>/xray.addr`。
+
+套接字**不**放在配置目录里：配置目录在 `/etc/W1nCray`（SELinux 类型 `etc_t`），而内核服务在 SELinux 机器上的域不允许在 `etc_t` 里创建套接字（见 §13.7）。`/run/W1nCray` 由 systemd 的 `RuntimeDirectory=W1nCray` 创建，OpenRC / procd 的 init 脚本与内核自己也会创建它；目录不可用时内核退回 `<config 目录>/xray.sock`，agent 两边都读，所以升级中的旧内核也照常工作。
 
 `GET /status` 返回：
 
@@ -759,7 +761,7 @@ type Service interface {
 
 `agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它。X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。X2 起由 `agent/xraykern` 实现它：
 
-- `Status` 读 `<config 目录>/xray.sock`（Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
+- `Status` 读 `/run/W1nCray/xray.sock`（旧内核的 `<config 目录>/xray.sock` 仍然接受；Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
 - `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。
 - `WaitReloaded` 在 `files_apply` 写入受管文件后，等待状态接口的 `config_fingerprint` 变成**写入后文件的指纹**，超时 30 s。指纹用 `config.Fingerprint` 对 `config.WatchedFiles` 计算——与内核（`xraynode`）**同一份代码**，所以两边不可能不一致；超时即 `files_apply` 失败，走既有的 `last_good` 回滚路径（§13.6 的 `files_apply` 行）。
 
@@ -769,9 +771,9 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 | 后端 | 探测 | 服务文件 |
 |---|---|---|
-| systemd | `/run/systemd/system` 存在 | `/etc/systemd/system/W1nCray-xray.service`：`ExecStart=<当前版本二进制绝对路径> run -c <config.yml 绝对路径>`、`Restart=always`、`RestartSec=5`、`LimitNOFILE=1048576`、`WorkingDirectory=<配置目录>`；`systemctl daemon-reload`、`enable`、`start` |
-| OpenRC | `/sbin/openrc-run` 存在 | `/etc/init.d/W1nCray-xray`（`supervisor="supervise-daemon"`）；`rc-update add W1nCray-xray default`、`rc-service W1nCray-xray start` |
-| procd | `/sbin/procd` 与 `/etc/rc.common` 存在 | `/etc/init.d/W1nCray-xray`（`USE_PROCD=1`、`respawn`）；`enable`、`start`；内核目录与 init 脚本追加进 `/etc/sysupgrade.conf`（去重） |
+| systemd | `/run/systemd/system` 存在 | `/etc/systemd/system/W1nCray-xray.service`：`ExecStart=<当前版本二进制绝对路径> run -c <config.yml 绝对路径>`、`Restart=always`、`RestartSec=5`、`LimitNOFILE=1048576`、`WorkingDirectory=<配置目录>`、`RuntimeDirectory=W1nCray`（状态套接字目录，见 §13.4/§13.7）；`systemctl daemon-reload`、`enable`、`start` |
+| OpenRC | `/sbin/openrc-run` 存在 | `/etc/init.d/W1nCray-xray`（`supervisor="supervise-daemon"`，`start_pre` 里 `mkdir -p /run/W1nCray`）；`rc-update add W1nCray-xray default`、`rc-service W1nCray-xray start` |
+| procd | `/sbin/procd` 与 `/etc/rc.common` 存在 | `/etc/init.d/W1nCray-xray`（`USE_PROCD=1`、`respawn`，`start_service` 里 `mkdir -p /run/W1nCray`）；`enable`、`start`；内核目录与 init 脚本追加进 `/etc/sysupgrade.conf`（去重） |
 | agent 子进程 | 三者都没有 | 由 agent supervisor 运行（与 gost 相同），状态里 `managed_by: "agent"`，面板据此提示「此系统 Xray 会随 agent 重启」 |
 
 服务名固定为 `W1nCray-xray`。`Install`/`Upgrade`/`Rollback`/`Restart`/`Remove` 都幂等、带超时、失败可读：
@@ -812,5 +814,24 @@ W1nCray xray stop
 | `self_update` | `W1nCray` | 重启 agent 进程；`W1nCray-xray` 由服务管理器独立运行，**不中断** |
 
 拆分后 `config.yml` 同时属于两个程序：`W1nCray` 只读它的 `Agent:` 块，`W1nCray-xray` 读 Xray 部分并按上面的表监听重载。
+
+### 13.7 SELinux（CentOS/RHEL 系，enforcing）
+
+内核二进制装在 agent 的 state 目录（`/etc/W1nCray/state/kernels/kernels/<名字>/<版本>/`），**默认类型是 `etc_t`**——因为它在 `/etc` 下。systemd（`init_t`）执行 `etc_t` 文件时**不会**转到 `unconfined_service_t`（`/usr/local` 下的 agent 二进制是 `usr_t`，会转），进程留在 `init_t`；而 `init_t` 不允许在 `etc_t` 目录里创建套接字：
+
+```
+type=AVC msg=audit(...): avc:  denied  { create } for  pid=... comm="W1nCray-xray"
+  name="xray.sock" scontext=system_u:system_r:init_t:s0
+  tcontext=system_u:object_r:etc_t:s0 tclass=sock_file permissive=0
+```
+
+结果是服务启动即退出（`Error: status socket /etc/W1nCray/xray.sock: listen unix ...: bind: permission denied`），`Restart=always` 让它反复重启，健康检查永远不通过。修复分两层：
+
+1. **状态套接字搬出配置目录**（§13.4）：`/run/W1nCray/xray.sock`。`/run/W1nCray` 是 `var_run_t`，不是配置树的一部分；systemd 用 `RuntimeDirectory=` 创建，OpenRC / procd 的 init 脚本创建，agent 的 fallback 后端与内核自己也会创建。
+2. **内核二进制标为 `bin_t`**（`agent/selinux`）：`bin_t` 让 systemd 把进程放进 `unconfined_service_t`（与 agent 同域）。有 `semanage` 时对内核树加一条持久 fcontext 规则（`<KernelsDir>/kernels(/.*)?` → `bin_t`）再 `restorecon -R -F`；没有 `semanage` 时退回 `chcon -R -t bin_t`；两个工具都没有时只记一条警告——缺工具绝不能让安装失败（服务随后会以可读的错误报出来）。
+
+打标签的时机：`kernelx` 在 `Ensure`（安装/升级）与 `Rollback` 成功后给整棵树打标签（尽力而为，只记日志）；`xraysvc` 在写服务文件、启动之前再确认一次（这里失败即中止启动）；`supervisor` 在每次启动 gost/realm/frp 子进程前确认该二进制（同一进程内按路径去重，已被整棵树覆盖的二进制直接跳过，所以不会为每个版本堆积 fcontext 规则）。`install.sh` 在安装时也做一次（`selinux_prepare`，卸载时 `selinux_forget` 删掉规则）。
+
+SELinux 关闭时这些路径全是空操作（`agent/selinux` 先读 `/sys/fs/selinux/enforce`）；因此非 SELinux 机器与 Windows 不受影响。
 
 

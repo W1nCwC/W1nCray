@@ -37,7 +37,7 @@
 | 配置 | 内核读 config.yml（Xray 部分）与受管文件；机器模式所需的面板地址/机器 ID/令牌/节点控制器设置只读取自 agent.yml（与现在相同的字段） |
 | 应用受管文件前的校验 | agent 执行已安装的 `W1nCray-xray check-staged --dir <暂存目录>`，输出 JSON 错误（原进程内 CoreValidator 移到内核） |
 | 重载 | 内核自身监听配置文件变化（沿用 v10 指纹去重）；files_apply 写入后等待内核状态报告新指纹已加载 |
-| 状态/遥测 | 内核提供本地 Unix 套接字 `<state>/xray.sock` 的 `GET /status`（版本、运行时长、节点数、在线用户、最近错误、已加载配置指纹），agent 汇入 components 与概览 |
+| 状态/遥测 | 内核提供本地 Unix 套接字 `/run/W1nCray/xray.sock`（D1：原先在配置目录，SELinux enforcing 下 `init_t` 不能在 `etc_t` 里创建它）的 `GET /status`（版本、运行时长、节点数、在线用户、最近错误、已加载配置指纹），agent 汇入 components 与概览 |
 | Xboard 节点通信 | 仍由内核直接与面板通信（用户、流量、在线 IP、WS），与现在一致 |
 
 ### 2.4 安装/卸载由谁触发
@@ -109,7 +109,7 @@ agent 不再链接 Xray-core，转发规则/实例只用 gost、realm（frp 用�
 ### 哪些差异真正影响我们（代码证据）
 - **C 库无关**：W1nCray、W1nCray-xray、gost、frp 均为 Go 静态编译（`release/build.sh` `CGO_ENABLED=0`），realm 用 musl 静态版（清单 variant `musl-full`）——glibc 版本、musl 与否都不影响运行。
 - **R1 init 及版本**：install.sh 三套后端（systemd / OpenRC supervise-daemon / procd，`install.sh:405-565`）；自升级 watchdog 用 `systemd-run --no-block`（`agent/selfupdate/restart.go:173-207`），`--no-block` 需 systemd ≥ 220，**CentOS 7 是 219** → 走 setsid 回退路径，必须实测；v11 新增 Xray 内核服务同样涉及三套后端。
-- **R2 SELinux**（CentOS Stream 9/10 默认 enforcing）：内核二进制放在 state 目录（/etc/W1nCray 下），被 init_t 执行可能被拒；agent 写 systemd 单元的标签。必须在开启 enforcing 的真机/虚拟机实测。
+- **R2 SELinux**（CentOS Stream 9/10 默认 enforcing）：内核二进制放在 state 目录（/etc/W1nCray 下），被 init_t 执行可能被拒；agent 写 systemd 单元的标签。必须在开启 enforcing 的真机/虚拟机实测。**D1 已实测并修复**：`etc_t` 的内核二进制被 systemd 以 `init_t` 启动，`init_t` 不能在 `etc_t` 目录里创建状态套接字（AVC `sock_file create`）；修复 = 状态套接字移到 `/run/W1nCray`（`RuntimeDirectory=`）+ 内核树标为 `bin_t`（`agent/selinux`，semanage 持久规则、chcon 回退）。CentOS 7 / Stream 9 / Stream 10 三台 enforcing 虚拟机实测通过，无新 AVC（docs/AGENT.md §13.7）。
 - **R3 CA 证书与 TLS**：Go 使用系统根证书；CentOS 7、Debian 9 的证书包较旧 → 访问 GitHub / 面板 HTTPS；lite 版内置备用根证书（构建标签 fallbackroots）。
 - **R4 内核版本**：CentOS 7 为 3.10；Go 运行时、PTY、realm 的特性需在真内核上跑（chroot 用的是宿主内核，测不出来）。
 - **R5 下载与工具**：curl/wget（busybox/uclient-fetch）、sha256sum、gunzip、mktemp（`install.sh:241-377`）。

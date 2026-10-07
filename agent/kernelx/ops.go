@@ -35,8 +35,16 @@ func (e *Ensurer) Remove(name, version string) error { return e.in.Remove(name, 
 
 // Rollback makes the previous version current again and marks the version that
 // was current as bad (with back-off), so a later Ensure of the same pin does
-// not immediately switch back. It returns the now-current kernel.
-func (e *Ensurer) Rollback(name string) (driver.Installed, error) { return e.in.Rollback(name) }
+// not immediately switch back. It returns the now-current kernel, after
+// labelling it for SELinux (best effort, like Ensure).
+func (e *Ensurer) Rollback(name string) (driver.Installed, error) {
+	inst, err := e.in.Rollback(name)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(context.Background())
+	return inst, nil
+}
 
 // Current returns the version the installer last made current, from the
 // pointer alone (no process check).

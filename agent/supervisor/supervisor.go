@@ -53,12 +53,21 @@ const (
 	waitDelay = 2 * time.Second
 )
 
+// BinLabeler makes one kernel binary executable on an SELinux machine before it
+// is started. *selinux.Labeler implements it; nil disables labelling.
+type BinLabeler interface {
+	EnsureBinT(ctx context.Context, path string) error
+}
+
 // Options configures a Supervisor. The zero value is usable.
 type Options struct {
 	// Log receives supervisor events (never process arguments or environment).
 	Log driver.Logger
 	// PIDDir, if set, is where <id>.pid files are kept (mode 0700 directory).
 	PIDDir string
+	// Labeler is applied to a child's binary before it is started. It is a
+	// no-op when SELinux is off and idempotent per path.
+	Labeler BinLabeler
 	// LogMaxBytes is the size at which a log file rotates (default 10 MiB).
 	LogMaxBytes int64
 	// LogKeep is how many rotated files are kept (default 3; negative keeps none).
@@ -177,6 +186,14 @@ func (s *Supervisor) Start(ctx context.Context, p driver.ProcSpec) error {
 	}
 	if p.Path == "" {
 		return fmt.Errorf("supervisor: %s: empty path", p.ID)
+	}
+	// A kernel under the agent's state directory keeps the etc_t type; on an
+	// SELinux machine that would start it in init_t, where it cannot bind its
+	// ports or sockets. Label it before the first spawn (agent/selinux).
+	if s.opts.Labeler != nil {
+		if err := s.opts.Labeler.EnsureBinT(ctx, p.Path); err != nil {
+			return fmt.Errorf("supervisor: %s: %w", p.ID, err)
+		}
 	}
 	p = applyDefaults(p)
 	hash := specHash(p)
