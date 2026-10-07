@@ -122,7 +122,7 @@ Modules:
 | `Policy` | 见 §4（本地根信任，远端无法放宽） |
 | `Panel` | 见「机器模式节点」一节 |
 | `Terminal` | `Enabled`（缺省 **true**）、`MaxSessions`（≤2）、`IdleTimeoutS`、`MaxDurationS` |
-| `Files` | `Roots`、`Unrestricted`、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
+| `Files` | `Roots`、`Unrestricted`（**三态**，见下）、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
@@ -137,6 +137,14 @@ Modules:
 **终端（D8 / RULINGS v9 第 17 条）**：交互终端**默认开启**——不写 `Terminal` 段即为开启。机器只能在**本地**关闭它：写 `Terminal: {Enabled: false}`，或在安装/关联时用 `--noterminal`（`install.sh --noterminal`、`W1nCray link --noterminal`）。面板无法远程打开或关闭它：本机状态只通过 `hello.policy` 上报，面板据此显示「该机器已在本地关闭终端」。
 
 > ⚠️ **升级提醒**：已经部署的机器升级到带终端的版本后，由于缺省是开启，会**自动获得终端能力**（面板可以申请交互会话）。不需要的机器请显式写 `Terminal: {Enabled: false}`，或用 `--noterminal` 重新关联。
+
+**文件管理（D9 / PLAN v10）**：`Files.Roots` 是 `file_*` 命令能到达的目录（缺省 = xray 配置目录 + agent 状态目录）。`Files.Unrestricted` 是**三态**开关：
+
+- **不写**（缺省）：跟随终端。终端有效开启（见上，缺省开启）→ 文件管理**不受限**。理由：终端就是一个 root shell，根目录限制只剩不便，没有安全意义。
+- **显式 `true`**：不受限，与终端开关无关。
+- **显式 `false`**：永远受 `Roots` 限制，即使终端开着。
+
+`W1nCray check` 会报出**有效值**（`hello.policy.files.unrestricted`），面板据此显示与组装命令。**不受限模式**下路径必须是绝对路径（`Resolve` 忽略 `root` 参数），因此面板应传 `root: ""` + 绝对 `path`；`Roots` 仍照常上报，只是不再参与路径解析（它们是给面板的快捷入口）。**受限模式**的约定不变：`root` 是本机命名的 root 名（`xray`/`state`/…），`path` 是相对路径。不受限模式下即使 `Roots` 为空，`file_*` 命令与 `files` 能力照样提供。
 
 ### `config.yml` 的 `Agent:` 块（旧布局）
 
@@ -481,10 +489,12 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 与 `xray` 一律拒绝（见下）。 |
-| `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。 |
+| `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。`mode` 是八进制权限串，`mtime` 是 Unix 秒。 |
 | `file_read` | `{root, path, offset?, limit?}` | 回 `{data:"<base64>", size, eof}`。`limit` 不得超过本机上限（默认 128 KiB，契约 §7-8），超限回 `failed` + `result.code="too_large"`。 |
-| `file_write` | `{root, path, data:"<base64>", mode?, sha256?}` | 原子写（同目录临时文件 + `rename`）。`mode` 是八进制字符串（缺省 0644）：可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；给了 `sha256` 就先核对。 |
+| `file_write` | `{root, path, data:"<base64>", mode?, sha256?, append?}` | `append` 缺省/false：原子整体替换（同目录临时文件 + `rename`）。`append: true`：追加到**已存在**的普通文件末尾（文件不存在回 `failed` + `result.code="not_found"`；直接 `O_APPEND` 写，不再走临时文件），`mode` 不适用（文件已存在）。单片仍 ≤ 128 KiB（`MaxWrite`）。`mode` 是八进制字符串（缺省 0644）：可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；给了 `sha256` 就先核对（**该 sha256 始终是本次载荷**的）。结果 `{path, sha256, size, created, append?}` 里的 `sha256`/`size` 是**写完后整个文件**的（分片上传据此校验）。 |
 | `file_delete` | `{root, path}` | 删一个**普通文件**（目录一律拒绝），回 `{path, deleted:true}`。 |
+| `file_mkdir` | `{root, path, mode?}` | 等价 `mkdir -p`：逐级创建缺失的父目录（中间目录 0755），`mode` 只作用于最后一级，缺省 0755。目录 mode 只允许 `0700`/`0750`/`0755`（目录的可执行位是"可进入"，因此不需要 `Files.AllowExec`；world-writable 目录在 root 内是符号链接替换漏洞，一律拒绝），setuid/setgid/sticky 拒绝。回 `{path, created}`（已存在时 `created:false`，不是错误）。 |
+| `file_rename` | `{root, path, to}` | 在**同一个 root 内**把 `path` 移到 `to`（不受限模式两者都是绝对路径）。**目标已存在则拒绝**（不覆盖，回 `failed` + `result.code="already_exists"`），`to` 的父目录必须已存在。回 `{path, to, renamed:true}`。 |
 | `files_apply` | `{}` | 长命令。对**最近一次 desired 的 `files` 段**执行：下载 blob（按 sha256，命中缓存不重复下载）→ 暂存 → 校验 → 原子替换（先留 `last_good`）→ 重载。结果 `{status, files[], reload, applied_pending?, errors?, reason?, rolled_back?}`。 |
 | `files_validate` | `{}` | 只暂存 + 校验，**不写任何受管文件、不重载**。结果同 `files_apply`（`reload:"not_needed"`）。 |
 | `files_rollback` | `{}` | 用 `last_good` 快照恢复受管文件并重载。结果 `{status:"rolled_back", rolled_back:true, files[], reload}`。 |
@@ -498,7 +508,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 - **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。
 - **能力声明**：`hello.capabilities`（以及 HTTP `/config` 的 `features`）里出现 `kernel` 的条件是**内核安装器可用且已加载一份已签名清单**——没有清单时 `kernel_install` 无法解析版本，所以不做这个承诺（契约 §7-1）。
 - **能力集合是动态的，靠重连发布**：`hello.capabilities` 只在建连时发送一次，同一连接上第二个 `hello` 是协议错误（面板回 `unexpected_type`），而能力可能在握手之后才就绪（签名清单到达、`self_update` 注册完成）。agent 在每个 telemetry/components 周期把运行时的能力集合与上次 `hello` 实际发出的集合按**集合**比较（排序、去重）：不同就干净地断开当前连接并重连一次，让新的 `hello` 携带新集合。两次这样的重连至少间隔 30 s（集合来回抖动不会变成重连风暴），且本机有活动终端会话时推迟到会话结束（重连会打断用户的 shell）。这条路径**不发送任何新帧类型**（契约 §1/§3）。
-- **`file_*` 的根与错误码**：`root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`invalid_args`。
+- **`file_*` 的根与错误码**：受限模式下 `root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；不受限模式下 `root` 传空、`path` 传绝对路径（PLAN v10，见 §3 的 `Files`）。`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内（`mkdir`/`rename` 同样拒绝）。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`already_exists`、`not_found`、`invalid_args`。
 - **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
 - **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
 - **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
@@ -527,7 +537,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 - **固定白名单与固定目录**：`config.yml`、`route.json`、`custom_inbound.json`、`custom_outbound.json`、`dns.json`、`geoip.dat`、`geosite.dat`，只写在 xray 配置目录。名字必须是纯文件名：`../evil`、绝对路径、`sub/route.json`、`agent.yml`、状态文件一律拒绝，命令不执行。
 - **`config.yml` 只在 `agent.yml` 分离布局下可写**（契约 §7-2）：否则该文件就是 agent 自己的配置，面板写它等于让 agent 自杀。这种情况下 agent 不声明 `files` 能力，面板也就不会下发。
-- **`files` 能力名是两个功能的交集**（契约 §3 里 `files` 只有一个名字）：面板据它决定是否在 revision 里下发 `desired.files`（受管 xray 文件），也用同一个名字决定是否提供 `file_*` 文件管理。所以只有当**两者都能服务**时才声明：受管层已接线、本地 `Files.Roots` 非空、`agent.yml` 分离布局，且 `file_*` 命令已注册。单文件布局下 `file_*` 命令仍然注册可用（`file_list` 等照常执行，直接发命令即可），但**不声明** `files`。契约目前没有任何字段能区分这两个功能（`capabilities` 是集合，`policy.files` 只有 `roots`/`unrestricted`），这是 WP-G5 与 WP-G6 合并时的保守取舍：宁可少声明，也不让面板下发本机无法应用的 `desired.files`。风险与待决项见合并报告。
+- **`files` 能力名是两个功能的交集**（契约 §3 里 `files` 只有一个名字）：面板据它决定是否在 revision 里下发 `desired.files`（受管 xray 文件），也用同一个名字决定是否提供 `file_*` 文件管理。所以只有当**两者都能服务**时才声明：受管层已接线、本地 `Files` 能到达 xray 目录（`Roots` 非空**或** `Unrestricted` 有效开启）、`agent.yml` 分离布局，且 `file_*` 命令已注册。单文件布局下 `file_*` 命令仍然注册可用（`file_list` 等照常执行，直接发命令即可），但**不声明** `files`。契约目前没有任何字段能区分这两个功能（`capabilities` 是集合，`policy.files` 只有 `roots`/`unrestricted`），这是 WP-G5 与 WP-G6 合并时的保守取舍：宁可少声明，也不让面板下发本机无法应用的 `desired.files`。风险与待决项见合并报告。
 - **校验先于替换**：四个 JSON 先逐个 `core.CheckFiles`，再用**整实例预检**（`core.New` 只构造、不 `Start`，因此**不绑端口**）抓组合错误；`config.yml` 走完整 `LoadConfig`。校验不过 → 一个受管文件都不动、不重载，回 `status:"invalid"` 与带文件名/规则序号的错误。
 - **blob 完整性**：边写边算 sha256，与 desired 的 `sha256`/`size` 不符**不落缓存、不替换**；`If-None-Match` 拿到 304 而本地又没有缓存时重取一次。单文件上限默认 64 MiB（`Files.MaxBytes` 可改；设为负值 = 本机禁用 geo 下发，回显式原因而不是静默跳过）。
 - **原子替换与回滚**：替换前把当前文件快照成 `last_good`（缺失的文件记为"缺失"，回滚时删掉），替换走同目录临时文件 + `rename`。重载被拒（`LoadConfig` 失败）→ 恢复 `last_good` 并回 `status:"rolled_back"`。
@@ -603,6 +613,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 7. **审计只有元数据**：`terminal.AuditEvent` 结构体里**没有任何内容字段**（编译期保证），只有会话 id、动作、时间、时长、`BytesIn`/`BytesOut`、结束原因。终端字节永远不会进入审计、日志或事件帧。
 8. **`agent/fileops` 的边界**：`file_*` 只在 `Files.Roots` 内工作（默认 xray 配置目录 + agent 状态目录），`agent.yml`、`desired.json`、`last_good.json` **永不在任何 root 内**；拒绝 `..`、绝对路径、符号链接逃逸、FIFO/设备/非常规文件、目录删除；可执行位需 `Files.AllowExec`，setuid/setgid/sticky 一律拒绝；`file_read.limit` 与 `file_write` 载荷各 ≤ 128 KiB（WS 单帧 256 KiB 契约，RULINGS v9 第 9 条）。
 9. **已知限制（TOCTOU）**：`os` 包没有 `openat`，`fileops` 的"逐段 Lstat + `O_NOFOLLOW` 打开"之间存在极小的 TOCTOU 窗口。因此部署要求：**root 内不应有可被非 root 用户改写的目录**。这一条已在 `agent/fileops` 的包注释里写明。
+10. **`Files.Unrestricted` 三态（PLAN v10）**：`agent/fileops` 的根目录限制不再是"缺省开启"。`Files.Unrestricted` **不写**时跟随终端：终端有效开启（缺省开启）→ 文件管理**不受限**，面板可以用绝对路径（`root` 传空）读写 agent 进程有权限访问的任意文件。理由：终端本身就是一个 root shell，根目录限制没有安全增量，只剩不便。需要限制的机器必须**显式**写 `Files: {Unrestricted: false}`。两种模式下不变的部分：`agent.yml`、`desired.json`、`last_good.json` 永不可达；符号链接、FIFO/设备/非常规文件、`..`、大小上限（`MaxRead`/`MaxWrite`）规则照旧；新增的 `file_mkdir` / `file_rename` 与 `file_write` 走同一套路径规则，`file_rename` **永不覆盖**已存在的目标，`file_write append` 只追加到已存在的普通文件。本机有效值通过 `hello.policy.files.unrestricted` 上报。
 
 ## 11 已知限制与未决事项
 

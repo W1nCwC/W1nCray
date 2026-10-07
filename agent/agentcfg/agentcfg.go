@@ -240,13 +240,27 @@ func (t *TerminalConfig) Validate() error {
 
 // FilesConfig is the local file-operation policy (D9, ruling 13). Roots are
 // resolved and defaulted by ResolveLocalPolicy (xray config directory + state
-// directory); Unrestricted and AllowExec default to false, so the zero value is
-// the safe one. Only the types and their validation live here; the behaviour is
-// implemented by the later file-management package.
+// directory) unless the machine is unrestricted; AllowExec defaults to false,
+// so the zero value is the safe one. Only the types and their validation live
+// here; the behaviour is implemented by agent/fileops.
 type FilesConfig struct {
-	Roots        []string `mapstructure:"Roots"`
-	Unrestricted bool     `mapstructure:"Unrestricted"`
-	AllowExec    bool     `mapstructure:"AllowExec"`
+	Roots []string `mapstructure:"Roots"`
+	// Unrestricted is a THREE-STATE switch (PLAN v10):
+	//
+	//   - not written (nil): follow the terminal gate. A machine whose root
+	//     shell is already reachable gains nothing from confining the file
+	//     manager — the terminal can do anything the file manager can, only
+	//     less conveniently — so an effective terminal means "unrestricted".
+	//   - explicit true: unrestricted, whatever the terminal says.
+	//   - explicit false: the roots check always applies, even with the
+	//     terminal on.
+	//
+	// ResolveLocalPolicy materialises the value (so the field is non-nil after
+	// the load and every consumer sees the effective one); Config.
+	// UnrestrictedEnabled reads it defensively. In unrestricted mode the panel
+	// names an absolute path and sends an empty root.
+	Unrestricted *bool `mapstructure:"Unrestricted"`
+	AllowExec    bool  `mapstructure:"AllowExec"`
 	// MaxBytes bounds one managed-file blob (managed files are downloaded by
 	// sha256, see agent/filesync). 0 means the built-in default (64 MiB). A
 	// negative value turns geo downloads off locally: a machine that keeps no
@@ -325,12 +339,27 @@ func (c *Config) Validate() error {
 }
 
 // TerminalEnabled reports whether the interactive terminal is switched on
-// locally. The default is off (D8) and the panel can never relax it.
+// locally. The default is on (D8) and the panel can never relax it.
 func (c *Config) TerminalEnabled() bool {
 	if c == nil {
 		return false
 	}
 	return c.Terminal == nil || c.Terminal.Enabled == nil || *c.Terminal.Enabled
+}
+
+// UnrestrictedEnabled reports the effective Files.Unrestricted value: an
+// explicit true/false is honoured as written, an absent value follows the
+// terminal gate (see FilesConfig.Unrestricted). ResolveLocalPolicy materialises
+// the field, so this accessor only has to cover a Config that was never
+// resolved (a zero value, a test) — there the safe answer is "restricted".
+func (c *Config) UnrestrictedEnabled() bool {
+	if c == nil || c.Files == nil {
+		return false
+	}
+	if c.Files.Unrestricted != nil {
+		return *c.Files.Unrestricted
+	}
+	return c.TerminalEnabled()
 }
 
 // XrayNodesEnabled reports whether the local module gate allows node
@@ -406,9 +435,20 @@ func (c *Config) ResolveLocalPolicy(base, xrayDir string, excluded []string) err
 	if c.Files == nil {
 		c.Files = &FilesConfig{}
 	}
+	// The three-state switch is resolved first: materialising it here is what
+	// lets every consumer — the panel's fileops.Options, hello.policy.files —
+	// read the effective value instead of the raw one. An absent value follows
+	// the terminal gate (see FilesConfig.Unrestricted).
+	if c.Files.Unrestricted == nil {
+		v := c.TerminalEnabled()
+		c.Files.Unrestricted = &v
+	}
 	if len(c.Files.Roots) == 0 {
 		// Default: the xray configuration directory and the agent state
-		// directory, nothing else (D9).
+		// directory, nothing else (D9). The default is kept in unrestricted
+		// mode too: it is what the panel shows as the convenient shortcuts,
+		// while an unrestricted machine also accepts any absolute path with an
+		// empty root.
 		c.Files.Roots = []string{xrayDir, c.StateDir}
 	}
 	roots := make([]string, 0, len(c.Files.Roots))
