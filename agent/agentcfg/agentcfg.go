@@ -72,6 +72,10 @@ type Config struct {
 	Files *FilesConfig `mapstructure:"Files"`
 	// Modules is the local module switch (D3).
 	Modules *ModuleConfig `mapstructure:"Modules"`
+	// Firewall is the local firewall-automation switch (PLAN v11 D2). On
+	// OpenWrt the agent opens the WAN ports of the instances it runs; anywhere
+	// else it never touches the firewall.
+	Firewall *FirewallConfig `mapstructure:"Firewall"`
 
 	// dir is the directory the relative paths were resolved against and
 	// excludedFiles are the paths that are never reachable through
@@ -276,6 +280,30 @@ type FilesConfig struct {
 // on; the panel can only ask for nodes, never relax this gate.
 type ModuleConfig struct {
 	XrayNodes *bool `mapstructure:"XrayNodes"`
+}
+
+// FirewallConfig is the local firewall-automation switch (PLAN v11 D2).
+// AutoOpen is a pointer on purpose: nil (not written) follows the platform
+// default, which is ON on OpenWrt and OFF everywhere else. Only OpenWrt is
+// implemented in this release: on another system the agent never touches the
+// firewall, whatever the field says.
+type FirewallConfig struct {
+	AutoOpen *bool `mapstructure:"AutoOpen"`
+}
+
+// FirewallAutoOpen returns the effective value of Firewall.AutoOpen for a
+// machine whose OpenWrt detection is openWrt. An explicit true/false written in
+// the configuration is honoured on OpenWrt; "not written" is the platform
+// default. A non-OpenWrt machine always answers false because the agent has no
+// firewall automation there (the panel sees it in hello.policy.firewall).
+func (c *Config) FirewallAutoOpen(openWrt bool) bool {
+	if !openWrt {
+		return false
+	}
+	if c == nil || c.Firewall == nil || c.Firewall.AutoOpen == nil {
+		return true
+	}
+	return *c.Firewall.AutoOpen
 }
 
 // Load reads an agent.yml. A missing file returns (nil, nil): the caller then

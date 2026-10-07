@@ -196,6 +196,11 @@ type InstanceStat struct {
 	BytesDown   *uint64 `json:"bytes_down,omitempty"`
 	ConnsActive *uint64 `json:"conns_active,omitempty"`
 	ConnsTotal  *uint64 `json:"conns_total,omitempty"`
+	// FirewallOpen mirrors reconcile.InstanceReport.FirewallOpen: true when the
+	// agent has opened this instance's public ports in the machine's firewall.
+	// The panel reads it against hello.policy.firewall.auto_open, which says
+	// whether this machine manages its firewall at all.
+	FirewallOpen bool `json:"firewall_open"`
 }
 
 // HostStat is the optional machine load; unavailable fields are nil.

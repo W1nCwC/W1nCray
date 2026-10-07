@@ -138,6 +138,8 @@ L1 内核驱动测试（chroot，快）；L2：install.sh 全新安装 agent →
 ## 4.3 已发现的新问题
 - OpenWrt 系默认防火墙拒绝 WAN 入站：转发规则在路由器上监听的端口，用户从外网连不上。方案：agent 在 OpenWrt 上为实例监听端口维护一个专用的 fw4/fw3 规则组（`W1nCray_<实例>`），实例删除即移除；面板转发规则显示「已在路由器防火墙放行」。实测后定稿。
 
+**定稿（D2）**：实现见 `agent/fwopen`，规则为**每个实例一条** UCI `config rule`，section 名 `w1ncray_<实例id>`（UCI section 名只允许 `[A-Za-z0-9_]`，故 `-`→`_d`、`_`→`__`），字段 `name 'W1nCray <实例名>'`、`src wan`、`proto`（按 `network`，可为 `tcp udp`）、`dest_port`（支持范围）、`target ACCEPT`；只放行对外监听的实例（forward/tunnel_entry/reverse_portal 的 `listen`，tunnel_exit 的 `tunnel.listen`；回环地址、`enabled:false`、reverse_bridge 不放行）。本地开关 `agent.yml` `Firewall.AutoOpen`（OpenWrt 缺省 true，其它系统恒 false，本期只实现 OpenWrt），经 `hello.policy.firewall.auto_open` 与实例状态 `firewall_open` 上报；防火墙失败只告警、不回滚实例。实测（D2 实验室）：OpenWrt 21.02.7（fw3/iptables，`/etc/init.d/firewall reload`）、OpenWrt 24.10.8（fw4/nftables，`fw4 reload`）、iStoreOS 三台，规则分别出现在 `uci show firewall` 与 `iptables -S`/`nft list ruleset`；宿主经 QEMU 端口转发访问成功，删除实例后规则与可达性同时消失。
+
 ## 5. 风险与回滚
 
 - 拆分涉及 panel 包大规模重构：逐 WP 合并，每步全量测试；保留 v0.5.3 作为可回滚版本。

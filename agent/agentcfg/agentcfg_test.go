@@ -570,3 +570,30 @@ func TestLocalPolicyAlwaysHasTheXrayRootAndHidesTheToken(t *testing.T) {
 		t.Errorf("a shallow xray directory must not be added: %v", shallow.Files.Roots)
 	}
 }
+
+// TestFirewallAutoOpenDefaults pins the three-state switch of PLAN v11 D2:
+// "not written" follows the platform (on for OpenWrt, off elsewhere), an
+// explicit value is honoured on OpenWrt, and a non-OpenWrt machine never turns
+// it on because the agent has no firewall automation there.
+func TestFirewallAutoOpenDefaults(t *testing.T) {
+	on, off := true, false
+	cases := []struct {
+		name    string
+		cfg     *Config
+		openWrt bool
+		want    bool
+	}{
+		{"nil config on openwrt", nil, true, true},
+		{"nil config elsewhere", nil, false, false},
+		{"not written on openwrt", &Config{}, true, true},
+		{"not written elsewhere", &Config{}, false, false},
+		{"explicit on", &Config{Firewall: &FirewallConfig{AutoOpen: &on}}, true, true},
+		{"explicit off", &Config{Firewall: &FirewallConfig{AutoOpen: &off}}, true, false},
+		{"explicit on elsewhere", &Config{Firewall: &FirewallConfig{AutoOpen: &on}}, false, false},
+	}
+	for _, c := range cases {
+		if got := c.cfg.FirewallAutoOpen(c.openWrt); got != c.want {
+			t.Errorf("%s: FirewallAutoOpen = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
