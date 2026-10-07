@@ -21,6 +21,14 @@
 # After installation the same script is the `W1nCray` command: run it without
 # arguments for a menu, or use the shortcuts (see `W1nCray help`). XrayR files
 # are never modified; XrayR keeps running until `W1nCray switch`.
+#
+# v11 split the program in two: this script installs the *agent* (W1nCray) only.
+# The Xray kernel (W1nCray-xray) is a separate program and service that the
+# panel installs when a node is bound to the machine, or that an operator
+# installs locally with `W1nCray xray install`. `update` migrates a pre-v11
+# single program that serves Xray nodes: it downloads the agent and the kernel,
+# stops the old service, replaces the agent, installs the kernel service and
+# starts the agent again.
 
 set -eu
 
@@ -34,6 +42,8 @@ AGENT_CONF="$CONF_DIR/agent.yml"
 ENVFILE="$CONF_DIR/install.env"
 XRAYR_DIR="${XRAYR_DIR:-$ROOT/etc/XrayR}"
 XRAYR_UNIT="XrayR"
+# The Xray kernel's fixed service name (agent/xraysvc.ServiceName).
+XRAY_UNIT="W1nCray-xray"
 GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 DEFAULT_PREFIX="$ROOT/usr/local/W1nCray"
 # Seconds to watch a service after start / switch (tests shorten them).
@@ -235,6 +245,21 @@ asset_name() { # arch flavor -> name of the .gz asset
 	fi
 }
 
+# The Xray kernel is a separate program with its own asset names. On OpenWrt the
+# lite build (-tags dnslite,fallbackroots) is the one to install, exactly like
+# the agent's OpenWrt flavor.
+xray_asset_name() { # arch flavor -> name of the Xray kernel .gz asset
+	if [ "$2" = lite ]; then
+		echo "W1nCray-xray-linux-$1-lite.gz"
+	else
+		echo "W1nCray-xray-linux-$1.gz"
+	fi
+}
+
+xray_flavor() { # the Xray kernel flavor for this machine
+	if is_openwrt; then echo lite; else echo full; fi
+}
+
 # ---- downloads -------------------------------------------------------------
 
 download() { # url dest
@@ -339,6 +364,8 @@ check_space() { # dir flavor
 fetch_binary() {
 	_src="$1"
 	_fl="$2"
+	RELEASE_TAG=""
+	CHOSEN_ARCH=""
 	mkdir -p "$BIN_DIR"
 	check_space "$BIN_DIR" "$_fl"
 	TMPD="$BIN_DIR/.dl.$$"
@@ -367,6 +394,9 @@ fetch_binary() {
 		else
 			_tag="${_src#version:}"
 		fi
+		# Recorded for the v11 migration: it must download the matching Xray
+		# kernel asset from the very same release.
+		RELEASE_TAG="$_tag"
 		_arch="$(detect_arch)"
 		_ok=0
 		for _a in $(arch_fallbacks "$_arch"); do
@@ -379,6 +409,7 @@ fetch_binary() {
 			chmod 755 "$NEWBIN"
 			if "$NEWBIN" version >/dev/null 2>&1; then
 				_ok=1
+				CHOSEN_ARCH="$_a"
 				break
 			fi
 			yellow "$_a 版本无法在此 CPU 上运行，尝试更低要求的版本"
@@ -388,6 +419,24 @@ fetch_binary() {
 	esac
 	chmod 755 "$NEWBIN"
 	"$NEWBIN" version >/dev/null 2>&1 || die "程序无法运行（架构不符或文件损坏）"
+}
+
+# fetch_xray_kernel TAG ARCH leaves the verified Xray kernel asset at $XRAYGZ
+# and its sha256 at $XRAYSHA. It is the same release and the same SHA256SUMS
+# check as fetch_binary; the flavor is lite on OpenWrt. Unlike the agent, the
+# kernel cannot be executed here (that is what `W1nCray xray install` does), so
+# the architecture is the one the agent's own version check already proved.
+fetch_xray_kernel() {
+	_tag="$1"
+	_arch="$2"
+	_fl="$(xray_flavor)"
+	_asset="$(xray_asset_name "$_arch" "$_fl")"
+	yellow "下载 W1nCray-xray $_tag ($_arch, $_fl) ..."
+	download "https://github.com/$REPO/releases/download/$_tag/$_asset" "$TMPD/xray.gz" || die "下载失败: $REPO $_tag $_asset"
+	verify_sha256 "$TMPD/xray.gz" "$_asset" "$_tag"
+	XRAYGZ="$TMPD/xray.gz"
+	XRAYASSET="$_asset"
+	XRAYSHA="$(sha256_of "$XRAYGZ")"
 }
 
 # ---- service backends ------------------------------------------------------
@@ -425,7 +474,7 @@ EOF
 	systemctl daemon-reload
 }
 be_systemd_remove() {
-	rm -f "$ROOT/etc/systemd/system/W1nCray.service"
+	rm -f "$ROOT/etc/systemd/system/$1.service"
 	systemctl daemon-reload
 }
 be_systemd_exists() { systemctl list-unit-files "$1.service" --no-legend 2>/dev/null | grep -q "^$1.service"; }
@@ -483,7 +532,7 @@ start_pre() {
 EOF
 	chmod 755 "$ROOT/etc/init.d/W1nCray"
 }
-be_openrc_remove() { rm -f "$ROOT/etc/init.d/W1nCray"; }
+be_openrc_remove() { rm -f "$ROOT/etc/init.d/$1"; }
 be_openrc_exists() { [ -x "$ROOT/etc/init.d/$1" ]; }
 be_openrc_active() { rc-service "$1" status >/dev/null 2>&1; }
 # Runlevels a service is enabled in (XrayR community scripts used a custom one).
@@ -545,7 +594,7 @@ start_service() {
 EOF
 	chmod 755 "$ROOT/etc/init.d/W1nCray"
 }
-be_procd_remove() { rm -f "$ROOT/etc/init.d/W1nCray"; }
+be_procd_remove() { rm -f "$ROOT/etc/init.d/$1"; }
 be_procd_exists() { [ -x "$ROOT/etc/init.d/$1" ]; }
 # `status` reports "running" for a dead instance on OpenWRT <= 23.05; use `running`.
 be_procd_active() {
@@ -699,13 +748,17 @@ keep_on_sysupgrade() {
 }
 
 # drop_sysupgrade_entries removes what keep_on_sysupgrade added; the config
-# directory entry stays unless the config itself is purged.
+# directory entry stays unless the config itself is purged. The Xray kernel
+# service adds its own init-script entry on procd (agent/xraysvc); it is dropped
+# here too so uninstall leaves no dangling line.
 drop_sysupgrade_entries() { # $1 = 1 to drop the config directory entry too
 	is_openwrt || return 0
 	_sc="$ROOT/etc/sysupgrade.conf"
 	[ -f "$_sc" ] || return 0
 	_tmp="$(mktemp)"
 	grep -vxF "/etc/init.d/W1nCray" "$_sc" >"$_tmp" || true
+	grep -vxF "/etc/init.d/W1nCray-xray" "$_tmp" >"$_tmp.2" || true
+	mv "$_tmp.2" "$_tmp"
 	if [ "$1" -eq 1 ]; then
 		grep -vxF "/etc/W1nCray/" "$_tmp" >"$_tmp.2" || true
 		mv "$_tmp.2" "$_tmp"
@@ -821,6 +874,43 @@ static_node_ids() {
 		sed -n 's/.*NodeID[[:space:]]*:[[:space:]"]*\([0-9][0-9]*\).*/\1/p' |
 		tr '\n' ' ')"
 	printf '%s' "${_ids% }"
+}
+
+# ---- v11 migration detection ------------------------------------------------
+# A pre-v11 program is a single binary that serves Xray in-process and prints
+# "W1nCray <v> (Xray-core <v>, <flavor>)". The v11 agent prints
+# "W1nCray <v> (agent, <flavor>)".
+
+is_single_program() {
+	[ -x "$BIN" ] || return 1
+	"$BIN" version 2>/dev/null | grep -q 'Xray-core'
+}
+
+# machine_nodes_on: true when the effective agent configuration turns on
+# Panel.MachineNodes (the panel owns the node list). agent.yml wins over the
+# Agent: block of config.yml, exactly like LoadConfig.
+machine_nodes_on() {
+	for _f in "$AGENT_CONF" "$CONF"; do
+		if [ -f "$_f" ] && grep -q '^[[:space:]]*MachineNodes:[[:space:]]*true' "$_f" 2>/dev/null; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# xray_nodes_configured: true when this machine's configuration needs the Xray
+# kernel: config.yml has static Nodes, or machine mode owns them.
+xray_nodes_configured() {
+	has_static_nodes "$CONF" && return 0
+	machine_nodes_on
+}
+
+# xray_hint tells a fresh installation where the Xray kernel comes from.
+xray_hint() {
+	yellow "Xray 内核未安装：本机只装了 agent（W1nCray）。"
+	yellow "在面板给这台机器绑定节点后，agent 会自动安装 Xray 内核；也可现在手动安装："
+	yellow "  W1nCray xray install            # 按已签名清单安装最新版"
+	yellow "  W1nCray xray install --file <W1nCray-xray .gz> --sha256 <hex>   # 离线安装"
 }
 
 # panel_config DEST writes the xray side of the machine-mode config. The agent's
@@ -1076,10 +1166,37 @@ cmd_install() {
 		_was_active=1
 	fi
 
+	# v11 migration (PLAN v11 §2.6): a pre-v11 single program that serves Xray
+	# nodes must become the agent plus the W1nCray-xray kernel service. Both
+	# downloads happen before anything is stopped, so the interruption is only
+	# the two process restarts.
+	_migrate_xray=0
+	if is_single_program && xray_nodes_configured; then
+		case "$_src" in
+		latest | version:*)
+			_migrate_xray=1
+			;;
+		*)
+			yellow "检测到 0.5.x 单一程序与 Xray 节点配置，但本次用的是本地/自定义程序源，无法自动下载匹配的 Xray 内核。"
+			yellow "升级完成后请执行 W1nCray xray install 安装 Xray 内核（见 docs/AGENT.md §13）。"
+			;;
+		esac
+	fi
+
 	fetch_binary "$_src" "$FLAVOR"
+	if [ "$_migrate_xray" -eq 1 ]; then
+		fetch_xray_kernel "${RELEASE_TAG:-}" "${CHOSEN_ARCH:-$(detect_arch)}"
+		yellow "迁移到 v11：停止旧的单一程序 -> 替换 agent -> 安装并启动 Xray 内核服务 -> 启动 agent。"
+		yellow "下载已完成；中断只包含这两次重启（通常几秒到几十秒），期间经 Xray 节点的连接会断开。"
+		if [ "$BACKEND" != none ]; then
+			svc stop W1nCray >/dev/null 2>&1 || true
+		fi
+	fi
 	mv "$NEWBIN" "$BIN"
-	rm -rf "$TMPD"
-	trap - EXIT INT TERM
+	if [ "$_migrate_xray" -ne 1 ]; then
+		rm -rf "$TMPD"
+		trap - EXIT INT TERM
+	fi
 	green "已安装 $("$BIN" version | head -n1)"
 
 	mkdir -p "$CONF_DIR"
@@ -1165,6 +1282,11 @@ cmd_install() {
 	if [ "$BACKEND" = none ]; then
 		yellow "没有检测到可用的服务管理器（systemd / OpenRC / procd），程序与配置已就位但未注册为服务。"
 		yellow "可手动前台运行: $BIN -c $CONF   （或 W1nCray run）"
+		if [ "$_migrate_xray" -eq 1 ]; then
+			yellow "Xray 内核尚未安装：请执行 W1nCray xray install --file <文件> --sha256 $XRAYSHA"
+		else
+			xray_hint
+		fi
 		panel_hint "$_panel" "$_machine" "$_panel_pending"
 		return 0
 	fi
@@ -1172,6 +1294,16 @@ cmd_install() {
 	keep_on_sysupgrade
 	if is_openwrt; then
 		yellow "提示：固件升级（sysupgrade）后配置会保留，但程序文件需要重新执行安装命令"
+	fi
+
+	if [ "$_migrate_xray" -eq 1 ]; then
+		# Replace the in-process Xray with the kernel service before the agent
+		# comes back: the kernel serves the nodes while the agent restarts.
+		"$BIN" -c "$CONF" xray install --file "$XRAYGZ" --sha256 "$XRAYSHA" ||
+			die "Xray 内核安装失败。agent 已替换；请重新下载 $XRAYASSET 后执行: W1nCray xray install --file <文件> --sha256 $XRAYSHA"
+		rm -rf "$TMPD"
+		trap - EXIT INT TERM
+		green "Xray 内核服务已安装并启动（迁移完成）"
 	fi
 
 	if [ "$_was_active" -eq 1 ]; then
@@ -1195,6 +1327,9 @@ cmd_install() {
 		green "W1nCray 已启动并设为开机自启。管理命令: W1nCray（菜单）、W1nCray status、W1nCray log"
 	fi
 	panel_hint "$_panel" "$_machine" "$_panel_pending"
+	if [ "$_migrate_xray" -ne 1 ]; then
+		xray_hint
+	fi
 }
 
 cmd_update() {
@@ -1375,6 +1510,20 @@ cmd_uninstall() {
 	svc stop W1nCray >/dev/null 2>&1 || true
 	svc disable W1nCray >/dev/null 2>&1 || true
 	svc remove W1nCray || true
+	# The Xray kernel service is separate (PLAN v11 §2.2): stop and remove it
+	# too. Its own command deletes the kernel files and keeps config.yml; when
+	# it cannot run, the service is removed by backend so no dangling unit or
+	# init script is left behind.
+	if [ -x "$BIN" ]; then
+		if ! "$BIN" -c "$CONF" xray remove; then
+			yellow "W1nCray xray remove 未能完成，按当前服务后端清理 $XRAY_UNIT"
+			if [ "$BACKEND" != none ]; then
+				svc stop "$XRAY_UNIT" >/dev/null 2>&1 || true
+				svc disable "$XRAY_UNIT" >/dev/null 2>&1 || true
+				svc remove "$XRAY_UNIT" || true
+			fi
+		fi
+	fi
 	rm -f "$BIN" "$BIN_DIR/install.sh" "$MGR"
 	rmdir "$BIN_DIR" 2>/dev/null || true
 	drop_sysupgrade_entries "$_purge"
@@ -1399,6 +1548,19 @@ cmd_run() {
 	exec "$BIN" -c "$CONF" "$@"
 }
 
+# cmd_xray passes straight through to the program's `xray` command (status,
+# start, stop, restart, install [--file ... --sha256 ...], remove). The Xray
+# kernel is a service of its own, so the installer never rewrites its unit: the
+# program owns it (agent/xraysvc).
+cmd_xray() {
+	require_bin
+	case "${1:-}" in
+	status) ;;
+	*) need_root ;;
+	esac
+	"$BIN" -c "$CONF" xray "$@"
+}
+
 usage() {
 	cat <<'EOF'
 W1nCray 管理命令
@@ -1415,6 +1577,10 @@ W1nCray 管理命令
   W1nCray switch [-y]        停用 XrayR、启用 W1nCray（失败自动回滚）
   W1nCray rollback           停用 W1nCray、恢复 XrayR
   W1nCray uninstall [--purge] [-y]  卸载（--purge 同时删除配置）
+  W1nCray xray status|start|stop|restart|install|remove
+                             管理 Xray 内核服务（与面板同一套实现）
+  W1nCray xray install --file <W1nCray-xray 文件或 .gz> --sha256 <hex>
+                             离线安装 Xray 内核（sha256 必填）
   W1nCray run                前台运行（已有实例在运行时会被拒绝）
   W1nCray version | x25519 | init ...  程序本体的命令
 
@@ -1425,8 +1591,18 @@ W1nCray 管理命令
                         [--panel 面板地址 --machine 机器ID (--token 令牌 | --token-file 文件)
                          [--allow-http] [--port-range 20000-40000] [--noterminal]]
 
+  安装只装 agent（W1nCray 程序 + 服务），不安装 Xray 内核：Xray 内核由面板在
+  绑定节点时自动安装，或手动执行 W1nCray xray install。
+
   下载的发行包必须通过 SHA256SUMS 校验，缺少 sha256sum / SHA256SUMS 或不匹配都会拒绝安装；
   明知风险仍要跳过时才加 --insecure-skip-verify（或设置 W1NCRAY_INSECURE_SKIP_VERIFY=1）。
+
+升级（update）:
+  已是 v11 agent 的机器只更新 agent。
+  0.5.x 及以前的单一程序若配置里有 Xray 节点（config.yml 有 Nodes，或
+  Agent.Panel.MachineNodes 为真），会先下载 agent 与对应的 Xray 内核资产（OpenWrt 用
+  lite），校验 SHA256SUMS 后按顺序：停止旧服务 -> 替换 agent -> 安装并启动 Xray 内核
+  服务 -> 启动 agent；下载在停止服务之前完成，中断只有两次进程重启。
 
 面板一键接入（机器模式）:
   --panel 会写出 agent 配置：agent 启动后自动向面板领取本机器的节点与转发规则。
@@ -1463,6 +1639,8 @@ menu() {
    7. 编辑配置    8. 开机自启开关    9. 更新程序
   10. 从 XrayR 迁移配置   11. 切换到 W1nCray   12. 回滚到 XrayR
   13. 卸载
+  Xray 内核（独立服务）:
+  14. 状态   15. 启动   16. 停止   17. 重启   18. 安装   19. 卸载
    0. 退出
 ==================================================
 EOF
@@ -1484,6 +1662,12 @@ EOF
 		11) cmd_switch ;;
 		12) cmd_rollback ;;
 		13) cmd_uninstall ;;
+		14) cmd_xray status || true ;;
+		15) cmd_xray start || true ;;
+		16) cmd_xray stop || true ;;
+		17) cmd_xray restart || true ;;
+		18) cmd_xray install || true ;;
+		19) cmd_xray remove || true ;;
 		0 | q | Q | exit) return 0 ;;
 		*) yellow "无效的选择" ;;
 		esac
@@ -1521,6 +1705,7 @@ dispatch() {
 		;;
 	rollback) cmd_rollback ;;
 	uninstall) cmd_uninstall "$@" ;;
+	xray) cmd_xray "$@" ;;
 	run) cmd_run "$@" ;;
 	menu) menu ;;
 	help | -h | --help) usage ;;
