@@ -27,8 +27,11 @@ type fakeKernels struct {
 	running   string
 	exact     bool
 	ensureFn  func(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
-	removeFn  func(name, version string) error
-	rollFn    func(name string) (driver.Installed, error)
+	// ensureForceFn is the operator-initiated install path (D-M3). nil falls
+	// back to ensureFn.
+	ensureForceFn func(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
+	removeFn      func(name, version string) error
+	rollFn        func(name string) (driver.Installed, error)
 }
 
 func (f fakeKernels) List() ([]install.Entry, error) {
@@ -48,6 +51,16 @@ func (f fakeKernels) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Ins
 		return f.ensureFn(ctx, pin)
 	}
 	return driver.Installed{Version: pin.Version}, nil
+}
+
+// EnsureForce is the operator-initiated install the kernel_install command
+// uses (D-M3). Without a dedicated hook it falls back to Ensure, so a test
+// that does not care about the back-off keeps its old behaviour.
+func (f fakeKernels) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	if f.ensureForceFn != nil {
+		return f.ensureForceFn(ctx, pin)
+	}
+	return f.Ensure(ctx, pin)
 }
 func (f fakeKernels) Remove(name, version string) error {
 	if f.removeFn != nil {

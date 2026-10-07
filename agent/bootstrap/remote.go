@@ -530,11 +530,20 @@ func (c *wsCommands) Execute(ctx context.Context, id string, cmd wsproto.Cmd, ex
 	}
 	if sendErr := c.client.SendWait(ctx, env, ws.CommandQueueTimeout); sendErr != nil {
 		c.log.Warnf("bootstrap: cmd.result for %q not delivered over the WebSocket: %v", id, sendErr)
+		// The accepted answer never reached the panel: release the ordering
+		// gate so the final result (the only answer the panel will see) is not
+		// held back (D-M3).
+		c.runner.AcceptedSent(id)
 		// Not remembered: a redelivery (over either channel) is answered.
 		return "", nil, ws.ErrAnswered
 	}
 	if status != panelclient.ResultAccepted {
 		c.runner.MarkAnswered(id)
+	} else {
+		// A long command keeps its in-flight slot until its final result is
+		// delivered (lateResult), and the accepted answer is now on the wire,
+		// so the final result may follow it (D-M3).
+		c.runner.AcceptedSent(id)
 	}
 	// A long command keeps its in-flight slot until its final result is
 	// delivered (lateResult), so a redelivery in between is dropped instead of

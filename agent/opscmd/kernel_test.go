@@ -150,6 +150,16 @@ func (r *kernelRig) ensure(version string) driver.Installed {
 // this rig talks to kernel/install directly so the command layer is exercised
 // against the installer that actually refuses and swaps.)
 func (r *kernelRig) ensurePin(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return r.ensurePinWith(ctx, pin, r.in.Ensure)
+}
+
+// ensurePinForce is ensurePin through install.EnsureForce: the operator path
+// bypasses and clears the automatic retry back-off (D-M3).
+func (r *kernelRig) ensurePinForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return r.ensurePinWith(ctx, pin, r.in.EnsureForce)
+}
+
+func (r *kernelRig) ensurePinWith(ctx context.Context, pin spec.KernelPin, ensure func(context.Context, spec.KernelPin) (driver.Installed, error)) (driver.Installed, error) {
 	if pin.Version == "" {
 		m := r.in.Manifest()
 		if m == nil {
@@ -169,20 +179,21 @@ func (r *kernelRig) ensurePin(ctx context.Context, pin spec.KernelPin) (driver.I
 		}
 		pin.Version = best
 	}
-	return r.in.Ensure(ctx, pin)
+	return ensure(ctx, pin)
 }
 
 // ops exposes the installer through the opscmd surface. running/exact stand in
 // for the process check: the rig never runs a kernel binary.
 func (r *kernelRig) ops(running string, exact bool) KernelOps {
 	return fakeKernels{
-		running:   running,
-		exact:     exact,
-		listFn:    r.in.List,
-		catalogFn: r.in.Catalog,
-		ensureFn:  r.ensurePin,
-		removeFn:  r.in.Remove,
-		rollFn:    r.in.Rollback,
+		running:       running,
+		exact:         exact,
+		listFn:        r.in.List,
+		catalogFn:     r.in.Catalog,
+		ensureFn:      r.ensurePin,
+		ensureForceFn: r.ensurePinForce,
+		removeFn:      r.in.Remove,
+		rollFn:        r.in.Rollback,
 	}
 }
 
@@ -268,6 +279,53 @@ func TestKernelInstallIsLongAndInstallsTheNewestVersion(t *testing.T) {
 	}
 	if e, ok := rig.entry("2.0.0"); !ok || !e.Current {
 		t.Errorf("2.0.0 entry = %+v (present=%v), want current", e, ok)
+	}
+}
+
+// TestKernelInstallBypassesTheRollbackBackoff covers D-M3: a rollback marks the
+// version it rolled away from as failed with an exponential back-off, but an
+// administrator explicitly installing it again must not be refused by that
+// timer -- the back-off exists for the automatic retries only.
+func TestKernelInstallBypassesTheRollbackBackoff(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.addVersion("2.0.0")
+	rig.ensure("1.0.0")
+	rig.ensure("2.0.0")
+	// The rollback makes 1.0.0 current again and records 2.0.0 as failed.
+	if _, err := rig.in.Rollback("gost"); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if e, _ := rig.entry("2.0.0"); e.Bad == nil {
+		t.Fatal("the rollback did not put 2.0.0 in back-off")
+	}
+
+	calls := make(chan sinkCall, 4)
+	reg := mustRegistry(t, Deps{
+		Kernels: rig.ops("", false),
+		Sink: SinkFunc(func(id, status string, data json.RawMessage) {
+			calls <- sinkCall{id: id, status: status, data: data}
+		}),
+	})
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "bk1", Type: panelclient.CmdKernelInstall, Args: json.RawMessage(`{"name":"gost","version":"2.0.0"}`),
+	})
+	if status != panelclient.ResultAccepted {
+		t.Fatalf("kernel_install first answer = (%q, %s), want accepted", status, res)
+	}
+	select {
+	case c := <-calls:
+		if c.id != "bk1" || c.status != panelclient.ResultDone {
+			t.Fatalf("reinstall after rollback = %+v, want done (a back-off refusal is the D-M3 bug)", c)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("kernel_install never finished")
+	}
+	if e, ok := rig.entry("2.0.0"); !ok || !e.Current {
+		t.Errorf("2.0.0 = %+v (present=%v), want current after the forced reinstall", e, ok)
+	}
+	if e, _ := rig.entry("2.0.0"); e.Bad != nil {
+		t.Errorf("2.0.0 is still in back-off after a successful forced install: %+v", e.Bad)
 	}
 }
 

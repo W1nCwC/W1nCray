@@ -298,8 +298,24 @@ func (in *Installer) resolve(name, version string) (*manifest.Kernel, string, *m
 // self-checks the binary and switches atomically; the previous version is
 // kept. Any failure leaves the previously current version untouched and is
 // remembered with exponential back-off. Errors wrap the kinds in package
-// kernel (ErrUnavailable, ErrNoSpace, ErrVerify, ErrRevoked, ...).
+// kernel (ErrUnavailable, ErrNoSpace, ErrVerify, ErrRevoked, ...). An
+// operator-initiated install uses EnsureForce instead: the back-off constrains
+// the automatic retries only (D-M3).
 func (in *Installer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return in.ensure(ctx, pin, false)
+}
+
+// EnsureForce is Ensure for an operator-initiated install: it bypasses the
+// retry back-off and clears the failure record first, so an administrator who
+// explicitly asks for a version after a rollback (or a failed automatic
+// attempt) is never refused by a timer meant for automatic retries (D-M3). A
+// failure of the forced attempt starts a fresh back-off, so the automatic path
+// still backs off.
+func (in *Installer) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return in.ensure(ctx, pin, true)
+}
+
+func (in *Installer) ensure(ctx context.Context, pin spec.KernelPin, force bool) (driver.Installed, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 
@@ -307,6 +323,12 @@ func (in *Installer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Ins
 	k, key, t, err := in.resolve(name, version)
 	if err != nil {
 		return driver.Installed{}, err
+	}
+	if force {
+		// The operator's explicit request wins over the automatic back-off:
+		// the record is dropped so the attempt runs, and a fresh failure
+		// records a fresh count (recordFailure below).
+		in.clearFailure(name, version)
 	}
 	if mk := in.readMarker(name, version); mk != nil && mk.ArchiveSHA256 == t.ArchiveSHA256 && in.filesIntact(name, version, t) {
 		if err := in.activate(name, version); err != nil {

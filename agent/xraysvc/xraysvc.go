@@ -75,6 +75,10 @@ type Status struct {
 // implementation is *kernelx.Ensurer.
 type Kernels interface {
 	Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
+	// EnsureForce installs for an explicit operator request, bypassing and
+	// clearing the automatic retry back-off (D-M3). Install and Upgrade use it;
+	// the start-up migration (EnsureRunning) keeps Ensure.
+	EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
 	Current(name string) (driver.Installed, error)
 	Rollback(name string) (driver.Installed, error)
 	// Remove deletes one version; an empty version removes the whole kernel,
@@ -280,7 +284,7 @@ func (m *Manager) Install(ctx context.Context, version string) error {
 	m.installing.Store(true)
 	defer m.installing.Store(false)
 
-	inst, err := m.opts.Kernels.Ensure(ctx, pin(version))
+	inst, err := m.opts.Kernels.EnsureForce(ctx, pin(version))
 	if err != nil {
 		return err
 	}
@@ -307,7 +311,7 @@ func (m *Manager) Upgrade(ctx context.Context, version string) error {
 	defer m.installing.Store(false)
 
 	prev, perr := m.opts.Kernels.Current(xrayapi.KernelName)
-	inst, err := m.opts.Kernels.Ensure(ctx, pin(version))
+	inst, err := m.opts.Kernels.EnsureForce(ctx, pin(version))
 	if err != nil {
 		return err
 	}

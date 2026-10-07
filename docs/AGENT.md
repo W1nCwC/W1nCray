@@ -543,7 +543,7 @@ Agent:
 | type | args | 行为与结果 |
 |---|---|---|
 | `kernel_list` | `{}` | 回 `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}`。`kernels` 是**已安装**的版本（事实，读内核目录）；`catalog` 只列已签名清单里**本机可用**的版本。没有加载清单时 `catalog: []`，`kernels` 照常返回。 |
-| `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。 |
+| `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。**管理员明确下发时绕过并清除自动重试退避**（D-M3）：回滚掉的版本可以立刻重装，退避只约束自动重试。 |
 | `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`；**幂等**：目标本来就没装（或已经删掉）时同样 `done`，结果里带 `already_absent: true`（D-M2）。`name=xray` 不需要 `version`：整服务卸载，服务本就不存在时也回 `already_absent`。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 一律拒绝（见下）；`xray` 走 Xray 内核服务（§13.5.1），服务未托管时回 `not_supported`。 |
@@ -559,6 +559,7 @@ Agent:
 
 细节与边界：
 
+- **长命令的结果顺序是保证的**（D-M3）：面板把 `accepted` 的 `result` **覆盖**在命令行已有的结果上，所以 agent 保证 `accepted` 先于最终 `done`/`failed` 到达（否则最终结果先到会被清成 `null`，失败就没有错误信息了）。若 `accepted` 没能投出（面板不可达等），最终结果立即发出，不会被这条顺序规则拖住。
 - **保留名 `agent`**：签名清单里名为 `agent` 的条目属于 `self_update`（契约 §7-11）。`kernel_install`/`kernel_remove`/`kernel_rollback` 与 `component_restart` 一律拒绝它（`failed` + `result.code="reserved_name"`）；`kernel_list` 仍会如实列出已安装的版本。
 - **`component_restart` 不能重启 agent**：agent 不由 supervisor 管理（重启它会断掉面板连接），回 `failed` + `result.code="reserved_name"`。`name=xray` 由 Xray 内核服务处理（§13.5.1）：服务已托管则重启它，未托管回 `not_supported`。名字对应的内核进程没在跑时回 `failed`（`component "x" is not running`）。
 - **`in_use` 的判定**：优先用 supervisor 的 pid 记录（`<StateDir>/pid/*.pid`）+ 存活与 `/proc/<pid>/exe` 身份复核，把正在执行的二进制映射回 `<KernelsDir>/kernels/<name>/<version>/`；平台无法核实身份（Windows 等）或没配 pid 目录时，退化为"当前指针 = 在用"，不假装精确。回滚后进程仍执行旧版本的情况也能如实反映。

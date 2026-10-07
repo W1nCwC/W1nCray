@@ -202,7 +202,10 @@ func (k *kernelCmds) kernelInstall(ctx context.Context, req Request, complete Co
 	}
 	k.reg.logf().Infof("opscmd: kernel_install %s@%s accepted", a.Name, wanted)
 	go func() {
-		inst, err := k.deps.Kernels.Ensure(ctx, pin)
+		// EnsureForce, not Ensure: an administrator explicitly asked for this
+		// version, so the automatic retry back-off (which a rollback arms) must
+		// not refuse it (D-M3).
+		inst, err := k.deps.Kernels.EnsureForce(ctx, pin)
 		if err != nil {
 			k.reg.logf().Warnf("opscmd: kernel_install %s@%s failed: %v", a.Name, wanted, err)
 			complete(StatusFailed, nil, err)

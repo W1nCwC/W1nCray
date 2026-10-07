@@ -28,10 +28,27 @@ type fakeKernels struct {
 	rbErr    error
 	onRback  func()
 	ensured  []spec.KernelPin
-	removed  []string
+	// forced records the explicit (operator-initiated) installs, which must
+	// bypass the automatic back-off (D-M3).
+	forced  []spec.KernelPin
+	removed []string
 }
 
 func (f *fakeKernels) Ensure(_ context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return f.ensurePin(pin, false)
+}
+
+// EnsureForce mirrors the production installer: an explicit install bypasses
+// and clears the back-off. The fake has no back-off, so it only records that
+// the forced path was used.
+func (f *fakeKernels) EnsureForce(_ context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	f.mu.Lock()
+	f.forced = append(f.forced, pin)
+	f.mu.Unlock()
+	return f.ensurePin(pin, true)
+}
+
+func (f *fakeKernels) ensurePin(pin spec.KernelPin, forced bool) (driver.Installed, error) {
 	f.mu.Lock()
 	f.ensured = append(f.ensured, pin)
 	fn := f.ensureFn
@@ -629,7 +646,42 @@ func TestServiceAbsentRecognisesEveryInitSystem(t *testing.T) {
 	}
 }
 
-func TestUpgradeHealthFailureRollsBack(t *testing.T) {	f := newFixture(t, "run/systemd/system/")
+// TestExplicitInstallsBypassTheBackoff covers D-M3's service half: Install and
+// Upgrade are operator-initiated, so they go through EnsureForce; the start-up
+// migration (EnsureRunning) keeps the automatic Ensure and its back-off.
+func TestExplicitInstallsBypassTheBackoff(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	bin := installedKernel(t, f.root, "1.0.0")
+	f.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		return driver.Installed{Path: bin, Version: "1.0.0"}, nil
+	}
+	if err := f.manager.Install(context.Background(), "1.0.0"); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if len(f.kern.forced) != 1 {
+		t.Fatalf("Install used the automatic path %d time(s), want one forced Ensure", len(f.kern.forced))
+	}
+
+	// The start-up migration is automatic: it must keep honouring the back-off.
+	f2 := newFixture(t, "run/systemd/system/")
+	bin2 := installedKernel(t, f2.root, "1.0.0")
+	f2.kern.curErr = errors.New("not installed")
+	f2.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		return driver.Installed{Path: bin2, Version: "1.0.0"}, nil
+	}
+	if err := f2.manager.EnsureRunning(context.Background()); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	if len(f2.kern.forced) != 0 {
+		t.Errorf("the start-up migration used the forced path: %+v", f2.kern.forced)
+	}
+	if len(f2.kern.ensured) != 1 {
+		t.Errorf("the start-up migration did not call Ensure: %+v", f2.kern.ensured)
+	}
+}
+
+func TestUpgradeHealthFailureRollsBack(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
 	oldBin := installedKernel(t, f.root, "1.0.0")
 	newBin := installedKernel(t, f.root, "2.0.0")
 	f.kern.current = driver.Installed{Path: oldBin, Version: "1.0.0"}
