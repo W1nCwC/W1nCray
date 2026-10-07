@@ -234,6 +234,9 @@ type Component struct {
 	CPUPct    float64             `json:"cpu_pct,omitempty"`
 	RSS       uint64              `json:"rss,omitempty"`
 	Instances []ComponentInstance `json:"instances"`
+	// LastError is the last error the component reported (the Xray kernel's
+	// status endpoint); empty when there is none.
+	LastError string `json:"last_error,omitempty"`
 }
 
 type ComponentInstance struct {
@@ -254,6 +257,20 @@ type KernelEntry struct {
 	SizeBytes   int64  `json:"size_bytes,omitempty"`
 	InstalledAt int64  `json:"installed_at,omitempty"`
 	InUse       bool   `json:"in_use"`
+	// Service describes the service a kernel runs as, when it is not an agent
+	// child process (the Xray kernel). It is omitted for the supervised
+	// kernels (gost/realm/frp).
+	Service *KernelService `json:"service,omitempty"`
+}
+
+// KernelService is the service-manager view of a kernel that runs as its own
+// service: which backend owns it and what state it is in.
+type KernelService struct {
+	Backend string `json:"backend"` // systemd | openrc | procd | agent
+	State   string `json:"state"`   // running | stopped | failed | installing | not_installed
+	// ManagedBy is "service" when an init system owns the kernel and "agent"
+	// when the agent's supervisor does.
+	ManagedBy string `json:"managed_by,omitempty"`
 }
 
 // Cmd is the payload of a panel -> agent command.

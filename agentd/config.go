@@ -36,3 +36,11 @@ func LoadConfig(path string) (*Config, error) { return config.LoadAgent(path) }
 // AgentSource returns the file kind the effective agent configuration came
 // from.
 func AgentSource(c *Config) agentcfg.Source { return c.AgentSource() }
+
+// NeedsXray reports whether the machine's configuration asks for the Xray
+// kernel: config.yml configures at least one static node, or the panel owns the
+// node list in machine mode. It is what gates the start-up migration
+// (PLAN v11 §2.6).
+func NeedsXray(path string, cfg *Config) bool {
+	return config.HasNodes(path) || config.MachinePanel(cfg) != nil
+}

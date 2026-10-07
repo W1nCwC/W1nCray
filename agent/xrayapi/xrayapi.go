@@ -8,6 +8,22 @@ package xrayapi
 
 import "context"
 
+// The manifest kernel name of the Xray kernel and the names of its local
+// status endpoint. The kernel program (package xraynode) serves them; the
+// agent reads them without linking Xray-core, so they live here, next to the
+// wire types both sides share.
+const (
+	// KernelName is the kernel name in the signed manifest and in the kernel_*
+	// commands.
+	KernelName = "xray"
+	// StatusSocketName is the Unix socket next to config.yml on Unix systems.
+	StatusSocketName = "xray.sock"
+	// StatusAddrName is the file holding the loopback address on Windows.
+	StatusAddrName = "xray.addr"
+	// StatusPath is the HTTP path the status document is served on.
+	StatusPath = "/status"
+)
+
 // Status is the JSON body of GET /status on the kernel's local endpoint (a
 // Unix socket, or a loopback TCP port on Windows).
 type Status struct {

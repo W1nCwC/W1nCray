@@ -11,6 +11,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
 
@@ -61,6 +62,37 @@ func (f fakeKernels) Rollback(name string) (driver.Installed, error) {
 	return driver.Installed{Version: "1.0.0"}, nil
 }
 func (f fakeKernels) RunningVersion(name string) (string, bool) { return f.running, f.exact }
+
+// fakeXray is the XrayService surface.
+type fakeXray struct {
+	calls  []string
+	err    error
+	status xraysvc.Status
+}
+
+func (f *fakeXray) Install(_ context.Context, version string) error {
+	f.calls = append(f.calls, "install "+version)
+	return f.err
+}
+func (f *fakeXray) Upgrade(_ context.Context, version string) error {
+	f.calls = append(f.calls, "upgrade "+version)
+	return f.err
+}
+func (f *fakeXray) Rollback(context.Context) error {
+	f.calls = append(f.calls, "rollback")
+	return f.err
+}
+func (f *fakeXray) Restart(context.Context) error {
+	f.calls = append(f.calls, "restart")
+	return f.err
+}
+func (f *fakeXray) Remove(context.Context) error {
+	f.calls = append(f.calls, "remove")
+	return f.err
+}
+func (f *fakeXray) Status(context.Context) (xraysvc.Status, error) {
+	return f.status, f.err
+}
 
 func mustRegistry(t *testing.T, d Deps) *Registry {
 	t.Helper()
@@ -299,7 +331,8 @@ func (c *fakeComp) Restart(ctx context.Context, name string) (int, error) {
 }
 
 // TestComponentRestartRefusesAgentAndXray pins the two refusals: the agent is
-// not a kernel process, and the embedded xray engine shares the agent process.
+// not a kernel process, and a machine where the Xray kernel service is not
+// managed by this agent answers not_supported.
 func TestComponentRestartRefusesAgentAndXray(t *testing.T) {
 	comp := &fakeComp{}
 	reg := mustRegistry(t, Deps{Comp: comp})
@@ -317,8 +350,8 @@ func TestComponentRestartRefusesAgentAndXray(t *testing.T) {
 		t.Fatalf("xray restart status = %q, want failed (%s)", status, res)
 	}
 	f := decodeFailure(t, res)
-	if f.Code != "embedded" || !strings.Contains(f.Error, "embedded") {
-		t.Errorf("xray restart failure = %+v, want code embedded", f)
+	if f.Code != "not_supported" || !strings.Contains(f.Error, "Xray") {
+		t.Errorf("xray restart failure = %+v, want code not_supported", f)
 	}
 	if len(comp.calls) != 0 {
 		t.Errorf("a refused restart reached the component layer: %v", comp.calls)

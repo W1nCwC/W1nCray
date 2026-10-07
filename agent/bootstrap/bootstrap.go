@@ -33,6 +33,8 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
 	"github.com/W1nCwC/W1nCray/agent/terminal"
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
+	"github.com/W1nCwC/W1nCray/agent/xraykern"
+	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 	"github.com/W1nCwC/W1nCray/driver/frp"
 	"github.com/W1nCwC/W1nCray/driver/gost"
 	"github.com/W1nCwC/W1nCray/driver/realm"
@@ -106,8 +108,17 @@ type Options struct {
 	// on a machine where the kernel is not installed; the managed-file layer
 	// then refuses every apply with "Xray 内核未安装" instead of writing files
 	// no running instance would pick up. The agent itself never links
-	// Xray-core.
+	// Xray-core. When XrayConfigPath is set and this is nil, Boot builds the
+	// real client (xraykern).
 	Xray xrayapi.Service
+	// XrayConfigPath is the absolute path of config.yml. It is what the Xray
+	// status client and the service manager are built around; empty disables
+	// both (a machine with no Xray configuration).
+	XrayConfigPath string
+	// XrayNeeded reports whether this machine's configuration needs the Xray
+	// kernel (config.yml has Nodes, or machine mode is on). It gates the
+	// start-up migration.
+	XrayNeeded bool
 }
 
 // Runtime is a booted agent. It owns the supervisor and the reconciler.
@@ -135,6 +146,17 @@ type Runtime struct {
 	// is nil when no root is configured, and the "files" capability is then not
 	// declared.
 	FileOps *fileops.Ops
+	// Xray is the status client of the local Xray kernel (nil when the kernel
+	// is not installed or this machine has no Xray configuration).
+	Xray xrayapi.Service
+	// XrayManager manages the Xray kernel service (nil when it is unavailable
+	// on this machine).
+	XrayManager *xraysvc.Manager
+	// xrayNeeded is Options.XrayNeeded: whether the start-up migration should
+	// bring the Xray kernel service up.
+	xrayNeeded bool
+	// xrayOnce makes the start-up migration run once per process.
+	xrayOnce sync.Once
 	// cfg is the local agent configuration the capability list and the policy
 	// gates are read from (nil means the defaults).
 	cfg *agentcfg.Config
@@ -174,22 +196,28 @@ func Boot(opts Options) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
-	kern, err := kernelx.New(kernelx.Options{
-		Dir:          opts.KernelsDir,
-		ManifestPath: opts.ManifestPath,
-		KeysPath:     opts.ManifestKeysPath,
-		AgentVersion: opts.AgentVersion,
-		AllowHTTP:    opts.AllowHTTP,
-		// The pid directory is how the kernel commands tell "installed" from
-		// "actually running" (kernelx.RunningVersion).
-		PIDDir: filepath.Join(opts.StateDir, "pid"),
-		Log:    log,
-	})
+	kern, err := KernelInstaller(opts)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
-	loadPersistedManifest(kern, opts.StateDir, opts.ManifestPath, log)
 	sup := supervisor.New(supervisor.Options{Log: log, PIDDir: filepath.Join(opts.StateDir, "pid")})
+	// The Xray kernel service (PLAN v11 §2.2): its status client, its service
+	// manager and the managed-file validator/reloader are built here, where the
+	// kernel installer, the supervisor and the configuration path are all in
+	// scope. A failure only disables the service management; the agent keeps
+	// running.
+	var xrayMgr *xraysvc.Manager
+	if opts.XrayConfigPath != "" {
+		mgr, client, xerr := XrayManager(opts, kern, sup)
+		if xerr != nil {
+			log.Warnf("bootstrap: Xray service management unavailable: %v", xerr)
+		} else {
+			xrayMgr = mgr
+			if opts.Xray == nil {
+				opts.Xray = client
+			}
+		}
+	}
 	drivers, err := driverBuilder(opts.Policy, log)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
@@ -202,7 +230,17 @@ func Boot(opts Options) (*Runtime, error) {
 		State:   st,
 		Log:     log,
 	}
-	rt := &Runtime{Reconciler: rec, Sup: sup, Kernels: kern, State: st, log: log, cfg: opts.AgentConfig}
+	rt := &Runtime{
+		Reconciler:  rec,
+		Sup:         sup,
+		Kernels:     kern,
+		State:       st,
+		log:         log,
+		cfg:         opts.AgentConfig,
+		Xray:        opts.Xray,
+		XrayManager: xrayMgr,
+		xrayNeeded:  opts.XrayNeeded,
+	}
 	// The interactive terminal (D8) exists only when the local switch is on and
 	// this machine can really create a PTY. A nil manager is what makes the
 	// dispatcher answer term.error{terminal_disabled} and keeps the capability
@@ -231,6 +269,7 @@ func Boot(opts Options) (*Runtime, error) {
 	ops, err := opscmd.New(opscmd.Deps{
 		Kernels: kern,
 		Comp:    componentRestarter{rt: rt},
+		Xray:    xrayMgr,
 		Log:     log,
 	})
 	if err != nil {
@@ -263,7 +302,105 @@ func Boot(opts Options) (*Runtime, error) {
 	if opts.Resume {
 		rt.resume()
 	}
+	// The start-up migration (PLAN v11 §2.6): when the configuration needs the
+	// Xray kernel, its service is brought up. It must wait for a pending
+	// self-update to be confirmed — a rollback to a 0.5.x agent (in-process
+	// Xray) must not find the service already holding the ports — so Boot only
+	// starts it when nothing is pending; the confirmed hook in StartRemote (and
+	// the local command after Confirm) covers the other case.
+	if !rt.xrayStartupDeferred() {
+		bootXrayStart(rt)
+	}
 	return rt, nil
+}
+
+// bootXrayStart is the start-up migration trigger. It is a variable so tests
+// can observe the decision without racing a goroutine; production code never
+// changes it.
+var bootXrayStart = func(rt *Runtime) { go rt.EnsureXray(context.Background()) }
+
+// xrayStartupDeferred reports whether the start-up migration has to wait: a
+// committed self_update that has not reached the panel yet could still be
+// rolled back to the in-process 0.5.x agent, which must not find the Xray
+// service already running.
+func (r *Runtime) xrayStartupDeferred() bool {
+	if r == nil || r.Updater == nil {
+		return false
+	}
+	_, pending := r.Updater.Pending()
+	return pending
+}
+
+// EnsureXray brings the Xray kernel service up when the configuration needs
+// it. It is idempotent and runs at most once per process; the caller decides
+// when it is allowed to run (never before a pending self-update is confirmed).
+func (r *Runtime) EnsureXray(ctx context.Context) error {
+	if r == nil || r.XrayManager == nil || !r.xrayNeeded {
+		return nil
+	}
+	var err error
+	r.xrayOnce.Do(func() {
+		err = r.XrayManager.EnsureRunning(ctx)
+		if err != nil {
+			r.warnf("bootstrap: 启动 Xray 内核服务: %v", err)
+		}
+	})
+	return err
+}
+
+// KernelInstaller builds the kernel installer (kernelx) and loads the
+// persisted manifest. Boot uses it; the local `W1nCray xray` command uses it
+// too, so both go through exactly the same trust root.
+func KernelInstaller(o Options) (*kernelx.Ensurer, error) {
+	if o.KernelsDir == "" {
+		return nil, errors.New("bootstrap: KernelsDir is required")
+	}
+	log := o.Log
+	if log == nil {
+		log = nopLog{}
+	}
+	kern, err := kernelx.New(kernelx.Options{
+		Dir:          o.KernelsDir,
+		ManifestPath: o.ManifestPath,
+		KeysPath:     o.ManifestKeysPath,
+		AgentVersion: o.AgentVersion,
+		AllowHTTP:    o.AllowHTTP,
+		// The pid directory is how the kernel commands tell "installed" from
+		// "actually running" (kernelx.RunningVersion).
+		PIDDir: filepath.Join(o.StateDir, "pid"),
+		Log:    log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	loadPersistedManifest(kern, o.StateDir, o.ManifestPath, log)
+	return kern, nil
+}
+
+// XrayManager builds the Xray kernel service manager and its status client
+// from the same settings Boot uses. sup is the supervisor of the fallback
+// backend (Boot passes its own; the local command creates one).
+func XrayManager(o Options, kern *kernelx.Ensurer, sup *supervisor.Supervisor) (*xraysvc.Manager, xrayapi.Service, error) {
+	if o.XrayConfigPath == "" {
+		return nil, nil, errors.New("bootstrap: XrayConfigPath is required")
+	}
+	client, err := xraykern.New(xraykern.Options{ConfigPath: o.XrayConfigPath, Kernels: kern})
+	if err != nil {
+		return nil, nil, err
+	}
+	mgr, err := xraysvc.New(xraysvc.Options{
+		Kernels:    kern,
+		ConfigPath: o.XrayConfigPath,
+		KernelsDir: o.KernelsDir,
+		StateDir:   o.StateDir,
+		Status:     client,
+		Sup:        sup,
+		Log:        o.Log,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return mgr, client, nil
 }
 
 // newUpdater builds the self-update updater around the running executable and

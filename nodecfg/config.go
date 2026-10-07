@@ -8,7 +8,7 @@
 package nodecfg
 
 import (
-	"github.com/W1nCwC/W1nCray/common/cert"
+	"github.com/W1nCwC/W1nCray/common/certcfg"
 )
 
 // APIConfig is the "ApiConfig" section of a node (XrayR compatible).
@@ -52,7 +52,7 @@ type Config struct {
 	FallBackConfigs      []*FallBackConfig     `mapstructure:"FallBackConfigs"`
 	EnableREALITY        bool                  `mapstructure:"EnableREALITY"`
 	REALITYConfigs       *REALITYConfig        `mapstructure:"REALITYConfigs"`
-	CertConfig           *cert.Config          `mapstructure:"CertConfig"`
+	CertConfig           *certcfg.Config       `mapstructure:"CertConfig"`
 
 	// Deprecated XrayR options, accepted so old configs still load.
 	DisableIVCheck            bool           `mapstructure:"DisableIVCheck"`

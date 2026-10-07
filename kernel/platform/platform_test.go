@@ -54,6 +54,9 @@ func TestKeys(t *testing.T) {
 		{"mips64", env("linux", "mips64", nil), "linux/mips64", "hardfloat"},
 		{"mips64le soft", env("linux", "mips64le", map[string]string{"GOMIPS64": "softfloat"}), "linux/mips64le", "softfloat"},
 		{"windows", env("windows", "amd64", nil), "windows/amd64", ""},
+		{"openwrt amd64 prefers the lite target", env("linux", "amd64", nil, "/etc/openwrt_release"), "linux/amd64+openwrt,linux/amd64", ""},
+		{"openwrt arm falls back level by level", env("linux", "arm", map[string]string{"GOARM": "7"}, "/etc/openwrt_release"),
+			"linux/armv7+openwrt,linux/armv7,linux/armv6+openwrt,linux/armv6,linux/armv5+openwrt,linux/armv5", ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			i := DetectEnv(c.e)
@@ -67,6 +70,18 @@ func TestKeys(t *testing.T) {
 				t.Errorf("String() = %s lacks %s", i.String(), c.any)
 			}
 		})
+	}
+}
+
+func TestOpenWrtDetected(t *testing.T) {
+	if DetectEnv(env("linux", "amd64", nil)).OpenWrt {
+		t.Error("OpenWrt without /etc/openwrt_release")
+	}
+	if !DetectEnv(env("linux", "amd64", nil, "/etc/openwrt_release")).OpenWrt {
+		t.Error("OpenWrt with /etc/openwrt_release")
+	}
+	if DetectEnv(env("windows", "amd64", nil, "/etc/openwrt_release")).OpenWrt {
+		t.Error("OpenWrt on a non-linux GOOS")
 	}
 }
 

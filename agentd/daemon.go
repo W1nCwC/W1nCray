@@ -134,6 +134,12 @@ func (d *Daemon) startAgentLocked(cfg *Config) {
 		// The Xray kernel service (nil when it is not installed): the managed
 		// xray files are validated by the kernel itself.
 		Xray: d.xray,
+		// The Xray kernel service manager (PLAN v11 §2.2) is built inside Boot,
+		// around the supervisor it creates. Boot needs the config path to reach
+		// the kernel's status endpoint and to start it, and NeedsXray to know
+		// whether the start-up migration applies.
+		XrayConfigPath: d.path,
+		XrayNeeded:     NeedsXray(d.path, cfg),
 		// After a restart the persisted last good state comes back before
 		// (and without) the panel, so a panel that is down never costs
 		// forwarding.
@@ -173,6 +179,26 @@ func (d *Daemon) stopAgentLocked() {
 	}
 	cancel()
 	d.agent = nil
+}
+
+// EnsureXray runs the start-up migration (PLAN v11 §2.6) on the running
+// runtime: when the configuration needs the Xray kernel, its service is
+// installed or started. It is a no-op when the runtime is not up or the machine
+// does not need Xray, and idempotent within one process.
+//
+// The caller must only call it after a pending self-update is confirmed: a
+// rollback to the in-process 0.5.x agent must not find the Xray service already
+// holding the ports.
+func (d *Daemon) EnsureXray(ctx context.Context) {
+	d.mu.Lock()
+	rt := d.agent
+	d.mu.Unlock()
+	if rt == nil {
+		return
+	}
+	if err := rt.EnsureXray(ctx); err != nil {
+		log.Warnf("agent: Xray 内核服务: %v", err)
+	}
 }
 
 // applyAgentDesiredLocked applies a desired-state file and logs the outcome.

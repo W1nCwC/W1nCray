@@ -247,12 +247,15 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		// (design section 3.3).
 		SuppressHost: func() bool { return wsClient != nil && wsClient.Connected() },
 		OnConnected: func() {
-			if startup == nil {
-				return
+			if startup != nil {
+				if err := startup.Confirm(); err != nil {
+					log.Warnf("bootstrap: confirming the self-update: %v", err)
+				}
 			}
-			if err := startup.Confirm(); err != nil {
-				log.Warnf("bootstrap: confirming the self-update: %v", err)
-			}
+			// The pending self-update (if any) is confirmed: the Xray kernel
+			// service may be brought up now (PLAN v11 §2.6). Boot already did
+			// it when nothing was pending, and EnsureXray is idempotent.
+			go func() { _ = r.EnsureXray(context.Background()) }()
 		},
 	}
 	// The operations registry serves every command the Runner does not

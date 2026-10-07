@@ -690,6 +690,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `W1nCray check [-c config.yml] [--online]` | **只检查 agent 配置**（agent.yml 或 `config.yml` 的 `Agent:` 块、清单路径、令牌、清单同步）；不检查 `Nodes` 与 Xray 文件——那是 `W1nCray-xray check` 的职责 |
 | `W1nCray link` / `link --split` / `migrate` | 与 v10 相同；写入前的离线检查改为调用外部内核（见下） |
 | `W1nCray agent-apply -f desired.json` | 只支持外部引擎（gost / frp / realm）；`engine: xray` 被拒绝 |
+| `W1nCray xray status\|start\|stop\|restart\|install [version]\|remove` | 本机管理 Xray 内核服务，调用与面板路径**同一套** `agent/xraysvc`（见 §13.5） |
 
 `link` / `link --split` 的**写入前校验**需要 Xray 侧的检查：加 `--xray-bin <路径>`，或在 `W1nCray` 同目录 / `PATH` 找到 `W1nCray-xray` 时，会执行 `<W1nCray-xray> check -c <配置>` 并把输出里以 `✗` 开头的行当作失败项参与基线比较；找不到内核时**跳过该检查并打印说明**（agent 侧仍会校验机器模式的证书模式等问题）。
 
@@ -706,6 +707,8 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `W1nCray-xray check -c <config.yml> [--online]` | 原离线检查的 Xray 部分（节点、dns/route/自定义出入站、实例构建、机器节点列表） |
 | `W1nCray-xray check-staged -c <config.yml> --dir <暂存目录> --files a,b` | 校验暂存文件集，输出 `{"ok":bool,"errors":[{"file":..,"message":..}]}`；退出码 0/1（语义同原 `CoreValidator.ValidateStaged`） |
 | `W1nCray-xray x25519` | 生成 REALITY 密钥对 |
+
+在 OpenWrt（`/etc/openwrt_release` 存在）上，agent 查找清单目标时**先找 `linux/<arch>+openwrt`**（lite 变体），找不到再找 `linux/<arch>`；`+openwrt` 是清单目标键唯一允许的后缀。非 OpenWrt 只看 `linux/<arch>`。
 
 ### 13.3 单实例锁
 
@@ -754,7 +757,49 @@ type Service interface {
 }
 ```
 
-`agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它；X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。安装/卸载/systemd 管理、`files_apply` 调用 `check-staged`、遥测汇入 `GET /status`、迁移都由 X2 接入。
+`agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它。X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。X2 起由 `agent/xraykern` 实现它：
+
+- `Status` 读 `<config 目录>/xray.sock`（Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
+- `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。
+- `WaitReloaded` 在 `files_apply` 写入受管文件后，等待状态接口的 `config_fingerprint` 变成**写入后文件的指纹**，超时 30 s。指纹用 `config.Fingerprint` 对 `config.WatchedFiles` 计算——与内核（`xraynode`）**同一份代码**，所以两边不可能不一致；超时即 `files_apply` 失败，走既有的 `last_good` 回滚路径（§13.6 的 `files_apply` 行）。
+
+### 13.5.1 服务管理（`agent/xraysvc`）
+
+Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重启、升级、崩溃都不影响它。`agent/xraysvc` 按机器探测后端并**自己生成**服务文件（路径与内容全部来自 agent，面板永远不能传路径或命令）：
+
+| 后端 | 探测 | 服务文件 |
+|---|---|---|
+| systemd | `/run/systemd/system` 存在 | `/etc/systemd/system/W1nCray-xray.service`：`ExecStart=<当前版本二进制绝对路径> run -c <config.yml 绝对路径>`、`Restart=always`、`RestartSec=5`、`LimitNOFILE=1048576`、`WorkingDirectory=<配置目录>`；`systemctl daemon-reload`、`enable`、`start` |
+| OpenRC | `/sbin/openrc-run` 存在 | `/etc/init.d/W1nCray-xray`（`supervisor="supervise-daemon"`）；`rc-update add W1nCray-xray default`、`rc-service W1nCray-xray start` |
+| procd | `/sbin/procd` 与 `/etc/rc.common` 存在 | `/etc/init.d/W1nCray-xray`（`USE_PROCD=1`、`respawn`）；`enable`、`start`；内核目录与 init 脚本追加进 `/etc/sysupgrade.conf`（去重） |
+| agent 子进程 | 三者都没有 | 由 agent supervisor 运行（与 gost 相同），状态里 `managed_by: "agent"`，面板据此提示「此系统 Xray 会随 agent 重启」 |
+
+服务名固定为 `W1nCray-xray`。`Install`/`Upgrade`/`Rollback`/`Restart`/`Remove` 都幂等、带超时、失败可读：
+
+- `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动 → 健康检查（状态接口 30 s 内 `running=true`）。健康检查失败会停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
+- `Upgrade`：装新版本 → 改服务指向 → 重启 → 健康检查；失败自动 `kernelx` 回滚到上一版本并重启，报告里带上失败原因与回滚结果。
+- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。
+
+面板命令接入：`kernel_install`（已装过则走 `Upgrade`，带自动回滚）、`kernel_remove`（不需要版本号，整服务删除）、`kernel_rollback`、`component_restart` 在 `name=xray` 时都走这一套。`kernel_list` / `hello.kernel_entries` 里 xray 与其它内核格式一致，并附 `service`（`backend`、`state`、`managed_by`）；`state ∈ running/stopped/failed/installing/not_installed`。遥测的 `components` 里 xray 项来自状态接口：state、version、每个节点一项（在线数）、`last_error`。
+
+### 13.5.2 启动迁移与自升级顺序
+
+agent 启动时若配置需要 Xray（`config.yml` 有 `Nodes`，或机器模式 `Agent.Panel.MachineNodes` 为真），且服务未安装/未运行：
+
+1. 内核已在 `kernelx` 里（例如 0.5.x 面板先下发过 `kernel_install xray`）→ 只写服务并启动；
+2. 否则 → 按清单安装再启动，日志写明「检测到 Xray 节点配置，正在安装 Xray 内核」。
+
+**顺序是硬性的**：以上动作只在自升级确认（`selfupdate` 的 `Confirm`）之后做。没有待确认的自升级时在启动后立即做（`bootstrap.Boot` 里）；有待确认时，带面板的机器在面板应答（`OnConnected`）后做，本机（无面板）在 `W1nCray` 命令确认后做。理由：确认前若看门狗回滚到 0.5.x（进程内 Xray），不能已经有 Xray 服务占着端口。
+
+### 13.5.3 回退到 0.5.x
+
+0.5.x 的单一程序**不会**停止 Xray 服务。从 0.6 回退到 0.5.x 之前，必须先执行：
+
+```
+W1nCray xray stop
+```
+
+（或直接 `W1nCray xray remove` 卸载 Xray 内核。）否则 0.5.x 的进程内 Xray 会与 `W1nCray-xray` 服务争抢端口。0.6 内部回滚到 0.5.x 是安全的：回滚只可能发生在自升级确认之前，而那时服务还没启动（§13.5.2）。
 
 ### 13.6 重载语义（拆分后）
 
@@ -763,6 +808,7 @@ type Service interface {
 | `agent.yml`、`config.yml` 的 `Agent:` 块 | `W1nCray` | 生效的 agent 配置确实变化 → 只重启 agent（外部内核实例、面板链接重建）；内容不变（touch）→ 什么都不做 |
 | `desired.json` | `W1nCray` | 走期望状态应用（只增删实例） |
 | `config.yml` 的 Xray 部分、`route.json`、`dns.json`、`custom_inbound.json`、`custom_outbound.json`、节点 `RuleListPath`、机器节点列表 | `W1nCray-xray` | 只重建 Xray 实例与节点控制器；agent 完全不受影响（两个进程） |
+| `files_apply` 写入受管文件 | `W1nCray` → `W1nCray-xray` | 写入前 agent 用内核的 `check-staged` 校验；写入后重算受管文件指纹并等内核的状态接口报告它（30 s）。成功 = `reloaded`；超时/失败 = `files_apply` 失败并按既有路径回滚到 `last_good`（§13.5） |
 | `self_update` | `W1nCray` | 重启 agent 进程；`W1nCray-xray` 由服务管理器独立运行，**不中断** |
 
 拆分后 `config.yml` 同时属于两个程序：`W1nCray` 只读它的 `Agent:` 块，`W1nCray-xray` 读 Xray 部分并按上面的表监听重载。

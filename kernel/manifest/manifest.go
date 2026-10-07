@@ -71,10 +71,11 @@ type Kernel struct {
 	Capabilities map[string]any `json:"capabilities,omitempty"`
 	Run          Run            `json:"run"`
 	// Targets maps a platform key ("linux/amd64", "linux/mipsle",
-	// "linux/armv7", ...) to a build. A key present with a null value means
-	// "no build exists for that platform"; a missing key means the manifest
-	// says nothing about it. Both make the kernel unavailable there, but
-	// callers can tell them apart with Kernel.Lookup.
+	// "linux/armv7", "linux/amd64+openwrt", ...) to a build. A key present with
+	// a null value means "no build exists for that platform"; a missing key
+	// means the manifest says nothing about it. Both make the kernel
+	// unavailable there, but callers can tell them apart with Kernel.Lookup.
+	// "+openwrt" is the only accepted suffix (platform.OpenWrtSuffix).
 	Targets map[string]*Target `json:"targets"`
 	Revoked []Revocation       `json:"revoked,omitempty"`
 }
@@ -130,9 +131,12 @@ type Revocation struct {
 var (
 	reName    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 	reVersion = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$`)
-	reTarget  = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`)
-	reSHA256  = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	reFile    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
+	// reTarget is the manifest platform key: "linux/amd64", "linux/armv7", ...
+	// The only accepted suffix is "+openwrt" (platform.OpenWrtSuffix), which
+	// selects the OpenWrt-specific build of a kernel.
+	reTarget = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}(?:\+openwrt)?$`)
+	reSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	reFile   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
 )
 
 // reservedNames are file names the installer uses inside a version directory.

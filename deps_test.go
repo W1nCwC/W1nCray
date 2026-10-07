@@ -31,6 +31,17 @@ func TestXrayKernelLinksXrayCore(t *testing.T) {
 	}
 }
 
+// TestAgentDoesNotLinkACME is the WP-X2 guard: the agent program must not link
+// go-acme/lego (nor the dozens of cloud DNS SDKs its DNS-01 providers pull in).
+// The certificate *configuration* lives in common/certcfg, which is lego-free;
+// only the Xray kernel program links common/cert and lego.
+func TestAgentDoesNotLinkACME(t *testing.T) {
+	deps := goListDeps(t, ".")
+	if pkg := firstACMEDep(deps); pkg != "" {
+		t.Errorf("the agent main package depends on %s:\n%s", pkg, strings.Join(acmeDeps(deps), "\n"))
+	}
+}
+
 // goListDeps returns the transitive dependencies of pkg, one per line.
 func goListDeps(t *testing.T, pkg string) []string {
 	t.Helper()
@@ -64,6 +75,25 @@ func xrayDeps(deps []string) []string {
 // firstXrayDep returns the first Xray-core dependency, or "".
 func firstXrayDep(deps []string) string {
 	if out := xrayDeps(deps); len(out) > 0 {
+		return out[0]
+	}
+	return ""
+}
+
+// acmeDeps returns every dependency that belongs to go-acme/lego.
+func acmeDeps(deps []string) []string {
+	var out []string
+	for _, d := range deps {
+		if d == "github.com/go-acme/lego/v4" || strings.HasPrefix(d, "github.com/go-acme/lego/") {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// firstACMEDep returns the first go-acme/lego dependency, or "".
+func firstACMEDep(deps []string) string {
+	if out := acmeDeps(deps); len(out) > 0 {
 		return out[0]
 	}
 	return ""

@@ -157,6 +157,17 @@ func LoadAgent(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// HasNodes reports whether config.yml configures at least one static Xray node.
+// It reads the file without validating the Nodes section, so a broken node
+// entry cannot keep the agent from starting.
+func HasNodes(path string) bool {
+	raw, err := LoadConfigFile(path)
+	if err != nil {
+		return false
+	}
+	return len(raw.NodesConfig) > 0
+}
+
 // ConfigBlockAgent returns the raw "Agent:" block of config.yml (nil when the
 // file has none), without resolving agent.yml. It is what the check command
 // uses to tell that an agent.yml is shadowing a block the operator may still be

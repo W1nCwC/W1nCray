@@ -13,9 +13,11 @@ import (
 	"regexp"
 	"sort"
 
+	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
@@ -125,6 +127,9 @@ func (k *kernelCmds) kernelList(ctx context.Context, req Request, complete Compl
 			SizeBytes: e.Size,
 			InUse:     InUse(e, running[e.Name], exact[e.Name]),
 		}
+		if e.Name == xrayapi.KernelName && k.deps.Xray != nil {
+			entry.Service = k.xrayServiceInfo(ctx)
+		}
 		if !e.InstalledAt.IsZero() {
 			entry.InstalledAt = e.InstalledAt.Unix()
 		}
@@ -160,6 +165,20 @@ func catalogOf(entries []install.CatalogEntry) []panelclient.KernelCatalogEntry 
 	return out
 }
 
+// xrayServiceInfo reports the service state of the Xray kernel for
+// kernel_list, hello and /report. A failure is reported as an entry with an
+// empty state, never by dropping the kernel from the list.
+func (k *kernelCmds) xrayServiceInfo(ctx context.Context) *wsproto.KernelService {
+	if k.deps.Xray == nil {
+		return nil
+	}
+	st, err := k.deps.Xray.Status(ctx)
+	if err != nil {
+		return &wsproto.KernelService{}
+	}
+	return &wsproto.KernelService{Backend: st.Backend, State: st.State, ManagedBy: st.ManagedBy}
+}
+
 // kernelInstall answers kernel_install. Downloading, verifying and switching
 // can take minutes, so it answers "accepted" immediately and reports the
 // outcome through the registry's sink (ruling 7).
@@ -172,6 +191,9 @@ func (k *kernelCmds) kernelInstall(ctx context.Context, req Request, complete Co
 		return Result{}, err
 	}
 	version := manifest.NormalizeVersion(a.Version)
+	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
+		return k.xrayInstall(ctx, version, complete)
+	}
 	pin := spec.KernelPin{Name: a.Name, Version: version}
 	wanted := version
 	if wanted == "" {
@@ -192,6 +214,66 @@ func (k *kernelCmds) kernelInstall(ctx context.Context, req Request, complete Co
 	return accepted(), nil
 }
 
+// xrayInstall answers kernel_install for the Xray kernel through the service
+// manager: the kernel runs as a service of its own, so installing means
+// installing the service too. A version that is already installed is upgraded
+// (with automatic rollback on a failed health check) instead of reinstalled.
+func (k *kernelCmds) xrayInstall(ctx context.Context, version string, complete Completion) (Result, error) {
+	wanted := version
+	if wanted == "" {
+		wanted = "newest"
+	}
+	k.reg.logf().Infof("opscmd: kernel_install xray@%s accepted (service)", wanted)
+	go func() {
+		var err error
+		if k.anyInstalled(xrayapi.KernelName) {
+			err = k.deps.Xray.Upgrade(ctx, version)
+		} else {
+			err = k.deps.Xray.Install(ctx, version)
+		}
+		if err != nil {
+			k.reg.logf().Warnf("opscmd: kernel_install xray@%s failed: %v", wanted, err)
+			complete(StatusFailed, nil, err)
+			return
+		}
+		inst := k.currentOf(xrayapi.KernelName)
+		k.reg.logf().Infof("opscmd: kernel_install xray@%s done (service)", inst.Version)
+		k.reg.event("kernel.installed", "info", fmt.Sprintf("kernel xray@%s installed and running as a service", inst.Version))
+		complete(StatusDone, mustJSON(installedResult{Name: xrayapi.KernelName, Version: inst.Version, Path: inst.Path}), nil)
+	}()
+	return accepted(), nil
+}
+
+// currentOf returns the installed current version of a kernel from the kernel
+// list (KernelOps deliberately has no Current: the pointer is a detail of the
+// installer).
+func (k *kernelCmds) currentOf(name string) driver.Installed {
+	list, err := k.deps.Kernels.List()
+	if err != nil {
+		return driver.Installed{}
+	}
+	for _, e := range list {
+		if e.Name == name && e.Current {
+			return driver.Installed{Path: e.Path, Version: e.Version}
+		}
+	}
+	return driver.Installed{}
+}
+
+// anyInstalled reports whether any version of a kernel is installed.
+func (k *kernelCmds) anyInstalled(name string) bool {
+	list, err := k.deps.Kernels.List()
+	if err != nil {
+		return false
+	}
+	for _, e := range list {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // kernelRemove answers kernel_remove. It is quick (no network), so it finishes
 // inline. A version that is executing right now is refused even when the
 // current pointer already moved on, which a rollback can leave behind.
@@ -202,6 +284,17 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	}
 	if err := checkKernelName(a.Name); err != nil {
 		return Result{}, err
+	}
+	// The Xray kernel is a service: removing it stops and disables the
+	// service, deletes its service file and removes every installed version,
+	// while config.yml and the managed files stay. No version is required.
+	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
+		if err := k.deps.Xray.Remove(ctx); err != nil {
+			return Result{}, err
+		}
+		k.reg.logf().Infof("opscmd: kernel_remove xray done (service and files removed; configuration kept)")
+		k.reg.event("kernel.removed", "info", "kernel xray removed (service and files; configuration kept)")
+		return done(panelclient.KernelRemoveResult{}), nil
 	}
 	if a.Version == "" {
 		return Result{}, coded("invalid_args", errors.New("version is required"))
@@ -238,6 +331,14 @@ func (k *kernelCmds) kernelRollback(ctx context.Context, req Request, complete C
 	if err := checkKernelName(a.Name); err != nil {
 		return Result{}, err
 	}
+	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
+		if err := k.deps.Xray.Rollback(ctx); err != nil {
+			return Result{}, err
+		}
+		inst := k.currentOf(xrayapi.KernelName)
+		k.reg.logf().Infof("opscmd: kernel_rollback xray -> %s (service)", inst.Version)
+		return done(installedResult{Name: xrayapi.KernelName, Version: inst.Version, Path: inst.Path}), nil
+	}
 	inst, err := k.deps.Kernels.Rollback(a.Name)
 	if err != nil {
 		return Result{}, err
@@ -248,8 +349,8 @@ func (k *kernelCmds) kernelRollback(ctx context.Context, req Request, complete C
 
 // componentRestart answers component_restart. Only a kernel process can be
 // restarted: the agent is not supervised (and restarting it would drop the
-// panel link), and the embedded xray engine shares the agent process, so it
-// cannot be restarted on its own.
+// panel link). The Xray kernel is a service of its own and is restarted through
+// its service manager; the supervised kernels go through the supervisor.
 func (k *kernelCmds) componentRestart(ctx context.Context, req Request, complete Completion) (Result, error) {
 	var a panelclient.ComponentRestartArgs
 	if err := decodeArgs(req.Args, &a); err != nil {
@@ -260,6 +361,16 @@ func (k *kernelCmds) componentRestart(ctx context.Context, req Request, complete
 	}
 	if a.Name == ReservedAgentName {
 		return Result{}, coded("reserved_name", errors.New("component_restart never restarts the agent itself"))
+	}
+	if a.Name == xrayapi.KernelName {
+		if k.deps.Xray == nil {
+			return Result{}, coded("not_supported", errors.New("the Xray kernel service is not managed by this agent"))
+		}
+		if err := k.deps.Xray.Restart(ctx); err != nil {
+			return Result{}, err
+		}
+		k.reg.logf().Infof("opscmd: component_restart xray restarted the service")
+		return done(restartedResult{Name: a.Name, Restarted: 1}), nil
 	}
 	if a.Name == spec.EngineXray {
 		return Result{}, coded("embedded", errors.New("xray is embedded in the agent process; restart the agent service to restart it"))
