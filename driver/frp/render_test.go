@@ -337,8 +337,16 @@ func TestBinaries(t *testing.T) {
 	if err != nil || filepath.Base(frpc) != "frpc.exe" {
 		t.Fatalf("%v %v %v", frps, frpc, err)
 	}
-	if _, _, err := Binaries(filepath.Join("opt", "frpc")); err == nil {
-		t.Fatal("frpc must not be accepted as the kernel path")
+	// D-M6: the installed path comes from the manifest's run.binary, which is
+	// frpc for frp; both names must resolve to the same pair (this assertion
+	// replaces the old "frpc is refused" one, which encoded the broken
+	// contract).
+	frps, frpc, err = Binaries(filepath.Join("opt", "frp", "0.71.0", "frpc"))
+	if err != nil || frps != filepath.Join("opt", "frp", "0.71.0", "frps") || frpc != filepath.Join("opt", "frp", "0.71.0", "frpc") {
+		t.Fatalf("%v %v %v", frps, frpc, err)
+	}
+	if _, _, err := Binaries(filepath.Join("opt", "gost")); err == nil {
+		t.Fatal("a non-frp binary must not be accepted as the kernel path")
 	}
 	if _, _, err := Binaries(""); err == nil {
 		t.Fatal("empty path accepted")

@@ -5,9 +5,11 @@
 //
 // # Kernel layout
 //
-// rt.Kernel.Path is the absolute path of the frps binary of an installed frp
-// version directory. frpc lives next to it (see Binaries). Both binaries must
-// be the same release.
+// rt.Kernel.Path is the absolute path of one of the two binaries of an
+// installed frp version directory. The other binary is its sibling in the same
+// directory (see Binaries): the kernel manifest declares run.binary = frpc, so
+// kernel/install hands that path over, while a reverse_portal needs the frps
+// next to it. Both binaries must be the same release.
 //
 // # Process model (verified against frp v0.71.0)
 //
@@ -76,7 +78,13 @@ const Name = spec.EngineFrp
 const driverVersion = "w1ncray-frp-driver/1"
 
 // Binaries returns the paths of frps and frpc for the kernel path handed over
-// in driver.Runtime (kernelPath is the frps binary).
+// in driver.Runtime. kernelPath may name either binary of an installed frp
+// version directory; the other one is derived from the same directory, which is
+// where the installer always puts the pair (both manifest extract entries use
+// plain file names, see kernel/install and the frp manifest). Accepting both
+// names is what makes the real chain work: the manifest's run.binary is frpc,
+// so driver.Installed.Path is .../frpc, but a reverse_portal must run frps.
+// Only those two file names are accepted; any other path is still refused.
 func Binaries(kernelPath string) (frps, frpc string, err error) {
 	if kernelPath == "" {
 		return "", "", errors.New("frp: kernel path is empty")
@@ -84,11 +92,11 @@ func Binaries(kernelPath string) (frps, frpc string, err error) {
 	base := filepath.Base(kernelPath)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
-	if stem != "frps" {
-		return "", "", errors.New("frp: kernel path must point at the frps binary")
+	if stem != "frps" && stem != "frpc" {
+		return "", "", errors.New("frp: kernel path must point at the frps or frpc binary")
 	}
 	dir := filepath.Dir(kernelPath)
-	return kernelPath, filepath.Join(dir, "frpc"+ext), nil
+	return filepath.Join(dir, "frps"+ext), filepath.Join(dir, "frpc"+ext), nil
 }
 
 // Driver implements driver.Driver for frp. The zero value is not usable; call

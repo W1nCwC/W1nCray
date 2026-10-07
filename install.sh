@@ -1182,7 +1182,15 @@ cmd_install() {
 			[ -f "$_token_file" ] || die "--token-file 找不到文件: $_token_file"
 			[ -r "$_token_file" ] || die "--token-file 文件不可读: $_token_file"
 			# Read it without ever putting the secret on a command line.
-			_token="$(tr -d '[:space:]' <"$_token_file")"
+			# The whitespace is listed explicitly instead of using
+			# tr's '[:space:]' class: the BusyBox builds checked here
+			# (OpenWrt 21.02's v1.33.2 and 23.05's v1.36.1) are compiled
+			# without CONFIG_FEATURE_TR_CLASSES, so they treat the class
+			# as the literal set { [ : s p a c e ] } and silently delete
+			# those characters from the token, which made the agent fail
+			# with 401 bad_credentials (D-M5). Anything else left over
+			# (e.g. \v or \f) is refused by the check below.
+			_token="$(tr -d ' \t\r\n' <"$_token_file")"
 		fi
 		[ -n "$_token" ] || die "面板令牌为空：请检查 --token / --token-file 提供的内容"
 		case "$_token" in
