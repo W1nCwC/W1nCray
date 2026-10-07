@@ -36,7 +36,9 @@
 //     is refused if a Secret is supplied.
 //   - realm verifies server certificates only against the built-in Mozilla
 //     root set. It cannot pin a certificate and cannot trust a private CA.
-//     Security "tls_pin" and "vless_enc" are rejected. Self-signed exits
+//     Security "tls_pin", "tls_self" and "vless_enc" are rejected (tls_self
+//     derives a self-signed certificate, which realm has no way to verify; the
+//     gost and xray engines serve it). Self-signed exits
 //     only work when the driver is explicitly created with
 //     Options.InsecureSkipTLSVerify (development/local policy only; never
 //     derive it from remote desired state).

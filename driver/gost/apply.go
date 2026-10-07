@@ -40,7 +40,38 @@ func (d *Driver) Apply(ctx context.Context, rt driver.Runtime, set []driver.Rend
 	if err != nil {
 		return driver.ApplyResult{Failed: map[string]string{}}, err
 	}
+	// The tls_self certificate (and key) travels in the artifact: write it
+	// next to the fragment, 0600, before gost is asked to serve it. The
+	// fragment references it by relative name, and gost runs with the state
+	// directory as its working directory (procSpec.WorkDir).
+	if err := writeArtifactFiles(rt, set); err != nil {
+		return driver.ApplyResult{Failed: map[string]string{}}, err
+	}
 	return d.apply(ctx, rt, desired, true)
+}
+
+// writeArtifactFiles writes every artifact file except the fragment (today the
+// tls_self certificate and key) into the driver's state directory with mode
+// 0600. The names are plain file names: a name that could escape the state
+// directory is refused rather than joined.
+func writeArtifactFiles(rt driver.Runtime, set []driver.Rendered) error {
+	for _, r := range set {
+		for name, data := range r.Artifact.Files {
+			if name == fragmentFile {
+				continue
+			}
+			if name == "" || name != filepath.Base(name) || strings.Contains(name, "..") {
+				return fmt.Errorf("gost: artifact file name %q is not a plain file name", name)
+			}
+			if rt.StateDir == "" || !filepath.IsAbs(rt.StateDir) {
+				return errors.New("gost: runtime state dir must be absolute")
+			}
+			if err := writeFileAtomic(filepath.Join(rt.StateDir, name), data, 0o600); err != nil {
+				return fmt.Errorf("gost: write %s: %w", name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // desiredFromRendered checks that every artifact is genuine: it must be what

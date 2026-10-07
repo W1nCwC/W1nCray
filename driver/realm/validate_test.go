@@ -163,6 +163,8 @@ func TestValidateRejects(t *testing.T) {
 		{"tunnel quic", mut(baseEntry(), func(i *spec.Instance) { i.Tunnel.Type = "quic" }), "cannot carry"},
 		{"tunnel unknown", mut(baseEntry(), func(i *spec.Instance) { i.Tunnel.Type = "x" }), "unknown type"},
 		{"security tls_pin", mut(baseEntry(), func(i *spec.Instance) { i.Tunnel.Security = "tls_pin" }), "pin"},
+		{"security tls_self", mut(baseEntry(), func(i *spec.Instance) { i.Tunnel.Security = "tls_self" }), "self-signed"},
+		{"security tls_self exit", mut(baseExit(), func(i *spec.Instance) { i.Tunnel.Security = "tls_self" }), "self-signed"},
 		{"security vless_enc", mut(baseEntry(), func(i *spec.Instance) { i.Tunnel.Security = "vless_enc" }), "xray"},
 		{"security unknown", mut(baseEntry(), func(i *spec.Instance) { i.Tunnel.Security = "x" }), "security"},
 		{"pin sha256", mut(baseEntry(), func(i *spec.Instance) { i.Tunnel.PinSHA256 = strings.Repeat("a", 64) }), "pin"},

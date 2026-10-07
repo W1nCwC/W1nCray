@@ -54,6 +54,12 @@ func capsReason(c driver.Caps, in spec.Instance, requireStats bool) string {
 		if in.Tunnel.Security == "vless_enc" && c.Name != spec.EngineXray {
 			return "vless_enc security requires the xray engine"
 		}
+		// tls_self derives a self-signed certificate; realm verifies against
+		// the public CA roots only, so it can never accept one. Saying so here
+		// keeps "auto" from selecting realm (and gives the panel the reason).
+		if in.Tunnel.Security == "tls_self" && c.Name == spec.EngineRealm {
+			return "tls_self security cannot be verified by the realm engine (use gost or xray)"
+		}
 	}
 	if in.ProxyProtocolOut > 0 && !c.ProxyOut {
 		return "sending PROXY protocol is not supported"

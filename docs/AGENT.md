@@ -67,10 +67,10 @@
 
 各引擎还有这些「表里装不下」的约束（来自驱动的校验代码与文档，`engine` 写错时会收到对应拒绝信息，见 §8）：
 
-- **xray**：不支持 `limits`；`balance.health` 只支持 `type: tcp` 且至少两个目标，`failover` 必须带 `health`；目标权重之和 ≤ 64；多目标只能配单个监听端口；`tunnel.security` 省略时 tls/wss 用 TLS，其余用 VLESS 加密（`vless_enc`），**不接受不加密的 raw 隧道**；自签证书（`cert.mode: self`）必须配 `tls_pin`；`cert.mode` 为 `file` / `panel` 在当前内置装配里不可用（`bootstrap.buildDrivers` 没给 xray 配证书目录和面板证书源）。收 PROXY 头时按实测记录（PLAN-v6 §2.3）无头即断连。
-- **gost**：不支持 `tls_pin`、`vless_enc`、`tunnel.alpn`；权重只对 `random` 策略生效（其他策略写了非 1 的权重会被拒）；`tunnel_exit` / `reverse_portal` 不支持 `proxy_protocol_out` 与 `limits`，portal 不支持 `acl`；`accept_proxy_protocol` 仅限 forward / tunnel_entry；`tunnel_exit` 的目标不能用端口范围；入口方（entry / bridge）不带 `cert` 时用系统根证书严格校验出口，所以出口应使用公共 CA 签发的证书；出口用私有 CA / 自签证书时，入口方写 `tunnel.cert: {mode: "file", cert_file: "<CA 绝对路径>"}` 把它作为信任锚（不能带 `key_file`）。`balance.health` 只支持 `type: tcp`，不接受 `timeout_s` / `probe_url`；这是被动摘除：`max_fails` 次失败后该目标暂时退出轮转，`interval_s` 是它被摘除的时长。
+- **xray**：不支持 `limits`；`balance.health` 只支持 `type: tcp` 且至少两个目标，`failover` 必须带 `health`；目标权重之和 ≤ 64；多目标只能配单个监听端口；`tunnel.security` 省略时 tls/wss 用 TLS，其余用 VLESS 加密（`vless_enc`），**不接受不加密的 raw 隧道**；自签证书（`cert.mode: self`）必须配 `tls_pin`，或者直接用 `tls_self`（证书由 `secret` 派生，入口自己算指纹，不需要面板生成 x509，也不需要 `cert`/`pin_sha256`）；`cert.mode` 为 `file` / `panel` 在当前内置装配里不可用（`bootstrap.buildDrivers` 没给 xray 配证书目录和面板证书源）。收 PROXY 头时按实测记录（PLAN-v6 §2.3）无头即断连。
+- **gost**：不支持 `tls_pin`、`vless_enc`、`tunnel.alpn`；`tls_self` 可用（出口把 `secret` 派生的证书/私钥写进 state 目录，入口以同一张证书作 CA 并 `secure: true` 校验 `sni`），但只限 TLS 类传输（`tls` / `wss` / `grpc`），与 `tcp` / `ws` 组合会被拒；权重只对 `random` 策略生效（其他策略写了非 1 的权重会被拒）；`tunnel_exit` / `reverse_portal` 不支持 `proxy_protocol_out` 与 `limits`，portal 不支持 `acl`；`accept_proxy_protocol` 仅限 forward / tunnel_entry；`tunnel_exit` 的目标不能用端口范围；入口方（entry / bridge）不带 `cert` 时用系统根证书严格校验出口，所以出口应使用公共 CA 签发的证书；出口用私有 CA / 自签证书时，入口方写 `tunnel.cert: {mode: "file", cert_file: "<CA 绝对路径>"}` 把它作为信任锚（不能带 `key_file`）。`balance.health` 只支持 `type: tcp`，不接受 `timeout_s` / `probe_url`；这是被动摘除：`max_fails` 次失败后该目标暂时退出轮转，`interval_s` 是它被摘除的时长。
 - **frp**：每个 portal 一个 `frps`、每个 bridge 一个 `frpc` 进程；不支持 `acl`、`limits`、`idle_profile`、`allow_any_target`；bridge 只能有一个 target（端口范围须与 `listen.ports` 等长）或用 `port_map`；公共端口不能等于控制端口。**bridge 默认不校验 portal 的证书**（frp 的默认行为），TLS 只防窃听、不防中间人；要校验就在 bridge 写 `tunnel.cert: {mode: "file", cert_file: "<CA 或 portal 证书的绝对路径>"}` 作信任锚（不能带 `key_file`，不支持客户端证书）；`balance` 只能用在 bridge 上，且只接受 `failover`（单目标），`health` 可用 `tcp` / `http`，不能与 `network` 含 udp 同用；`secret` 即 frp token（还要避开 `: @`，见 §5）。
-- **realm**：无 ACL、无 limits、无健康检查（挂掉的目标仍会分到流量）；UDP 只能单目标；**隧道只支持 TCP，且只能 realm ↔ realm**；`tcp` / `tls` 隧道没有任何应用层认证（配 `secret` 会被拒），`ws` / `wss` 靠由 `secret` 派生的 path 令牌认证；只信任公共 CA 证书，不能固定指纹；entry 只能一个监听端口、不能 `port_map`；**出口不是守门员**——任何能连到出口端口的主机都能让它向目标建连，务必用防火墙把来源限制为入口机。
+- **realm**：无 ACL、无 limits、无健康检查（挂掉的目标仍会分到流量）；UDP 只能单目标；**隧道只支持 TCP，且只能 realm ↔ realm**；`tcp` / `tls` 隧道没有任何应用层认证（配 `secret` 会被拒），`ws` / `wss` 靠由 `secret` 派生的 path 令牌认证；只信任公共 CA 证书，不能固定指纹，**也不能用 `tls_self`**（自签证书无法校验，会被拒并提示改用 gost / xray）；entry 只能一个监听端口、不能 `port_map`；**出口不是守门员**——任何能连到出口端口的主机都能让它向目标建连，务必用防火墙把来源限制为入口机。
 
 `idle_profile`（空闲超时预设）在各引擎的实际取值：
 
@@ -393,7 +393,15 @@ Agent:
 | `reverse_portal` | 必填（公网侧用户口） | 必填，写 `listen`（控制链路） | 必填 | 不允许（目的地由 bridge 的 targets 决定） |
 | `reverse_bridge` | 只写 `ports` = portal 侧公网端口（`addr` 不用） | 必填，写 `server`（portal 的 `host:port`） | 必填 | 必填（内网目标，端口一一对应 `listen.ports`） |
 
-`tunnel` 字段：`type` ∈ tcp / tls / ws / wss / grpc / xhttp / kcp / quic（引擎支持子集见 §2）；`security` ∈ `none` / `tls` / `tls_pin` / `vless_enc`（`vless_enc` 仅 xray；`tls_pin` 需要 `pin_sha256` = 出口叶子证书 DER 的 SHA-256，64 位十六进制；`tls`/`wss` 类型再写 `none` 或 `vless_enc` 自相矛盾会被拒）；`host`（Host 头）、`path`、`sni`（须为域名）、`alpn`（≤8 项）；`cert`：出口/portal 侧是要出示的证书 `{mode: self|file|panel, cert_file, key_file}`（`file` 模式两个文件都要）；入口/bridge 侧只能是信任锚 `{mode: "file", cert_file}`（用来校验对端，不能带 `key_file`，`self` / `panel` 被拒；哪个引擎真正采用它由驱动决定：gost、frp 采用，xray 会以 `tunnel.cert is only valid on the accepting side` 拒绝，realm 以 `a certificate belongs to the tunnel exit` 拒绝）。路径须为绝对路径（只含字母数字和 `. _ / -`，不含 `..`）。
+`tunnel` 字段：`type` ∈ tcp / tls / ws / wss / grpc / xhttp / kcp / quic（引擎支持子集见 §2）；`security` ∈ `none` / `tls` / `tls_pin` / `tls_self` / `vless_enc`（`vless_enc` 仅 xray；`tls_pin` 需要 `pin_sha256` = 出口叶子证书 DER 的 SHA-256，64 位十六进制；`tls`/`wss` 类型再写 `none` 或 `vless_enc` 自相矛盾会被拒）；`host`（Host 头）、`path`、`sni`（须为域名）、`alpn`（≤8 项）；`cert`：出口/portal 侧是要出示的证书 `{mode: self|file|panel, cert_file, key_file}`（`file` 模式两个文件都要）；入口/bridge 侧只能是信任锚 `{mode: "file", cert_file}`（用来校验对端，不能带 `key_file`，`self` / `panel` 被拒；哪个引擎真正采用它由驱动决定：gost、frp 采用，xray 会以 `tunnel.cert is only valid on the accepting side` 拒绝，realm 以 `a certificate belongs to the tunnel exit` 拒绝）。路径须为绝对路径（只含字母数字和 `. _ / -`，不含 `..`）。
+
+**`security: tls_self`（两端自己派生证书）**：面板无法复刻 x509 生成，所以 `tls_self` 让**两端各自**用共享 `secret`（和 `sni`）派生出**同一张**确定性自签证书（`agent/tlsself`，HKDF-SHA256 + Ed25519；`sni` 为空时证书名是 `w1n-fwd.invalid`）：
+
+- 必须有 `Instance.Secret`（16–256 字符，与其他隧道同规则）；`pin_sha256` 与 `cert` 都**必须为空**（指纹由 secret 派生、证书由 secret 派生，写了就是矛盾，会被拒）。
+- **xray**：出口 / portal 直接出示派生证书；入口 / bridge 在本地算出同一张证书的指纹，走现有 `tls_pin` 路径（含 `fingerprint: unsafe`，因为证书是 Ed25519）。
+- **gost**：出口把派生证书与私钥写进该实例在 state 目录下的文件（`tls_self_<id>.crt` / `.key`，0600，`file` 名为相对路径，gost 的工作目录就是 state 目录），listener 的 `tls.certFile/keyFile` 指向它们；入口把派生证书当 CA（自签证书即自身 CA），渲染成 `tls: {secure: true, serverName: <sni 或 w1n-fwd.invalid>, caFile: tls_self_<id>.crt}`。只支持 TLS 类传输（`tls` / `wss` / `grpc`）；与 `tcp` / `ws` 组合会被拒。
+- **realm**：拒绝（只信任内置公共 CA 根，无法校验自签证书），提示改用 gost 或 xray；`engine: auto` 也不会选它。
+- 与 `tls_pin` 的区别：`tls_pin` 的指纹要面板/人工填进两份 desired，换 secret 就得重算；`tls_self` 只需要两端共享 secret，面板不需要碰证书。
 
 ## 6 样例索引
 
@@ -425,7 +433,7 @@ Agent:
 | [gost-wss-entry](../agent/examples/testdata/gost-wss-entry.json) / [exit](../agent/examples/testdata/gost-wss-exit.json) | gost | gost ↔ gost 的 wss 隧道 | listen | 入口不写 targets，目标由出口决定（出口只放行声明的目标）；出口需公共 CA 证书 |
 | [engine-auto](../agent/examples/testdata/engine-auto.json) | auto | `engine: auto`：自动选引擎 | listen | 四个引擎都在时 `auto-simple` → xray、`auto-iphash` → realm（xray 不支持 iphash）；只有外部引擎时两者都落到 realm |
 
-**重算 `tls_pin` 的指纹**：指纹是出口叶子证书 DER 的 SHA-256。xray 的自签证书由 `secret` 与出口 `tunnel.sni` 确定性生成，所以同样的 secret + sni 永远得到同一个指纹（测试里用 `xray.SelfCertPin(secret, sni)` 校验样例）。换了 `secret` 后：先在出口机应用 exit 文件（`pin_sha256` 暂时保持任意 64 位十六进制），再在任意机器上取出口实际出示的证书指纹，把结果填回**两份**文件的 `pin_sha256`：
+**重算 `tls_pin` 的指纹**：指纹是出口叶子证书 DER 的 SHA-256。xray 的自签证书由 `secret` 与出口 `tunnel.sni` 确定性生成，所以同样的 secret + sni 永远得到同一个指纹（测试里用 `tlsself.SelfCertPin(secret, sni)` 校验样例，`agent/tlsself` 是 xray 与 gost 共用的派生实现）。换了 `secret` 后：先在出口机应用 exit 文件（`pin_sha256` 暂时保持任意 64 位十六进制），再在任意机器上取出口实际出示的证书指纹，把结果填回**两份**文件的 `pin_sha256`：
 
 ```sh
 openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </dev/null 2>/dev/null \
@@ -621,8 +629,8 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 1. **xray 反向代理（已解决）**：语义已统一为「bridge 决定目的地」——portal 不带 `targets`（它给用户连接盖一个 TEST-NET-1 占位目的地），bridge 用自己的 `targets`（或 `allow_any_target` + 本地策略）改写每个被转发的连接；portal / 它的用户都选不了目的地。`reverse.bridge_allow` 在此语义下已无意义，写了会被拒（改用 bridge 的 `targets`）。xray 反向样例已晋升为正式样例。
 2. **`balance.health`（已解决）**：`reconcile/select.go` 现在按驱动实际接受什么来判断：主动（xray、frp）与被动摘除（gost）都放行，没有故障检测的引擎（realm）才拒绝；frp 的 `Caps` 如实声明 bridge 支持 `failover` + 主动健康检查。`auto` 优先主动探测，只能用被动时在 `considered` 里注明。`forward-gost-limits` 与 `reverse-frp-bridge` 样例已带上 `health`。
-3. **私有 CA / 自签证书（已解决）**：入口 / bridge 现在可以带 `tunnel.cert: {mode: "file", cert_file}` 作信任锚（gost 作 CA 文件，frp 作 `trustedCaFile`），`key_file` 与非 `file` 模式被拒；出口 / portal 侧规则不变。xray 驱动自己的校验仍会拒绝客户端侧的 `cert`（`tunnel.cert is only valid on the accepting side`），xray 入口请用 `tls_pin` 或 `vless_enc`，realm 入口只信公共 CA。
+3. **私有 CA / 自签证书（已解决）**：入口 / bridge 现在可以带 `tunnel.cert: {mode: "file", cert_file}` 作信任锚（gost 作 CA 文件，frp 作 `trustedCaFile`），`key_file` 与非 `file` 模式被拒；出口 / portal 侧规则不变。xray 驱动自己的校验仍会拒绝客户端侧的 `cert`（`tunnel.cert is only valid on the accepting side`），xray 入口请用 `tls_pin`、`tls_self` 或 `vless_enc`，realm 入口只信公共 CA。**`tls_self`（新增）**让面板不必生成 x509：两端用共享 secret 派生同一张自签证书（xray 走指纹固定路径，gost 写证书文件 + `secure`/`caFile`），realm 拒绝。
 4. **`secret` 字符集（已解决）**：`validate` 收紧到四个引擎的交集 `[A-Za-z0-9_.+/=-]`，`~` `:` `@` 等在校验阶段就被拒。
-5. **xray 的 `cert.mode: file` / `panel` 在内置装配里不可用**（`bootstrap.buildDrivers` 没配证书目录和面板证书源），xray TLS 隧道目前只能 `self` + `tls_pin`。
+5. **xray 的 `cert.mode: file` / `panel` 在内置装配里不可用**（`bootstrap.buildDrivers` 没配证书目录和面板证书源），xray TLS 隧道目前只能 `self` + `tls_pin`，或新的 `tls_self`（不需要任何证书来源）。
 6. `W1nCray check` 不校验 `desired.json` 内容，也没有 dry-run 命令。
 7. 面板下发（`Agent.Panel` 的期望状态与「机器模式节点」，见 §3）已实现；多机批量配置仍属后续阶段。

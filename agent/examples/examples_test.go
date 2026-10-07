@@ -16,6 +16,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/state"
+	"github.com/W1nCwC/W1nCray/agent/tlsself"
 	"github.com/W1nCwC/W1nCray/agent/validate"
 	"github.com/W1nCwC/W1nCray/driver/frp"
 	"github.com/W1nCwC/W1nCray/driver/gost"
@@ -373,7 +374,7 @@ func checkPair(t *testing.T, dial, accept spec.Desired) {
 	if at.Security == "tls_pin" && at.Cert != nil && at.Cert.Mode == "self" && d.Engine == spec.EngineXray {
 		// The xray driver derives the self-signed certificate from the secret
 		// and the SNI, so the pin in the sample is checkable.
-		want, err := xray.SelfCertPin(a.Secret, at.SNI)
+		want, err := tlsself.SelfCertPin(a.Secret, at.SNI)
 		if err != nil {
 			t.Fatal(err)
 		}

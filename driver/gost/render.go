@@ -57,7 +57,22 @@ func (d *Driver) Render(in spec.Instance) (driver.Artifact, error) {
 		return driver.Artifact{}, fmt.Errorf("gost: marshal fragment: %w", err)
 	}
 	files := map[string][]byte{fragmentFile: b}
+	// tls_self adds the derived certificate (and the key on the accepting
+	// side). They are part of the artifact, so the hash covers them and Apply
+	// writes exactly what Render produced.
+	for name, data := range p.selfFiles() {
+		files[name] = data
+	}
 	return driver.Artifact{Files: files, Hash: hashFiles(files), PortClaims: claims}, nil
+}
+
+// selfFiles returns the extra artifact files of the plan (the tls_self PEMs);
+// it is nil for every other instance.
+func (p *plan) selfFiles() map[string][]byte {
+	if p.tun == nil {
+		return nil
+	}
+	return p.tun.selfFiles
 }
 
 // hashFiles is sha256 over the driver tag and the files in name order. The
@@ -241,6 +256,12 @@ func (p *plan) buildChain() chain {
 			// skips the host name check in this mode, which suits a
 			// self-issued exit certificate.
 			tc.CAFile = t.certFile
+			if t.selfTLS {
+				// tls_self: the derived certificate is its own CA, and the
+				// name it carries (serverName above) must match, so full
+				// verification stays on.
+				tc.Secure = true
+			}
 		} else {
 			// No anchor given: full verification against the system roots,
 			// including the host name (SNI, or the server host).

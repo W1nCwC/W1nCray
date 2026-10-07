@@ -129,6 +129,23 @@ func TestValidBaselines(t *testing.T) {
 			t.Errorf("%s should be valid:%s", in.Kind, dump(errs))
 		}
 	}
+	// tls_self is accepted by the engines that can derive and verify it: xray
+	// on any carrier, gost on a TLS one, and "auto" (the selector picks one).
+	for _, tc := range []struct {
+		engine, typ string
+	}{
+		{"auto", "tls"}, {"xray", "tls"}, {"xray", "tcp"}, {"gost", "tls"}, {"gost", "wss"}, {"gost", "grpc"},
+	} {
+		in := entry()
+		in.Engine, in.Tunnel.Type, in.Tunnel.Security = tc.engine, tc.typ, "tls_self"
+		in.Tunnel.SNI = "tun.example.com"
+		if tc.typ != "wss" {
+			in.Tunnel.Host, in.Tunnel.Path = "", ""
+		}
+		if errs := Desired(desired(in), policy(), opts()); len(errs) != 0 {
+			t.Errorf("%s/%s tls_self should be valid:%s", tc.engine, tc.typ, dump(errs))
+		}
+	}
 	all := desired(fwd(), entry(), exit(), portal(), bridge())
 	// make listeners distinct
 	all.Instances[2].Tunnel.Listen = "127.0.0.1:9444"
@@ -275,6 +292,27 @@ func TestInstanceRules(t *testing.T) {
 			i.Tunnel.PinSHA256 = strings.Repeat("g", 64)
 		}, "tunnel.pin_sha256", "64 hex"},
 		{"pin without tls_pin", entry, func(i *spec.Instance) { i.Tunnel.PinSHA256 = strings.Repeat("a", 64) }, "tunnel.pin_sha256", "only meaningful"},
+		{"tls_self with a pin", entry, func(i *spec.Instance) {
+			i.Engine = "xray"
+			i.Tunnel.Security = "tls_self"
+			i.Tunnel.PinSHA256 = strings.Repeat("a", 64)
+		}, "tunnel.pin_sha256", "derives the pin"},
+		{"tls_self with a cert", exit, func(i *spec.Instance) {
+			i.Engine = "xray"
+			i.Tunnel.Security = "tls_self"
+			i.Tunnel.Cert = &spec.Cert{Mode: "self"}
+		}, "tunnel.cert", "derives the certificate"},
+		{"tls_self without a secret", entry, func(i *spec.Instance) {
+			i.Engine = "xray"
+			i.Tunnel.Security = "tls_self"
+			i.Secret = ""
+		}, "secret", "required"},
+		{"tls_self on realm", entry, func(i *spec.Instance) { i.Engine = "realm"; i.Tunnel.Security = "tls_self" }, "tunnel.security", "realm"},
+		{"tls_self on gost tcp", entry, func(i *spec.Instance) {
+			i.Engine = "gost"
+			i.Tunnel.Type = "tcp"
+			i.Tunnel.Security = "tls_self"
+		}, "tunnel.security", "TLS carrier"},
 
 		// tunnel text fields (hostile)
 		{"host space", entry, func(i *spec.Instance) { i.Tunnel.Host = "a b" }, "tunnel.host", "invalid host"},

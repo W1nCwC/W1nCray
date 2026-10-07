@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/tlsself"
 )
 
 const testSecret = "s3cret-for-tests-0123456789abcdef"
@@ -807,7 +808,7 @@ func TestTunnelSecurityMatrix(t *testing.T) {
 			in.Tunnel.Cert = &spec.Cert{Mode: "panel"}
 		}
 		o := testOpts()
-		o.PanelCert = func(string) (string, string, error) { cp, kp, _, _ := SelfCert("x", ""); return cp, kp, nil }
+		o.PanelCert = func(string) (string, string, error) { cp, kp, _, _ := tlsself.SelfCert("x", ""); return cp, kp, nil }
 		_, err := Compile(in, o)
 		if (err == nil) != c.ok {
 			t.Errorf("%s/%s (%s): err=%v want ok=%v", c.ty, c.sec, c.note, err, c.ok)
@@ -867,7 +868,7 @@ func TestCertModes(t *testing.T) {
 		t.Fatal("panel mode accepted without provider")
 	}
 	o.PanelCert = func(id string) (string, string, error) {
-		cp, kp, _, err := SelfCert("panel-"+id, "")
+		cp, kp, _, err := tlsself.SelfCert("panel-"+id, "")
 		return cp, kp, err
 	}
 	c = mustCompile(t, ex, o)
@@ -879,21 +880,110 @@ func TestCertModes(t *testing.T) {
 // The self-signed certificate (and therefore its pin) is a pure function of
 // secret and server name.
 func TestSelfCertDeterministic(t *testing.T) {
-	c1, k1, p1, err := SelfCert(testSecret, "a.example")
+	c1, k1, p1, err := tlsself.SelfCert(testSecret, "a.example")
 	if err != nil {
 		t.Fatal(err)
 	}
-	c2, k2, p2, _ := SelfCert(testSecret, "a.example")
+	c2, k2, p2, _ := tlsself.SelfCert(testSecret, "a.example")
 	if c1 != c2 || k1 != k2 || p1 != p2 {
 		t.Fatal("not deterministic")
 	}
-	_, _, p3, _ := SelfCert(testSecret, "b.example")
-	_, _, p4, _ := SelfCert(testSecret+"x", "a.example")
+	_, _, p3, _ := tlsself.SelfCert(testSecret, "b.example")
+	_, _, p4, _ := tlsself.SelfCert(testSecret+"x", "a.example")
 	if p1 == p3 || p1 == p4 {
 		t.Fatal("pin must depend on secret and name")
 	}
 	if len(p1) != 64 {
 		t.Fatalf("pin %q", p1)
+	}
+}
+
+// TestTunnelTLSSelf covers security tls_self end to end at the compile level:
+// the accepting side serves the certificate derived from the shared secret,
+// the dialing side pins exactly that certificate through the tls_pin code path
+// (and sends the certificate's own name as serverName), and the values that
+// contradict the derivation (pin_sha256, tunnel.cert, a missing secret) are
+// refused.
+func TestTunnelTLSSelf(t *testing.T) {
+	const sni = "tun.example.net"
+	certPEM, keyPEM, pin, err := tlsself.SelfCert(testSecret, sni)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The PEM is inlined as an array of lines; a body line identifies the
+	// exact certificate.
+	bodyLine := func(pem string) string { return strings.Split(strings.TrimRight(pem, "\n"), "\n")[1] }
+
+	exit := exitInst("x-self")
+	exit.Tunnel.Type, exit.Tunnel.Security, exit.Tunnel.SNI = "tls", "tls_self", sni
+	out := raw(mustCompile(t, exit, testOpts()))
+	if !strings.Contains(out, bodyLine(certPEM)) || !strings.Contains(out, bodyLine(keyPEM)) {
+		t.Fatal("the accepting side does not serve the derived certificate")
+	}
+
+	e := entry("e-self")
+	e.Tunnel.Type, e.Tunnel.Security, e.Tunnel.SNI = "tls", "tls_self", sni
+	out = raw(mustCompile(t, e, testOpts()))
+	if !strings.Contains(out, pin) {
+		t.Fatal("the dialing side does not pin the derived certificate")
+	}
+	if !strings.Contains(out, `"serverName":"`+sni+`"`) {
+		t.Fatal("the dialing side must send the certificate's name")
+	}
+	// The pinned certificate is Ed25519 (self mode), which the default Chrome
+	// fingerprint does not offer.
+	if !strings.Contains(out, `"fingerprint":"unsafe"`) {
+		t.Fatal("a pinned tunnel needs the unsafe fingerprint")
+	}
+
+	// With no SNI the certificate carries tlsself.DefaultName, and that is
+	// what the dialing side sends.
+	e2 := entry("e-default")
+	e2.Tunnel.Type, e2.Tunnel.Security = "tls", "tls_self"
+	out = raw(mustCompile(t, e2, testOpts()))
+	if !strings.Contains(out, `"serverName":"`+tlsself.DefaultName+`"`) {
+		t.Fatalf("serverName must default to %s: %s", tlsself.DefaultName, out)
+	}
+	pinDefault, err := tlsself.SelfCertPin(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, pinDefault) {
+		t.Fatal("the default-name pin is missing")
+	}
+
+	// wss works the same way, and so does the reverse portal.
+	wss := exitInst("x-wss")
+	wss.Tunnel.Type, wss.Tunnel.Security, wss.Tunnel.SNI = "wss", "tls_self", sni
+	wss.Tunnel.Path = "/w"
+	if out := raw(mustCompile(t, wss, testOpts())); !strings.Contains(out, bodyLine(certPEM)) {
+		t.Fatal("wss/tls_self does not serve the derived certificate")
+	}
+	portal := portalInst("p-self")
+	portal.Tunnel.Type, portal.Tunnel.Security = "tls", "tls_self"
+	if out := raw(mustCompile(t, portal, testOpts())); !strings.Contains(out, bodyLine(certPEM)) {
+		t.Fatal("a reverse portal with tls_self does not serve the derived certificate")
+	}
+
+	// pin_sha256 is derived, so writing one is contradictory.
+	bad := exitInst("x-bad")
+	bad.Tunnel.Type, bad.Tunnel.Security, bad.Tunnel.SNI = "tls", "tls_self", sni
+	bad.Tunnel.PinSHA256 = strings.Repeat("ab", 32)
+	if _, err := Compile(bad, testOpts()); err == nil || !strings.Contains(err.Error(), "pin_sha256") {
+		t.Fatalf("tls_self with a pin: %v", err)
+	}
+	// tunnel.cert is not used either.
+	bad.Tunnel.PinSHA256 = ""
+	bad.Tunnel.Cert = &spec.Cert{Mode: "self"}
+	if _, err := Compile(bad, testOpts()); err == nil || !strings.Contains(err.Error(), "tunnel.cert") {
+		t.Fatalf("tls_self with a cert: %v", err)
+	}
+	// The certificate comes from the secret: without one there is nothing to
+	// derive.
+	bad.Tunnel.Cert = nil
+	bad.Secret = ""
+	if _, err := Compile(bad, testOpts()); err == nil {
+		t.Fatal("tls_self without a secret was accepted")
 	}
 }
 
