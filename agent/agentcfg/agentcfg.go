@@ -450,6 +450,22 @@ func (c *Config) ResolveLocalPolicy(base, xrayDir string, excluded []string) err
 		// while an unrestricted machine also accepts any absolute path with an
 		// empty root.
 		c.Files.Roots = []string{xrayDir, c.StateDir}
+	} else if xrayDir != "" && len(strings.Split(strings.Trim(filepath.ToSlash(filepath.Clean(xrayDir)), "/"), "/")) >= 2 {
+		// The xray configuration directory is always a root (named "xray"),
+		// even when Roots lists other directories: the panel's Xray config
+		// view reads the managed files there (PLAN v10 WP-C), and files_apply
+		// already writes them. A shallow directory ("/etc") is not added: the
+		// file-ops sanity check would refuse it and disable every root.
+		found := false
+		for _, r := range c.Files.Roots {
+			if abs, err := absPath(base, r); err == nil && samePath(abs, xrayDir) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			c.Files.Roots = append(c.Files.Roots, xrayDir)
+		}
 	}
 	roots := make([]string, 0, len(c.Files.Roots))
 	for i, r := range c.Files.Roots {
@@ -458,6 +474,10 @@ func (c *Config) ResolveLocalPolicy(base, xrayDir string, excluded []string) err
 			return fmt.Errorf("config: Agent.Files.Roots[%d]: %v", i, err)
 		}
 		roots = append(roots, abs)
+	}
+	// The machine token file is a credential: never reachable through a root.
+	if c.Panel != nil && c.Panel.TokenFile != "" {
+		excluded = append(append([]string(nil), excluded...), c.Panel.TokenFile)
 	}
 	excl := make([]string, 0, len(excluded))
 	for _, e := range excluded {

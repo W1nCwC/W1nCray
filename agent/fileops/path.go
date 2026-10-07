@@ -70,7 +70,12 @@ func (o *Ops) resolveBase(root, rel string) (string, []string, error) {
 	}
 
 	var base string
-	if o.opts.IsUnrestricted() {
+	if r, named := o.roots[root]; named && root != "" {
+		// A named root ("xray", "state") keeps meaning a root plus a relative
+		// path in unrestricted mode too: the panel's managed-file views use
+		// it. Unrestricted only adds the empty root with an absolute path.
+		base = r.Path
+	} else if o.opts.IsUnrestricted() {
 		abs := filepath.Clean(rel)
 		if !filepath.IsAbs(abs) {
 			return "", nil, fmt.Errorf("%w: Files.Unrestricted needs an absolute path, got %q", ErrBadPath, rel)

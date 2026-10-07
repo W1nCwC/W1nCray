@@ -910,3 +910,27 @@ func TestFileListReportsModeAndMTime(t *testing.T) {
 func boolPtr(v bool) *bool { return &v }
 
 var _ driver.Logger = nopLog{}
+
+// TestUnrestrictedKeepsNamedRoots: an unrestricted machine still resolves a
+// named root plus a relative path (the panel's Xray config view reads
+// {root:"xray", path:"route.json"}); only the empty root takes an absolute path.
+func TestUnrestrictedKeepsNamedRoots(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "route.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ops, err := New(Options{Unrestricted: boolPtr(true), Roots: []Root{{Name: "xray", Path: dir}}, testAllowSystemRoot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ops.Resolve("xray", "route.json"); err != nil || got != filepath.Join(dir, "route.json") {
+		t.Fatalf("Resolve(xray, route.json) = %q, %v", got, err)
+	}
+	if _, err := ops.Resolve("xray", "../escape"); !errors.Is(err, ErrBadPath) {
+		t.Errorf("a named root must still refuse ..: %v", err)
+	}
+	abs := filepath.Join(dir, "route.json")
+	if got, err := ops.Resolve("", abs); err != nil || got != abs {
+		t.Errorf("Resolve(\"\", abs) = %q, %v", got, err)
+	}
+}

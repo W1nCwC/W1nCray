@@ -535,3 +535,38 @@ func TestSeparatedLayout(t *testing.T) {
 		t.Error("Separated = false although agent.yml exists")
 	}
 }
+
+// TestLocalPolicyAlwaysHasTheXrayRootAndHidesTheToken (PLAN v10 WP-C): explicit
+// Roots elsewhere still get the xray configuration directory added, a shallow
+// one is not added, and the machine token file is excluded.
+func TestLocalPolicyAlwaysHasTheXrayRootAndHidesTheToken(t *testing.T) {
+	base := t.TempDir()
+	xrayDir := filepath.Join(base, "etc", "W1nCray")
+	other := filepath.Join(base, "files")
+	cfg := &Config{Enabled: true, StateDir: filepath.Join(base, "state"),
+		Files: &FilesConfig{Roots: []string{other}},
+		Panel: &PanelConfig{TokenFile: filepath.Join(xrayDir, "agent.token")}}
+	if err := cfg.ResolveLocalPolicy(xrayDir, xrayDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Files.Roots) != 2 || cfg.Files.Roots[1] != xrayDir {
+		t.Errorf("Roots = %v, want [%s %s]", cfg.Files.Roots, other, xrayDir)
+	}
+	found := false
+	for _, e := range cfg.ExcludedFiles() {
+		if e == filepath.Join(xrayDir, "agent.token") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the token file is not excluded: %v", cfg.ExcludedFiles())
+	}
+
+	shallow := &Config{Enabled: true, Files: &FilesConfig{Roots: []string{other}}}
+	if err := shallow.ResolveLocalPolicy(base, string(filepath.Separator)+"etc", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(shallow.Files.Roots) != 1 {
+		t.Errorf("a shallow xray directory must not be added: %v", shallow.Files.Roots)
+	}
+}
