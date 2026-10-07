@@ -98,3 +98,15 @@ Firewall:
 #   Kernels: {AllowHTTP: true}
 Kernels:
   AllowHTTP: false
+
+# ---- 驱动计时（D4）------------------------------------------------------------
+# frp 每启动一个实例都要等它就绪（管理 API 能应答，portal 还要控制链路建立）。
+# 缺省上限按架构：amd64/arm64 是 15 秒，其它架构（mips/arm/386/riscv64…）是 60 秒，
+# 因为路由器 CPU 启动 frps 慢得多。比架构缺省还慢的机器可以在本机调大（单位秒）：
+#   Drivers:
+#     Frp:
+#       ReadyTimeoutSec: 90
+# 0（或不写这一段）= 用架构缺省；负值会被配置校验拒绝。
+Drivers:
+  Frp:
+    ReadyTimeoutSec: 0

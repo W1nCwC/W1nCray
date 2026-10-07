@@ -80,7 +80,7 @@ func TestRenderGolden(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			art, err := New().Render(c.in())
+			art, err := New(Options{}).Render(c.in())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -96,22 +96,22 @@ func TestRenderGolden(t *testing.T) {
 
 func TestRenderDeterministic(t *testing.T) {
 	for _, in := range []spec.Instance{portalInst(), bridgeInst()} {
-		a, err := New().Render(in)
+		a, err := New(Options{}).Render(in)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for i := 0; i < 20; i++ {
-			b, _ := New().Render(in)
+			b, _ := New(Options{}).Render(in)
 			if a.Hash != b.Hash || !reflect.DeepEqual(a.Files, b.Files) || !reflect.DeepEqual(a.PortClaims, b.PortClaims) {
 				t.Fatal("Render is not deterministic")
 			}
 		}
 	}
 	// A different instance gives a different hash.
-	a, _ := New().Render(portalInst())
+	a, _ := New(Options{}).Render(portalInst())
 	in := portalInst()
 	in.Listen.Ports = "20000-20010"
-	b, _ := New().Render(in)
+	b, _ := New(Options{}).Render(in)
 	if a.Hash == b.Hash {
 		t.Fatal("hash does not depend on the config")
 	}
@@ -265,7 +265,7 @@ func TestSecretNeverInErrorsOrArgs(t *testing.T) {
 }
 
 func TestCapsAreConsistent(t *testing.T) {
-	c := New().Caps()
+	c := New(Options{}).Caps()
 	if c.Name != "frp" || !c.Reverse || c.ProxyIn || !c.ProxyOut || c.ProxyOutUDP || c.DisruptsOnChange {
 		t.Fatalf("unexpected caps %+v", c)
 	}
@@ -277,7 +277,7 @@ func TestCapsAreConsistent(t *testing.T) {
 	for _, typ := range []string{"tcp", "tls", "ws", "wss", "grpc", "xhttp", "kcp", "quic"} {
 		in := portalInst()
 		in.Tunnel = &spec.Tunnel{Type: typ, Listen: "0.0.0.0:7000", Security: "tls"}
-		err := New().Validate(in)
+		err := New(Options{}).Validate(in)
 		declared := false
 		for _, d := range c.TunnelTypes {
 			declared = declared || d == typ
@@ -296,7 +296,7 @@ func TestCapsAreConsistent(t *testing.T) {
 // declared exactly when a bridge accepts it, and the declared active health
 // check is the frpc healthCheck the e2e suite exercises.
 func TestCapsBalanceMatchesValidate(t *testing.T) {
-	c := New().Caps()
+	c := New(Options{}).Caps()
 	if c.HealthCheck != "active" {
 		t.Fatalf("HealthCheck = %q", c.HealthCheck)
 	}
@@ -308,7 +308,7 @@ func TestCapsBalanceMatchesValidate(t *testing.T) {
 		for _, d := range c.Balance {
 			declared = declared || d == s
 		}
-		err := New().Validate(in)
+		err := New(Options{}).Validate(in)
 		if declared && err != nil {
 			t.Fatalf("declared strategy %s rejected: %v", s, err)
 		}
@@ -323,7 +323,7 @@ func TestCapsBalanceMatchesValidate(t *testing.T) {
 	in := bridgeInst()
 	in.Network = []string{"tcp"}
 	in.Balance = &spec.Balance{Strategy: "failover", Health: &spec.Health{Type: "tcp", IntervalS: 1, TimeoutS: 1, MaxFails: 1}}
-	if err := New().Validate(in); err != nil {
+	if err := New(Options{}).Validate(in); err != nil {
 		t.Fatalf("failover + health rejected: %v", err)
 	}
 }

@@ -187,7 +187,7 @@ func (nopLog) Errorf(string, ...any) {}
 
 // driverBuilder builds the engine registry. It is a package variable so tests
 // can substitute fakes without a running xray core; production code never
-// changes it.
+// changes it. cfg carries the local driver overrides (agent.yml Drivers, D4).
 var driverBuilder = buildDrivers
 
 // Boot builds and starts the agent. The Xray forwarding engine is gone
@@ -234,7 +234,7 @@ func Boot(opts Options) (*Runtime, error) {
 			}
 		}
 	}
-	drivers, err := driverBuilder(opts.Policy, log)
+	drivers, err := driverBuilder(opts.Policy, opts.AgentConfig, log)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
@@ -534,10 +534,16 @@ func newFirewall(opts Options, openWrt bool, log driver.Logger) reconcile.Firewa
 // buildDrivers is the production driver registry. The Xray forwarding engine
 // is gone (PLAN v11 §2.5): the Xray instance is the separate W1nCray-xray
 // program, so no engine here links Xray-core.
-func buildDrivers(pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
+func buildDrivers(pol spec.Policy, cfg *agentcfg.Config, log driver.Logger) (map[string]driver.Driver, error) {
+	// The frp readiness limit is per architecture unless agent.yml overrides it
+	// (Drivers.Frp.ReadyTimeoutSec, D4).
+	var frpOpts frp.Options
+	if d, ok := cfg.FrpReadyTimeout(); ok {
+		frpOpts.ReadyTimeout = d
+	}
 	m := map[string]driver.Driver{}
 	m[spec.EngineGost] = gost.New(gost.Options{})
-	m[spec.EngineFrp] = frp.New()
+	m[spec.EngineFrp] = frp.New(frpOpts)
 	m[spec.EngineRealm] = realm.New(realm.Options{})
 	return m, nil
 }

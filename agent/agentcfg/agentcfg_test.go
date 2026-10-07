@@ -131,6 +131,49 @@ func TestKernelsAllowHTTPIsALocalSwitch(t *testing.T) {
 	}
 }
 
+// TestFrpReadyTimeoutIsAnOptionalLocalOverride covers D4's configuration half:
+// Drivers.Frp.ReadyTimeoutSec overrides the frp driver's readiness limit, is
+// absent by default (the architecture default applies) and refuses a negative
+// value.
+func TestFrpReadyTimeoutIsAnOptionalLocalOverride(t *testing.T) {
+	var nilCfg *Config
+	if d, ok := nilCfg.FrpReadyTimeout(); ok || d != 0 {
+		t.Errorf("nil Config = (%s, %v), want (0, false)", d, ok)
+	}
+	if _, ok := (&Config{}).FrpReadyTimeout(); ok {
+		t.Error("a Config without a Drivers section must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{}}).FrpReadyTimeout(); ok {
+		t.Error("a Drivers section without Frp must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{Frp: &FrpConfig{}}}).FrpReadyTimeout(); ok {
+		t.Error("ReadyTimeoutSec 0 must mean the driver default")
+	}
+	if d, ok := (&Config{Drivers: &DriversConfig{Frp: &FrpConfig{ReadyTimeoutSec: 90}}}).FrpReadyTimeout(); !ok || d != 90*time.Second {
+		t.Errorf("explicit override = (%s, %v), want (1m30s, true)", d, ok)
+	}
+
+	// The field is read from agent.yml.
+	dir := t.TempDir()
+	path := writeFile(t, filepath.Join(dir, FileName), "Enabled: true\nDrivers:\n  Frp:\n    ReadyTimeoutSec: 45\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := cfg.FrpReadyTimeout(); !ok || d != 45*time.Second {
+		t.Errorf("agent.yml override = (%s, %v), want (45s, true)", d, ok)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	// A negative value is refused instead of silently ignored.
+	bad := &Config{Enabled: true, Drivers: &DriversConfig{Frp: &FrpConfig{ReadyTimeoutSec: -1}}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "ReadyTimeoutSec") {
+		t.Errorf("Validate(negative) = %v, want a ReadyTimeoutSec error", err)
+	}
+}
+
 func TestResolvePrecedence(t *testing.T) {
 	t.Run("agent.yml wins as a whole", func(t *testing.T) {
 		dir, path := configPath(t)

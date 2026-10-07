@@ -59,6 +59,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -115,16 +116,48 @@ type timing struct {
 	verify      time.Duration
 }
 
+// Options configures a Driver. The zero value is usable.
+type Options struct {
+	// ReadyTimeout bounds how long Apply waits for a started frps/frpc to
+	// answer before it reports that instance as failed. 0 means
+	// DefaultReadyTimeout(runtime.GOARCH). It is what agent.yml's
+	// Drivers.Frp.ReadyTimeoutSec overrides (D4).
+	ReadyTimeout time.Duration
+}
+
+// DefaultReadyTimeout is the readiness limit of one architecture (a GOARCH
+// string): 15s on the fast 64-bit targets (amd64, arm64) and 60s everywhere
+// else, where a router CPU (mips/mipsle, arm, 386, riscv64, ...) can take much
+// longer to start frps and open its admin API. The v11 D4 run measured the 15s
+// limit being hit repeatedly on MIPS and ARM routers (QEMU TCG).
+func DefaultReadyTimeout(goarch string) time.Duration {
+	switch goarch {
+	case "amd64", "arm64":
+		return 15 * time.Second
+	default:
+		return 60 * time.Second
+	}
+}
+
 // New returns a ready driver.
-func New() *Driver {
+func New(opts Options) *Driver {
+	ready := opts.ReadyTimeout
+	if ready <= 0 {
+		ready = DefaultReadyTimeout(runtime.GOARCH)
+	}
 	return &Driver{
 		admins:  map[string]adminInfo{},
 		stats:   map[string]*instStats{},
 		current: map[string]*unit{},
 		now:     time.Now,
-		timing:  timing{ready: 15 * time.Second, reloadSettl: 3 * time.Second, verify: 15 * time.Second},
+		timing:  timing{ready: ready, reloadSettl: 3 * time.Second, verify: 15 * time.Second},
 	}
 }
+
+// ReadyTimeout reports the readiness limit in force: the architecture default
+// unless Options.ReadyTimeout (agent.yml Drivers.Frp.ReadyTimeoutSec) overrode
+// it. It is what Apply waits for a started instance to answer (D4).
+func (d *Driver) ReadyTimeout() time.Duration { return d.timing.ready }
 
 var _ driver.Driver = (*Driver)(nil)
 
