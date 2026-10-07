@@ -215,8 +215,10 @@ func TestLocalPolicyDefaultsThroughLoadConfig(t *testing.T) {
 	if len(a.Files.Roots) != 2 || a.Files.Roots[0] != want[0] || a.Files.Roots[1] != want[1] {
 		t.Errorf("Roots = %v, want %v", a.Files.Roots, want)
 	}
-	if a.Files.Unrestricted || a.Files.AllowExec {
-		t.Errorf("the file gates must default to closed: %+v", a.Files)
+	// The terminal defaults to ON, so the file manager follows it (PLAN v10's
+	// three-state Files.Unrestricted): only AllowExec stays closed by default.
+	if !a.UnrestrictedEnabled() || a.Files.AllowExec {
+		t.Errorf("the file gates must follow the terminal default: %+v", a.Files)
 	}
 	excluded := a.ExcludedFiles()
 	for i, wantEx := range []string{

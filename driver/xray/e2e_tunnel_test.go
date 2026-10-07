@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/tlsself"
 )
 
 // tunnelPairShared puts entry and exit on one Xray instance: Xray keeps the
@@ -50,7 +51,7 @@ func tunnelPair(t *testing.T, ty, sec string, targetHost string, targetPort int,
 	exitT.Listen = fmt.Sprintf("127.0.0.1:%d", tp)
 	if sec == "tls_pin" {
 		exitT.Cert = &spec.Cert{Mode: "self"}
-		pin, err := SelfCertPin(secret, "tun.example.net")
+		pin, err := tlsself.SelfCertPin(secret, "tun.example.net")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -200,7 +201,7 @@ func TestE2ETLSPinMismatch(t *testing.T) {
 // Certificate files (file mode) work, inside the permitted directory only.
 func TestE2ETLSFileCert(t *testing.T) {
 	dir := t.TempDir()
-	cp, kp, pin, err := SelfCert("file-cert-secret-0123456789", "tun.example.net")
+	cp, kp, pin, err := tlsself.SelfCert("file-cert-secret-0123456789", "tun.example.net")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +229,7 @@ func TestE2ETLSFileCert(t *testing.T) {
 	})
 	// renewing the files changes the effective hash, so Apply restarts the inbound
 	old := b.drv.state.inst["ex"].hash
-	cp2, kp2, pin2, _ := SelfCert("another-secret-0123456789abc", "tun.example.net")
+	cp2, kp2, pin2, _ := tlsself.SelfCert("another-secret-0123456789abc", "tun.example.net")
 	os.WriteFile(cf, []byte(cp2), 0o600)
 	os.WriteFile(kf, []byte(kp2), 0o600)
 	res := b.apply(ex)

@@ -78,14 +78,20 @@ pid?, uptime_s?, restarts?, cpu_pct?, rss?, instances:[{id, state, conns?, up_by
 | `kernel_rollback` | `{name}` | |
 | `component_restart` | `{name}` | restarts a kernel process (not the agent) |
 | `self_update` | `{version}` | version listed for `agent` in the signed manifest; verified; swap + restart; auto-rollback |
-| `file_list` | `{root, path}` | `{entries:[{name,type,size,mode,mtime}]}` |
-| `file_read` | `{root, path, offset?, limit?}` | `{data:"<base64>", size, eof}` (limit ≤ 1 MiB) |
-| `file_write` | `{root, path, data:"<base64>", mode?, sha256?}` | atomic write; refuses outside roots |
-| `file_delete` | `{root, path}` | |
+| `file_list` | `{root, path}` | `{entries:[{name,type,size,mode,mtime}], roots:[…]}` (`mode` octal string, `mtime` Unix seconds) |
+| `file_read` | `{root, path, offset?, limit?}` | `{data:"<base64>", size, eof}` (limit ≤ 128 KiB) |
+| `file_write` | `{root, path, data:"<base64>", mode?, sha256?, append?}` | `append` absent/false: atomic whole-file replace; `append:true`: append the chunk to an **existing** file (`not_found` otherwise), `mode` unused. Result `{path, sha256, size, created, append?}` where `sha256`/`size` describe the **whole file after the write** (chunked-upload verification); `sha256` in the args is always the payload's |
+| `file_delete` | `{root, path}` | `{path, deleted:true}`; one regular file, never a directory |
+| `file_mkdir` | `{root, path, mode?}` | `mkdir -p`; `mode` (octal string, default `0755`) applies to the last component, allowed: `0700`/`0750`/`0755`; result `{path, created}` |
+| `file_rename` | `{root, path, to}` | move inside the same root; the target must not exist (`already_exists`); result `{path, to, renamed:true}` |
 | `files_apply` | `{}` | same as `hint files` but reports the apply outcome (validate → swap → reload → confirm/rollback) |
 
 All file commands are confined to the roots in the agent's local policy (`policy.files.roots`), unless
 `policy.files.unrestricted` is set locally. Path traversal, symlink escapes and non-regular files are refused.
+`policy.files.unrestricted` is a **three-state** local switch (`Files.Unrestricted`): not written means "follow
+`policy.terminal`" (a machine with the terminal on has a root shell anyway), so an unrestricted machine is addressed with
+an **empty `root` and an absolute `path`** (the `root` argument is ignored); a confined machine keeps the root-name +
+relative-path form. `policy.files.unrestricted` always reports the **effective** value.
 
 ## 5 browser ⇄ panel
 Browser messages (after a valid ticket):
@@ -120,7 +126,9 @@ A browser may hold at most one terminal session per machine; the panel enforces 
    The panel keeps the command `pending` until the final result; the WS push never marks it `sent` (HTTP fallback may deliver
    the same command again: the agent de-duplicates by command id).
 8. **Size limits:** `file_read.limit` and `file_write` payload are each **≤ 128 KiB raw** (fits the 256 KiB frame after base64).
-   Anything larger goes through the managed-files blob download over HTTPS.
+   A file larger than one frame is uploaded with `file_write{append:true}` chunks (each ≤ 128 KiB); the result of every chunk
+   carries the whole file's `size` and `sha256`, so the panel can verify the assembled file. Other large payloads go through
+   the managed-files blob download over HTTPS.
 9. **New commands:** `files_validate {}` (stage + `core.CheckFiles`/`LoadConfig`, no write, no reload) and
    `files_rollback {}` (restore the last good managed files and reload). `files_apply` answers `accepted`, then
    `done{applied_pending:true}` once the reload was initiated; the **panel** judges health (a `hello`/`telemetry` within 60 s and
@@ -135,6 +143,6 @@ A browser may hold at most one terminal session per machine; the panel enforces 
     "Started but cannot reach the panel" is only reported (`self_update.stalled`), never auto-rolled back.
 12. **High-risk operations** (issuing a terminal ticket, `self_update`, writes outside managed files) require the admin to
     re-enter their password (`confirm_password`, checked server side, rate limited).
-13. **Local gates the panel can never relax:** `Terminal.Enabled` (**default true** by the owner's decision; a machine opts out locally with `Terminal.Enabled: false`, installer/`link` flag `--noterminal`), `Files.Roots`, `Files.Unrestricted`,
+13. **Local gates the panel can never relax:** `Terminal.Enabled` (**default true** by the owner's decision; a machine opts out locally with `Terminal.Enabled: false`, installer/`link` flag `--noterminal`), `Files.Roots`, `Files.Unrestricted` (**three-state**: not written follows `Terminal.Enabled`, `true`/`false` are explicit),
     `Files.AllowExec` (refuse writes with an exec bit), `Modules.XrayNodes`. `agent.yml` and the agent state files
     (`desired.json`, `last_good.json`) are never inside any root.

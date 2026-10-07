@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/tlsself"
 )
 
 // Limits on what a single instance may expand to. A listen range becomes one
@@ -79,6 +80,16 @@ type tunnelPlan struct {
 	certFile string // exit/portal: served cert; entry/bridge: CA file
 	keyFile  string
 	selfCert bool
+	// selfTLS is security tls_self: the certificate is derived from the shared
+	// secret (agent/tlsself) instead of tunnel.cert, so the panel
+	// never has to generate x509. certFile/keyFile name the derived PEM files.
+	selfTLS bool
+	// selfFiles are the derived PEM files, keyed by the plain file name they
+	// are written under in the driver's state directory. The fragment
+	// references them by that relative name because gost runs with the state
+	// directory as its working directory; Render is a pure function and cannot
+	// know the absolute path.
+	selfFiles map[string][]byte
 }
 
 // plan is the validated, normalised form of a spec.Instance. Validate and
@@ -545,6 +556,7 @@ func (p *plan) planTunnel(in spec.Instance) error {
 	if len(t.ALPN) > 0 {
 		return fmt.Errorf("tunnel.alpn is not supported")
 	}
+	selfTLS := false
 	switch t.Security {
 	case "", "none":
 		if tlsBased {
@@ -558,6 +570,14 @@ func (p *plan) planTunnel(in spec.Instance) error {
 		}
 	case "tls_pin":
 		return fmt.Errorf("security \"tls_pin\" is not supported by gost (no certificate pinning); use tunnel.cert with a certificate file as trust anchor instead")
+	case "tls_self":
+		// Both ends derive the same certificate from the shared secret. gost
+		// has no pinning, but it can verify the derived certificate as its
+		// own CA, so the shared secret replaces the panel-generated x509.
+		if !tlsBased {
+			return fmt.Errorf("security \"tls_self\" needs a TLS carrier (tls, wss, grpc), not %s", t.Type)
+		}
+		selfTLS = true
 	case "vless_enc":
 		return fmt.Errorf("security \"vless_enc\" is Xray only")
 	default:
@@ -566,7 +586,7 @@ func (p *plan) planTunnel(in spec.Instance) error {
 	if t.PinSHA256 != "" {
 		return fmt.Errorf("tunnel.pin_sha256 is not supported by gost")
 	}
-	tp := &tunnelPlan{typ: t.Type, tlsBased: tlsBased}
+	tp := &tunnelPlan{typ: t.Type, tlsBased: tlsBased, selfTLS: selfTLS}
 	if t.Type == "ws" || t.Type == "wss" {
 		tp.path = "/ws"
 		if t.Path != "" {
@@ -621,6 +641,9 @@ func (p *plan) planTunnel(in spec.Instance) error {
 		if !tlsBased {
 			return fmt.Errorf("tunnel.cert needs a TLS carrier")
 		}
+		if selfTLS {
+			return fmt.Errorf("tunnel.cert is not used with security tls_self (the certificate is derived from the secret)")
+		}
 		switch c.Mode {
 		case "self":
 			// Server side only: gost serves its own generated certificate.
@@ -654,6 +677,28 @@ func (p *plan) planTunnel(in spec.Instance) error {
 			return fmt.Errorf("tunnel.cert.mode panel must be materialised into files by the agent core before it reaches the driver")
 		default:
 			return fmt.Errorf("unknown tunnel.cert.mode %q", c.Mode)
+		}
+	}
+	if selfTLS {
+		certPEM, keyPEM, _, err := tlsself.SelfCert(in.Secret, t.SNI)
+		if err != nil {
+			return fmt.Errorf("self-signed certificate derivation failed")
+		}
+		certName := "tls_self_" + in.ID + ".crt"
+		tp.certFile = certName
+		tp.selfFiles = map[string][]byte{certName: []byte(certPEM)}
+		if dialSide {
+			// The dialing side only needs the certificate as its trust anchor
+			// (a self-signed certificate is its own CA) and verifies the name
+			// in it, so the certificate's name is what it sends as
+			// serverName.
+			if tp.sni == "" {
+				tp.sni = tlsself.DefaultName
+			}
+		} else {
+			keyName := "tls_self_" + in.ID + ".key"
+			tp.keyFile = keyName
+			tp.selfFiles[keyName] = []byte(keyPEM)
 		}
 	}
 	p.tun = tp

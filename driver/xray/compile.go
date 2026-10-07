@@ -12,6 +12,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/tlsself"
 )
 
 // CompileVersion is part of every artifact hash; bump it whenever the
@@ -467,13 +468,23 @@ func (b *builder) tunnelServer(users bool) (*credentials, error) {
 	return cr, nil
 }
 
-// serverCert resolves the certificate of the accepting side.
+// serverCert resolves the certificate of the accepting side. With security
+// tls_self it is the deterministic certificate derived from the shared secret
+// (the same one the dialing side pins), so no certificate file or panel source
+// is needed.
 func (b *builder) serverCert() (*jCert, error) {
 	p := b.p
 	c := p.tunnel.Cert
+	if p.tunnel.SelfCert {
+		certPEM, keyPEM, _, err := tlsself.SelfCert(p.in.Secret, p.tunnel.SNI)
+		if err != nil {
+			return nil, p.fail("self-signed certificate generation failed")
+		}
+		return &jCert{Cert: splitLines(certPEM), Key: splitLines(keyPEM), OneTimeLoading: true}, nil
+	}
 	switch c.Mode {
 	case "self":
-		certPEM, keyPEM, _, err := SelfCert(p.in.Secret, p.tunnel.SNI)
+		certPEM, keyPEM, _, err := tlsself.SelfCert(p.in.Secret, p.tunnel.SNI)
 		if err != nil {
 			return nil, p.fail("self-signed certificate generation failed")
 		}
@@ -547,6 +558,10 @@ func (t *tunnelPlan) alpn() []string {
 
 func (t *tunnelPlan) clientServerName() string {
 	switch {
+	case t.SelfCertName != "":
+		// tls_self: the name is baked into the derived certificate, so the
+		// dialing side sends exactly it (SNI, or tlsself.DefaultName).
+		return t.SelfCertName
 	case t.SNI != "":
 		return t.SNI
 	case t.Host != "":

@@ -33,6 +33,23 @@ func openRegular(p string) (*os.File, error) {
 	return os.Open(p)
 }
 
+// openAppend opens p for appending. Like openRegular it relies on the Lstat
+// check (Windows has no O_NOFOLLOW) and it never creates the file: an append to
+// a missing file must fail.
+func openAppend(p string) (*os.File, error) {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return nil, err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, wrapSymlink(p)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, notRegular(p)
+	}
+	return os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+}
+
 // isSymlinkErr has no kernel-level equivalent on Windows: the check is the
 // Lstat the caller already did.
 func isSymlinkErr(error) bool { return false }

@@ -121,7 +121,7 @@ func TestPolicyComesFromTheLocalAgentConfig(t *testing.T) {
 
 	cfg := &agentcfg.Config{
 		Terminal: &agentcfg.TerminalConfig{Enabled: boolPtr(false)},
-		Files:    &agentcfg.FilesConfig{Roots: []string{"/etc/W1nCray"}, Unrestricted: true},
+		Files:    &agentcfg.FilesConfig{Roots: []string{"/etc/W1nCray"}, Unrestricted: boolPtr(true)},
 		Modules:  &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)},
 	}
 	pol = rt.Streams(nil, cfg).Policy()

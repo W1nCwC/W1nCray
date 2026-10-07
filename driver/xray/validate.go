@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/tlsself"
 )
 
 // Options configures compilation and validation. The zero value is valid.
@@ -290,15 +291,23 @@ type tunnelPlan struct {
 	TLS      bool
 	Pin      string // lower hex
 	VlessEnc bool
-	Host     string
-	SNI      string
-	Path     string
-	ALPN     []string
-	Server   hostRef // client side
-	ServerP  int
-	ListenA  netip.Addr // server side
-	ListenP  int
-	Cert     *spec.Cert
+	// SelfCert is security tls_self: the certificate is derived from the
+	// shared secret (agent/tlsself) instead of tunnel.cert, and the
+	// client pins it locally (Pin above), so the panel never has to generate
+	// x509.
+	SelfCert bool
+	// SelfCertName is the DNS name of the derived certificate (the SNI, or
+	// tlsself.DefaultName). It is what the dialing side sends as serverName.
+	SelfCertName string
+	Host         string
+	SNI          string
+	Path         string
+	ALPN         []string
+	Server       hostRef // client side
+	ServerP      int
+	ListenA      netip.Addr // server side
+	ListenP      int
+	Cert         *spec.Cert
 }
 
 // plan is the validated, normalised form of an instance.
@@ -955,6 +964,18 @@ func (p *plan) checkTunnel(server, udp bool) error {
 			return p.fail("tunnel.pin_sha256 must be 64 hex characters")
 		}
 		tp.Pin = strings.ToLower(t.PinSHA256)
+	case "tls_self":
+		// Both ends derive the same certificate from the shared secret. The
+		// dialing side pins it locally (the existing tls_pin code path), the
+		// accepting side serves it; tunnel.cert is not used.
+		tp.TLS = true
+		tp.SelfCert = true
+		pin, err := tlsself.SelfCertPin(in.Secret, t.SNI)
+		if err != nil {
+			return p.fail("self-signed certificate derivation failed")
+		}
+		tp.Pin = pin
+		tp.SelfCertName = tlsself.Name(t.SNI)
 	case "vless_enc":
 		if tlsType {
 			return p.fail("vless_enc cannot be combined with tunnel type %s (use security tls or tls_pin)", t.Type)
@@ -966,7 +987,11 @@ func (p *plan) checkTunnel(server, udp bool) error {
 	if tp.TLS && sec == "none" {
 		return p.fail("inconsistent tunnel security")
 	}
-	if sec != "tls_pin" && t.PinSHA256 != "" {
+	switch {
+	case sec == "tls_pin":
+	case sec == "tls_self" && t.PinSHA256 != "":
+		return p.fail("tunnel.pin_sha256 is not allowed with security tls_self (the pin is derived from the secret)")
+	case t.PinSHA256 != "":
 		return p.fail("tunnel.pin_sha256 needs security tls_pin")
 	}
 
@@ -1029,7 +1054,11 @@ func (p *plan) checkTunnel(server, udp bool) error {
 			}
 		}
 		if tp.TLS {
-			if err := p.checkCert(t.Cert, sec == "tls_pin"); err != nil {
+			if tp.SelfCert {
+				if t.Cert != nil {
+					return p.fail("tunnel.cert is not used with security tls_self (the certificate is derived from the secret)")
+				}
+			} else if err := p.checkCert(t.Cert, sec == "tls_pin"); err != nil {
 				return err
 			}
 			tp.Cert = t.Cert

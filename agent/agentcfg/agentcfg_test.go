@@ -78,7 +78,7 @@ Modules:
 	if !cfg.TerminalEnabled() || cfg.Terminal.Sessions() != 1 {
 		t.Errorf("terminal = %+v", cfg.Terminal)
 	}
-	if cfg.Files == nil || !cfg.Files.Unrestricted || !cfg.Files.AllowExec {
+	if cfg.Files == nil || cfg.Files.Unrestricted == nil || !*cfg.Files.Unrestricted || !cfg.Files.AllowExec {
 		t.Errorf("files = %+v", cfg.Files)
 	}
 	if cfg.XrayNodesEnabled() {
@@ -182,8 +182,14 @@ func TestLocalPolicyDefaults(t *testing.T) {
 	if len(cfg.Files.Roots) != len(want) || cfg.Files.Roots[0] != want[0] || cfg.Files.Roots[1] != want[1] {
 		t.Errorf("Roots = %v, want %v", cfg.Files.Roots, want)
 	}
-	if cfg.Files.Unrestricted || cfg.Files.AllowExec {
-		t.Errorf("the file gates must default to closed: %+v", cfg.Files)
+	if cfg.Files.AllowExec {
+		t.Errorf("AllowExec must default to false: %+v", cfg.Files)
+	}
+	// The terminal defaults to ON, so the file manager follows it: PLAN v10's
+	// three-state rule means "not written" is unrestricted on a machine whose
+	// root shell is already reachable. An explicit false is what confines it.
+	if !cfg.UnrestrictedEnabled() || cfg.Files.Unrestricted == nil || !*cfg.Files.Unrestricted {
+		t.Errorf("Files.Unrestricted must follow the terminal default (on): %+v", cfg.Files)
 	}
 	if !cfg.XrayNodesEnabled() {
 		t.Error("Modules.XrayNodes must default to on")
@@ -208,6 +214,42 @@ func TestLocalPolicyDefaults(t *testing.T) {
 				t.Errorf("root %q is an excluded file", root)
 			}
 		}
+	}
+}
+
+// TestUnrestrictedTriState pins PLAN v10's three-state rule for
+// Files.Unrestricted: an absent value follows the terminal gate, an explicit
+// value wins, and ResolveLocalPolicy materialises the effective value so every
+// consumer (the panel's fileops options, hello.policy.files) reads it.
+func TestUnrestrictedTriState(t *testing.T) {
+	cases := []struct {
+		name          string
+		terminal      *TerminalConfig
+		unrestricted  *bool
+		wantEffective bool
+	}{
+		{"unset + terminal on", nil, nil, true},
+		{"unset + terminal off", &TerminalConfig{Enabled: boolPtr(false)}, nil, false},
+		{"explicit true + terminal off", &TerminalConfig{Enabled: boolPtr(false)}, boolPtr(true), true},
+		{"explicit false + terminal on", nil, boolPtr(false), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, path := configPath(t)
+			cfg := resolveLocal(t, &Config{Enabled: true, Terminal: tc.terminal, Files: &FilesConfig{Unrestricted: tc.unrestricted}}, path)
+			if got := cfg.UnrestrictedEnabled(); got != tc.wantEffective {
+				t.Errorf("UnrestrictedEnabled() = %v, want %v", got, tc.wantEffective)
+			}
+			if cfg.Files.Unrestricted == nil || *cfg.Files.Unrestricted != tc.wantEffective {
+				t.Errorf("materialised Unrestricted = %v, want %v", cfg.Files.Unrestricted, tc.wantEffective)
+			}
+		})
+	}
+	// An unresolved Config has no Files section at all: the accessor must stay
+	// on the safe side (restricted) instead of inventing a policy.
+	raw := &Config{Enabled: true}
+	if raw.UnrestrictedEnabled() {
+		t.Error("a Config without a Files section must not report unrestricted")
 	}
 }
 
@@ -491,5 +533,40 @@ func TestSeparatedLayout(t *testing.T) {
 	}
 	if !Separated(path) {
 		t.Error("Separated = false although agent.yml exists")
+	}
+}
+
+// TestLocalPolicyAlwaysHasTheXrayRootAndHidesTheToken (PLAN v10 WP-C): explicit
+// Roots elsewhere still get the xray configuration directory added, a shallow
+// one is not added, and the machine token file is excluded.
+func TestLocalPolicyAlwaysHasTheXrayRootAndHidesTheToken(t *testing.T) {
+	base := t.TempDir()
+	xrayDir := filepath.Join(base, "etc", "W1nCray")
+	other := filepath.Join(base, "files")
+	cfg := &Config{Enabled: true, StateDir: filepath.Join(base, "state"),
+		Files: &FilesConfig{Roots: []string{other}},
+		Panel: &PanelConfig{TokenFile: filepath.Join(xrayDir, "agent.token")}}
+	if err := cfg.ResolveLocalPolicy(xrayDir, xrayDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Files.Roots) != 2 || cfg.Files.Roots[1] != xrayDir {
+		t.Errorf("Roots = %v, want [%s %s]", cfg.Files.Roots, other, xrayDir)
+	}
+	found := false
+	for _, e := range cfg.ExcludedFiles() {
+		if e == filepath.Join(xrayDir, "agent.token") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the token file is not excluded: %v", cfg.ExcludedFiles())
+	}
+
+	shallow := &Config{Enabled: true, Files: &FilesConfig{Roots: []string{other}}}
+	if err := shallow.ResolveLocalPolicy(base, string(filepath.Separator)+"etc", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(shallow.Files.Roots) != 1 {
+		t.Errorf("a shallow xray directory must not be added: %v", shallow.Files.Roots)
 	}
 }

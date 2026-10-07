@@ -83,7 +83,7 @@ var (
 	engines       = []string{spec.EngineAuto, spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
 	kernelNames   = []string{spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
 	tunnelTypes   = []string{"tcp", "tls", "ws", "wss", "grpc", "xhttp", "kcp", "quic"}
-	securities    = []string{"", "none", "tls", "tls_pin", "vless_enc"}
+	securities    = []string{"", "none", "tls", "tls_pin", "tls_self", "vless_enc"}
 	strategies    = []string{"round_robin", "random", "iphash", "failover", "least_ping"}
 	idleProfiles  = []string{"", "tcp_long", "tcp_default", "udp_short", "udp_long"}
 	certModes     = []string{"self", "file", "panel"}
@@ -330,6 +330,11 @@ func (x *inst) checkText(field, s string, max int) {
 	}
 }
 
+// gostTLSTypes are the carriers the gost driver can wrap in TLS. The engine
+// rejects tls_self on the others (tcp, ws): unlike xray it has no way to add a
+// TLS layer to a plain carrier.
+var gostTLSTypes = []string{"tls", "wss", "grpc"}
+
 func (x *inst) engine() {
 	e := x.in.Engine
 	if !contains(engines, e) {
@@ -339,8 +344,25 @@ func (x *inst) engine() {
 	if e != spec.EngineAuto && len(x.v.p.AllowEngines) > 0 && !contains(x.v.p.AllowEngines, e) {
 		x.err("engine", "engine %q is not allowed by the local policy", e)
 	}
-	if t := x.in.Tunnel; t != nil && t.Security == "vless_enc" && e != spec.EngineXray && e != spec.EngineAuto {
-		x.err("tunnel.security", "vless_enc is only supported by the xray engine")
+	if t := x.in.Tunnel; t != nil {
+		switch t.Security {
+		case "vless_enc":
+			if e != spec.EngineXray && e != spec.EngineAuto {
+				x.err("tunnel.security", "vless_enc is only supported by the xray engine")
+			}
+		case "tls_self":
+			// Both engines that accept tls_self derive the certificate from
+			// the secret; realm verifies against the public roots only, so it
+			// can never accept one.
+			switch e {
+			case spec.EngineRealm:
+				x.err("tunnel.security", "tls_self is not supported by the realm engine (realm cannot verify a self-signed certificate); use gost or xray")
+			case spec.EngineGost:
+				if !contains(gostTLSTypes, t.Type) {
+					x.err("tunnel.security", "tls_self needs a TLS carrier on the gost engine (%s), not %q", strings.Join(gostTLSTypes, ", "), t.Type)
+				}
+			}
+		}
 	}
 }
 
@@ -660,7 +682,7 @@ func (x *inst) tunnel() {
 	}
 
 	if !contains(securities, t.Security) {
-		x.err("tunnel.security", "unknown security %q (want none, tls, tls_pin or vless_enc)", t.Security)
+		x.err("tunnel.security", "unknown security %q (want none, tls, tls_pin, tls_self or vless_enc)", t.Security)
 	}
 	switch t.Type {
 	case "tls", "wss":
@@ -668,11 +690,21 @@ func (x *inst) tunnel() {
 			x.err("tunnel.security", "tunnel type %q is TLS by definition; security %q is contradictory", t.Type, t.Security)
 		}
 	}
-	if t.Security == "tls_pin" {
+	switch {
+	case t.Security == "tls_pin":
 		if !rePin.MatchString(t.PinSHA256) {
 			x.err("tunnel.pin_sha256", "tls_pin requires pin_sha256: 64 hex characters (SHA-256 of the leaf certificate)")
 		}
-	} else if t.PinSHA256 != "" {
+	case t.Security == "tls_self":
+		// The certificate (and therefore the pin) is derived from the shared
+		// secret: an explicit pin or certificate contradicts it.
+		if t.PinSHA256 != "" {
+			x.err("tunnel.pin_sha256", "tls_self derives the pin from the secret; pin_sha256 must be empty")
+		}
+		if t.Cert != nil {
+			x.err("tunnel.cert", "tls_self derives the certificate from the secret; tunnel.cert must be empty")
+		}
+	case t.PinSHA256 != "":
 		x.err("tunnel.pin_sha256", "only meaningful with security tls_pin")
 	}
 	if t.Cert != nil {

@@ -159,10 +159,13 @@ type Tunnel struct {
 	SNI    string   `json:"sni,omitempty"`
 	ALPN   []string `json:"alpn,omitempty"`
 	// Security is "none", "tls", "tls_pin" (certificate pinned by
-	// PinSHA256) or "vless_enc" (Xray VLESS encryption; xray engine only).
+	// PinSHA256), "tls_self" (both ends derive the same self-signed
+	// certificate from Instance.Secret, so the panel never has to generate
+	// x509; xray and gost only) or "vless_enc" (Xray VLESS encryption; xray
+	// engine only).
 	Security  string `json:"security,omitempty"`
 	PinSHA256 string `json:"pin_sha256,omitempty"` // hex SHA-256 of the leaf certificate DER
-	Cert      *Cert  `json:"cert,omitempty"`       // server side certificate source
+	Cert      *Cert  `json:"cert,omitempty"`       // server side certificate source (unused by tls_self)
 }
 
 // Cert is the certificate used by a tunnel server side.

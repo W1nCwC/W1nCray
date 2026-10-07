@@ -134,17 +134,21 @@ func capabilities(cfg *agentcfg.Config, kernel, term, files bool) []string {
 
 // fileCapable reports whether the managed-file commands can really be served on
 // this machine (ruling 1: a capability is a promise). It requires the file
-// layer to be wired, a local Files policy with at least one root, and — because
-// the panel must never overwrite the agent's own configuration — the separated
-// agent.yml layout when config.yml is part of the set. The capability is about
-// the xray files the panel manages, so the separated layout is required: with
-// the single-file layout the panel would be handed a write path to the agent's
-// own settings (ruling 2).
+// layer to be wired, a local Files policy that can reach the xray directory
+// (at least one root, or Files.Unrestricted), and — because the panel must
+// never overwrite the agent's own configuration — the separated agent.yml
+// layout when config.yml is part of the set. The capability is about the xray
+// files the panel manages, so the separated layout is required: with the
+// single-file layout the panel would be handed a write path to the agent's own
+// settings (ruling 2).
 func (r *Runtime) fileCapable() bool {
 	if r == nil || r.Files == nil || !r.Files.Enabled() {
 		return false
 	}
-	if r.cfg == nil || r.cfg.Files == nil || len(r.cfg.Files.Roots) == 0 {
+	if r.cfg == nil || r.cfg.Files == nil {
+		return false
+	}
+	if len(r.cfg.Files.Roots) == 0 && !r.cfg.UnrestrictedEnabled() {
 		return false
 	}
 	return r.Files.LayoutSeparated()
@@ -204,16 +208,21 @@ func (r *Runtime) filesCapable() bool {
 }
 
 // fileCmdsCapable reports whether the file_* commands can be served: a manager
-// with at least one root exists. A machine without roots must not declare the
+// exists and it can reach something — at least one root, or Files.Unrestricted
+// (PLAN v10), where an empty root list is normal because the panel names
+// absolute paths. A machine that can serve neither must not declare the
 // capability, and the commands are not registered either.
 func (r *Runtime) fileCmdsCapable() bool {
-	return r != nil && r.FileOps != nil && len(r.FileOps.RootNames()) > 0
+	return r != nil && r.FileOps != nil && (len(r.FileOps.RootNames()) > 0 || r.FileOps.Unrestricted())
 }
 
 // localPolicy maps the agent.yml local policy onto the wire type. A nil config
 // keeps the accessors' defaults (the terminal gate off for a nil receiver, no
 // file roots, the xray-nodes module on); a running agent always has a non-nil
-// Config, whose terminal default is on.
+// Config, whose terminal default is on. Files.Unrestricted is reported as the
+// EFFECTIVE value (agentcfg resolves "not written" against the terminal gate
+// and ResolveLocalPolicy materialises it), so the panel never has to redo the
+// three-state rule.
 func localPolicy(cfg *agentcfg.Config) wsproto.Policy {
 	pol := wsproto.Policy{
 		Terminal: cfg.TerminalEnabled(),
@@ -222,7 +231,7 @@ func localPolicy(cfg *agentcfg.Config) wsproto.Policy {
 	if cfg != nil && cfg.Files != nil {
 		pol.Files = wsproto.FilesPolicy{
 			Roots:        append([]string(nil), cfg.Files.Roots...),
-			Unrestricted: cfg.Files.Unrestricted,
+			Unrestricted: cfg.UnrestrictedEnabled(),
 		}
 	}
 	return pol

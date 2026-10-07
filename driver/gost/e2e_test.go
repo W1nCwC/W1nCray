@@ -374,6 +374,49 @@ func TestE2ETunnelSecurity(t *testing.T) {
 	}
 }
 
+// A tls_self tunnel needs nothing from the panel: both ends derive the same
+// certificate from the shared secret, and the PEM files the driver writes into
+// its state directory are referenced by relative name (gost runs with the
+// state directory as its working directory).
+func TestE2ETunnelTLSSelf(t *testing.T) {
+	entry, exit := newNode(t, Options{}), newNode(t, Options{})
+	be := startBackend(t, "")
+	ctl, lp := freePorts(t, 1), freePorts(t, 1)
+	const sni = "tun.example.net"
+	ex := spec.Instance{
+		ID: "ex", Enabled: true, Engine: spec.EngineGost, Kind: spec.KindTunnelExit, Secret: e2eSecret,
+		Tunnel:  &spec.Tunnel{Type: "tls", Listen: addr(ctl), SNI: sni, Security: "tls_self"},
+		Targets: []spec.Target{{Host: "127.0.0.1", Ports: fmt.Sprint(be.Port)}},
+	}
+	en := spec.Instance{
+		ID: "en", Enabled: true, Engine: spec.EngineGost, Kind: spec.KindTunnelEntry, Secret: e2eSecret,
+		Listen: &spec.Listen{Addr: "127.0.0.1", Ports: fmt.Sprint(lp)},
+		Tunnel: &spec.Tunnel{Type: "tls", Server: addr(ctl), SNI: sni, Security: "tls_self"},
+	}
+	exit.apply(ex)
+	entry.apply(en)
+	if _, err := tcpEcho(addr(lp), "self", false); err != nil {
+		t.Fatalf("tls_self tunnel: %v", err)
+	}
+	for _, name := range []string{"tls_self_ex.crt", "tls_self_ex.key"} {
+		if _, err := os.Stat(filepath.Join(exit.rt.StateDir, name)); err != nil {
+			t.Errorf("the exit did not write %s: %v", name, err)
+		}
+	}
+	// A different secret derives a different certificate: the entry's own
+	// trust anchor no longer matches the one the exit serves.
+	other := newNode(t, Options{})
+	otherEntry := en
+	otherEntry.ID = "en2"
+	otherEntry.Secret = "another-e2e-secret-0123456789"
+	lp2 := freePorts(t, 1)
+	otherEntry.Listen = &spec.Listen{Addr: "127.0.0.1", Ports: fmt.Sprint(lp2)}
+	other.apply(otherEntry)
+	if _, err := tcpEcho(addr(lp2), "nope", false); err == nil {
+		t.Error("an entry with a different secret was served")
+	}
+}
+
 // Open exit (allow_any_target): the entry chooses the target.
 func TestE2ETunnelOpenExit(t *testing.T) {
 	entry, exit := newNode(t, Options{}), newNode(t, Options{})

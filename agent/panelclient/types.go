@@ -37,6 +37,8 @@ const (
 	CmdFileRead         = "file_read"
 	CmdFileWrite        = "file_write"
 	CmdFileDelete       = "file_delete"
+	CmdFileMkdir        = "file_mkdir"
+	CmdFileRename       = "file_rename"
 	CmdFilesApply       = "files_apply"
 	// CmdFilesValidate stages and validates the managed files without writing
 	// or reloading anything; CmdFilesRollback restores the last good set and
