@@ -1,16 +1,31 @@
-package panel
+package config
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
-	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 )
+
+// Split: the running-service cases that used to live in this file moved with
+// the panel, which was split into config/xraynode/agentd:
+//
+//   - TestCheckReportNamesTheAgentYMLSource, and the CheckReport half of
+//     TestBrokenAgentYMLStopsTheLoadAndIsReportedFirst, drove panel.CheckReport;
+//     that report now lives in agentd (agentd/check.go), which owns the
+//     running agent.
+//   - TestAgentYMLHotReload and TestAgentYMLCreatedLaterIsPickedUp drove a
+//     running panel.New(...).Start() watcher; the agentd worker (and xraynode
+//     for the Xray side) recreates those.
+//
+// The cases kept below are the pure loader cases: they call Load and read the
+// returned *Config, so they belong to this package.
 
 // writeAgentYML writes an agent.yml with the given body.
 func writeAgentYML(t *testing.T, dir, body string) string {
@@ -34,11 +49,52 @@ func writeAgentOnlyConfig(t *testing.T, dir, stateDir string) string {
 	return path
 }
 
-// TestLoadConfigRealV03FixtureStillLoads pins the compatibility promise: a real
+// Split: the shared test log hook used by TestAgentYMLWinsOverTheConfigBlock
+// was defined in panel/nodecontrollers_test.go, which now belongs to xraynode;
+// the config package keeps its own copy so the warning assertion can stay here.
+type logCapture struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (c *logCapture) Levels() []log.Level { return log.AllLevels }
+
+func (c *logCapture) Fire(e *log.Entry) error {
+	c.mu.Lock()
+	c.msgs = append(c.msgs, e.Message)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *logCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.msgs, "\n")
+}
+
+// captureLogs installs a log hook and restores the logger afterwards.
+func captureLogs(t *testing.T) *logCapture {
+	t.Helper()
+	c := &logCapture{}
+	oldHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
+	oldLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	log.AddHook(c)
+	t.Cleanup(func() {
+		log.StandardLogger().ReplaceHooks(oldHooks)
+		log.SetLevel(oldLevel)
+	})
+	return c
+}
+
+// TestLoadRealV03FixtureStillLoads pins the compatibility promise: a real
 // single-file config (the v0.3 fixture cmd/link_test.go uses) keeps loading
 // byte for byte, with no agent configuration.
-func TestLoadConfigRealV03FixtureStillLoads(t *testing.T) {
-	cfg, err := LoadConfig(filepath.Join("..", "cmd", "testdata", "link_v03_real.yml"))
+//
+// Split: the full loader panel.LoadConfig is named Load in this package; the
+// test keeps its coverage of the full (Nodes + agent) load.
+func TestLoadRealV03FixtureStillLoads(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "cmd", "testdata", "link_v03_real.yml"))
 	if err != nil {
 		t.Fatalf("the v0.3 fixture no longer loads: %v", err)
 	}
@@ -61,7 +117,8 @@ func TestAgentYMLWinsOverTheConfigBlock(t *testing.T) {
 	agentPath := writeAgentYML(t, dir, "Enabled: true\nStateDir: state-from-agentyml\n")
 
 	cap := captureLogs(t)
-	cfg, err := LoadConfig(configPath)
+	// Split: panel.LoadConfig -> config.Load (full load, validates Nodes).
+	cfg, err := Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +158,8 @@ Panel:
   MachineID: 7
   TokenFile: panel.token
 `)
-	cfg, err := LoadConfig(configPath)
+	// Split: panel.LoadConfig -> config.Load.
+	cfg, err := Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,60 +174,29 @@ Panel:
 	}
 }
 
-// TestBrokenAgentYMLStopsTheLoadAndIsReportedFirst: a broken agent.yml fails
-// the start-up load, and "W1nCray check" shows it on the first screen (R5).
-func TestBrokenAgentYMLStopsTheLoadAndIsReportedFirst(t *testing.T) {
+// TestBrokenAgentYMLStopsTheLoad: a broken agent.yml fails the start-up load
+// (R5).
+//
+// Split: the old test also asserted that panel.CheckReport showed the parse
+// error on the first screen; that check-report case moved to agentd
+// (agentd/check.go), which owns the running agent. The loader refusal it pinned
+// stays here, where the loader lives.
+func TestBrokenAgentYMLStopsTheLoad(t *testing.T) {
 	dir := t.TempDir()
 	configPath := writeAgentOnlyConfig(t, dir, "state")
 	agentPath := writeAgentYML(t, dir, "Panel: [\n")
 
-	if _, err := LoadConfig(configPath); err == nil || !strings.Contains(err.Error(), agentPath) {
-		t.Fatalf("LoadConfig err = %v, want it to name %s", err, agentPath)
-	}
-
-	var out bytes.Buffer
-	items, err := CheckReport(configPath, false, &out)
-	if err == nil {
-		t.Fatalf("CheckReport passed:\n%s", out.String())
-	}
-	lines := strings.Split(out.String(), "\n")
-	if len(lines) < 2 || !strings.HasPrefix(lines[0], "  agent.yml: ") {
-		t.Fatalf("the first screen does not name agent.yml:\n%s", out.String())
-	}
-	if !strings.Contains(lines[1], "\u2717 agent.yml \u89e3\u6790\u5931\u8d25") {
-		t.Fatalf("the parse error is not on the first screen:\n%s", out.String())
-	}
-	if len(items) == 0 {
-		t.Error("CheckReport reported no failure item")
-	}
-}
-
-// TestCheckReportNamesTheAgentYMLSource checks the successful report: the file,
-// the winning source and the shadowed config.yml block.
-func TestCheckReportNamesTheAgentYMLSource(t *testing.T) {
-	dir := t.TempDir()
-	configPath := writeAgentOnlyConfig(t, dir, "state-from-config")
-	agentPath := writeAgentYML(t, dir, "Enabled: true\nStateDir: state-from-agentyml\n")
-
-	var out bytes.Buffer
-	if _, err := CheckReport(configPath, false, &out); err != nil {
-		t.Fatalf("%v\n%s", err, out.String())
-	}
-	report := out.String()
-	for _, want := range []string{
-		"agent.yml: " + agentPath,
-		"\u2713 agent.yml \u5df2\u89e3\u6790",
-		"Agent \u6bb5\u88ab agent.yml \u8986\u76d6",
-		"\u6765\u6e90 " + agentPath,
-	} {
-		if !strings.Contains(report, want) {
-			t.Errorf("the report does not contain %q:\n%s", want, report)
-		}
+	// Split: panel.LoadConfig -> config.Load.
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), agentPath) {
+		t.Fatalf("Load err = %v, want it to name %s", err, agentPath)
 	}
 }
 
 // TestAgentYMLBrokenDuringStartupIsRefused: the rule of the old Agent block
 // still holds in the separated layout.
+//
+// Split: this is a pure loader case (it never constructs a Panel/Service), so
+// it stays in config with panel.LoadConfig -> config.Load.
 func TestAgentYMLBrokenDuringStartupIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	// A static node keeps the "no Nodes and no Agent" rule out of the way, so
@@ -186,18 +213,22 @@ Agent:
 		t.Fatal(err)
 	}
 	writeAgentYML(t, dir, "Enabled: false\nPanel:\n  Enabled: true\n  URL: https://p.example.com\n  MachineID: 7\n  Token: t\n")
-	if _, err := LoadConfig(configPath); err == nil || !strings.Contains(err.Error(), "requires Agent.Enabled") {
+	// Split: panel.LoadConfig -> config.Load.
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "requires Agent.Enabled") {
 		t.Fatalf("err = %v", err)
 	}
 }
 
-// TestLocalPolicyDefaultsThroughLoadConfig: the new local gates are defined,
+// TestLocalPolicyDefaultsThroughLoad: the new local gates are defined,
 // defaulted and resolved by the load (only types and validation; the behaviour
 // comes with the later packages).
-func TestLocalPolicyDefaultsThroughLoadConfig(t *testing.T) {
+//
+// Split: the old name pinned panel.LoadConfig; the full loader is config.Load
+// in this package.
+func TestLocalPolicyDefaultsThroughLoad(t *testing.T) {
 	dir := t.TempDir()
 	configPath := writeAgentOnlyConfig(t, dir, "state")
-	cfg, err := LoadConfig(configPath)
+	cfg, err := Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,111 +264,13 @@ func TestLocalPolicyDefaultsThroughLoadConfig(t *testing.T) {
 	// A root pointing at the agent's own file is refused.
 	bad := writeAgentOnlyConfig(t, t.TempDir(), "state")
 	writeAgentYML(t, filepath.Dir(bad), "Enabled: true\nFiles:\n  Roots: ["+filepath.ToSlash(filepath.Join(filepath.Dir(bad), agentcfg.FileName))+"]\n")
-	if _, err := LoadConfig(bad); err == nil || !strings.Contains(err.Error(), "never managed") {
+	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "never managed") {
 		t.Fatalf("err = %v, want the excluded-root refusal", err)
 	}
 	// A terminal limit above the hard cap is a config error, not a clamp.
 	bad2 := writeAgentOnlyConfig(t, t.TempDir(), "state")
 	writeAgentYML(t, filepath.Dir(bad2), "Enabled: true\nTerminal:\n  Enabled: true\n  MaxSessions: 9\n")
-	if _, err := LoadConfig(bad2); err == nil || !strings.Contains(err.Error(), "MaxSessions") {
+	if _, err := Load(bad2); err == nil || !strings.Contains(err.Error(), "MaxSessions") {
 		t.Fatalf("err = %v, want the MaxSessions refusal", err)
-	}
-}
-
-// waitForConfig polls the running config until cond holds.
-func waitForConfig(t *testing.T, p *Panel, timeout time.Duration, what string, cond func(*Config) bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		p.mu.Lock()
-		ok := cond(p.cfg)
-		p.mu.Unlock()
-		if ok {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// TestAgentYMLHotReload: the watcher follows agent.yml, a change takes effect,
-// and a broken file is refused while the running configuration keeps serving
-// (design T15 / R5).
-func TestAgentYMLHotReload(t *testing.T) {
-	dir := t.TempDir()
-	configPath := writeAgentOnlyConfig(t, dir, "state-from-config")
-	agentPath := writeAgentYML(t, dir, "Enabled: true\nStateDir: state-one\n")
-
-	cfg, err := LoadConfig(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := New(configPath, cfg)
-	if err := p.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-
-	one := filepath.Join(dir, "state-one")
-	waitForConfig(t, p, 10*time.Second, "the agent.yml state directory", func(c *Config) bool {
-		return c.Agent != nil && c.Agent.StateDir == one
-	})
-
-	writeAgentYML(t, dir, "Enabled: true\nStateDir: state-two\n")
-	two := filepath.Join(dir, "state-two")
-	waitForConfig(t, p, 30*time.Second, "the hot-reloaded agent.yml", func(c *Config) bool {
-		return c.Agent != nil && c.Agent.StateDir == two && c.AgentSource() == agentcfg.SourceAgentYML
-	})
-
-	// Break agent.yml: the reload must be refused and the running config kept.
-	cap := captureLogs(t)
-	if err := os.WriteFile(agentPath, []byte("Panel: [\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(30 * time.Second)
-	for !strings.Contains(cap.String(), "reload aborted") {
-		if time.Now().After(deadline) {
-			t.Fatalf("the broken agent.yml never triggered a reload attempt:\n%s", cap.String())
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	p.mu.Lock()
-	got, running := p.cfg.Agent.StateDir, p.running
-	p.mu.Unlock()
-	if got != two || !running {
-		t.Fatalf("after a broken agent.yml: state = %q, running = %v; want %q and true", got, running, two)
-	}
-}
-
-// TestAgentYMLCreatedLaterIsPickedUp: the watcher registers agent.yml even
-// before it exists, so switching to the separated layout needs no restart.
-func TestAgentYMLCreatedLaterIsPickedUp(t *testing.T) {
-	dir := t.TempDir()
-	configPath := writeAgentOnlyConfig(t, dir, "state-from-config")
-	cfg, err := LoadConfig(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.AgentSource() != agentcfg.SourceConfig {
-		t.Fatalf("source = %q, want %q", cfg.AgentSource(), agentcfg.SourceConfig)
-	}
-	p := New(configPath, cfg)
-	if err := p.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-
-	agentPath := writeAgentYML(t, dir, "Enabled: true\nStateDir: state-from-agentyml\n")
-	want := filepath.Join(dir, "state-from-agentyml")
-	waitForConfig(t, p, 30*time.Second, "the newly created agent.yml", func(c *Config) bool {
-		return c.Agent != nil && c.Agent.StateDir == want
-	})
-	p.mu.Lock()
-	sourcePath := p.cfg.AgentSourcePath()
-	p.mu.Unlock()
-	if sourcePath != agentPath {
-		t.Errorf("source path = %q, want %q", sourcePath, agentPath)
 	}
 }

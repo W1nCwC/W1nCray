@@ -1,0 +1,72 @@
+// Package xrayapi holds the wire types of the W1nCray-xray kernel's local
+// status interface and the interface the agent uses to reach it.
+//
+// It has no dependency on the Xray kernel, so the agent can link it: the agent
+// program must never pull in Xray-core, while it still has to read the kernel's
+// JSON status, ask it to pre-check staged files and wait for a reload.
+package xrayapi
+
+import "context"
+
+// Status is the JSON body of GET /status on the kernel's local endpoint (a
+// Unix socket, or a loopback TCP port on Windows).
+type Status struct {
+	// Version is the kernel program's own version ("0.6.0").
+	Version string `json:"version"`
+	// XrayCore is the Xray-core version the kernel was built with.
+	XrayCore string `json:"xray_core"`
+	// StartedAt is when the kernel started, as a Unix timestamp.
+	StartedAt int64 `json:"started_at"`
+	// Running reports whether the Xray instance is up.
+	Running bool `json:"running"`
+	// Nodes describes every node controller of the running instance.
+	Nodes []NodeStatus `json:"nodes"`
+	// ConfigFingerprint is the content fingerprint of the watched files at the
+	// last successful reload.
+	ConfigFingerprint string `json:"config_fingerprint"`
+	// LastReloadAt is the Unix timestamp of the last successful reload (0 when
+	// the instance was only built at start-up).
+	LastReloadAt int64 `json:"last_reload_at"`
+	// LastError is the last reload error, "" when there is none.
+	LastError string `json:"last_error,omitempty"`
+}
+
+// NodeStatus is one entry of Status.Nodes.
+type NodeStatus struct {
+	Tag    string `json:"tag"`
+	ID     int    `json:"id"`
+	Type   string `json:"type"`
+	Users  int    `json:"users"`
+	Online int    `json:"online"`
+	Error  string `json:"error,omitempty"`
+}
+
+// StagedError is one problem `check-staged` found in a staged file.
+type StagedError struct {
+	File    string `json:"file"`
+	Message string `json:"message"`
+}
+
+// StagedResult is the JSON document `check-staged` prints.
+type StagedResult struct {
+	OK     bool          `json:"ok"`
+	Errors []StagedError `json:"errors"`
+}
+
+// Service is the agent's view of the locally installed Xray kernel. The agent
+// holds it as an interface so that a machine without the kernel (the default)
+// degrades safely instead of failing to start; the implementation (X2) talks
+// to the kernel's local endpoint.
+//
+// A nil Service means "the Xray kernel is not installed": managed Xray files
+// are refused with "Xray 内核未安装" instead of being half-applied.
+type Service interface {
+	// Status returns the kernel's current status document.
+	Status(ctx context.Context) (Status, error)
+	// CheckStaged pre-checks a staged managed-file set with the kernel's own
+	// configuration loader. files are the managed-file names in dir.
+	CheckStaged(ctx context.Context, dir string, files []string) (StagedResult, error)
+	// WaitReloaded waits until the kernel reports fingerprint as its loaded
+	// configuration fingerprint (or ctx ends).
+	WaitReloaded(ctx context.Context, fingerprint string) error
+}
