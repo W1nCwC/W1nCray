@@ -3,8 +3,7 @@
 // (static Nodes or the machine's node list discovered from the panel), watches
 // the Xray configuration files and exposes a local status interface.
 //
-// It is the only package (with driver/xray and corehost) that links
-// Xray-core; the agent program must not.
+// It is the only package that links Xray-core; the agent program must not.
 package xraynode
 
 import (

@@ -372,9 +372,6 @@ func (k *kernelCmds) componentRestart(ctx context.Context, req Request, complete
 		k.reg.logf().Infof("opscmd: component_restart xray restarted the service")
 		return done(restartedResult{Name: a.Name, Restarted: 1}), nil
 	}
-	if a.Name == spec.EngineXray {
-		return Result{}, coded("embedded", errors.New("xray is embedded in the agent process; restart the agent service to restart it"))
-	}
 	if k.deps.Comp == nil {
 		return Result{}, coded("not_supported", errors.New("component restart is not wired on this agent"))
 	}

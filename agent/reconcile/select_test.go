@@ -10,7 +10,7 @@ import (
 )
 
 // Capability sets copied from the real drivers (driver/gost, driver/frp,
-// driver/realm, driver/xray Caps()), reduced to what capsReason looks at.
+// driver/realm Caps()), reduced to what capsReason looks at.
 func realGostCaps() driver.Caps {
 	return driver.Caps{
 		Name:        spec.EngineGost,
