@@ -50,7 +50,7 @@ func bootWithManifest(t *testing.T) *Runtime {
 		StateDir:         stateDir,
 		KernelsDir:       filepath.Join(dir, "kernels"),
 		ManifestKeysPath: keysPath,
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}

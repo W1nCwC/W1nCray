@@ -1,4 +1,4 @@
-package panel
+package xraynode
 
 import (
 	"encoding/json"
@@ -107,6 +107,29 @@ func freePort(t *testing.T) int {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+// waitDial polls addr until a TCP dial succeeds (wantOpen) or fails. It used to
+// live in the panel package; the split moved the agent tests to agentd, so the
+// xray-side tests carry their own copy (rule 4 of the split: port the helper,
+// never weaken the test).
+func waitDial(t *testing.T, addr string, wantOpen bool, timeout time.Duration, what string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		c, err := net.DialTimeout("tcp", addr, time.Second)
+		open := err == nil
+		if open {
+			c.Close()
+		}
+		if open == wantOpen {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s (open=%v)", what, open)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // Two nodes in one instance, one with a panel DNS route; then a config file

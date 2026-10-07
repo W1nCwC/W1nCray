@@ -79,7 +79,7 @@ func TestTerminalCapabilityFollowsTheManager(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: true, Shell: terminal.DefaultShell},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestTerminalDisabledKeepsTheCapabilityOut(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: false},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 	}
 
 	// Without roots.
-	rt, err := Boot(Options{StateDir: filepath.Join(dir, "state"), KernelsDir: filepath.Join(dir, "kernels")}, nil)
+	rt, err := Boot(Options{StateDir: filepath.Join(dir, "state"), KernelsDir: filepath.Join(dir, "kernels")})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		FileOps:    fileops.Options{Roots: []fileops.Root{{Name: "xray", Path: root}}},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 			LayoutSeparated: true,
 		},
 		FileOps: fileops.Options{Roots: []fileops.Root{{Name: "xray", Path: root}}},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestUnrestrictedFilesWithoutRoots(t *testing.T) {
 			LayoutSeparated: true,
 		},
 		FileOps: fileops.Options{Unrestricted: boolPtr(true)},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestWSTerminalAdapter(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: true, Shell: terminal.DefaultShell},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestBootShutdownClosesTheTerminal(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: true, Shell: terminal.DefaultShell},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}

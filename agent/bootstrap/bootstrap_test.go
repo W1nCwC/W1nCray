@@ -244,7 +244,7 @@ func dialOK(addr string) bool {
 func TestBootApplyFileReportShutdown(t *testing.T) {
 	fd := newFakeDriver()
 	orig := driverBuilder
-	driverBuilder = func(_ XrayHost, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
+	driverBuilder = func(pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
 		return map[string]driver.Driver{spec.EngineGost: fd}, nil
 	}
 	t.Cleanup(func() { driverBuilder = orig })
@@ -254,7 +254,7 @@ func TestBootApplyFileReportShutdown(t *testing.T) {
 	kernelsDir := filepath.Join(dir, "kernels")
 	desiredPath := filepath.Join(dir, "desired.json")
 
-	rt, err := Boot(Options{StateDir: stateDir, KernelsDir: kernelsDir}, nil)
+	rt, err := Boot(Options{StateDir: stateDir, KernelsDir: kernelsDir})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -334,7 +334,7 @@ func (l *recLog) warnText() string {
 func useFake(t *testing.T, fd *fakeDriver) {
 	t.Helper()
 	orig := driverBuilder
-	driverBuilder = func(_ XrayHost, pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
+	driverBuilder = func(pol spec.Policy, log driver.Logger) (map[string]driver.Driver, error) {
 		return map[string]driver.Driver{spec.EngineGost: fd}, nil
 	}
 	t.Cleanup(func() { driverBuilder = orig })
@@ -351,7 +351,7 @@ func bootCycle(t *testing.T, dir string, resume bool, log driver.Logger) (*Runti
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Resume:     resume,
 		Log:        log,
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot(Resume:%v): %v", resume, err)
 	}

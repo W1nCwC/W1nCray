@@ -1,4 +1,4 @@
-package panel
+package agentd
 
 import (
 	"bytes"
@@ -11,21 +11,18 @@ import (
 // TestCheckReportMatchesCheckOutput pins the refactor behind link's baseline
 // comparison: CheckReport reports the failure items Check prints, and both the
 // output and the error of Check stay exactly what they were.
+//
+// The fixture is an agent-side failure now. The agent check no longer inspects
+// Nodes or the Xray instance (that is `W1nCray-xray check`), so the failure is
+// an enabled Agent whose ManifestPath points at a file that does not exist.
 func TestCheckReportMatchesCheckOutput(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
 	body := `Log: {Level: warning}
-RouteConfigPath: ` + filepath.ToSlash(filepath.Join(dir, "missing-route.json")) + `
-Nodes:
-  - PanelType: "Xboard"
-    ApiConfig:
-      ApiHost: "https://panel.example.com"
-      ApiKey: "k"
-      NodeID: 173
-      NodeType: V2ray
-    ControllerConfig:
-      CertConfig:
-        CertMode: none
+Agent:
+  Enabled: true
+  StateDir: ` + filepath.ToSlash(filepath.Join(dir, "state")) + `
+  ManifestPath: ` + filepath.ToSlash(filepath.Join(dir, "missing-manifest.json")) + `
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -34,7 +31,7 @@ Nodes:
 	var checkOut bytes.Buffer
 	checkErr := Check(path, false, &checkOut)
 	if checkErr == nil {
-		t.Fatalf("Check passed on a config with a missing route.json:\n%s", checkOut.String())
+		t.Fatalf("Check passed on an agent with a missing ManifestPath:\n%s", checkOut.String())
 	}
 
 	var reportOut bytes.Buffer

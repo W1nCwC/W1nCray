@@ -1,4 +1,4 @@
-package panel
+package xraynode
 
 import (
 	"bytes"
@@ -177,14 +177,14 @@ func machineNodeJSON(id int, name string, updated int) map[string]any {
 	return map[string]any{"id": id, "type": "vmess", "name": name, "updated_at": updated}
 }
 
-func panelNodes(t *testing.T, p *Panel) []*node.Controller {
+func panelNodes(t *testing.T, p *Service) []*node.Controller {
 	t.Helper()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]*node.Controller(nil), p.nodes...)
 }
 
-func waitNodes(t *testing.T, p *Panel, want int, msg string) {
+func waitNodes(t *testing.T, p *Service, want int, msg string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {

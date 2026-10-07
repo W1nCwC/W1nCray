@@ -1,4 +1,4 @@
-package panel
+package xraynode
 
 import (
 	"context"
@@ -10,14 +10,18 @@ import (
 )
 
 // agentOnlyConfig is a config.yml with the agent enabled and no static nodes.
+// The Agent block is only what makes the file valid without Nodes; xraynode no
+// longer owns the agent lifecycle.
 func agentOnlyConfig(stateDir string) string {
 	return "Log: {Level: warning}\nAgent:\n  Enabled: true\n  StateDir: " + stateDir + "\n"
 }
 
-// TestReloadForAgentValidatesBeforeTouchingTheInstance covers ruling 2: a
-// config.yml that does not load is refused, the running instance is kept, and
-// the good case asks for a rebuild without shutting anything down in-process.
-func TestReloadForAgentValidatesBeforeTouchingTheInstance(t *testing.T) {
+// TestReloadValidatesBeforeTouchingTheInstance covers ruling 2: a config.yml
+// that does not load is refused, the running instance is kept, and the good
+// case asks for a rebuild without shutting anything down in-process. The split
+// renamed panel.ReloadForAgent to Service.Reload (it is the filesync.Reloader
+// now); the agent restart it used to drive belongs to agentd.
+func TestReloadValidatesBeforeTouchingTheInstance(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(configPath, []byte(agentOnlyConfig(filepath.Join(dir, "state-one"))), 0o600); err != nil {
@@ -27,24 +31,24 @@ func TestReloadForAgentValidatesBeforeTouchingTheInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := New(configPath, cfg)
-	if err := p.Start(); err != nil {
+	s := New(configPath, cfg)
+	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer s.Close()
 
 	// A broken config.yml: an error, and nothing is torn down.
 	if err := os.WriteFile(configPath, []byte("Agent: [\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.ReloadForAgent(context.Background(), "managed files applied"); err == nil {
+	if err := s.Reload(context.Background(), "managed files applied"); err == nil {
 		t.Fatal("a broken config.yml was accepted")
 	} else if !strings.Contains(err.Error(), "reload refused") {
 		t.Errorf("error = %v, want a refusal", err)
 	}
-	p.mu.Lock()
-	running := p.running
-	p.mu.Unlock()
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
 	if !running {
 		t.Fatal("the instance was shut down by a refused reload")
 	}
@@ -52,7 +56,7 @@ func TestReloadForAgentValidatesBeforeTouchingTheInstance(t *testing.T) {
 	// A cancelled context never starts anything.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := p.ReloadForAgent(ctx, "managed files applied"); err == nil {
+	if err := s.Reload(ctx, "managed files applied"); err == nil {
 		t.Error("a cancelled context was accepted")
 	}
 
@@ -61,14 +65,14 @@ func TestReloadForAgentValidatesBeforeTouchingTheInstance(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(agentOnlyConfig(filepath.Join(dir, "state-two"))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.ReloadForAgent(context.Background(), "managed files applied"); err != nil {
-		t.Fatalf("ReloadForAgent: %v", err)
+	if err := s.Reload(context.Background(), "managed files applied"); err != nil {
+		t.Fatalf("Reload: %v", err)
 	}
-	p.mu.Lock()
-	running = p.running
-	p.mu.Unlock()
+	s.mu.Lock()
+	running = s.running
+	s.mu.Unlock()
 	if !running {
-		t.Error("ReloadForAgent shut the instance down before returning")
+		t.Error("Reload shut the instance down before returning")
 	}
 
 	// The rebuild picks the new configuration up, so the request really went
@@ -76,12 +80,12 @@ func TestReloadForAgentValidatesBeforeTouchingTheInstance(t *testing.T) {
 	want := filepath.Join(dir, "state-two")
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		p.mu.Lock()
+		s.mu.Lock()
 		got := ""
-		if p.cfg != nil && p.cfg.Agent != nil {
-			got = p.cfg.Agent.StateDir
+		if s.cfg != nil && s.cfg.Agent != nil {
+			got = s.cfg.Agent.StateDir
 		}
-		p.mu.Unlock()
+		s.mu.Unlock()
 		if got == want {
 			return
 		}
@@ -92,10 +96,10 @@ func TestReloadForAgentValidatesBeforeTouchingTheInstance(t *testing.T) {
 	}
 }
 
-// TestReloadForAgentIsSerialisedWithTheWatcher: two reload requests in a row
-// must not run two rebuilds at once. The second request is remembered and
-// served after the first, so the final configuration is the last one written.
-func TestReloadForAgentIsSerialisedWithTheWatcher(t *testing.T) {
+// TestReloadIsSerialisedWithTheWatcher: two reload requests in a row must not
+// run two rebuilds at once. The second request is remembered and served after
+// the first, so the final configuration is the last one written.
+func TestReloadIsSerialisedWithTheWatcher(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(configPath, []byte(agentOnlyConfig(filepath.Join(dir, "s1"))), 0o600); err != nil {
@@ -105,33 +109,33 @@ func TestReloadForAgentIsSerialisedWithTheWatcher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := New(configPath, cfg)
-	if err := p.Start(); err != nil {
+	s := New(configPath, cfg)
+	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer s.Close()
 
 	if err := os.WriteFile(configPath, []byte(agentOnlyConfig(filepath.Join(dir, "s2"))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.ReloadForAgent(context.Background(), "managed files applied"); err != nil {
+	if err := s.Reload(context.Background(), "managed files applied"); err != nil {
 		t.Fatal(err)
 	}
 	// A second request while the first may still be running.
 	if err := os.WriteFile(configPath, []byte(agentOnlyConfig(filepath.Join(dir, "s3"))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p.requestReload("a second reason")
+	s.requestReload("a second reason")
 
 	want := filepath.Join(dir, "s3")
 	deadline := time.Now().Add(40 * time.Second)
 	for {
-		p.mu.Lock()
+		s.mu.Lock()
 		got := ""
-		if p.cfg != nil && p.cfg.Agent != nil {
-			got = p.cfg.Agent.StateDir
+		if s.cfg != nil && s.cfg.Agent != nil {
+			got = s.cfg.Agent.StateDir
 		}
-		p.mu.Unlock()
+		s.mu.Unlock()
 		if got == want {
 			return
 		}

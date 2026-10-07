@@ -1,4 +1,4 @@
-package panel
+package agentd
 
 import (
 	"bytes"
@@ -21,7 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
+	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
 
@@ -144,7 +146,9 @@ func TestCheckTokenFileMode(t *testing.T) {
 		{0o777, "windows", false},
 	}
 	for _, tc := range cases {
-		err := checkTokenFileMode("/etc/W1nCray/panel.token", tc.mode, tc.goos)
+		// The token-file rules moved to agentcfg with the agent configuration;
+		// the old panel wrappers are gone.
+		err := agentcfg.CheckTokenFileMode("/etc/W1nCray/panel.token", tc.mode, tc.goos)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("mode %04o on %s: err = %v, wantErr %v", tc.mode, tc.goos, err, tc.wantErr)
 		}
@@ -168,33 +172,33 @@ func TestReadTokenFile(t *testing.T) {
 	}
 
 	t.Run("trims surrounding whitespace", func(t *testing.T) {
-		got, err := readTokenFile(write("a", "  "+testPanelToken+" \r\n\n", 0o600))
+		got, err := agentcfg.ReadTokenFile(write("a", "  "+testPanelToken+" \r\n\n", 0o600))
 		if err != nil || got != testPanelToken {
 			t.Fatalf("got %q, %v", got, err)
 		}
 	})
 	t.Run("empty", func(t *testing.T) {
-		if _, err := readTokenFile(write("empty", " \n", 0o600)); err == nil || !strings.Contains(err.Error(), "empty") {
+		if _, err := agentcfg.ReadTokenFile(write("empty", " \n", 0o600)); err == nil || !strings.Contains(err.Error(), "empty") {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("more than a token", func(t *testing.T) {
-		if _, err := readTokenFile(write("two", "tok en\n", 0o600)); err == nil {
+		if _, err := agentcfg.ReadTokenFile(write("two", "tok en\n", 0o600)); err == nil {
 			t.Fatal("accepted a file with whitespace inside")
 		}
 	})
 	t.Run("too large", func(t *testing.T) {
-		if _, err := readTokenFile(write("big", strings.Repeat("a", maxTokenFileBytes+1), 0o600)); err == nil || !strings.Contains(err.Error(), "larger") {
+		if _, err := agentcfg.ReadTokenFile(write("big", strings.Repeat("a", agentcfg.MaxTokenFileBytes+1), 0o600)); err == nil || !strings.Contains(err.Error(), "larger") {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("missing", func(t *testing.T) {
-		if _, err := readTokenFile(filepath.Join(dir, "nope")); err == nil {
+		if _, err := agentcfg.ReadTokenFile(filepath.Join(dir, "nope")); err == nil {
 			t.Fatal("accepted a missing file")
 		}
 	})
 	t.Run("directory", func(t *testing.T) {
-		if _, err := readTokenFile(dir); err == nil {
+		if _, err := agentcfg.ReadTokenFile(dir); err == nil {
 			t.Fatal("accepted a directory")
 		}
 	})
@@ -203,7 +207,7 @@ func TestReadTokenFile(t *testing.T) {
 			t.Skip("permission bits are not enforced on Windows")
 		}
 		p := write("loose", testPanelToken, 0o640)
-		_, err := readTokenFile(p)
+		_, err := agentcfg.ReadTokenFile(p)
 		if err == nil || !strings.Contains(err.Error(), "group or other") {
 			t.Fatalf("err = %v", err)
 		}
@@ -213,7 +217,7 @@ func TestReadTokenFile(t *testing.T) {
 		if err := os.Chmod(p, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := readTokenFile(p); err != nil || got != testPanelToken {
+		if got, err := agentcfg.ReadTokenFile(p); err != nil || got != testPanelToken {
 			t.Fatalf("after chmod 600: %q, %v", got, err)
 		}
 	})
@@ -378,20 +382,26 @@ func (f *fakePanelServer) count(ep string) int {
 	return f.counts[ep]
 }
 
-// TestPanelLinkEndToEnd runs the whole panel with an agent linked to a (fake)
-// panel: the pushed state is applied and acknowledged with the token file's
-// token; after a restart the last good state comes back without the panel, and
+// TestPanelLinkEndToEnd runs the daemon with an agent linked to a (fake) panel:
+// the pushed state is applied and acknowledged with the token file's token;
+// after a restart the last good state comes back without the panel, and
 // stopping the panel ends the link.
+//
+// The pushed instance is disabled on purpose: the old test ran it on the
+// builtin xray engine and watched its port, but agentd no longer links an Xray
+// core (the Xray instance is the separate W1nCray-xray program) and the external
+// engines need a signed manifest and an installed kernel. A disabled instance
+// still drives the whole link contract (pull, apply, ack, resume) without an
+// engine.
 func TestPanelLinkEndToEnd(t *testing.T) {
 	port := freePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	dir := t.TempDir()
 	tokenFile := filepath.Join(dir, "panel.token")
 	if err := os.WriteFile(tokenFile, []byte(testPanelToken+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fp := newFakePanelServer(t)
-	fp.desired = fmt.Sprintf(`{"version":1,"revision":1,"instances":[{"id":"fwd1","enabled":true,"engine":"xray","kind":"forward","listen":{"addr":"127.0.0.1","ports":"%d"},"targets":[{"host":"1.1.1.1","ports":"80"}]}]}`, port)
+	fp.desired = fmt.Sprintf(`{"version":1,"revision":1,"instances":[{"id":"fwd1","enabled":false,"engine":"gost","kind":"forward","listen":{"addr":"127.0.0.1","ports":"%d"},"targets":[{"host":"1.1.1.1","ports":"80"}]}]}`, port)
 
 	configPath := writeAgentConfig(t, dir, fmt.Sprintf(`    Enabled: true
     URL: %s
@@ -404,12 +414,11 @@ func TestPanelLinkEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := New(configPath, cfg)
+	p := New(configPath, cfg, Options{})
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waitDial(t, addr, true, 20*time.Second, "port open after the panel pushed the state")
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for fp.count("ack") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("no ack reached the panel")
@@ -426,8 +435,14 @@ func TestPanelLinkEndToEnd(t *testing.T) {
 	if auth != "Bearer "+testPanelToken || hdr.Get("X-Machine-Id") != "7" {
 		t.Errorf("credentials sent: %q / machine %q", auth, hdr.Get("X-Machine-Id"))
 	}
+	// The pushed revision reached the runtime.
+	p.mu.Lock()
+	rt := p.agent
+	p.mu.Unlock()
+	if rt == nil || rt.Reconciler.LastDesired().Revision != 1 {
+		t.Fatal("the pushed revision did not reach the runtime")
+	}
 	p.Close()
-	waitDial(t, addr, false, 20*time.Second, "port closed after Close")
 	// Close ended the link: no more requests.
 	n := fp.count("config")
 	time.Sleep(100 * time.Millisecond)
@@ -443,12 +458,17 @@ func TestPanelLinkEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2 := New(configPath, cfg2)
+	p2 := New(configPath, cfg2, Options{})
 	if err := p2.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer p2.Close()
-	waitDial(t, addr, true, 20*time.Second, "port open after restart with the panel down (Resume)")
+	p2.mu.Lock()
+	rt2 := p2.agent
+	p2.mu.Unlock()
+	if rt2 == nil {
+		t.Fatal("the restarted agent did not resume")
+	}
 	deadline = time.Now().Add(10 * time.Second)
 	for fp.count("config") <= n {
 		if time.Now().After(deadline) {
@@ -456,18 +476,24 @@ func TestPanelLinkEndToEnd(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !dialOK(addr) {
-		t.Error("a panel outage took the resumed forwarding down")
+	// Resume re-applied the persisted last good state before the panel answered.
+	rep2, ok := rt2.Reconciler.Last()
+	if !ok || rep2.Status != reconcile.StatusApplied || rep2.Revision != 1 {
+		t.Errorf("after restart: %+v (ok=%v), want the resumed revision 1 applied", rep2, ok)
 	}
 }
 
-func dialOK(addr string) bool {
-	c, err := net.DialTimeout("tcp", addr, time.Second)
+// freePort returns a loopback TCP port that is free at call time. The old panel
+// package had it in panel_test.go, which was not carried over to agentd; the
+// agentd tests that drive a listening instance need it.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return false
+		t.Fatal(err)
 	}
-	c.Close()
-	return true
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 // ---- kernel manifest sync ----------------------------------------------------
@@ -632,7 +658,7 @@ Agent:
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := New(configPath, cfg)
+	p := New(configPath, cfg, Options{})
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}

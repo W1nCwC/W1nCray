@@ -10,7 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
-	"github.com/W1nCwC/W1nCray/panel"
+	"github.com/W1nCwC/W1nCray/agentd"
 )
 
 var agentApplyFile string
@@ -21,14 +21,14 @@ var acquireLock = acquireInstanceLock
 
 func init() {
 	// The panel link reports the build version; the version string lives here.
-	panel.AgentVersion = version
+	agentd.AgentVersion = version
 
 	c := &cobra.Command{
 		Use:   "agent-apply",
 		Short: "Apply a desired-state JSON file once and print the report",
 		Long: "Apply a desired-state JSON file once and print the resulting report as JSON.\n" +
-			"Only the external engines (gost, frp, realm) can run without a panel: the\n" +
-			"builtin xray engine needs the running instance and is not registered here.\n" +
+			"Only the external engines (gost, frp, realm) are available: the xray\n" +
+			"forwarding engine was removed (PLAN v11 §2.5).\n" +
 			"Kernels that were started keep running after the command exits.\n" +
 			"The command takes the same single-instance lock as the service: stop the\n" +
 			"service first if it runs with this config.",
@@ -40,7 +40,6 @@ func init() {
 			if err != nil {
 				return err
 			}
-			setAssetLocation(path)
 			return runAgentApply(path, agentApplyFile, os.Stdout)
 		},
 	}
@@ -61,7 +60,7 @@ func runAgentApply(configPath, desiredFile string, out io.Writer) error {
 	}
 	defer lock.release()
 
-	cfg, err := panel.LoadConfig(configPath)
+	cfg, err := agentd.LoadConfig(configPath)
 	if err != nil {
 		return err
 	}
@@ -85,9 +84,9 @@ func runAgentApply(configPath, desiredFile string, out io.Writer) error {
 		// agent-apply never applies files; it still reports the same local
 		// policy as the service (the capability list is only sent over the
 		// panel link anyway).
-		Files: panel.FilesOptionsFor(cfg, configPath),
+		Files: agentd.FilesOptionsFor(cfg, configPath),
 		Log:   log.StandardLogger(),
-	}, nil)
+	})
 	if err != nil {
 		return err
 	}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	xcore "github.com/xtls/xray-core/core"
 
 	"github.com/W1nCwC/W1nCray/common/cert"
 )
@@ -22,6 +21,8 @@ func init() {
 	})
 }
 
+// showVersion prints the agent version. The Xray-core version is printed by
+// the kernel program (W1nCray-xray version): the agent does not link Xray-core.
 func showVersion() {
-	fmt.Printf("W1nCray %s (Xray-core %s, %s)\n", version, xcore.Version(), cert.BuildFlavor)
+	fmt.Printf("W1nCray %s (agent, %s)\n", version, cert.BuildFlavor)
 }

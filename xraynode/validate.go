@@ -1,4 +1,4 @@
-package panel
+package xraynode
 
 import (
 	"context"
@@ -13,51 +13,51 @@ import (
 )
 
 // CoreValidator pre-checks a staged managed-file set offline with the same xray
-// kernel the running instance uses (design section 3.4 step 3). It lives in
-// panel because panel is what owns the live instance options: the four JSON
-// paths, the DNS name servers of the running nodes, and the config loader for
-// config.yml.
+// kernel the running instance uses. It lives here because this package owns the
+// live instance options: the four JSON paths, the DNS name servers of the
+// running nodes, and the config loader for config.yml.
+//
+// It is what `W1nCray-xray check-staged` serves, so the agent can validate a
+// managed-file set before replacing anything.
 type CoreValidator struct {
 	// base returns the live instance's core options. The validator overrides
 	// the four JSON paths with their staged copies. It is read per validation:
-	// the agent (and so this validator) outlives xray rebuilds, and each
-	// rebuild publishes the options of the instance it built (see
-	// Panel.publishCoreOptionsLocked).
+	// each rebuild publishes the options of the instance it built (see
+	// Service.publishCoreOptionsLocked).
 	base func() core.Options
 	// configPath is the live config.yml, needed to pre-check a staged
 	// config.yml with the full LoadConfig.
 	configPath string
 }
 
-// NewCoreValidator builds the validator for one panel. A validation must see
+// NewCoreValidator builds the validator for one service. A validation must see
 // the configuration the running instance was built from, not a half-updated
 // one: the options are a snapshot taken when an xray instance finished
-// starting, read without p.mu (a validation runs inside a files_apply, which
-// the agent shutdown under p.mu may be waiting for).
+// starting, read without s.mu.
 //
-// The caller must hold p.mu, so this helper must not take it again.
-func (p *Panel) NewCoreValidator() *CoreValidator {
-	p.publishCoreOptionsLocked()
-	return &CoreValidator{base: p.liveCoreOptions, configPath: p.path}
+// The caller must hold s.mu, so this helper must not take it again.
+func (s *Service) NewCoreValidator() *CoreValidator {
+	s.publishCoreOptionsLocked()
+	return &CoreValidator{base: s.liveCoreOptions, configPath: s.path}
 }
 
 // publishCoreOptionsLocked stores the core options of the running instance
-// (p.cfg and the name servers of p.nodes). The caller holds p.mu.
-func (p *Panel) publishCoreOptionsLocked() {
+// (s.cfg and the name servers of s.nodes). The caller holds s.mu.
+func (s *Service) publishCoreOptionsLocked() {
 	var opts core.Options
-	if p.cfg != nil {
+	if s.cfg != nil {
 		var ns []core.NameServer
-		for _, n := range p.nodes {
+		for _, n := range s.nodes {
 			ns = append(ns, n.NameServers()...)
 		}
-		opts = coreOptions(p.cfg, ns)
+		opts = coreOptions(s.cfg, ns)
 	}
-	p.coreOpts.Store(&opts)
+	s.coreOpts.Store(&opts)
 }
 
 // liveCoreOptions returns the last published options (zero before the first).
-func (p *Panel) liveCoreOptions() core.Options {
-	if o := p.coreOpts.Load(); o != nil {
+func (s *Service) liveCoreOptions() core.Options {
+	if o := s.coreOpts.Load(); o != nil {
 		return *o
 	}
 	return core.Options{}
@@ -117,11 +117,31 @@ func (v *CoreValidator) ValidateStaged(ctx context.Context, dir string, files []
 			errs = append(errs, err)
 		}
 	}
-	return errs
+	return normalizeStagedPaths(errs, dir, files)
 }
 
-// checkStagedConfig pre-checks a staged config.yml with the panel's own loader.
-// The copy is written next to the live config.yml, so LoadConfig resolves the
+// normalizeStagedPaths rewrites the absolute staged path of a file back to its
+// plain name, so an error can be attributed to a managed file by its name (the
+// JSON `file` field of `check-staged`, and the filesync validator's messages).
+func normalizeStagedPaths(errs []error, dir string, files []filesync.FileRef) []error {
+	if len(errs) == 0 {
+		return errs
+	}
+	out := make([]error, 0, len(errs))
+	for _, e := range errs {
+		msg := e.Error()
+		for _, f := range files {
+			p := filepath.Join(dir, f.Name)
+			msg = strings.ReplaceAll(msg, p, f.Name)
+			msg = strings.ReplaceAll(msg, filepath.ToSlash(p), f.Name)
+		}
+		out = append(out, errors.New(msg))
+	}
+	return out
+}
+
+// checkStagedConfig pre-checks a staged config.yml with the full loader. The
+// copy is written next to the live config.yml, so the loader resolves the
 // agent section exactly as the running machine would (including agent.yml
 // winning over the staged "Agent:" block); the copy's name never ends in .yml,
 // so viper's format detection falls back to the YAML default rather than
@@ -155,4 +175,23 @@ func (v *CoreValidator) checkStagedConfig(staged string) error {
 		return fmt.Errorf("config.yml: %s", strings.TrimSpace(err.Error()))
 	}
 	return nil
+}
+
+// CheckStaged validates the named staged managed files against configPath. It
+// is what `W1nCray-xray check-staged` runs: no running instance is needed, the
+// core options come from the live config file. The staged config.yml (when
+// present) is checked with the full loader, so the agent section is resolved
+// exactly as the running machine would.
+func CheckStaged(ctx context.Context, configPath, dir string, names []string) []error {
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		return []error{err}
+	}
+	opts := coreOptions(cfg, nil)
+	v := &CoreValidator{base: func() core.Options { return opts }, configPath: configPath}
+	files := make([]filesync.FileRef, 0, len(names))
+	for _, n := range names {
+		files = append(files, filesync.FileRef{Name: n})
+	}
+	return v.ValidateStaged(ctx, dir, files)
 }

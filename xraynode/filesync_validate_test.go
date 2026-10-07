@@ -1,4 +1,4 @@
-package panel
+package xraynode
 
 import (
 	"context"
@@ -12,9 +12,11 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/filesync"
 )
 
-// newValidatorRig builds a panel whose config.yml only enables the agent (no
+// newValidatorRig builds a service whose config.yml only enables the agent (no
 // static nodes), so the validator can be exercised without a panel connection.
-func newValidatorRig(t *testing.T, configBody string) (*Panel, string, string) {
+// The split renamed panel.Panel to xraynode.Service; the rig is otherwise the
+// same.
+func newValidatorRig(t *testing.T, configBody string) (*Service, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")

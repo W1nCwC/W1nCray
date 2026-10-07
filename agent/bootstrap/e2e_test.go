@@ -121,7 +121,7 @@ func TestAgentGostEndToEnd(t *testing.T) {
 		KernelsDir:       kernelsDir,
 		ManifestPath:     manifestPath,
 		ManifestKeysPath: keysPath,
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}

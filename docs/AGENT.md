@@ -46,6 +46,8 @@
 
 ## 2 引擎能力与限制
 
+> **v11 变更（WP-X1）**：agent 的**内嵌 xray 转发引擎已移除**（PLAN v11 §2.5）。`engine: xray` 的实例会被校验拒绝（`xray 转发引擎已移除，请使用 gost 或 realm`），`auto` 只在 gost / frp / realm 里选；`tunnel.security: vless_enc` 一并移除。Xray 本身改为独立的 `W1nCray-xray` 程序（见 §13），转发只用 gost / realm（frp 用于反向代理）。下表里的「xray（内嵌）」一列与相关样例保留为历史说明与驱动级测试夹具，**不再由 agent 提供**。
+
 下表**以各驱动 `Caps()` 为准**（`driver/xray/driver.go`、`driver/gost/driver.go`、`driver/frp/frp.go`、`driver/realm/realm.go`），不要凭印象。Reconciler 在选引擎时用同一份数据拒绝不支持的特性，不会静默降级。
 
 | 能力 | xray（内嵌） | gost（外部） | frp（外部） | realm（外部） |
@@ -393,7 +395,7 @@ Agent:
 | `reverse_portal` | 必填（公网侧用户口） | 必填，写 `listen`（控制链路） | 必填 | 不允许（目的地由 bridge 的 targets 决定） |
 | `reverse_bridge` | 只写 `ports` = portal 侧公网端口（`addr` 不用） | 必填，写 `server`（portal 的 `host:port`） | 必填 | 必填（内网目标，端口一一对应 `listen.ports`） |
 
-`tunnel` 字段：`type` ∈ tcp / tls / ws / wss / grpc / xhttp / kcp / quic（引擎支持子集见 §2）；`security` ∈ `none` / `tls` / `tls_pin` / `tls_self` / `vless_enc`（`vless_enc` 仅 xray；`tls_pin` 需要 `pin_sha256` = 出口叶子证书 DER 的 SHA-256，64 位十六进制；`tls`/`wss` 类型再写 `none` 或 `vless_enc` 自相矛盾会被拒）；`host`（Host 头）、`path`、`sni`（须为域名）、`alpn`（≤8 项）；`cert`：出口/portal 侧是要出示的证书 `{mode: self|file|panel, cert_file, key_file}`（`file` 模式两个文件都要）；入口/bridge 侧只能是信任锚 `{mode: "file", cert_file}`（用来校验对端，不能带 `key_file`，`self` / `panel` 被拒；哪个引擎真正采用它由驱动决定：gost、frp 采用，xray 会以 `tunnel.cert is only valid on the accepting side` 拒绝，realm 以 `a certificate belongs to the tunnel exit` 拒绝）。路径须为绝对路径（只含字母数字和 `. _ / -`，不含 `..`）。
+`tunnel` 字段：`type` ∈ tcp / tls / ws / wss / grpc / xhttp / kcp / quic（引擎支持子集见 §2）；`security` ∈ `none` / `tls` / `tls_pin` / `tls_self`（`vless_enc` **已随 xray 转发引擎移除**，写了会被拒；`tls_pin` 需要 `pin_sha256` = 出口叶子证书 DER 的 SHA-256，64 位十六进制；`tls`/`wss` 类型再写 `none` 自相矛盾会被拒）；`host`（Host 头）、`path`、`sni`（须为域名）、`alpn`（≤8 项）；`cert`：出口/portal 侧是要出示的证书 `{mode: self|file|panel, cert_file, key_file}`（`file` 模式两个文件都要）；入口/bridge 侧只能是信任锚 `{mode: "file", cert_file}`（用来校验对端，不能带 `key_file`，`self` / `panel` 被拒；哪个引擎真正采用它由驱动决定：gost、frp 采用，realm 以 `a certificate belongs to the tunnel exit` 拒绝）。路径须为绝对路径（只含字母数字和 `. _ / -`，不含 `..`）。
 
 **`security: tls_self`（两端自己派生证书）**：面板无法复刻 x509 生成，所以 `tls_self` 让**两端各自**用共享 `secret`（和 `sni`）派生出**同一张**确定性自签证书（`agent/tlsself`，HKDF-SHA256 + Ed25519；`sni` 为空时证书名是 `w1n-fwd.invalid`）：
 
@@ -424,7 +426,6 @@ Agent:
 | [proxy-send](../agent/examples/testdata/proxy-send.json) | xray | 向目标发送 PROXY v2 | listen | 目标服务必须开启接收 PROXY，否则会把头当作数据；仅 TCP |
 | [proxy-accept](../agent/examples/testdata/proxy-accept.json) | xray | 接收 PROXY（前置 nginx / haproxy 送入） | **默认** | 只监听 `127.0.0.1`。PROXY 头可伪造，改成公网监听会被拒（需 `AllowAcceptProxyOnPublic`，不建议） |
 | [proxy-passthrough](../agent/examples/testdata/proxy-passthrough.json) | xray | PROXY 透传：收头再发头，保留真实来源 | **默认** | 同上；上游必须真的发 PROXY 头，否则连接被断 |
-| [tunnel-vless-enc-entry](../agent/examples/testdata/tunnel-vless-enc-entry.json) / [exit](../agent/examples/testdata/tunnel-vless-enc-exit.json) | xray | 隧道：raw + VLESS 加密（无需证书，最简单） | listen | 出口只放行声明的目标；入口 `targets` 必须与出口一致；两端 `secret` 相同 |
 | [tunnel-tls-pin-entry](../agent/examples/testdata/tunnel-tls-pin-entry.json) / [exit](../agent/examples/testdata/tunnel-tls-pin-exit.json) | xray | 隧道：wss + 自签证书 + 指纹固定 | listen | **`pin_sha256` 由 `secret` 和 `sni` 决定**：样例里的指纹对应占位 secret + `relay.example.com`，换 secret 或 sni 后必须重算（见下） |
 | [reverse-frp-portal](../agent/examples/testdata/reverse-frp-portal.json) / [bridge](../agent/examples/testdata/reverse-frp-bridge.json) | frp | 反向代理：bridge 在内网主动连出，portal 在公网开口 | portal：listen；bridge：private | bridge 的 `listen.ports` 要与 portal 的公网端口一致；bridge 默认不校验 portal 证书（可用 `tunnel.cert.cert_file` 指定信任锚）；样例带 `failover` + TCP 主动健康检查，目标挂掉时 frpc 撤下该公网端口；`secret` 就是 frp token |
 | [reverse-gost-portal](../agent/examples/testdata/reverse-gost-portal.json) / [bridge](../agent/examples/testdata/reverse-gost-bridge.json) | gost | 反向代理：wss 控制链路 | portal：listen；bridge：private | portal 需公共 CA 证书文件（`cert.mode: file`）；bridge 严格校验域名，`sni` 必须对得上 |
@@ -586,7 +587,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `tunnel.cert.key_file: not used by kind "reverse_bridge" …` / `tunnel.cert.mode: kind "tunnel_entry" only supports mode "file" …` | 入口 / bridge 侧的 `cert` 只能是信任锚：`mode: file` + `cert_file`，不能带 `key_file`，不能用 `self` / `panel` | 去掉 `key_file`，`mode` 改 `file` |
 | `driver validation: realm: acl: realm has no access control …` | 引擎的专属限制（ACL / limits / 证书 / UDP 隧道…），冒号后是驱动给出的原因 | 按原因换引擎或去掉该字段 |
 | `driver validation: xray: … limits (max_conns, rate_up_bps, rate_down_bps) are not supported by the xray driver` | xray 不支持限速/限连接 | 换 gost |
-| `tunnel.security: vless_enc is only supported by the xray engine` | VLESS 加密只有 xray | 引擎改 xray，或换 `tls` + 证书 |
+| `tunnel.security: vless_enc 已随 xray 转发引擎移除，请改用 tls / tls_pin / tls_self` | vless_enc 是内嵌 xray 引擎的隧道安全模式，随转发引擎一起移除（v11 §2.5） | 改用 `tls` + 证书、`tls_pin` 或 `tls_self` |
 | `a self-signed certificate needs security tls_pin …` | xray 自签证书客户端只能用指纹验证 | `security` 改 `tls_pin` 并填 `pin_sha256` |
 | `certificate files are not allowed (no certificate root configured)` | xray 的 `cert.mode: file` 在当前装配里不可用 | xray 用 `cert.mode: self` + `tls_pin`；要用真实证书的隧道请用 gost / realm |
 | `a self-signed certificate cannot be verified by a realm entry …` | realm 入口只信公共 CA | 出口用 `cert.mode: file` 的公共 CA 证书 |
@@ -666,4 +667,104 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 - `Agent.Enabled` 从 true 变 false：**停 agent**（终端、实例、面板链接全部结束），xray 照常运行。
 - 从 false 变 true：**启动 agent**（`Boot` + 面板链接），xray 照常运行。
 - agent 只在进程生命周期内 Boot 一次；之后的重载要么不动它，要么（agent.yml / Agent 配置变化时）整体重启它。
+
+## 13 程序结构（两个程序）
+
+从 v11（WP-X1）起，原来的单一程序拆成**两个可执行文件**，可以同时运行、互不阻塞：
+
+| 程序 | 安装方式 | 链接 Xray-core |
+|---|---|---|
+| `W1nCray`（agent） | `install.sh` 一键安装 | **否** |
+| `W1nCray-xray`（Xray 内核） | 由 agent 按已签名清单下载安装（清单内核名 `xray`），**默认不安装** | 是 |
+
+### 13.1 `W1nCray`（agent）
+
+职责：面板连接（HTTP + WebSocket）、交互终端、文件管理、外部内核（gost / frp / realm）的下载与监管、转发实例、自升级、遥测。它**不链接 Xray-core**，也不建立 Xray 实例；机器模式所需的面板地址、机器 ID、令牌与 `NodeController(s)` 只由它读取后交给内核进程使用（`W1nCray-xray` 自己再读一次同样的 agent 配置）。
+
+命令：
+
+| 命令 | 说明 |
+|---|---|
+| `W1nCray run`（默认） | 常驻：agent 运行时 + 面板链接 + 终端/文件/自升级 |
+| `W1nCray version` | 打印 agent 版本（不含 Xray-core 版本） |
+| `W1nCray check [-c config.yml] [--online]` | **只检查 agent 配置**（agent.yml 或 `config.yml` 的 `Agent:` 块、清单路径、令牌、清单同步）；不检查 `Nodes` 与 Xray 文件——那是 `W1nCray-xray check` 的职责 |
+| `W1nCray link` / `link --split` / `migrate` | 与 v10 相同；写入前的离线检查改为调用外部内核（见下） |
+| `W1nCray agent-apply -f desired.json` | 只支持外部引擎（gost / frp / realm）；`engine: xray` 被拒绝 |
+
+`link` / `link --split` 的**写入前校验**需要 Xray 侧的检查：加 `--xray-bin <路径>`，或在 `W1nCray` 同目录 / `PATH` 找到 `W1nCray-xray` 时，会执行 `<W1nCray-xray> check -c <配置>` 并把输出里以 `✗` 开头的行当作失败项参与基线比较；找不到内核时**跳过该检查并打印说明**（agent 侧仍会校验机器模式的证书模式等问题）。
+
+### 13.2 `W1nCray-xray`（Xray 内核）
+
+职责：Xray-core 实例；`app/dispatcher`（包装 Xray 内部 DefaultDispatcher）与 `common/limiter` 实现 Xboard 用户的**限速、设备数限制、在线 IP 统计、断开连接**；每个节点的 Xboard 控制器（静态 `Nodes` 与机器模式面板下发）；Xray 配置文件监听（`config.yml`、`route.json`、`dns.json`、`custom_inbound.json`、`custom_outbound.json`、节点 `RuleListPath`，沿用 v10 的内容指纹去重）；暂存文件校验；离线检查；本机状态接口。
+
+命令：
+
+| 命令 | 说明 |
+|---|---|
+| `W1nCray-xray run -c <config.yml>`（默认） | 常驻：Xray 实例 + 节点控制器 + 配置监听 + 状态接口 |
+| `W1nCray-xray version` | 打印 `W1nCray-xray v0.6.0 (Xray-core 26.3.27)`，供清单 `version_cmd` 使用 |
+| `W1nCray-xray check -c <config.yml> [--online]` | 原离线检查的 Xray 部分（节点、dns/route/自定义出入站、实例构建、机器节点列表） |
+| `W1nCray-xray check-staged -c <config.yml> --dir <暂存目录> --files a,b` | 校验暂存文件集，输出 `{"ok":bool,"errors":[{"file":..,"message":..}]}`；退出码 0/1（语义同原 `CoreValidator.ValidateStaged`） |
+| `W1nCray-xray x25519` | 生成 REALITY 密钥对 |
+
+### 13.3 单实例锁
+
+两个程序各自加锁，**互不冲突**，可以同时运行：
+
+| 程序 | 锁文件 |
+|---|---|
+| `W1nCray` | `<config>.lock` |
+| `W1nCray-xray` | `<config>.xray.lock` |
+
+锁是 `flock(2)`（无 flock 的平台为无操作），进程以任何方式退出都会释放；锁文件里写着持有者的 pid，抢占失败时的报错会带上它。
+
+### 13.4 状态接口
+
+`W1nCray-xray run` 在本机提供只读状态接口：
+
+- Unix 系统：`<config 目录>/xray.sock`（Unix 套接字，权限 0600）。
+- Windows：`127.0.0.1` 上的随机端口，端口写入 `<config 目录>/xray.addr`。
+
+`GET /status` 返回：
+
+```json
+{
+  "version": "0.6.0",
+  "xray_core": "26.3.27",
+  "started_at": 1760000000,
+  "running": true,
+  "nodes": [{"tag": "node173@machine3", "id": 173, "type": "vless", "users": 12, "online": 3, "error": ""}],
+  "config_fingerprint": "<sha256>",
+  "last_reload_at": 1760000123,
+  "last_error": ""
+}
+```
+
+`config_fingerprint` 就是 v10 的被监听文件内容指纹（重载成功后更新）；`running` 表示 Xray 实例是否在跑；`last_error` 是最近一次重载/启动错误。
+
+### 13.5 agent ↔ 内核的接入点（X2）
+
+agent 通过 `agent/xrayapi` 的接口访问内核，**不导入任何 Xray-core 包**：
+
+```go
+type Service interface {
+	Status(ctx context.Context) (Status, error)
+	CheckStaged(ctx context.Context, dir string, files []string) (StagedResult, error)
+	WaitReloaded(ctx context.Context, fingerprint string) error
+}
+```
+
+`agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它；X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。安装/卸载/systemd 管理、`files_apply` 调用 `check-staged`、遥测汇入 `GET /status`、迁移都由 X2 接入。
+
+### 13.6 重载语义（拆分后）
+
+| 变化的文件 | 谁反应 | 结果 |
+|---|---|---|
+| `agent.yml`、`config.yml` 的 `Agent:` 块 | `W1nCray` | 生效的 agent 配置确实变化 → 只重启 agent（外部内核实例、面板链接重建）；内容不变（touch）→ 什么都不做 |
+| `desired.json` | `W1nCray` | 走期望状态应用（只增删实例） |
+| `config.yml` 的 Xray 部分、`route.json`、`dns.json`、`custom_inbound.json`、`custom_outbound.json`、节点 `RuleListPath`、机器节点列表 | `W1nCray-xray` | 只重建 Xray 实例与节点控制器；agent 完全不受影响（两个进程） |
+| `self_update` | `W1nCray` | 重启 agent 进程；`W1nCray-xray` 由服务管理器独立运行，**不中断** |
+
+拆分后 `config.yml` 同时属于两个程序：`W1nCray` 只读它的 `Agent:` 块，`W1nCray-xray` 读 Xray 部分并按上面的表监听重载。
+
 

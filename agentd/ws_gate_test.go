@@ -1,4 +1,4 @@
-package panel
+package agentd
 
 import (
 	"fmt"
@@ -75,10 +75,14 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 
 // TestLegacyNodeModeNeverOpensTheAgentWebSocket is the compatibility guard of
 // the task: a machine in the legacy node mode (static Nodes, no agent panel
-// link) must behave exactly as before, i.e. never open /w1ncray-ws.
+// link) must not open /w1ncray-ws.
+//
+// The legacy node itself now runs in the separate W1nCray-xray program, so the
+// old "wait for the node's first config fetch" precondition is gone: agentd
+// starts with no agent at all, which is exactly the state that must keep the
+// channel closed.
 func TestLegacyNodeModeNeverOpensTheAgentWebSocket(t *testing.T) {
-	nodePort := freePort(t)
-	rec := newPathRecorder(t, nodePort)
+	rec := newPathRecorder(t, freePort(t))
 
 	path := filepath.Join(t.TempDir(), "config.yml")
 	body := fmt.Sprintf(`
@@ -99,15 +103,20 @@ Nodes:
 		t.Fatalf("the fixture must not configure an agent: %+v", cfg.Agent)
 	}
 
-	p := New(path, cfg)
+	p := New(path, cfg, Options{})
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer p.Close()
 
-	// The node is running and talking to the panel; only then is "no socket"
-	// a meaningful statement.
-	waitUntil(t, "the node's first config fetch", func() bool { return rec.anyPathSuffix("/config") })
+	// The daemon runs with no agent; only then is "no socket" a meaningful
+	// statement.
+	p.mu.Lock()
+	running, rt := p.running, p.agent
+	p.mu.Unlock()
+	if !running || rt != nil {
+		t.Fatalf("running=%v agent=%v, want a running daemon with no agent", running, rt != nil)
+	}
 	time.Sleep(300 * time.Millisecond)
 	if n := rec.count(ws.WSPath); n != 0 {
 		t.Fatalf("the legacy node mode opened %d agent WebSocket(s)", n)
@@ -131,7 +140,7 @@ func TestPanelLinkOpensTheAgentWebSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := New(path, cfg)
+	p := New(path, cfg, Options{})
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
