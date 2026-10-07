@@ -42,6 +42,10 @@ type KernelCfg struct {
 	Capabilities map[string]any `yaml:"capabilities"`
 	Run          RunCfg         `yaml:"run"`
 	Revoked      []RevokedCfg   `yaml:"revoked"`
+	// Mirrors overrides the top-level mirrors for this kernel only (e.g. the
+	// agent's own entry is served from the W1nCray release while the other
+	// kernels keep their upstream URLs).
+	Mirrors []string `yaml:"mirrors"`
 
 	// Checksums names an upstream checksum file (sha256sum format) that is
 	// cross-checked with GitHub's asset digest. Dgst enables the per-asset

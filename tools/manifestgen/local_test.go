@@ -253,3 +253,15 @@ kernels:
 		t.Fatalf("err = %v, want a duplicate-key refusal", err)
 	}
 }
+
+func TestKernelMirrorsOverrideTheTopLevelOnes(t *testing.T) {
+	cfg := &Config{Mirrors: []string{"https://top/{name}/{asset}"}}
+	own := &KernelCfg{Name: "agent", Mirrors: []string{"https://own/v{version}/{asset}"}}
+	other := &KernelCfg{Name: "gost"}
+	if got := mirrorsFor(cfg, own); len(got) != 1 || got[0] != "https://own/v{version}/{asset}" {
+		t.Errorf("own mirrors = %v", got)
+	}
+	if got := mirrorsFor(cfg, other); len(got) != 1 || got[0] != "https://top/{name}/{asset}" {
+		t.Errorf("fallback mirrors = %v", got)
+	}
+}

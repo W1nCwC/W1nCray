@@ -257,7 +257,7 @@ func buildTarget(ctx context.Context, o buildOptions, kc *KernelCfg, rel *ghRele
 	for _, e := range ex {
 		t.InstalledSize += e.Size
 	}
-	for _, mtpl := range o.Cfg.Mirrors {
+	for _, mtpl := range mirrorsFor(o.Cfg, kc) {
 		t.URLs = append(t.URLs, strings.NewReplacer("{name}", kc.Name, "{version}", kc.Version, "{asset}", a.Name).Replace(mtpl))
 	}
 	if !o.Cfg.NoUpstream {
@@ -339,7 +339,7 @@ func buildLocalTarget(o buildOptions, kc *KernelCfg, la LocalAssetCfg) (*manifes
 		Variant: la.Variant, Archive: format, ArchiveSHA256: sum, ArchiveSize: n, Extract: ex,
 		InstalledSize: ex[0].Size,
 	}
-	for _, mtpl := range o.Cfg.Mirrors {
+	for _, mtpl := range mirrorsFor(o.Cfg, kc) {
 		t.URLs = append(t.URLs, strings.NewReplacer("{name}", kc.Name, "{version}", kc.Version, "{asset}", asset).Replace(mtpl))
 	}
 	if len(t.URLs) == 0 {
@@ -470,4 +470,13 @@ func hashMembers(archivePath, format string, ex []manifest.Extract) error {
 		}
 	}
 	return nil
+}
+
+// mirrorsFor returns the kernel's own mirrors when it lists any, otherwise the
+// top-level ones.
+func mirrorsFor(cfg *Config, kc *KernelCfg) []string {
+	if len(kc.Mirrors) > 0 {
+		return kc.Mirrors
+	}
+	return cfg.Mirrors
 }
