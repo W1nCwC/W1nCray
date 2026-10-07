@@ -52,7 +52,10 @@ agent 不再链接 Xray-core，转发规则/实例只用 gost、realm（frp 用�
 
 ### 2.6 迁移（已有机器）
 
-- **landing-01（agent 模式，v0.5.x 单一程序）**：面板先发布 xray 内核到清单；agent 升级到 v0.6.0 的流程改为：旧进程仍在服务时，新 agent 的升级步骤先下载并安装 xray 内核（不启动），提交升级时依次「停止旧进程 → 启动 Xray 服务 → 启动新 agent」，Xray 中断时间 = 一次重启（秒级），不含下载时间。自动回滚仍有效（回到 v0.5.x 单一程序，Xray 服务被停用）。
+- **landing-01（agent 模式，v0.5.x 单一程序）**：不需要改旧版本代码——
+  1. 面板先对 0.5.x agent 下发 `kernel_install {name:xray}`：0.5.x 的 kernelx 是通用的，只下载、校验、解压到内核目录，不运行；
+  2. 再下发 self_update 到 0.6.0：新 agent 启动后**先完成自升级确认**（面板应答），确认之后才写入并启动 `W1nCray-xray.service`。自动回滚只可能发生在确认之前，此时 Xray 服务尚未启动，回滚到 0.5.x（进程内 Xray）不会与 Xray 服务争端口；
+  3. Xray 中断 = 旧进程退出到新服务启动（秒级），不含下载时间。面板「升级到 0.6」按钮自动按 1→2 编排。
 - **用户其它 v0.3 单机服务器（无 agent）**：`install.sh update` 检测到已有 Nodes 配置时，安装 agent + Xray 内核服务两者（Xray 内核由 install.sh 直接按发布地址下载并校验 SHA256SUMS），行为与现在一致；之后可按需绑定面板。
 - 新 agent 首次启动若发现 config.yml 有节点但 Xray 内核未安装（例如手工替换二进制），自动安装 Xray 内核并启动，日志明确说明。
 
