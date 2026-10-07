@@ -179,3 +179,29 @@ agent（Go，随 v0.5.3）：
 2. 前端：WP-E 骨架 → WP-B 终端+文件 → WP-C → WP-D（避免同文件冲突，顺序合并）。
 3. 测试机端到端（双 agent），真实浏览器桌面 + 375px 双尺寸验收。
 4. 发布 W1nCray v0.5.3 预发布 → 生产（征得同意后）。
+
+## 6. 执行记录（2026-10-07，测试机 141.11.193.156 双 agent：machine 3 入口 / machine 4 出口）
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| WP-A 解耦 | ✅ | 改 config.yml 触发 xray 重建（日志 reloading → xray reattached → Xray started），同期 gost 隧道长连接 60/60、179/179 往返成功，WS 未重连 |
+| WP-B 终端免密 + 文件管理 | ✅ | 浏览器直接连终端；文件管理器浏览 `/`；「在终端中打开」→ `cd '/etc'`；3 MiB 分片上传后服务器 sha256 与浏览器一致 |
+| WP-C Xray 配置查看 | ✅ | 列表显示机器真实大小/时间；查看 route.json；编辑 config.yml「保存并生效」→ revision 9 落盘并重建 |
+| WP-D 一键转发 | ✅ | 直连、TLS、WSS、gRPC 隧道四种实测通（HTTP 301 / echo）；出口证书 CN=w1n-fwd，非 TLS/无 relay 认证的连接被关闭 |
+| WP-E 5 标签 | ✅ | 桌面 + 375px 逐页检查无溢出 |
+| WP-G tls_self | ✅ | gost tls/wss/grpc；grpc 需 authority=证书名（已修） |
+
+验收中发现并修复的问题（均有回归测试）：
+- 卡片模式在真实浏览器空白（NodeList）、桌面表格被掏空（单元格移入 details）、自动刷新收起详情。
+- 命名根 xray 只在 Roots 恰好含配置目录时存在；不受限模式忽略命名根；token 文件未排除。
+- files_apply 先于期望状态到达 → 用旧文件清单「already current」，编辑未落盘（加 revision 参数，agent 先拉取再应用）。
+- 文件监听在 agent 写入后二次重建 xray（内容指纹去重）。
+- WS hello 记录新运行实例却不清零 last_seq → 新一轮上报全部被当重复丢弃，实例状态不写入、规则一直「生效中」（v9 起的缺陷）。
+- hello.policy 不含端口范围 → 面板分配到 agent 拒绝的端口；拒绝原因未显示；只允许回环监听的机器未提前拦截。
+- 面板接受 agent 不认识的 mtls/mwss → 整份 revision 被拒、两台机器冻结（改为 gRPC，面板白名单与 agent 一致）。
+- frp 不能承载转发规则；PHP ConvertEmptyStringsToNull 把空 root 变 null；ForwardController 时间戳、测试助手方法名冲突。
+
+遗留 / 后续：
+- self_update 仍会重启整个进程（含 xray）；xray 拆为独立子进程未做（见 WP-A 否决理由）。
+- engine=xray 的转发实例在 xray 配置变更时会随重建短暂中断（gost/realm 不受影响；面板文案已注明）。
+- 生产部署需：面板文件 + 1 个迁移 + WS 网关重启（telemetry 修复在网关进程内）+ agent v0.5.3 发布与清单 seq 3，待用户同意。
