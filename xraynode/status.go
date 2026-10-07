@@ -9,17 +9,18 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 )
 
-// Names of the local status endpoint. On Unix-like systems it is a Unix socket
-// called StatusSocketName next to config.yml; on Windows (and anywhere a Unix
-// socket is unavailable) it is a loopback TCP listener whose address is written
-// to StatusAddrName.
+// Names of the local status endpoint. They live in agent/xrayapi (the wire
+// package the agent also links); the aliases keep the names this package used
+// before the split.
 const (
-	StatusSocketName = "xray.sock"
-	StatusAddrName   = "xray.addr"
+	StatusSocketName = xrayapi.StatusSocketName
+	StatusAddrName   = xrayapi.StatusAddrName
 	// StatusPath is the HTTP path the status document is served on.
-	StatusPath = "/status"
+	StatusPath = xrayapi.StatusPath
 )
 
 // StatusServer serves GET /status on the kernel's local endpoint.

@@ -2,10 +2,7 @@ package xraynode
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,6 +16,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 	"github.com/W1nCwC/W1nCray/api/xboard"
 	"github.com/W1nCwC/W1nCray/common/cert"
+	"github.com/W1nCwC/W1nCray/config"
 	"github.com/W1nCwC/W1nCray/core"
 	"github.com/W1nCwC/W1nCray/node"
 )
@@ -693,19 +691,9 @@ func (s *Service) WatchedFiles() []string { return s.watchedFiles() }
 
 func (s *Service) watchedFiles() []string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	files := []string{s.path}
-	for _, f := range []string{s.cfg.DnsConfigPath, s.cfg.RouteConfigPath, s.cfg.InboundConfigPath, s.cfg.OutboundConfigPath} {
-		if f != "" {
-			files = append(files, f)
-		}
-	}
-	for _, n := range s.cfg.NodesConfig {
-		if n.ApiConfig != nil && n.ApiConfig.RuleListPath != "" {
-			files = append(files, n.ApiConfig.RuleListPath)
-		}
-	}
-	return files
+	cfg, path := s.cfg, s.path
+	s.mu.Unlock()
+	return cfg.WatchedFiles(path)
 }
 
 // Fingerprint returns the content fingerprint of the watched files at the last
@@ -758,22 +746,9 @@ func (s *Service) setLastError(err error) {
 func (s *Service) clearLastError() { s.lastError.Store(nil) }
 
 // filesFingerprint hashes the names and contents of files (a missing or
-// unreadable file counts as its own state).
-func filesFingerprint(files []string) string {
-	h := sha256.New()
-	for _, f := range files {
-		h.Write([]byte(f))
-		h.Write([]byte{0})
-		if b, err := os.ReadFile(f); err == nil {
-			sum := sha256.Sum256(b)
-			h.Write(sum[:])
-		} else {
-			h.Write([]byte("absent"))
-		}
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
+// unreadable file counts as its own state). It is config.Fingerprint, which the
+// agent also computes after a managed-file apply.
+func filesFingerprint(files []string) string { return config.Fingerprint(files) }
 
 func certDir(path string, cfg *Config) string {
 	if cfg.CertDir != "" {
