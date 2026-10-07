@@ -144,3 +144,21 @@ func joinErrors(errs []error) string {
 	}
 	return strings.Join(parts, "; ")
 }
+
+// TestCoreValidatorFollowsXrayRebuilds: the agent, and with it the validator,
+// outlives xray rebuilds (PLAN v10 WP-A), so a validation must use the options
+// of the instance running now, not of the one the agent was booted with.
+func TestCoreValidatorFollowsXrayRebuilds(t *testing.T) {
+	p, _, _ := newValidatorRig(t, "Log: {Level: warning}\nAgent:\n  Enabled: true\n")
+	p.mu.Lock()
+	v := p.NewCoreValidator()
+	before := v.base().DNSConfigPath
+	next := *p.cfg
+	next.DnsConfigPath = filepath.Join(t.TempDir(), "dns-after-rebuild.json")
+	p.cfg = &next
+	p.publishCoreOptionsLocked() // what startXrayLocked does after a rebuild
+	p.mu.Unlock()
+	if got := v.base().DNSConfigPath; got != next.DnsConfigPath || got == before {
+		t.Fatalf("validator base DnsConfigPath = %q, want the rebuilt instance's %q", got, next.DnsConfigPath)
+	}
+}

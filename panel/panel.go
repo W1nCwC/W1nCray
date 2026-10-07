@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -60,6 +61,10 @@ type Panel struct {
 	// ReattachXray swaps in the new core and recreates the engine=xray
 	// instances on it, so an xray change never restarts the agent.
 	host *corehost.Swappable
+
+	// coreOpts is the core options of the running xray instance, published by
+	// startXrayLocked for the files validator (read without p.mu).
+	coreOpts atomic.Pointer[core.Options]
 
 	// remoteStop ends the agent's panel link (nil when it is not running).
 	remoteStop func()
@@ -322,6 +327,7 @@ func (p *Panel) startXrayLocked(cfg *Config) (err error) {
 		p.startMachineWatch(machineCtx, &machineWG, machine, machineVersion)
 	}
 	p.core, p.nodes = cr, nodes
+	p.publishCoreOptionsLocked()
 	p.machineCancel, p.machineWG = machineCancel, &machineWG
 	return nil
 }
@@ -814,10 +820,19 @@ func (p *Panel) rebuildXray(cfg *Config, restartAgent bool) {
 		} else {
 			log.Errorf("xray restart failed: %v; retrying in 10s", err)
 		}
+		// Do not hold p.mu while waiting: the previous implementation
+		// released it between attempts too, and Close (and everything else
+		// that takes p.mu) must not stall for as long as xray keeps failing.
+		p.mu.Unlock()
+		var stopped bool
 		select {
 		case <-p.stop:
-			return
+			stopped = true
 		case <-time.After(10 * time.Second):
+		}
+		p.mu.Lock()
+		if stopped {
+			return
 		}
 	}
 	p.running = true
