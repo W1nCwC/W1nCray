@@ -42,10 +42,22 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "config file (default: ./config.yml, /etc/W1nCray/config.yml)")
+	rootCmd.AddCommand(runCmd())
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(checkCmd())
 	rootCmd.AddCommand(checkStagedCmd())
 	rootCmd.AddCommand(x25519Cmd())
+}
+
+// runCmd is explicit as well as the default action, so the systemd unit and
+// operators can always name it.
+func runCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "run",
+		Short:        "Run the Xray kernel (same as running W1nCray-xray with no subcommand)",
+		RunE:         func(cmd *cobra.Command, args []string) error { return runKernel() },
+		SilenceUsage: true,
+	}
 }
 
 func main() {

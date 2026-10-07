@@ -27,6 +27,14 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "config file (default: ./config.yml, /etc/W1nCray/config.yml)")
+	// `run` is explicit as well as the default action, so service units and
+	// operators can always name it.
+	rootCmd.AddCommand(&cobra.Command{
+		Use:          "run",
+		Short:        "Run the agent (same as running W1nCray with no subcommand)",
+		RunE:         func(cmd *cobra.Command, args []string) error { return run() },
+		SilenceUsage: true,
+	})
 }
 
 // Execute runs the root command.
