@@ -103,6 +103,40 @@ agent 不再链接 Xray-core，转发规则/实例只用 gost、realm（frp 用�
 
 每格记录：命令、原始输出摘要、结论；失败项先修再进下一层。L1 Debian 先行（不依赖 v11 代码）。
 
+## 4.2 系统兼容矩阵（用户要求：多系统实测；有把握的同类可不测）
+
+### 哪些差异真正影响我们（代码证据）
+- **C 库无关**：W1nCray、W1nCray-xray、gost、frp 均为 Go 静态编译（`release/build.sh` `CGO_ENABLED=0`），realm 用 musl 静态版（清单 variant `musl-full`）——glibc 版本、musl 与否都不影响运行。
+- **R1 init 及版本**：install.sh 三套后端（systemd / OpenRC supervise-daemon / procd，`install.sh:405-565`）；自升级 watchdog 用 `systemd-run --no-block`（`agent/selfupdate/restart.go:173-207`），`--no-block` 需 systemd ≥ 220，**CentOS 7 是 219** → 走 setsid 回退路径，必须实测；v11 新增 Xray 内核服务同样涉及三套后端。
+- **R2 SELinux**（CentOS Stream 9/10 默认 enforcing）：内核二进制放在 state 目录（/etc/W1nCray 下），被 init_t 执行可能被拒；agent 写 systemd 单元的标签。必须在开启 enforcing 的真机/虚拟机实测。
+- **R3 CA 证书与 TLS**：Go 使用系统根证书；CentOS 7、Debian 9 的证书包较旧 → 访问 GitHub / 面板 HTTPS；lite 版内置备用根证书（构建标签 fallbackroots）。
+- **R4 内核版本**：CentOS 7 为 3.10；Go 运行时、PTY、realm 的特性需在真内核上跑（chroot 用的是宿主内核，测不出来）。
+- **R5 下载与工具**：curl/wget（busybox/uclient-fetch）、sha256sum、gunzip、mktemp（`install.sh:241-377`）。
+- **R6 OpenWrt 系**：procd 版本、busybox 配置、包管理（opkg → 25.x 的 apk，install.sh 不装包，影响小）、防火墙 fw3(iptables)/fw4(nftables)——**转发端口在 WAN 侧默认被防火墙拦截**（新发现，见 4.3）、/tmp 为 tmpfs、sysupgrade 保留目录。
+
+### 选型（每个风险点取最旧 + 最新 + 有特殊改动的；其余标注「同类推断」）
+| 系统 | 方式 | 理由 |
+|---|---|---|
+| CentOS 7 (systemd 219, 内核 3.10) | KVM 虚拟机 | R1 最旧、R3、R4 |
+| CentOS Stream 9 / 10 (SELinux enforcing) | KVM 虚拟机 | R2 |
+| Debian 9 (systemd 232) | KVM 虚拟机 | R1、R3 旧 |
+| Debian 13 | KVM 虚拟机 | 最新 |
+| Ubuntu 18.04 (systemd 237) | KVM 虚拟机 | Ubuntu 最旧 |
+| Ubuntu 26.04 | KVM 虚拟机 | 最新 |
+| Debian 10/11/12、Ubuntu 20.04/22.04/24.04 | 同类推断 + chroot 冒烟 | systemd 241–255 之间无我们用到的行为差异；Debian 12 已在测试机实测 |
+| Alpine 3.21 / 3.24 (OpenRC) | KVM 虚拟机 | 最旧 + 最新；3.20 已 chroot 实测 |
+| Alpine 3.22 / 3.23 | chroot 冒烟 | 同类推断 |
+| OpenWrt 21.02 (fw3) / 23.05 (fw4) / 24.10 / 最新 | KVM 虚拟机 (x86-64 官方镜像) | R6 |
+| ImmortalWrt 24.10、iStoreOS、KWRT | KVM 虚拟机 (x86-64 官方镜像) | 魔改系：默认软件包、防火墙、密码、存储布局不同 |
+| Lean's LEDE | 无官方二进制，仅源码 | 若时间允许自行编译 x86-64 实测；否则按代码推断（procd + fw4/fw3，同 OpenWrt） |
+| MIPS / ARM 路由器 | qemu 模拟 OpenWrt malta(mipsel) / armvirt | 只验证功能，不测性能 |
+
+### 每个系统测什么
+L1 内核驱动测试（chroot，快）；L2：install.sh 全新安装 agent → 服务运行 → 连上测试面板 → 安装 gost/realm/frp → 直连与隧道流量 → 终端 → 文件 → agent 重启/自升级；L3（v11 完成后）：Xray 内核安装/运行/卸载、agent 重启不断流。
+
+## 4.3 已发现的新问题
+- OpenWrt 系默认防火墙拒绝 WAN 入站：转发规则在路由器上监听的端口，用户从外网连不上。方案：agent 在 OpenWrt 上为实例监听端口维护一个专用的 fw4/fw3 规则组（`W1nCray_<实例>`），实例删除即移除；面板转发规则显示「已在路由器防火墙放行」。实测后定稿。
+
 ## 5. 风险与回滚
 
 - 拆分涉及 panel 包大规模重构：逐 WP 合并，每步全量测试；保留 v0.5.3 作为可回滚版本。
