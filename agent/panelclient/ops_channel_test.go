@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
 )
@@ -105,7 +106,9 @@ func TestLongCommandStaysInFlightUntilTheFinalResult(t *testing.T) {
 		t.Fatalf("the long command ran %d times, want 1", n)
 	}
 
-	// The final result goes over the HTTP link and remembers the id.
+	// The final result goes over the HTTP link and remembers the id. The
+	// channel reports the accepted answer first (D-M3 ordering).
+	r.AcceptedSent("L1")
 	if err := r.DeliverResult(ctx, "L1", ResultDone, mustJSON(map[string]string{"version": "3.3.0"})); err != nil {
 		t.Fatalf("DeliverResult: %v", err)
 	}
@@ -120,6 +123,81 @@ func TestLongCommandStaysInFlightUntilTheFinalResult(t *testing.T) {
 	}
 	if n := len(fr.called()); n != 1 {
 		t.Fatalf("the command ran %d times after its final result", n)
+	}
+}
+
+// TestFinalResultWaitsForTheAcceptedAnswer covers D-M3's ordering rule: the
+// panel stores the "accepted" payload on top of whatever result a command row
+// already has, so a final result delivered first is erased (status failed,
+// result null). A long command's final result must therefore wait until the
+// accepted answer is on the wire.
+func TestFinalResultWaitsForTheAcceptedAnswer(t *testing.T) {
+	p := newPanel(t)
+	c := newClient(t, p.srv)
+	fr := &fakeCommandRunner{answer: func(Command) (string, json.RawMessage) {
+		return ResultAccepted, nil
+	}}
+	r, err := NewRunner(c, &fakeApp{}, RunnerOptions{InstanceID: runnerID, Commands: fr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if status, _, err := r.ExecuteCommand(ctx, "O1", CmdKernelInstall, nil, 0); err != nil || status != ResultAccepted {
+		t.Fatalf("ExecuteCommand = (%q, %v), want accepted", status, err)
+	}
+	// The final result must not reach the panel before the accepted answer.
+	done := make(chan error, 1)
+	go func() {
+		done <- r.DeliverResult(ctx, "O1", ResultFailed, mustJSON(map[string]string{"error": "boom", "code": "download_failed"}))
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("DeliverResult returned before the accepted answer was sent: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if n := p.count("command-result"); n != 0 {
+		t.Fatalf("the final result was posted before the accepted answer (%d post(s))", n)
+	}
+
+	// The channel sends the accepted answer and reports it.
+	r.AcceptedSent("O1")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DeliverResult: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeliverResult never returned after the accepted answer was sent")
+	}
+	p.waitCount("command-result", 1)
+	res := p.resultReq(0)
+	if res.Status != ResultFailed {
+		t.Fatalf("final status = %q, want failed", res.Status)
+	}
+	if !strings.Contains(string(res.Result), "boom") {
+		t.Errorf("final result = %s, want the error body", res.Result)
+	}
+}
+
+// TestAcceptedSentIsIdempotentAndSafeForUnknownIds keeps the release hook from
+// panicking or wedging when a channel reports an id twice (or one the runner
+// never saw).
+func TestAcceptedSentIsIdempotentAndSafeForUnknownIds(t *testing.T) {
+	p := newPanel(t)
+	c := newClient(t, p.srv)
+	r, err := NewRunner(c, &fakeApp{}, RunnerOptions{InstanceID: runnerID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.AcceptedSent("never-seen")
+	r.AcceptedSent("never-seen")
+	ctx := context.Background()
+	// Waiting on an unknown id returns at once (nothing is deferred).
+	start := time.Now()
+	r.WaitAccepted(ctx, "never-seen")
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("WaitAccepted on an unknown id blocked for %s", elapsed)
 	}
 }
 
@@ -150,6 +228,7 @@ func TestReleaseCommandLetsARedeliveryRunAgain(t *testing.T) {
 	}
 
 	// A final delivery that fails releases the id as well.
+	r.AcceptedSent("L2")
 	if err := r.DeliverResult(ctx, "L2", ResultDone, nil); err != nil {
 		t.Fatalf("DeliverResult: %v", err)
 	}

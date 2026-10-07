@@ -116,6 +116,9 @@ func (d *Daemon) startAgentLocked(cfg *Config) {
 		ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 		Policy:           cfg.Agent.PolicySpec(),
 		AgentConfig:      cfg.Agent,
+		// The local kernel-source switch (Kernels.AllowHTTP, D-M1): off unless
+		// this machine's own configuration turned it on.
+		AllowHTTP: KernelAllowHTTP(cfg),
 		// The build version names the watchdog copy of the previous binary
 		// a committed self_update leaves behind, and the single-instance
 		// lock is how that watchdog tells a restarted broken binary from a

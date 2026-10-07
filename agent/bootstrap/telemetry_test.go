@@ -157,6 +157,28 @@ func TestPolicyComesFromTheLocalAgentConfig(t *testing.T) {
 	}
 }
 
+// TestPolicyReportsTheLocalKernelSwitch covers D-M1's reporting half:
+// hello.policy.kernels.allow_http is the machine's own Kernels.AllowHTTP value,
+// so the panel can display it (and must never try to turn it on remotely).
+func TestPolicyReportsTheLocalKernelSwitch(t *testing.T) {
+	rt, _ := bootCycle(t, t.TempDir(), false, nil)
+
+	if pol := rt.Streams(nil, nil).Policy(); pol.Kernels.AllowHTTP {
+		t.Errorf("a nil config must report allow_http false: %+v", pol.Kernels)
+	}
+	if pol := rt.Streams(nil, &agentcfg.Config{}).Policy(); pol.Kernels.AllowHTTP {
+		t.Errorf("a zero config must report allow_http false: %+v", pol.Kernels)
+	}
+	on := &agentcfg.Config{Kernels: &agentcfg.KernelsConfig{AllowHTTP: true}}
+	if pol := rt.Streams(nil, on).Policy(); !pol.Kernels.AllowHTTP {
+		t.Errorf("Kernels.AllowHTTP: true must be reported: %+v", pol.Kernels)
+	}
+	off := &agentcfg.Config{Kernels: &agentcfg.KernelsConfig{AllowHTTP: false}}
+	if pol := rt.Streams(nil, off).Policy(); pol.Kernels.AllowHTTP {
+		t.Errorf("Kernels.AllowHTTP: false must be reported: %+v", pol.Kernels)
+	}
+}
+
 // TestComponentsReportTheRunningInstances wires the runtime probe: the fake
 // engine's running instance must show up as a component next to the agent, and
 // the embedded xray engine must never claim a PID of its own (ruling 2).

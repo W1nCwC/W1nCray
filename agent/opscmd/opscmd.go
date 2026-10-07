@@ -111,6 +111,11 @@ type KernelOps interface {
 	// Ensure installs the pin if needed and makes it current (empty version =
 	// newest the manifest offers).
 	Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
+	// EnsureForce is Ensure for an operator-initiated install (kernel_install
+	// from the panel): it bypasses and clears the automatic retry back-off, so
+	// a version an administrator explicitly asks for is really attempted
+	// (D-M3). The reconcile loop keeps using Ensure and its back-off.
+	EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
 	// Remove deletes one installed version.
 	Remove(name, version string) error
 	// Rollback makes the previous version current again.
@@ -137,7 +142,10 @@ type XrayService interface {
 	Upgrade(ctx context.Context, version string) error
 	Rollback(ctx context.Context) error
 	Restart(ctx context.Context) error
-	Remove(ctx context.Context) error
+	// Remove stops and deletes the service and every installed version. It
+	// reports whether anything was actually there, so kernel_remove can answer
+	// an already-absent machine with success (D-M2).
+	Remove(ctx context.Context) (removed bool, err error)
 	Status(ctx context.Context) (xraysvc.Status, error)
 }
 

@@ -163,7 +163,7 @@ func TestSystemdServiceE2E(t *testing.T) {
 	if err := mgr.Restart(ctx); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
-	if err := mgr.Remove(ctx); err != nil {
+	if _, err := mgr.Remove(ctx); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 	if _, err := os.Stat(systemdUnitFile); !os.IsNotExist(err) {

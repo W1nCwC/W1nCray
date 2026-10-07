@@ -116,6 +116,11 @@ Modules:
   XrayNodes: true
 Firewall:
   AutoOpen: true # 仅 OpenWrt：为对外监听的实例自动放行 WAN 端口（缺省即开启）
+Kernels:
+  AllowHTTP: false # 允许清单资产走明文 http:// 镜像（缺省 false = 只允许 https；仅本机可配）
+Drivers:
+  Frp:
+    ReadyTimeoutSec: 0 # 0 = 按架构缺省（amd64/arm64 15s，其它架构 60s）
 ```
 
 | 段 | 字段 |
@@ -127,6 +132,8 @@ Firewall:
 | `Files` | `Roots`、`Unrestricted`（**三态**，见下）、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
 | `Firewall` | `AutoOpen`（**三态**，见「路由器防火墙自动放行」：OpenWrt 上缺省 true，其它系统恒为 false） |
+| `Kernels` | `AllowHTTP`（缺省 **false**：内核清单的资产只允许 `https://`；见「内网 http 镜像」） |
+| `Drivers` | `Frp.ReadyTimeoutSec`（frp 实例就绪等待上限；**0 = 按架构缺省**：amd64/arm64 15s，其它架构 60s；见「frp 就绪等待」） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
 
@@ -182,6 +189,46 @@ config rule 'w1ncray_<实例id>'
 - **失败不拆实例**：防火墙命令失败只记一条 warn，实例继续运行（本机转发仍然可用），对应实例的 `firewall_open` 为 `false`；不会因为防火墙失败回滚正在运行的实例。
 - **状态上报**：实例状态里新增 `firewall_open`（`/ack` 的 `report.instances[]` 与 `/report` 的 `instances[]`）。它只在 agent 确实放行了该实例的公网端口时为 `true`；机器不由 agent 管理防火墙时恒为 `false`，面板要结合 `hello.policy.firewall.auto_open` 解读。
 
+### 内网 http 镜像（`Kernels.AllowHTTP`，D-M1）
+
+内核（gost / frp / realm / xray）只从**已签名清单**安装：清单签名、`archive_sha256` 与每个成员文件的 `sha256` 都由 agent 在本机校验，**下载走什么协议不影响完整性**。所以清单里写了明文 `http://` 镜像（自建/内网、没有 TLS）时，agent 默认仍然拒绝，报：
+
+```
+…: download failed: all 1 sources failed: http://mirror.example/dist/W1nCray-xray-linux-amd64.gz: scheme not allowed
+```
+
+本机想用 http 镜像时，在 `agent.yml`（或 `config.yml` 的 `Agent:` 块）打开这个开关：
+
+```yaml
+Kernels:
+  AllowHTTP: true # 缺省 false = 只允许 https
+```
+
+- **只能本地配置**：面板下发的是期望状态与受管文件，不是 agent 配置，无法打开或关闭它；本机状态通过 `hello.policy.kernels.allow_http` 上报，面板据此显示「该机器允许 http 镜像」。
+- **只影响 scheme**：签名、有效期、吊销、序号防回滚、`min_agent`、平台 target、archive/成员哈希校验一律照旧（fail-closed 不变）。https 与 http 源可以混在同一个清单里，按清单顺序尝试。
+- `W1nCray check` 会打印该开关；`W1nCray xray install` 与常驻服务读同一份配置、同一个值。
+
+### frp 就绪等待（`Drivers.Frp.ReadyTimeoutSec`，D4）
+
+frp 驱动每启动一个实例（portal 的 `frps`、bridge 的 `frpc`）都要等它就绪：管理 API 能应答，portal 还要控制链路建立。这个等待上限是**按架构**的：
+
+| 架构 | 缺省上限 |
+|---|---|
+| `amd64`、`arm64` | **15 s** |
+| 其它（`mips`/`mipsle`、`arm`、`386`、`riscv64` …） | **60 s** |
+
+慢设备（MIPS / ARM 路由器，或 QEMU 模拟）上 15 s 明显偏紧：v11 D4 的模拟机测试里 frps 在 15 s 内没起来就被判失败、重启，进而拖垮一批用例。按架构放宽后这些设备无需改配置即可工作。
+
+比架构缺省更慢的机器可以本机覆盖（单位秒，**只能本地配置**）：
+
+```yaml
+Drivers:
+  Frp:
+    ReadyTimeoutSec: 90 # 0（或不写）= 按架构缺省；负值会被配置校验拒绝
+```
+
+超时的报错形如 `frp: frps-rp did not become ready in time (see the log of instance rp)`；看到它说明该实例在 `ReadyTimeoutSec` 内没起来，先看实例日志（端口占用、证书、token），确实只是启动慢再调大这个值。
+
 ### `config.yml` 的 `Agent:` 块（旧布局）
 
 写在 `config.yml` 里（与 `Nodes` 同级，YAML）。未启用（`Enabled: false` 或整块缺省）时 Agent 完全不工作。同目录一旦出现 `agent.yml`，本块即被整体忽略（见上）。
@@ -207,6 +254,8 @@ Agent:
 | `ManifestKeysPath` | 空 | 额外信任的 ed25519 公钥文件（hex，每行一个），叠加在二进制内嵌公钥之上，供本地/自托管使用；生产信任根是编译时内嵌的公钥。没有任何公钥时任何清单都会被拒（fail-closed，预期行为） |
 | `StateDir` | 配置文件所在目录下的 `state` | Agent 状态目录：已应用/上次可用的期望状态、冻结记录、各驱动的私有目录、PID 目录。文件权限 0600（含 `secret`） |
 | `KernelsDir` | `StateDir/kernels` | 外部内核安装目录 |
+| `Kernels.AllowHTTP` | `false` | 允许内核清单的资产走明文 `http://` 镜像（本机开关，见「内网 http 镜像」；签名与 sha256 校验不受影响） |
+| `Drivers.Frp.ReadyTimeoutSec` | `0`（按架构） | frp 实例就绪等待上限（秒）；0 = amd64/arm64 15s、其它架构 60s（见「frp 就绪等待」） |
 | `Policy` | 见 §4 | 本地根信任策略 |
 
 校验：`PortRange` 必须恰好两个元素 `[lo, hi]`；`Policy.AllowEngines` 只能出现 `auto` / `xray` / `gost` / `frp` / `realm`（`xray` 只是保留的名字，写了也会在校验阶段被拒）。**建议留空**：留空表示不限制引擎，面板下发的实例可选任一引擎，实际可用性由已签名清单决定（gost / frp / realm 由 agent 按需下载安装，见 §3 与 §4）。
@@ -520,8 +569,8 @@ Agent:
 | type | args | 行为与结果 |
 |---|---|---|
 | `kernel_list` | `{}` | 回 `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}`。`kernels` 是**已安装**的版本（事实，读内核目录）；`catalog` 只列已签名清单里**本机可用**的版本。没有加载清单时 `catalog: []`，`kernels` 照常返回。 |
-| `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。 |
-| `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
+| `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。**管理员明确下发时绕过并清除自动重试退避**（D-M3）：回滚掉的版本可以立刻重装，退避只约束自动重试。 |
+| `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`；**幂等**：目标本来就没装（或已经删掉）时同样 `done`，结果里带 `already_absent: true`（D-M2）。`name=xray` 不需要 `version`：整服务卸载，服务本就不存在时也回 `already_absent`。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 一律拒绝（见下）；`xray` 走 Xray 内核服务（§13.5.1），服务未托管时回 `not_supported`。 |
 | `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。`mode` 是八进制权限串，`mtime` 是 Unix 秒。 |
@@ -536,6 +585,7 @@ Agent:
 
 细节与边界：
 
+- **长命令的结果顺序是保证的**（D-M3）：面板把 `accepted` 的 `result` **覆盖**在命令行已有的结果上，所以 agent 保证 `accepted` 先于最终 `done`/`failed` 到达（否则最终结果先到会被清成 `null`，失败就没有错误信息了）。若 `accepted` 没能投出（面板不可达等），最终结果立即发出，不会被这条顺序规则拖住。
 - **保留名 `agent`**：签名清单里名为 `agent` 的条目属于 `self_update`（契约 §7-11）。`kernel_install`/`kernel_remove`/`kernel_rollback` 与 `component_restart` 一律拒绝它（`failed` + `result.code="reserved_name"`）；`kernel_list` 仍会如实列出已安装的版本。
 - **`component_restart` 不能重启 agent**：agent 不由 supervisor 管理（重启它会断掉面板连接），回 `failed` + `result.code="reserved_name"`。`name=xray` 由 Xray 内核服务处理（§13.5.1）：服务已托管则重启它，未托管回 `not_supported`。名字对应的内核进程没在跑时回 `failed`（`component "x" is not running`）。
 - **`in_use` 的判定**：优先用 supervisor 的 pid 记录（`<StateDir>/pid/*.pid`）+ 存活与 `/proc/<pid>/exe` 身份复核，把正在执行的二进制映射回 `<KernelsDir>/kernels/<name>/<version>/`；平台无法核实身份（Windows 等）或没配 pid 目录时，退化为"当前指针 = 在用"，不假装精确。回滚后进程仍执行旧版本的情况也能如实反映。
@@ -615,6 +665,8 @@ Agent:
 | `a self-signed certificate cannot be verified by a realm entry …` | realm 入口只信公共 CA | 出口用 `cert.mode: file` 的公共 CA 证书 |
 | `realm tunnels carry TCP only …` | realm 隧道不承载 UDP | `network` 改 `["tcp"]` |
 | `no signed kernel manifest loaded (set Agent.ManifestPath)` | 外部内核需要已签名清单 | 配置 `ManifestPath`（及 `ManifestKeysPath`）并重启/重载 |
+| `download failed: all 1 sources failed: http://…: scheme not allowed` | 清单里的资产是明文 `http://`，而本机没开 `Kernels.AllowHTTP` | 用 https 镜像；确需内网 http 镜像时在 `agent.yml` 写 `Kernels: {AllowHTTP: true}`（只能本机配置，面板不能下发） |
+| `frp: frps-… did not become ready in time (see the log of instance …)` | 实例在就绪上限内没起来（慢设备，或端口/证书/token 有问题） | 先看该实例日志；确实只是启动慢时调大 `Drivers.Frp.ReadyTimeoutSec`（缺省 amd64/arm64 15s、其它架构 60s） |
 | `json: unknown field "listn"` | 字段名拼错；解码是严格的 | 对照 §5 改字段名；JSON 里不能有注释 |
 | `status: rolled_back` + `blocked` | 应用中途失败已回滚，这份内容被冻结 | 看 `message` 里的具体原因，**改内容**（改 revision 不算）后再应用 |
 
@@ -783,7 +835,7 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 - `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动 → 健康检查（状态接口 30 s 内 `running=true`）。健康检查失败会停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
 - `Upgrade`：装新版本 → 改服务指向 → 重启 → 健康检查；失败自动 `kernelx` 回滚到上一版本并重启，报告里带上失败原因与回滚结果。
-- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。
+- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
 
 面板命令接入：`kernel_install`（已装过则走 `Upgrade`，带自动回滚）、`kernel_remove`（不需要版本号，整服务删除）、`kernel_rollback`、`component_restart` 在 `name=xray` 时都走这一套。`kernel_list` / `hello.kernel_entries` 里 xray 与其它内核格式一致，并附 `service`（`backend`、`state`、`managed_by`）；`state ∈ running/stopped/failed/installing/not_installed`。遥测的 `components` 里 xray 项来自状态接口：state、version、每个节点一项（在线数）、`last_error`。
 

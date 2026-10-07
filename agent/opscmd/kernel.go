@@ -18,6 +18,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
+	"github.com/W1nCwC/W1nCray/kernel"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
@@ -201,7 +202,10 @@ func (k *kernelCmds) kernelInstall(ctx context.Context, req Request, complete Co
 	}
 	k.reg.logf().Infof("opscmd: kernel_install %s@%s accepted", a.Name, wanted)
 	go func() {
-		inst, err := k.deps.Kernels.Ensure(ctx, pin)
+		// EnsureForce, not Ensure: an administrator explicitly asked for this
+		// version, so the automatic retry back-off (which a rollback arms) must
+		// not refuse it (D-M3).
+		inst, err := k.deps.Kernels.EnsureForce(ctx, pin)
 		if err != nil {
 			k.reg.logf().Warnf("opscmd: kernel_install %s@%s failed: %v", a.Name, wanted, err)
 			complete(StatusFailed, nil, err)
@@ -288,9 +292,17 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	// The Xray kernel is a service: removing it stops and disables the
 	// service, deletes its service file and removes every installed version,
 	// while config.yml and the managed files stay. No version is required.
+	//
+	// It is idempotent (D-M2): a machine where the service was never installed
+	// answers done with already_absent, never a "Unit not loaded" failure.
 	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
-		if err := k.deps.Xray.Remove(ctx); err != nil {
+		removed, err := k.deps.Xray.Remove(ctx)
+		if err != nil {
 			return Result{}, err
+		}
+		if !removed {
+			k.reg.logf().Infof("opscmd: kernel_remove xray: nothing installed (already absent)")
+			return done(panelclient.KernelRemoveResult{AlreadyAbsent: true}), nil
 		}
 		k.reg.logf().Infof("opscmd: kernel_remove xray done (service and files removed; configuration kept)")
 		k.reg.event("kernel.removed", "info", "kernel xray removed (service and files; configuration kept)")
@@ -315,6 +327,13 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 		}
 	}
 	if err := k.deps.Kernels.Remove(a.Name, version); err != nil {
+		// An already removed version is the desired state of kernel_remove:
+		// report success with already_absent instead of failing the command
+		// (D-M2). This makes gost/realm/frp removal idempotent too.
+		if errors.Is(err, kernel.ErrNotInstalled) {
+			k.reg.logf().Infof("opscmd: kernel_remove %s@%s: not installed (already absent)", a.Name, version)
+			return done(panelclient.KernelRemoveResult{AlreadyAbsent: true}), nil
+		}
 		return Result{}, err
 	}
 	k.reg.logf().Infof("opscmd: kernel_remove %s@%s done (%d bytes freed)", a.Name, version, freed)

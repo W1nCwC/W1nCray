@@ -22,6 +22,12 @@ type migrationKernels struct {
 func (k migrationKernels) Ensure(context.Context, spec.KernelPin) (driver.Installed, error) {
 	return k.current, k.err
 }
+
+// EnsureForce is the operator-initiated install path (D-M3); the migration
+// tests never exercise it, but the interface requires it.
+func (k migrationKernels) EnsureForce(context.Context, spec.KernelPin) (driver.Installed, error) {
+	return k.current, k.err
+}
 func (k migrationKernels) Current(string) (driver.Installed, error)  { return k.current, k.err }
 func (k migrationKernels) Rollback(string) (driver.Installed, error) { return k.current, k.err }
 func (k migrationKernels) Remove(string, string) error               { return nil }

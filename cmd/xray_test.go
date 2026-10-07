@@ -3,12 +3,15 @@ package cmd
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
+	"github.com/W1nCwC/W1nCray/agentd"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
 
@@ -37,6 +40,27 @@ func TestXrayKernelVersionRegex(t *testing.T) {
 	}
 	if xrayKernelRun.Binary != xrayBinaryName || len(xrayKernelRun.VersionCmd) != 1 || xrayKernelRun.VersionCmd[0] != "version" {
 		t.Fatalf("xrayKernelRun = %+v", xrayKernelRun)
+	}
+}
+
+// TestXrayKernelOptionsCarryTheLocalHTTPSwitch covers D-M1's `W1nCray xray
+// install` half: the command builds its kernel installer from the machine's own
+// configuration, so Kernels.AllowHTTP reaches it exactly as it reaches the
+// service.
+func TestXrayKernelOptionsCarryTheLocalHTTPSwitch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if off := xrayKernelOptions(path, &agentd.Config{}); off.AllowHTTP {
+		t.Errorf("a machine without the switch must stay https-only: %+v", off)
+	}
+	on := xrayKernelOptions(path, &agentd.Config{Agent: &agentcfg.Config{Kernels: &agentcfg.KernelsConfig{AllowHTTP: true}}})
+	if !on.AllowHTTP {
+		t.Error("Kernels.AllowHTTP: true did not reach the xray command's installer")
+	}
+	if want := filepath.Join(filepath.Dir(path), "state"); on.StateDir != want {
+		t.Errorf("StateDir = %q, want %q", on.StateDir, want)
+	}
+	if want := filepath.Join(filepath.Dir(path), "state", "kernels"); on.KernelsDir != want {
+		t.Errorf("KernelsDir = %q, want %q", on.KernelsDir, want)
 	}
 }
 

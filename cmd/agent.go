@@ -74,6 +74,9 @@ func runAgentApply(configPath, desiredFile string, out io.Writer) error {
 		ManifestKeysPath: cfg.Agent.ManifestKeysPath,
 		Policy:           cfg.Agent.PolicySpec(),
 		AgentConfig:      cfg.Agent,
+		// The local kernel-source switch (Kernels.AllowHTTP, D-M1): off unless
+		// this machine's own configuration turned it on.
+		AllowHTTP: agentd.KernelAllowHTTP(cfg),
 		// The offline apply can commit a self_update too (the command is
 		// registered from StartRemote, so in practice it cannot), but the
 		// watchdog must still be told which lock to watch and which version it

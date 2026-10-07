@@ -37,6 +37,23 @@ func LoadConfig(path string) (*Config, error) { return config.LoadAgent(path) }
 // from.
 func AgentSource(c *Config) agentcfg.Source { return c.AgentSource() }
 
+// KernelAllowHTTP reports whether this machine's configuration permits plain
+// http:// sources for the signed kernel manifest's assets
+// (Kernels.AllowHTTP, default false). It is the one place the local switch is
+// read, so the daemon, agent-apply and `W1nCray xray` cannot diverge: all
+// three pass the result to bootstrap.Options.AllowHTTP.
+//
+// The switch is local by construction: the panel pushes a desired state, never
+// agent configuration. Integrity does not depend on it (the manifest is signed
+// and every asset is checked against its sha256); it exists so a self-hosted
+// http-only mirror can be used.
+func KernelAllowHTTP(cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.Agent.KernelsAllowHTTP()
+}
+
 // NeedsXray reports whether the machine's configuration asks for the Xray
 // kernel: config.yml configures at least one static node, or the panel owns the
 // node list in machine mode. It is what gates the start-up migration

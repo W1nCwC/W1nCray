@@ -90,3 +90,23 @@ Modules:
 #   Firewall: {AutoOpen: false}
 Firewall:
   AutoOpen: true
+
+# ---- 内网 http 镜像（D-M1）----------------------------------------------------
+# 内核只从已签名清单安装：签名与每个资产的 sha256 都由 agent 在本机校验，下载走
+# 什么协议不影响完整性。缺省只允许 https；自建/内网只有明文 http 镜像时在本机打开
+# 这个开关（面板无法远程打开或关闭它，只通过 hello.policy.kernels 上报）。
+#   Kernels: {AllowHTTP: true}
+Kernels:
+  AllowHTTP: false
+
+# ---- 驱动计时（D4）------------------------------------------------------------
+# frp 每启动一个实例都要等它就绪（管理 API 能应答，portal 还要控制链路建立）。
+# 缺省上限按架构：amd64/arm64 是 15 秒，其它架构（mips/arm/386/riscv64…）是 60 秒，
+# 因为路由器 CPU 启动 frps 慢得多。比架构缺省还慢的机器可以在本机调大（单位秒）：
+#   Drivers:
+#     Frp:
+#       ReadyTimeoutSec: 90
+# 0（或不写这一段）= 用架构缺省；负值会被配置校验拒绝。
+Drivers:
+  Frp:
+    ReadyTimeoutSec: 0

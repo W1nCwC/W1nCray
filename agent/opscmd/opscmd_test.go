@@ -27,8 +27,11 @@ type fakeKernels struct {
 	running   string
 	exact     bool
 	ensureFn  func(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
-	removeFn  func(name, version string) error
-	rollFn    func(name string) (driver.Installed, error)
+	// ensureForceFn is the operator-initiated install path (D-M3). nil falls
+	// back to ensureFn.
+	ensureForceFn func(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
+	removeFn      func(name, version string) error
+	rollFn        func(name string) (driver.Installed, error)
 }
 
 func (f fakeKernels) List() ([]install.Entry, error) {
@@ -49,6 +52,16 @@ func (f fakeKernels) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Ins
 	}
 	return driver.Installed{Version: pin.Version}, nil
 }
+
+// EnsureForce is the operator-initiated install the kernel_install command
+// uses (D-M3). Without a dedicated hook it falls back to Ensure, so a test
+// that does not care about the back-off keeps its old behaviour.
+func (f fakeKernels) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	if f.ensureForceFn != nil {
+		return f.ensureForceFn(ctx, pin)
+	}
+	return f.Ensure(ctx, pin)
+}
 func (f fakeKernels) Remove(name, version string) error {
 	if f.removeFn != nil {
 		return f.removeFn(name, version)
@@ -68,6 +81,9 @@ type fakeXray struct {
 	calls  []string
 	err    error
 	status xraysvc.Status
+	// removed is what Remove reports: false means "nothing was installed"
+	// (the D-M2 already-absent answer).
+	removed bool
 }
 
 func (f *fakeXray) Install(_ context.Context, version string) error {
@@ -86,9 +102,9 @@ func (f *fakeXray) Restart(context.Context) error {
 	f.calls = append(f.calls, "restart")
 	return f.err
 }
-func (f *fakeXray) Remove(context.Context) error {
+func (f *fakeXray) Remove(context.Context) (bool, error) {
 	f.calls = append(f.calls, "remove")
-	return f.err
+	return f.removed, f.err
 }
 func (f *fakeXray) Status(context.Context) (xraysvc.Status, error) {
 	return f.status, f.err

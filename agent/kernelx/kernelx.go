@@ -172,7 +172,7 @@ func (e *Ensurer) ManifestSequence() (int64, bool) {
 // without the labelling tools, is a no-op) because the service manager labels
 // again — and fails loudly — right before it starts a kernel.
 func (e *Ensurer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
-	inst, err := e.ensure(ctx, pin)
+	inst, err := e.ensure(ctx, pin, false)
 	if err != nil {
 		return inst, err
 	}
@@ -180,14 +180,30 @@ func (e *Ensurer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Instal
 	return inst, nil
 }
 
-// ensure is Ensure without the labelling step.
-func (e *Ensurer) ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+// EnsureForce is Ensure for an operator-initiated install (the panel's
+// kernel_install): it bypasses and clears the automatic retry back-off, so a
+// version an operator explicitly asks for after a rollback is really attempted
+// (D-M3). The reconcile loop keeps using Ensure and its back-off.
+func (e *Ensurer) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	inst, err := e.ensure(ctx, pin, true)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(ctx)
+	return inst, nil
+}
+
+// ensure is Ensure/EnsureForce without the labelling step.
+func (e *Ensurer) ensure(ctx context.Context, pin spec.KernelPin, force bool) (driver.Installed, error) {
 	if pin.Version == "" {
 		v, err := e.defaultVersion(pin.Name)
 		if err != nil {
 			return driver.Installed{}, err
 		}
 		pin.Version = v
+	}
+	if force {
+		return e.in.EnsureForce(ctx, pin)
 	}
 	return e.in.Ensure(ctx, pin)
 }

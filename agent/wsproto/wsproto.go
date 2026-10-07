@@ -112,6 +112,11 @@ type Policy struct {
 	// firewall_open against it, because false there also means "this machine
 	// does not manage its firewall".
 	Firewall FirewallPolicy `json:"firewall"`
+	// Kernels reports the local kernel-source switch (Kernels.AllowHTTP, D-M1).
+	// It is only ever true when the machine's own configuration permits plain
+	// http:// mirrors for the signed manifest's assets; the panel may display
+	// it and must never assume it can be turned on remotely.
+	Kernels KernelsPolicy `json:"kernels"`
 	// Instances is the local instance policy (agent.yml Policy). The panel
 	// uses it to pick ports inside the permitted range and to explain a
 	// listen address the machine will refuse (PLAN v10 WP-D); the agent still
@@ -122,6 +127,11 @@ type Policy struct {
 // FirewallPolicy mirrors the effective local firewall automation switch.
 type FirewallPolicy struct {
 	AutoOpen bool `json:"auto_open"`
+}
+
+// KernelsPolicy mirrors the local kernel-source switch (Kernels.AllowHTTP).
+type KernelsPolicy struct {
+	AllowHTTP bool `json:"allow_http"`
 }
 
 // InstancePolicy mirrors spec.Policy for display and planning.
