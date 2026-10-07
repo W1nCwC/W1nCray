@@ -59,6 +59,19 @@ agent 不再链接 Xray-core，转发规则/实例只用 gost、realm（frp 用�
 - **用户其它 v0.3 单机服务器（无 agent）**：`install.sh update` 检测到已有 Nodes 配置时，安装 agent + Xray 内核服务两者（Xray 内核由 install.sh 直接按发布地址下载并校验 SHA256SUMS），行为与现在一致；之后可按需绑定面板。
 - 新 agent 首次启动若发现 config.yml 有节点但 Xray 内核未安装（例如手工替换二进制），自动安装 Xray 内核并启动，日志明确说明。
 
+## 2.7 Alpine（OpenRC）/ OpenWrt（procd）
+
+现状（2026-10-07 核查）：
+- 【已验证，v0.3】install.sh 的 OpenRC / procd 服务后端、架构与 MIPS 浮点检测、busybox 下载与校验，在测试机上以真实 rootfs（Alpine 3.20.3、OpenWrt 23.05.5 x86-64）chroot + unshare 验证过（PLAN-v5 V6）。当时程序只有 Xray 节点功能。
+- 【代码有、未实测】agent 自升级在无 systemd 时以 setsid 脱离进程（`agent/selfupdate/respawn_unix.go:35-48`），回滚后依赖 OpenRC/procd 自身重拉（`ready_linux.go:87-111`）；内核下载不使用 /tmp（OpenWrt 的 /tmp 占内存）；平台探测区分 musl/glibc（`kernel/platform/platform.go:33-85`）。
+- 【未验证】v0.4 起的 agent 功能（面板链接、终端、文件管理、内核下载、转发、自升级）只在 Debian（systemd）上实测过。
+- 内核覆盖：gost 全架构（Go 静态）；realm 只发 musl 版（Alpine/OpenWrt 可用，但缺 386/armv5/loong64/riscv64）；frp 缺 386/armv6。
+
+本期要求：
+- X2：Xray 内核服务除 systemd 外，同样提供 OpenRC（`/etc/init.d/W1nCray-xray`，supervise-daemon 守护）与 procd（`/etc/init.d/W1nCray-xray`，procd respawn）两种后端，写法与 install.sh 现有后端一致；三者都没有时才退回 agent 子进程。
+- X3：Xray 内核在清单中为 OpenWrt 提供 lite 变体（与现在 W1nCray lite 相同的构建标签），agent 在 OpenWrt 上选择 lite；OpenWrt 上把内核目录与服务脚本追加进 `/etc/sysupgrade.conf`（固件升级后保留）。
+- 验收增加：在测试机上用 Alpine 3.20 与 OpenWrt 23.05 真实 rootfs（chroot + unshare，与 v0.3 同法）跑通「安装 agent → 面板连上 → 安装 Xray 内核 → 服务运行 → agent 重启不影响 Xray → 卸载」，以及 gost 转发与终端。
+
 ## 3. 工作包
 
 | WP | 内容 | 仓库 |
