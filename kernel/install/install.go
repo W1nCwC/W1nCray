@@ -411,12 +411,8 @@ func sumExtract(t *manifest.Target) int64 {
 // has already been matched against t.ArchiveSHA256.
 func (in *Installer) installArchive(ctx context.Context, k *manifest.Kernel, key string, t *manifest.Target, archivePath string) (err error) {
 	name, version := k.Name, k.Version
-	if err := os.MkdirAll(in.partialDir(name), privDir); err != nil {
-		return err
-	}
-	stage := filepath.Join(in.partialDir(name), "stage-"+version)
-	_ = os.RemoveAll(stage)
-	if err := os.MkdirAll(stage, dirMode); err != nil {
+	stage, err := in.newStage(name, version)
+	if err != nil {
 		return err
 	}
 	defer func() {
@@ -437,6 +433,30 @@ func (in *Installer) installArchive(ctx context.Context, k *manifest.Kernel, key
 	if err := in.selfCheck(check, filepath.Join(stage, k.Run.Binary), k); err != nil {
 		return err
 	}
+	return in.commit(stage, k, key, t)
+}
+
+// newStage creates an empty staging directory for name@version under the
+// kernel's .partial area. The caller removes it on failure.
+func (in *Installer) newStage(name, version string) (string, error) {
+	if err := os.MkdirAll(in.partialDir(name), privDir); err != nil {
+		return "", err
+	}
+	stage := filepath.Join(in.partialDir(name), "stage-"+version)
+	_ = os.RemoveAll(stage)
+	if err := os.MkdirAll(stage, dirMode); err != nil {
+		return "", err
+	}
+	return stage, nil
+}
+
+// commit writes the installation marker into stage and atomically switches
+// <name>/<version> to it, keeping the version that was current as previous.
+// It is the shared tail of a manifest install and a local install: the two
+// produce byte-for-byte the same on-disk layout, so list/upgrade/rollback/
+// remove treat them identically.
+func (in *Installer) commit(stage string, k *manifest.Kernel, key string, t *manifest.Target) (err error) {
+	name, version := k.Name, k.Version
 	mk := marker{
 		Name: name, Version: version, Target: key, Variant: t.Variant, Binary: k.Run.Binary,
 		ArchiveSHA256: t.ArchiveSHA256, InstalledAt: in.now().UTC(),
@@ -497,6 +517,10 @@ func (in *Installer) installArchive(ctx context.Context, k *manifest.Kernel, key
 	}
 	// Re-check from the final location: catches noexec mounts and anything
 	// that differs between staging and the real path.
+	check := in.cfg.Check
+	if check == nil {
+		check = DefaultCheck(k.Run)
+	}
 	if err := in.selfCheck(check, filepath.Join(final, k.Run.Binary), k); err != nil {
 		revert()
 		return err

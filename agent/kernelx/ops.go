@@ -56,3 +56,11 @@ func (e *Ensurer) DownloadFor(ctx context.Context, name, version, dir string) (m
 func (e *Ensurer) VerifyArchiveFor(ctx context.Context, name, version, archivePath, dest string) (manifest.Target, string, error) {
 	return e.in.VerifyArchiveFor(ctx, name, version, archivePath, dest)
 }
+
+// InstallLocal installs a kernel from a file already on this machine, without
+// a signed manifest, pinning the bytes with the operator-supplied sha256 (see
+// install.Installer.InstallLocal). The result is indistinguishable from a
+// manifest install, so list/upgrade/rollback/remove all work on it.
+func (e *Ensurer) InstallLocal(ctx context.Context, li install.LocalInstall) (driver.Installed, error) {
+	return e.in.InstallLocal(ctx, li)
+}
