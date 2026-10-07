@@ -483,7 +483,8 @@ func TestNewRefusesUnsafeRoots(t *testing.T) {
 	}{
 		{"filesystem-root", string(filepath.Separator)},
 		{"etc", "/etc"},
-		{"etc-below", "/etc/xray"},
+		// "/etc/xray" (a directory below /etc) is a valid root since 6b377f9:
+		// /etc/W1nCray is the standard install; path_regress_test.go covers it.
 		{"usr", "/usr"},
 		{"var", "/var"},
 		{"dev", "/dev"},
