@@ -13,6 +13,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
+	"github.com/W1nCwC/W1nCray/kernel"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
 
@@ -267,6 +268,9 @@ type fakeSup struct {
 	specs    []driver.ProcSpec
 	running  bool
 	lastExit string
+	// stuck makes Stop leave the process reported as running, modelling a
+	// child that has not exited yet (R1-8).
+	stuck bool
 }
 
 func (f *fakeSup) Start(_ context.Context, p driver.ProcSpec) error {
@@ -280,7 +284,9 @@ func (f *fakeSup) Start(_ context.Context, p driver.ProcSpec) error {
 func (f *fakeSup) Stop(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.running = false
+	if !f.stuck {
+		f.running = false
+	}
 	return nil
 }
 
@@ -368,6 +374,7 @@ func newFixture(t *testing.T, markers ...string) *fixture {
 		HealthTimeout:  100 * time.Millisecond,
 		HealthInterval: time.Millisecond,
 		StatusTimeout:  50 * time.Millisecond,
+		RemoveTimeout:  20 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1059,6 +1066,46 @@ func TestAgentBackendRunsUnderTheSupervisor(t *testing.T) {
 	}
 	if st.State != StateRunning || st.Backend != BackendAgent || st.ManagedBy != "agent" {
 		t.Fatalf("status = %+v", st)
+	}
+}
+
+// TestRemoveRefusesWhileTheAgentChildIsStillRunning is R1-8: on a machine with
+// no init system the kernel is a child of the agent's supervisor, and Remove
+// must not delete its directory while the process is still alive. Before the
+// fix Remove went straight to Kernels.Remove after the stop.
+func TestRemoveRefusesWhileTheAgentChildIsStillRunning(t *testing.T) {
+	f := newFixture(t)
+	bin := installedKernel(t, f.root, "1.0.0")
+	f.kern.current = driver.Installed{Path: bin, Version: "1.0.0"}
+	f.kern.curErr = nil
+	f.sup.mu.Lock()
+	f.sup.running = true
+	f.sup.stuck = true
+	f.sup.mu.Unlock()
+
+	removed, err := f.manager.Remove(context.Background())
+	if !errors.Is(err, kernel.ErrInUse) {
+		t.Fatalf("Remove error = %v, want in_use", err)
+	}
+	if !removed {
+		t.Error("Remove did not report the installed service it refused to delete")
+	}
+	if code := kernel.Code(err); code != "in_use" {
+		t.Fatalf("kernel.Code = %q, want in_use", code)
+	}
+	if len(f.kern.removed) != 0 {
+		t.Fatalf("the kernel files were removed while the process was alive: %v", f.kern.removed)
+	}
+
+	// Once the process is really gone the same call removes everything.
+	f.sup.mu.Lock()
+	f.sup.stuck = false
+	f.sup.mu.Unlock()
+	if _, err := f.manager.Remove(context.Background()); err != nil {
+		t.Fatalf("Remove after the exit: %v", err)
+	}
+	if len(f.kern.removed) != 1 {
+		t.Fatalf("kernel removal = %v, want one", f.kern.removed)
 	}
 }
 

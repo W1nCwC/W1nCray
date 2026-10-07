@@ -418,6 +418,15 @@ func (b *agentBackend) active(context.Context) (string, error) {
 	}
 }
 
+// running reports whether the supervised child is still alive. Remove uses it
+// to refuse deleting the kernel files of a process that has not exited (R1-8).
+func (b *agentBackend) running() bool {
+	if b.sup == nil {
+		return false
+	}
+	return b.sup.Status(agentProcID).Running
+}
+
 // ---- file helpers ----------------------------------------------------------
 
 // writeIfChanged writes content to path when the file does not already hold

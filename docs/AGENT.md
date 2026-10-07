@@ -835,7 +835,7 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 - `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动/重启 → 健康检查（状态接口 30 s 内 `running=true`）。**换版本一定重启**：服务文件内容变化、或运行中的内核报告的版本与要装的版本不同时，`activate` 用 `restart` 而不是 `start`（三个 init 系统的 `start` 对已 active 的单元是 no-op，否则旧进程会继续跑而单元与 current 指针已指向新版本）；同版本、服务文件不变的幂等重装不重启。健康检查失败时：**安装前服务在运行** → 回滚到安装前运行的版本并重启（与 `Upgrade` 一致），不会把可用的 Xray 停掉；安装前本来没有服务 → 停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
 - `Upgrade`：装新版本 → 改服务指向 → 重启 → 健康检查；失败自动 `kernelx` 回滚到上一版本并重启，报告里带上失败原因与回滚结果。
-- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
+- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。agent 子进程后端（没有 init 系统）下，删除内核文件前会等待 supervisor 的子进程真正退出（`RemoveTimeout`，默认 10 s）；超时仍在运行则返回 **`in_use`** 且**不删任何文件**（R1-8），避免删掉正在执行的二进制与回滚指针。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
 
 面板命令接入：`kernel_install`（已装过则走 `Upgrade`，带自动回滚）、`kernel_remove`（不需要版本号，整服务删除）、`kernel_rollback`、`component_restart` 在 `name=xray` 时都走这一套。`kernel_list` / `hello.kernel_entries` 里 xray 与其它内核格式一致，并附 `service`（`backend`、`state`、`managed_by`）；`state ∈ running/stopped/failed/installing/not_installed`。遥测的 `components` 里 xray 项来自状态接口：state、version、每个节点一项（在线数）、`last_error`。
 

@@ -138,6 +138,9 @@ type Options struct {
 	// HealthInterval is how often the status endpoint is polled while waiting
 	// for health (default 500ms).
 	HealthInterval time.Duration
+	// RemoveTimeout is how long Remove waits for the fallback backend's child
+	// process to exit before refusing with in_use (default 10s).
+	RemoveTimeout time.Duration
 	// StatusTimeout bounds one health-check status read (default 2s).
 	StatusTimeout time.Duration
 	// Backend overrides backend detection (tests).
@@ -172,6 +175,9 @@ func New(o Options) (*Manager, error) {
 	}
 	if o.HealthInterval <= 0 {
 		o.HealthInterval = 500 * time.Millisecond
+	}
+	if o.RemoveTimeout <= 0 {
+		o.RemoveTimeout = 10 * time.Second
 	}
 	if o.StatusTimeout <= 0 {
 		o.StatusTimeout = 2 * time.Second
@@ -456,6 +462,17 @@ func (m *Manager) Remove(ctx context.Context) (removed bool, err error) {
 	}
 
 	derr := m.deactivate(ctx)
+	// The fallback backend runs the kernel as a child of the agent's
+	// supervisor. Deleting the kernel directory while that process is still
+	// alive removes the binary of a running program (and the rollback pointer
+	// with it), so the removal waits for the exit and refuses otherwise
+	// (R1-8).
+	if werr := m.waitChildGone(ctx); werr != nil {
+		if derr != nil {
+			return removed, fmt.Errorf("%v；%w", derr, werr)
+		}
+		return removed, werr
+	}
 	rerr := m.opts.Kernels.Remove(xrayapi.KernelName, "")
 	if rerr != nil && !errors.Is(rerr, kernel.ErrNotInstalled) {
 		if derr != nil {
@@ -464,6 +481,35 @@ func (m *Manager) Remove(ctx context.Context) (removed bool, err error) {
 		return removed, rerr
 	}
 	return removed, derr
+}
+
+// waitChildGone waits for the fallback backend's child process to really exit
+// after it was stopped, and reports kernel.ErrInUse (in_use) when it is still
+// alive at the deadline. Backends whose process belongs to an init system
+// return immediately: their process is the init system's to stop, and the
+// manager never waits on a service it does not own.
+func (m *Manager) waitChildGone(ctx context.Context) error {
+	b, ok := m.backend.(*agentBackend)
+	if !ok {
+		return nil
+	}
+	deadline := time.Now().Add(m.opts.RemoveTimeout)
+	for {
+		if !b.running() {
+			return nil
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			break
+		}
+		t := time.NewTimer(m.opts.HealthInterval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+		case <-t.C:
+		}
+	}
+	return kernel.Newf(kernel.ErrInUse, xrayapi.KernelName, "",
+		"内核进程在 %s 内没有退出；内核文件保留，稍后重试 remove", m.opts.RemoveTimeout)
 }
 
 // activate writes the service definition, enables the service, starts it (or

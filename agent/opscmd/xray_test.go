@@ -8,6 +8,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/xraysvc"
+	"github.com/W1nCwC/W1nCray/kernel"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
 
@@ -101,6 +102,28 @@ func TestKernelRemoveXrayIsIdempotent(t *testing.T) {
 	}
 	if !out.AlreadyAbsent {
 		t.Errorf("kernel_remove on an absent service = %s, want already_absent", res)
+	}
+}
+
+// TestKernelRemoveXrayReportsInUseWhileTheProcessLives is the wire half of
+// R1-8: the service manager refuses to delete the kernel files while the kernel
+// process is still alive, and the panel must see the stable in_use code instead
+// of a generic error.
+func TestKernelRemoveXrayReportsInUseWhileTheProcessLives(t *testing.T) {
+	x := &fakeXray{err: kernel.Newf(kernel.ErrInUse, "xray", "", "内核进程尚未退出")}
+	reg := mustRegistry(t, Deps{Xray: x})
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "x7", Type: panelclient.CmdKernelRemove,
+		Args: json.RawMessage(`{"name":"xray"}`),
+	})
+	if status != panelclient.ResultFailed {
+		t.Fatalf("kernel_remove = (%q, %s), want failed", status, res)
+	}
+	if f := decodeFailure(t, res); f.Code != "in_use" {
+		t.Fatalf("failure = %+v, want code in_use", f)
+	}
+	if len(x.calls) != 1 || x.calls[0] != "remove" {
+		t.Fatalf("service calls = %v, want [remove]", x.calls)
 	}
 }
 
