@@ -691,6 +691,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `W1nCray link` / `link --split` / `migrate` | 与 v10 相同；写入前的离线检查改为调用外部内核（见下） |
 | `W1nCray agent-apply -f desired.json` | 只支持外部引擎（gost / frp / realm）；`engine: xray` 被拒绝 |
 | `W1nCray xray status\|start\|stop\|restart\|install [version]\|remove` | 本机管理 Xray 内核服务，调用与面板路径**同一套** `agent/xraysvc`（见 §13.5） |
+| `W1nCray xray install --file <文件或 .gz> --sha256 <hex>` | 离线安装本地 Xray 内核构建（见 §13.7.2） |
 
 `link` / `link --split` 的**写入前校验**需要 Xray 侧的检查：加 `--xray-bin <路径>`，或在 `W1nCray` 同目录 / `PATH` 找到 `W1nCray-xray` 时，会执行 `<W1nCray-xray> check -c <配置>` 并把输出里以 `✗` 开头的行当作失败项参与基线比较；找不到内核时**跳过该检查并打印说明**（agent 侧仍会校验机器模式的证书模式等问题）。
 
@@ -812,5 +813,65 @@ W1nCray xray stop
 | `self_update` | `W1nCray` | 重启 agent 进程；`W1nCray-xray` 由服务管理器独立运行，**不中断** |
 
 拆分后 `config.yml` 同时属于两个程序：`W1nCray` 只读它的 `Agent:` 块，`W1nCray-xray` 读 Xray 部分并按上面的表监听重载。
+
+### 13.7 发布产物与清单条目（WP-X3）
+
+#### 13.7.1 `release/build.sh` 的产物
+
+`bash release/build.sh [vX.Y.Z] [arch ...]` 为 12 个架构各产出两个程序，同一个版本号注入两个程序（agent 的 `cmd.version`、内核的 `xraynode.Version`）：
+
+| 产物 | 程序 | 构建标签 |
+|---|---|---|
+| `W1nCray-linux-<arch>.gz` | agent | `fallbackroots`（内置备用根证书；agent 不含 DNS/ACME，约 12 MB） |
+| `W1nCray-linux-<arch>-lite.gz` | agent | 与上一行**同内容**的副本，仅为兼容 v11 之前的安装脚本（它们按 `-lite` 名字取 OpenWrt 资产）而保留 |
+| `W1nCray-linux-amd64\|arm64` | agent | 裸文件，供 v0.3.0 之前的安装脚本升级 |
+| `W1nCray-xray-linux-<arch>.gz` | Xray 内核 | 无（full） |
+| `W1nCray-xray-linux-<arch>-lite.gz` | Xray 内核 | `dnslite,fallbackroots`（OpenWrt） |
+
+`SHA256SUMS` 覆盖以上全部产物。构建矩阵断言除原有的架构/PTY 检查外，还对每个产物做 `file(1)` 架构检查、在本机架构上执行 `version` 自检（交叉架构跳过并注明），并用 `go version -m` 检查 **agent 产物不含 `github.com/xtls/xray-core`**、内核产物必须含它。
+
+#### 13.7.2 清单条目（`tools/manifestgen/examples/v11.yaml`）
+
+agent 与 Xray 内核都是本地构建（`local:` 条目从 `dist/` 计算哈希，需要一个 mirror 提供下载地址），上游 gost/realm/frp 仍从各自 GitHub Release 取：
+
+```yaml
+  - name: xray
+    version: "0.6.0"
+    run:
+      binary: W1nCray-xray
+      version_cmd: ["version"]
+      version_regex: "W1nCray-xray v?([0-9][0-9.]*)"   # 从 "W1nCray-xray v0.6.0 (Xray-core 26.3.27)" 取 0.6.0
+    mirrors: ["https://<mirror>/W1nCray-xray/{version}/{asset}"]
+    local:
+      - {file: dist/W1nCray-xray-linux-amd64.gz,      target: linux/amd64,         to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-amd64-lite.gz, target: linux/amd64+openwrt, to: W1nCray-xray, variant: fallbackroots}
+      # ... 其余架构相同：full -> linux/<arch>，lite -> linux/<arch>+openwrt
+```
+
+- 资产是**单文件 raw gz**（与 agent 条目相同的解包方式：`archive: gz`，`extract.from` 默认取归档基名）。
+- `min_agent` 故意留空：0.5.x agent 必须能先安装 Xray 内核（§2.6 的迁移顺序），所以内核条目不能要求 0.6。
+- `manifestgen build -kernels xray` 只重建选定的内核条目，便于 agent/内核重新构建后单独发布，而不必重新下载全部上游资产。
+- 第二个 Xray 版本（升级/回滚测试用）在示例里是**注释掉的占位条目**：本仓库没有旧构建，`release/build.sh` 只产出当前版本；用旧 tag 构建到 `dist/old/` 后取消注释即可。不要把它指向当前 `dist/` 文件——内核自检会发现版本不符。
+
+#### 13.7.3 本地文件安装（`W1nCray xray install --file`）
+
+`W1nCray xray install --file <W1nCray-xray 文件或 .gz> --sha256 <hex>` 用于 install.sh 的迁移和离线环境：
+
+1. 校验文件的 sha256（必填，缺失或不是 64 位十六进制即拒绝）；
+2. 解包（gzip 魔数判断，裸文件也接受）到内核目录的暂存区，执行 `version` 自检得到版本；
+3. 用**与按清单安装完全相同**的 `commit` 写入 `<kernels>/xray/<版本>/` 与 `.installed.json`、`current`/`previous` 指针，因此 `kernel_list`、升级、回滚、卸载都能识别它；
+4. 复用 `agent/xraysvc` 写服务并启动（与面板路径同一套实现）。
+
+`install.sh` 的 `update` 在检测到「0.5.x 及以前的单一程序 + 配置里有 Xray 节点」时自动执行这一串步骤（见 §13.8）。
+
+### 13.8 install.sh 的三条路径（v11）
+
+| 路径 | 行为 |
+|---|---|
+| `install`（全新） | 只安装 agent（`W1nCray` 程序 + `W1nCray` 服务），**不安装 Xray 内核**；结束时提示「Xray 内核将在面板绑定节点时自动安装，或执行 `W1nCray xray install`」。`--panel URL --machine ID --token TOKEN` 一键接入保持不变。 |
+| `update`（升级） | 已是 v11 agent：只更新 agent。0.5.x 及以前的**单一程序**且配置需要 Xray（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真）：先下载 agent 与对应架构的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序 **停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...` → 启动 agent**，并打印中断时长提示。下载在停止服务之前完成。 |
+| `uninstall` | 停止并删除 `W1nCray` 服务后，调用 `W1nCray xray remove` 停止并删除 `W1nCray-xray` 服务与内核文件（失败时脚本按当前后端自己删除 unit/init 脚本）；是否保留配置目录与原来一致（`--purge` 才删除）。 |
+
+管理菜单新增 14–19（Xray 内核 状态/启动/停止/重启/安装/卸载），快捷命令 `W1nCray xray ...` 直接透传给程序本体（带 `-c <配置>`）。
 
 
