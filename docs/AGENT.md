@@ -833,7 +833,7 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 服务名固定为 `W1nCray-xray`。`Install`/`Upgrade`/`Rollback`/`Restart`/`Remove` 都幂等、带超时、失败可读：
 
-- `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动 → 健康检查（状态接口 30 s 内 `running=true`）。健康检查失败会停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
+- `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动/重启 → 健康检查（状态接口 30 s 内 `running=true`）。**换版本一定重启**：服务文件内容变化、或运行中的内核报告的版本与要装的版本不同时，`activate` 用 `restart` 而不是 `start`（三个 init 系统的 `start` 对已 active 的单元是 no-op，否则旧进程会继续跑而单元与 current 指针已指向新版本）；同版本、服务文件不变的幂等重装不重启。健康检查失败时：**安装前服务在运行** → 回滚到安装前运行的版本并重启（与 `Upgrade` 一致），不会把可用的 Xray 停掉；安装前本来没有服务 → 停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
 - `Upgrade`：装新版本 → 改服务指向 → 重启 → 健康检查；失败自动 `kernelx` 回滚到上一版本并重启，报告里带上失败原因与回滚结果。
 - `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
 

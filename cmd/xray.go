@@ -266,8 +266,11 @@ func xrayInstallCmd() *cobra.Command {
 					return err
 				}
 				// The kernel is in place; the service manager points the
-				// service at it and starts it (same path as a manifest
-				// install's activate step).
+				// service at it and brings it up. A service that was already
+				// running another version is restarted here (activate decides
+				// from the changed unit and the running kernel's version), so
+				// the old process cannot keep serving behind the new pointer
+				// (R1-5).
 				if err := mgr.Start(cmd.Context()); err != nil {
 					return fmt.Errorf("%w（内核已安装，可执行 `W1nCray xray start` 重试）", err)
 				}
