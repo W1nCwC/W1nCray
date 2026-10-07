@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
@@ -20,6 +21,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
 	"github.com/W1nCwC/W1nCray/agent/ws"
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 )
 
 // Supervisor id prefixes used by the engine drivers. The drivers keep their
@@ -326,6 +328,62 @@ func (p runtimeProbe) SupervisedProcesses() []telemetry.SupervisedProcess {
 	return out
 }
 
+// ServiceComponents returns one component per kernel that runs as its own
+// service (the Xray kernel). The state and backend come from the service
+// manager, the version, node list, online users and last error from the
+// kernel's status endpoint. A machine without such a kernel returns nil.
+func (p runtimeProbe) ServiceComponents() []wsproto.Component {
+	if p.rt == nil || p.rt.XrayManager == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st, err := p.rt.XrayManager.Status(ctx)
+	if err != nil {
+		return nil
+	}
+	comp := wsproto.Component{
+		Name:      xrayapi.KernelName,
+		Kind:      "kernel",
+		Version:   st.Version,
+		State:     st.State,
+		Instances: []wsproto.ComponentInstance{},
+	}
+	if p.rt.Xray != nil {
+		if ks, kerr := p.rt.Xray.Status(ctx); kerr == nil {
+			if comp.Version == "" {
+				comp.Version = ks.Version
+			}
+			if ks.StartedAt > 0 {
+				if up := time.Now().Unix() - ks.StartedAt; up > 0 {
+					comp.UptimeS = up
+				}
+			}
+			insts := make([]wsproto.ComponentInstance, 0, len(ks.Nodes))
+			for _, n := range ks.Nodes {
+				state := wsproto.StateRunning
+				if n.Error != "" {
+					state = wsproto.StateFailed
+				}
+				insts = append(insts, wsproto.ComponentInstance{
+					ID:    n.Tag,
+					State: state,
+					// Conns carries the node's online-user count: the wire
+					// instance has no user field, and this is the number the
+					// panel shows next to a node.
+					Conns: n.Online,
+				})
+			}
+			comp.Instances = insts
+			comp.LastError = ks.LastError
+			if !ks.Running {
+				comp.State = wsproto.StateFailed
+			}
+		}
+	}
+	return []wsproto.Component{comp}
+}
+
 // frpSupervisorID finds the supervisor id of one frp instance. The role (portal
 // vs bridge) decides between the frps- and frpc- prefixes and is not part of
 // the report, so the supervisor's own id list is searched instead of guessing.
@@ -382,6 +440,13 @@ func (r *Runtime) KernelEntries() ([]wsproto.KernelEntry, error) {
 			SizeBytes: e.Size,
 			// One rule for kernel_list and hello/report (opscmd.InUse).
 			InUse: opscmd.InUse(e, running[e.Name], exact[e.Name]),
+		}
+		if e.Name == xrayapi.KernelName && r.XrayManager != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if st, serr := r.XrayManager.Status(ctx); serr == nil {
+				entry.Service = &wsproto.KernelService{Backend: st.Backend, State: st.State, ManagedBy: st.ManagedBy}
+			}
+			cancel()
 		}
 		if !e.InstalledAt.IsZero() {
 			entry.InstalledAt = e.InstalledAt.Unix()

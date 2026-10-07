@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -104,6 +105,10 @@ func run() error {
 		if err := startup.Confirm(); err != nil {
 			log.Warnf("agent: confirming the self-update: %v", err)
 		}
+		// No panel link: the pending self-update is confirmed now, so the
+		// start-up migration (PLAN v11 §2.6) may bring the Xray kernel service
+		// up. With a panel link, bootstrap runs it once the panel answered.
+		d.EnsureXray(context.Background())
 	}
 
 	<-sig

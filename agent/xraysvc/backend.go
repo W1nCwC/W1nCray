@@ -23,7 +23,10 @@ type ExecRunner struct{}
 
 // Run implements Runner.
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	// name is a fixed service-manager command (systemctl, rc-service,
+	// rc-update) or the agent-generated init script; args is an argv array,
+	// never a command string.
+	return exec.CommandContext(ctx, name, args...).CombinedOutput() //nolint:noshell -- fixed service-manager command or agent-generated init script
 }
 
 // agentProcID is the supervisor id of the kernel in the fallback backend.

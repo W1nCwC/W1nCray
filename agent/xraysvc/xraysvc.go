@@ -305,6 +305,26 @@ func (m *Manager) Rollback(ctx context.Context) error {
 	return m.activate(ctx, inst, true)
 }
 
+// Start starts the service on the installed current version. A machine without
+// an installed kernel is refused (use Install).
+func (m *Manager) Start(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cur, err := m.opts.Kernels.Current(xrayapi.KernelName)
+	if err != nil {
+		return fmt.Errorf("%s 服务未安装（先执行 install）", ServiceName)
+	}
+	return m.activate(ctx, cur, false)
+}
+
+// Stop stops the service without disabling it.
+func (m *Manager) Stop(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.backend.stop(ctx)
+}
+
 // Restart restarts the service on the current version.
 func (m *Manager) Restart(ctx context.Context) error {
 	m.mu.Lock()

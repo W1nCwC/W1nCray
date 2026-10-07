@@ -51,7 +51,9 @@ type ExecRunner struct{}
 
 // Run implements Runner.
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	// name is the installed kernel binary (verified by the signed manifest
+	// before it was unpacked) and args is an argv array, never a command string.
+	return exec.CommandContext(ctx, name, args...).CombinedOutput() //nolint:noshell -- manifest-verified kernel binary
 }
 
 // Defaults.

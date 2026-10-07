@@ -28,6 +28,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 	"github.com/W1nCwC/W1nCray/kernel"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
@@ -128,6 +129,18 @@ type ComponentOps interface {
 	Restart(ctx context.Context, name string) (int, error)
 }
 
+// XrayService is the Xray kernel service manager (agent/xraysvc). The xray
+// kernel runs as a service of its own, so its kernel_* commands install,
+// remove and roll back the service, not just the files.
+type XrayService interface {
+	Install(ctx context.Context, version string) error
+	Upgrade(ctx context.Context, version string) error
+	Rollback(ctx context.Context) error
+	Restart(ctx context.Context) error
+	Remove(ctx context.Context) error
+	Status(ctx context.Context) (xraysvc.Status, error)
+}
+
 // Deps configures the registry.
 type Deps struct {
 	// Kernels is required: without a kernel manager the kernel_* commands
@@ -135,6 +148,9 @@ type Deps struct {
 	Kernels KernelOps
 	// Comp serves component_restart. Nil answers it with not_supported.
 	Comp ComponentOps
+	// Xray is the Xray kernel service manager. Nil keeps the plain kernel_*
+	// behaviour for the xray name too (files only, no service).
+	Xray XrayService
 	// Files serves files_apply / files_validate / files_rollback, the MANAGED
 	// xray files (D4/D5). Nil answers them with not_supported (protocol ruling
 	// 5: never silently ignored).
