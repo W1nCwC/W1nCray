@@ -428,3 +428,47 @@ Agent:
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestUnchangedWatchedFilesDoNotRebuild: the agent's files_apply writes
+// config.yml and asks for the rebuild itself; the watcher then sees the same
+// write. Rewriting identical content must not rebuild xray a second time, a
+// real change still must.
+func TestUnchangedWatchedFilesDoNotRebuild(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	agent := fmt.Sprintf("Agent:\n  Enabled: true\n  StateDir: %q\n", filepath.Join(dir, "state"))
+	body := "Log: {Level: warning}\n" + agent
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New(configPath, cfg)
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.mu.Lock()
+	core1 := p.core
+	p.mu.Unlock()
+
+	// Same bytes: the watcher fires, nothing is rebuilt.
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second) // longer than the watcher debounce
+	p.mu.Lock()
+	same := p.core == core1
+	p.mu.Unlock()
+	if !same {
+		t.Fatal("identical content rebuilt xray")
+	}
+
+	// Different bytes: rebuilt.
+	if err := os.WriteFile(configPath, []byte("Log: {Level: info}\n"+agent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitCoreChanged(t, p, core1)
+}

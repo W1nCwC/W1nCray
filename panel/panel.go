@@ -2,7 +2,10 @@ package panel
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -61,6 +64,12 @@ type Panel struct {
 	// ReattachXray swaps in the new core and recreates the engine=xray
 	// instances on it, so an xray change never restarts the agent.
 	host *corehost.Swappable
+
+	// fingerprint is the content hash of the watched files at the last
+	// (re)build. A watcher event whose files hash the same is skipped: the
+	// agent's files_apply writes config.yml and asks for a rebuild itself, and
+	// the watcher would otherwise rebuild xray a second time two seconds later.
+	fingerprint string
 
 	// coreOpts is the core options of the running xray instance, published by
 	// startXrayLocked for the files validator (read without p.mu).
@@ -214,6 +223,10 @@ func (p *Panel) Start() error {
 	if err := p.start(); err != nil {
 		return err
 	}
+	fp := filesFingerprint(p.watchedFiles())
+	p.mu.Lock()
+	p.fingerprint = fp
+	p.mu.Unlock()
 	ready := make(chan struct{})
 	go p.watch(ready)
 	// Returning before the directory watches exist would lose a config change
@@ -743,9 +756,22 @@ func (p *Panel) applyReload(req reloadRequest) {
 		return
 	}
 
+	fp := filesFingerprint(p.watchedFiles())
 	p.mu.Lock()
 	old := p.cfg
+	unchanged := len(req.files) > 0 && fp == p.fingerprint
 	p.mu.Unlock()
+	if unchanged {
+		// A watcher event for content the running instance was already built
+		// from (the agent's own files_apply write, or a touch).
+		log.Infof("reload: the watched files are unchanged since the last rebuild; nothing to do")
+		return
+	}
+	defer func() {
+		p.mu.Lock()
+		p.fingerprint = fp
+		p.mu.Unlock()
+	}()
 
 	if isAgentYMLOnly(req.files, p.path) {
 		if sameAgentConfig(old, cfg) {
@@ -1002,6 +1028,24 @@ func (p *Panel) watchedFiles() []string {
 	// (D1). The watcher registers the directory, so the create event arrives.
 	files = append(files, filepath.Join(filepath.Dir(p.path), agentcfg.FileName))
 	return files
+}
+
+// filesFingerprint hashes the names and contents of files (a missing or
+// unreadable file counts as its own state).
+func filesFingerprint(files []string) string {
+	h := sha256.New()
+	for _, f := range files {
+		h.Write([]byte(f))
+		h.Write([]byte{0})
+		if b, err := os.ReadFile(f); err == nil {
+			sum := sha256.Sum256(b)
+			h.Write(sum[:])
+		} else {
+			h.Write([]byte("absent"))
+		}
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // agentDesiredPath returns the configured desired-state file ("" if none).
