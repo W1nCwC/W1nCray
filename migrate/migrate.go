@@ -17,7 +17,7 @@ import (
 
 	yaml "go.yaml.in/yaml/v3"
 
-	"github.com/W1nCwC/W1nCray/common/cert"
+	"github.com/W1nCwC/W1nCray/common/certcfg"
 )
 
 // Options configures a migration.
@@ -350,7 +350,7 @@ func (m *migration) convertNode(i int, n *yaml.Node) bool {
 		m.report.change("%s: 删除 GlobalDeviceLimitConfig", label)
 	}
 	if c := mapGet(cc, "CertConfig"); c != nil {
-		if strings.EqualFold(scalar(c, "CertMode"), cert.ModeFile) {
+		if strings.EqualFold(scalar(c, "CertMode"), certcfg.ModeFile) {
 			for _, k := range []string{"CertFile", "KeyFile"} {
 				if p := m.origin[scalar(c, k)]; p != "" {
 					if _, err := os.Stat(p); err != nil {
@@ -384,20 +384,20 @@ func nodeType(t string, enableVless bool) string {
 func (m *migration) planACMECert(label string, c *yaml.Node) {
 	mode := strings.ToLower(scalar(c, "CertMode"))
 	domain := scalar(c, "CertDomain")
-	if (mode != cert.ModeDNS && mode != cert.ModeHTTP && mode != cert.ModeTLS) || domain == "" {
+	if (mode != certcfg.ModeDNS && mode != certcfg.ModeHTTP && mode != certcfg.ModeTLS) || domain == "" {
 		return
 	}
-	if mode == cert.ModeDNS && !cert.DNSProviderSupported(scalar(c, "Provider")) {
-		m.report.warn("%s: 证书使用 DNS 供应商 %q，当前程序是 %s 版，不包含它；请安装完整版（W1nCray update --full），否则 W1nCray 无法自动续期该证书", label, scalar(c, "Provider"), cert.BuildFlavor)
+	if mode == certcfg.ModeDNS && !certcfg.DNSProviderSupported(scalar(c, "Provider")) {
+		m.report.warn("%s: 证书使用 DNS 供应商 %q，当前程序是 %s 版，不包含它；请安装完整版（W1nCray update --full），否则 W1nCray 无法自动续期该证书", label, scalar(c, "Provider"), certcfg.BuildFlavor)
 	}
-	cfg := &cert.Config{CertDomain: domain, CertFile: scalar(c, "CertFile"), KeyFile: scalar(c, "KeyFile")}
-	dstCert, dstKey := cert.TargetPaths(filepath.Join(m.toDir, "cert"), cfg)
+	cfg := &certcfg.Config{CertDomain: domain, CertFile: scalar(c, "CertFile"), KeyFile: scalar(c, "KeyFile")}
+	dstCert, dstKey := certcfg.TargetPaths(filepath.Join(m.toDir, "cert"), cfg)
 	name := strings.ReplaceAll(domain, "*", "_")
 	dirs := append([]string{m.fromDir}, m.opts.SearchDirs...)
 	for _, d := range dirs {
 		srcCert := filepath.Join(d, "cert", "certificates", name+".crt")
 		srcKey := filepath.Join(d, "cert", "certificates", name+".key")
-		if cert.Valid(srcCert, srcKey, domain) {
+		if certcfg.Valid(srcCert, srcKey, domain) {
 			m.plan(srcCert, filepath.FromSlash(dstCert))
 			m.plan(srcKey, filepath.FromSlash(dstKey))
 			m.report.change("%s: 沿用 XrayR 已签发的 %s 证书", label, domain)

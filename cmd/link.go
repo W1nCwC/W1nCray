@@ -21,7 +21,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
-	"github.com/W1nCwC/W1nCray/common/cert"
+	"github.com/W1nCwC/W1nCray/common/certcfg"
 	"github.com/W1nCwC/W1nCray/config"
 	"github.com/W1nCwC/W1nCray/nodecfg"
 )
@@ -239,7 +239,7 @@ func linkCertModeFailure(where string, cc *nodecfg.Config) string {
 		return ""
 	}
 	switch strings.ToLower(strings.TrimSpace(cc.CertConfig.CertMode)) {
-	case "", cert.ModeNone, cert.ModeFile, cert.ModeContent, cert.ModeSelf, cert.ModeHTTP, cert.ModeTLS, cert.ModeDNS:
+	case "", certcfg.ModeNone, certcfg.ModeFile, certcfg.ModeContent, certcfg.ModeSelf, certcfg.ModeHTTP, certcfg.ModeTLS, certcfg.ModeDNS:
 		return ""
 	}
 	return fmt.Sprintf("✗ %s.CertConfig.CertMode: 不支持的证书模式 %q（可选 none/file/content/self/http/tls/dns）", where, cc.CertConfig.CertMode)

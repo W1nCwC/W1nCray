@@ -1,6 +1,12 @@
 // Package cert provides TLS certificates for node inbounds: existing files,
 // certificates pushed by the panel, self-signed certificates and ACME
 // (HTTP-01, TLS-ALPN-01, DNS-01) certificates issued with lego.
+//
+// It is the *issuing* half of the certificate support and therefore links
+// lego (and every DNS provider SDK). The pure configuration half — the mode
+// constants, the Config type, TargetPaths, the on-disk file check and the
+// static provider lists — lives in common/certcfg, which has no lego
+// dependency and is what the agent program links.
 package cert
 
 import (
@@ -22,45 +28,24 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/W1nCwC/W1nCray/common/certcfg"
 )
 
-// Modes.
+// Modes, aliased from common/certcfg (which owns them).
 const (
-	ModeNone    = "none"
-	ModeFile    = "file"
-	ModeContent = "content"
-	ModeSelf    = "self"
-	ModeHTTP    = "http"
-	ModeTLS     = "tls"
-	ModeDNS     = "dns"
+	ModeNone    = certcfg.ModeNone
+	ModeFile    = certcfg.ModeFile
+	ModeContent = certcfg.ModeContent
+	ModeSelf    = certcfg.ModeSelf
+	ModeHTTP    = certcfg.ModeHTTP
+	ModeTLS     = certcfg.ModeTLS
+	ModeDNS     = certcfg.ModeDNS
 )
 
-// renewBefore is how long before expiry a certificate is replaced.
-const renewBefore = 30 * 24 * time.Hour
-
-// Config describes where a certificate comes from. The mapstructure names are
-// those of XrayR's CertConfig.
-type Config struct {
-	CertMode   string            `mapstructure:"CertMode"`
-	CertDomain string            `mapstructure:"CertDomain"`
-	CertFile   string            `mapstructure:"CertFile"`
-	KeyFile    string            `mapstructure:"KeyFile"`
-	Provider   string            `mapstructure:"Provider"`
-	Email      string            `mapstructure:"Email"`
-	DNSEnv     map[string]string `mapstructure:"DNSEnv"`
-	HTTPPort   int               `mapstructure:"HTTPPort"`
-
-	RejectUnknownSni bool `mapstructure:"RejectUnknownSni"`
-
-	// Content mode (panel cert push).
-	CertContent string `mapstructure:"-"`
-	KeyContent  string `mapstructure:"-"`
-}
-
-// Enabled reports whether the config yields a certificate.
-func (c *Config) Enabled() bool {
-	return c != nil && c.CertMode != "" && c.CertMode != ModeNone
-}
+// Config is the certificate source configuration, aliased from
+// common/certcfg (which owns it).
+type Config = certcfg.Config
 
 // Manager obtains certificates into a storage directory.
 type Manager struct {
@@ -87,16 +72,13 @@ func (m *Manager) paths(domain string) (string, string) {
 // TargetPaths returns where Ensure stores the certificate of cfg: CertFile and
 // KeyFile when both are set, otherwise <dir>/<domain>.crt|.key.
 func TargetPaths(dir string, cfg *Config) (certFile, keyFile string) {
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		return cfg.CertFile, cfg.KeyFile
-	}
-	return (&Manager{Dir: dir}).paths(cfg.CertDomain)
+	return certcfg.TargetPaths(dir, cfg)
 }
 
 // Valid reports whether the pair exists, covers domain and does not expire
 // within the renewal window.
 func Valid(certFile, keyFile, domain string) bool {
-	return valid(certFile, keyFile, domain)
+	return certcfg.Valid(certFile, keyFile, domain)
 }
 
 // Ensure returns the certificate and key file paths for cfg, creating,
@@ -204,20 +186,10 @@ func (m *Manager) ensureACME(cfg *Config) (string, string, bool, error) {
 }
 
 // valid reports whether the pair exists, covers domain and is not about to
-// expire.
+// expire. It is certcfg.Valid, kept under its old name for the internal
+// callers.
 func valid(certFile, keyFile, domain string) bool {
-	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil || len(pair.Certificate) == 0 {
-		return false
-	}
-	leaf, err := x509.ParseCertificate(pair.Certificate[0])
-	if err != nil {
-		return false
-	}
-	if time.Until(leaf.NotAfter) < renewBefore {
-		return false
-	}
-	return leaf.VerifyHostname(domain) == nil
+	return certcfg.Valid(certFile, keyFile, domain)
 }
 
 func writePair(certFile, keyFile string, certPEM, keyPEM []byte) error {
