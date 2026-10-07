@@ -270,3 +270,23 @@ func TestValidateTLSSelf(t *testing.T) {
 		t.Error("the fragment is not valid JSON")
 	}
 }
+
+// TestRenderTLSSelfGRPCAuthority: grpc-go requires the ClientConn authority to
+// match the TLS server name, so a gRPC tls_self entry dials with host = the
+// certificate name (test VPS: "authority ... don't match" before this).
+func TestRenderTLSSelfGRPCAuthority(t *testing.T) {
+	in := tlsSelfEntry()
+	in.Tunnel.Type = "grpc"
+	in.Tunnel.SNI = ""
+	d := New(Options{})
+	if err := d.Validate(in); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if _, err := d.Render(in); err != nil {
+		t.Fatal(err)
+	}
+	dl := frag(t, in).Chains[0].Hops[0].Nodes[0].Dialer
+	if dl.Metadata["host"] != tlsself.DefaultName {
+		t.Errorf("grpc host = %q, want %q", dl.Metadata["host"], tlsself.DefaultName)
+	}
+}

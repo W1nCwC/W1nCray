@@ -245,6 +245,12 @@ func (p *plan) buildChain() chain {
 	}
 	if t.hostHdr != "" {
 		md["host"] = t.hostHdr
+	} else if t.typ == "grpc" && t.tlsBased && t.sni != "" {
+		// grpc-go refuses a ClientConn whose authority (by default the dialed
+		// address) differs from the TLS server name: "ClientConn's authority
+		// from transport creds ... and dial option ... don't match" (seen on
+		// the test VPS with tls_self, whose name is w1n-fwd.invalid).
+		md["host"] = t.sni
 	}
 	if len(md) > 0 {
 		dl.Metadata = md
