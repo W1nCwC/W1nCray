@@ -91,6 +91,18 @@ agent 不再链接 Xray-core，转发规则/实例只用 gost、realm（frp 用�
 6. 转发（gost/realm）全部回归；engine=xray 被拒绝并说明原因。
 7. Go 全量测试（含 Linux -race）、phpunit、前端自测、真实浏览器桌面 + 375px。
 
+## 4.1 内核测试矩阵（gost / realm / frp / xray × 三种系统）
+
+现状（2026-10-07 核查）：三个外部内核都有「真实二进制」端到端测试（`driver/gost/e2e_*`、`driver/realm/e2e_test.go`、`driver/frp/e2e_*`，构建标签 `e2e`），但需要环境变量指定二进制，**此前所有回归都跳过了它们**；面板级实测只覆盖了 gost（直连 + TLS/WSS/gRPC 隧道）。realm、frp 从未用真实二进制跑过。
+
+| 层 | 内容 | Debian (systemd) | Alpine 3.20 (OpenRC) | OpenWrt 23.05 (procd) |
+|---|---|---|---|---|
+| L1 驱动 | `go test -tags e2e` 真实二进制（各内核自己的全部 E2E 用例） | gost / realm / frp | 同左（musl 环境，二进制取清单中该平台的资产） | 同左 |
+| L2 agent | 经面板下发：gost 直连 + tls/wss/grpc 隧道；realm 直连（TCP/UDP）+ realm 隧道（ws）；frp 反向代理（portal/bridge，经原始实例）；崩溃自动重启；agent 重启后恢复 | ✅ 必测 | ✅ 必测 | ✅ 必测 |
+| L3 Xray 内核 | 安装 → 节点用户可连 → agent 重启不断流 → 升级/坏版本回滚 → 卸载 | ✅ | ✅ | ✅（lite） |
+
+每格记录：命令、原始输出摘要、结论；失败项先修再进下一层。L1 Debian 先行（不依赖 v11 代码）。
+
 ## 5. 风险与回滚
 
 - 拆分涉及 panel 包大规模重构：逐 WP 合并，每步全量测试；保留 v0.5.3 作为可回滚版本。
