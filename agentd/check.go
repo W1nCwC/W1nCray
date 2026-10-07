@@ -145,6 +145,11 @@ func checkAgent(w io.Writer, cfg *Config, online bool) error {
 		}
 		fmt.Fprintf(w, "  ✓ Agent.ManifestKeysPath: %s\n", a.ManifestKeysPath)
 	}
+	if a.KernelsAllowHTTP() {
+		fmt.Fprintln(w, "  ! Agent.Kernels.AllowHTTP 已开启：内核资产允许明文 http:// 镜像（签名与 sha256 校验照旧）")
+	} else {
+		fmt.Fprintln(w, "  内核源: 仅 https（Agent.Kernels.AllowHTTP=false）")
+	}
 	if a.DesiredPath != "" {
 		if _, err := os.Stat(a.DesiredPath); err != nil {
 			fmt.Fprintf(w, "  ! Agent.DesiredPath 不存在（启动时不会应用）: %v\n", err)

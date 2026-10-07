@@ -74,6 +74,39 @@ func xrayCmd() *cobra.Command {
 	return c
 }
 
+// xrayKernelOptions builds the bootstrap options of the local xray command
+// from the machine's configuration. It is separate from xrayManager so the
+// wiring of the local kernel-source switch (Kernels.AllowHTTP) can be tested
+// without a running service manager.
+func xrayKernelOptions(path string, cfg *agentd.Config) bootstrap.Options {
+	stateDir, kernelsDir := "", ""
+	manifest, keys := "", ""
+	if a := cfg.Agent; a != nil {
+		stateDir, kernelsDir = a.StateDir, a.KernelsDir
+		manifest, keys = a.ManifestPath, a.ManifestKeysPath
+	}
+	if stateDir == "" {
+		stateDir = filepath.Join(filepath.Dir(path), "state")
+	}
+	if kernelsDir == "" {
+		kernelsDir = filepath.Join(stateDir, "kernels")
+	}
+	return bootstrap.Options{
+		StateDir:         stateDir,
+		KernelsDir:       kernelsDir,
+		ManifestPath:     manifest,
+		ManifestKeysPath: keys,
+		AgentVersion:     agentd.AgentVersion,
+		// The local kernel-source switch (Kernels.AllowHTTP, D-M1): the same
+		// value the service uses, so `W1nCray xray install` can reach the same
+		// mirror the agent would.
+		AllowHTTP:      agentd.KernelAllowHTTP(cfg),
+		XrayConfigPath: path,
+		Labeler:        selinux.New(selinux.Options{Log: log.StandardLogger()}),
+		Log:            log.StandardLogger(),
+	}
+}
+
 // xrayManager builds the service manager and the kernel installer from the
 // machine's configuration. The installer is returned too: the local install
 // path (--file) needs it, and it is the same object the manager uses, so the
@@ -87,33 +120,12 @@ func xrayManager() (*xraysvc.Manager, *kernelx.Ensurer, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	stateDir, kernelsDir := "", ""
-	manifest, keys := "", ""
-	if a := cfg.Agent; a != nil {
-		stateDir, kernelsDir = a.StateDir, a.KernelsDir
-		manifest, keys = a.ManifestPath, a.ManifestKeysPath
-	}
-	if stateDir == "" {
-		stateDir = filepath.Join(filepath.Dir(path), "state")
-	}
-	if kernelsDir == "" {
-		kernelsDir = filepath.Join(stateDir, "kernels")
-	}
-	o := bootstrap.Options{
-		StateDir:         stateDir,
-		KernelsDir:       kernelsDir,
-		ManifestPath:     manifest,
-		ManifestKeysPath: keys,
-		AgentVersion:     agentd.AgentVersion,
-		XrayConfigPath:   path,
-		Labeler:          selinux.New(selinux.Options{Log: log.StandardLogger()}),
-		Log:              log.StandardLogger(),
-	}
+	o := xrayKernelOptions(path, cfg)
 	kern, err := bootstrap.KernelInstaller(o)
 	if err != nil {
 		return nil, nil, err
 	}
-	sup := supervisor.New(supervisor.Options{Log: o.Log, PIDDir: filepath.Join(stateDir, "pid"), Labeler: o.Labeler})
+	sup := supervisor.New(supervisor.Options{Log: o.Log, PIDDir: filepath.Join(o.StateDir, "pid"), Labeler: o.Labeler})
 	mgr, _, err := bootstrap.XrayManager(o, kern, sup)
 	return mgr, kern, err
 }

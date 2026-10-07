@@ -116,6 +116,8 @@ Modules:
   XrayNodes: true
 Firewall:
   AutoOpen: true # 仅 OpenWrt：为对外监听的实例自动放行 WAN 端口（缺省即开启）
+Kernels:
+  AllowHTTP: false # 允许清单资产走明文 http:// 镜像（缺省 false = 只允许 https；仅本机可配）
 ```
 
 | 段 | 字段 |
@@ -127,6 +129,7 @@ Firewall:
 | `Files` | `Roots`、`Unrestricted`（**三态**，见下）、`AllowExec`、`MaxBytes`（单个受管文件 blob 上限，缺省 64 MiB；**负值 = 本机禁用 geo 下发**）、`MaxGeoBytes`（只覆盖 `geoip.dat`/`geosite.dat`，0 = 用 `MaxBytes`） |
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
 | `Firewall` | `AutoOpen`（**三态**，见「路由器防火墙自动放行」：OpenWrt 上缺省 true，其它系统恒为 false） |
+| `Kernels` | `AllowHTTP`（缺省 **false**：内核清单的资产只允许 `https://`；见「内网 http 镜像」） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
 
@@ -182,6 +185,25 @@ config rule 'w1ncray_<实例id>'
 - **失败不拆实例**：防火墙命令失败只记一条 warn，实例继续运行（本机转发仍然可用），对应实例的 `firewall_open` 为 `false`；不会因为防火墙失败回滚正在运行的实例。
 - **状态上报**：实例状态里新增 `firewall_open`（`/ack` 的 `report.instances[]` 与 `/report` 的 `instances[]`）。它只在 agent 确实放行了该实例的公网端口时为 `true`；机器不由 agent 管理防火墙时恒为 `false`，面板要结合 `hello.policy.firewall.auto_open` 解读。
 
+### 内网 http 镜像（`Kernels.AllowHTTP`，D-M1）
+
+内核（gost / frp / realm / xray）只从**已签名清单**安装：清单签名、`archive_sha256` 与每个成员文件的 `sha256` 都由 agent 在本机校验，**下载走什么协议不影响完整性**。所以清单里写了明文 `http://` 镜像（自建/内网、没有 TLS）时，agent 默认仍然拒绝，报：
+
+```
+…: download failed: all 1 sources failed: http://mirror.example/dist/W1nCray-xray-linux-amd64.gz: scheme not allowed
+```
+
+本机想用 http 镜像时，在 `agent.yml`（或 `config.yml` 的 `Agent:` 块）打开这个开关：
+
+```yaml
+Kernels:
+  AllowHTTP: true # 缺省 false = 只允许 https
+```
+
+- **只能本地配置**：面板下发的是期望状态与受管文件，不是 agent 配置，无法打开或关闭它；本机状态通过 `hello.policy.kernels.allow_http` 上报，面板据此显示「该机器允许 http 镜像」。
+- **只影响 scheme**：签名、有效期、吊销、序号防回滚、`min_agent`、平台 target、archive/成员哈希校验一律照旧（fail-closed 不变）。https 与 http 源可以混在同一个清单里，按清单顺序尝试。
+- `W1nCray check` 会打印该开关；`W1nCray xray install` 与常驻服务读同一份配置、同一个值。
+
 ### `config.yml` 的 `Agent:` 块（旧布局）
 
 写在 `config.yml` 里（与 `Nodes` 同级，YAML）。未启用（`Enabled: false` 或整块缺省）时 Agent 完全不工作。同目录一旦出现 `agent.yml`，本块即被整体忽略（见上）。
@@ -207,6 +229,7 @@ Agent:
 | `ManifestKeysPath` | 空 | 额外信任的 ed25519 公钥文件（hex，每行一个），叠加在二进制内嵌公钥之上，供本地/自托管使用；生产信任根是编译时内嵌的公钥。没有任何公钥时任何清单都会被拒（fail-closed，预期行为） |
 | `StateDir` | 配置文件所在目录下的 `state` | Agent 状态目录：已应用/上次可用的期望状态、冻结记录、各驱动的私有目录、PID 目录。文件权限 0600（含 `secret`） |
 | `KernelsDir` | `StateDir/kernels` | 外部内核安装目录 |
+| `Kernels.AllowHTTP` | `false` | 允许内核清单的资产走明文 `http://` 镜像（本机开关，见「内网 http 镜像」；签名与 sha256 校验不受影响） |
 | `Policy` | 见 §4 | 本地根信任策略 |
 
 校验：`PortRange` 必须恰好两个元素 `[lo, hi]`；`Policy.AllowEngines` 只能出现 `auto` / `xray` / `gost` / `frp` / `realm`（`xray` 只是保留的名字，写了也会在校验阶段被拒）。**建议留空**：留空表示不限制引擎，面板下发的实例可选任一引擎，实际可用性由已签名清单决定（gost / frp / realm 由 agent 按需下载安装，见 §3 与 §4）。
@@ -615,6 +638,7 @@ Agent:
 | `a self-signed certificate cannot be verified by a realm entry …` | realm 入口只信公共 CA | 出口用 `cert.mode: file` 的公共 CA 证书 |
 | `realm tunnels carry TCP only …` | realm 隧道不承载 UDP | `network` 改 `["tcp"]` |
 | `no signed kernel manifest loaded (set Agent.ManifestPath)` | 外部内核需要已签名清单 | 配置 `ManifestPath`（及 `ManifestKeysPath`）并重启/重载 |
+| `download failed: all 1 sources failed: http://…: scheme not allowed` | 清单里的资产是明文 `http://`，而本机没开 `Kernels.AllowHTTP` | 用 https 镜像；确需内网 http 镜像时在 `agent.yml` 写 `Kernels: {AllowHTTP: true}`（只能本机配置，面板不能下发） |
 | `json: unknown field "listn"` | 字段名拼错；解码是严格的 | 对照 §5 改字段名；JSON 里不能有注释 |
 | `status: rolled_back` + `blocked` | 应用中途失败已回滚，这份内容被冻结 | 看 `message` 里的具体原因，**改内容**（改 revision 不算）后再应用 |
 

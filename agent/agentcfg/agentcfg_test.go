@@ -86,6 +86,51 @@ Modules:
 	}
 }
 
+// TestKernelsAllowHTTPIsALocalSwitch covers D-M1: the agent.yml
+// Kernels.AllowHTTP switch exists, defaults to false (https only) and is read
+// from the machine's own configuration file. Nothing the panel pushes can set
+// it — the panel sends a desired state, never agent configuration.
+func TestKernelsAllowHTTPIsALocalSwitch(t *testing.T) {
+	var nilCfg *Config
+	if nilCfg.KernelsAllowHTTP() {
+		t.Error("a nil Config must not permit http kernel sources")
+	}
+	if (&Config{}).KernelsAllowHTTP() {
+		t.Error("a Config without a Kernels section must not permit http")
+	}
+	if (&Config{Kernels: &KernelsConfig{}}).KernelsAllowHTTP() {
+		t.Error("Kernels.AllowHTTP must default to false")
+	}
+	if !(&Config{Kernels: &KernelsConfig{AllowHTTP: true}}).KernelsAllowHTTP() {
+		t.Error("Kernels.AllowHTTP: true was ignored")
+	}
+
+	dir := t.TempDir()
+	path := writeFile(t, filepath.Join(dir, FileName), "Enabled: true\nKernels:\n  AllowHTTP: true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.KernelsAllowHTTP() {
+		t.Errorf("agent.yml Kernels.AllowHTTP was not read: %+v", cfg.Kernels)
+	}
+	// The switch is a local gate, not a policy: validation accepts it and the
+	// file that carries it stays loadable.
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	// The config.yml "Agent:" block uses the same field names, so a machine on
+	// the old layout gets the switch too.
+	block, err := Load(writeFile(t, filepath.Join(dir, "other.yml"), "Enabled: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if block.KernelsAllowHTTP() {
+		t.Error("a config without the section must stay https-only")
+	}
+}
+
 func TestResolvePrecedence(t *testing.T) {
 	t.Run("agent.yml wins as a whole", func(t *testing.T) {
 		dir, path := configPath(t)

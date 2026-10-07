@@ -90,3 +90,11 @@ Modules:
 #   Firewall: {AutoOpen: false}
 Firewall:
   AutoOpen: true
+
+# ---- 内网 http 镜像（D-M1）----------------------------------------------------
+# 内核只从已签名清单安装：签名与每个资产的 sha256 都由 agent 在本机校验，下载走
+# 什么协议不影响完整性。缺省只允许 https；自建/内网只有明文 http 镜像时在本机打开
+# 这个开关（面板无法远程打开或关闭它，只通过 hello.policy.kernels 上报）。
+#   Kernels: {AllowHTTP: true}
+Kernels:
+  AllowHTTP: false

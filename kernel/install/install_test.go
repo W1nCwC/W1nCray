@@ -383,6 +383,24 @@ func TestPlainHTTPRefusedByDefault(t *testing.T) {
 	}
 }
 
+// TestPlainHTTPAllowedWhenConfigured is the D-M1 counterpart of
+// TestPlainHTTPRefusedByDefault: Config.AllowHTTP is what a local agent.yml
+// switch drives, and when it is on the http source is really used (the
+// signature and the per-asset sha256 are still enforced).
+func TestPlainHTTPAllowedWhenConfigured(t *testing.T) {
+	f := newFixture(t)
+	fs := newFileServer(t)
+	k := publish(t, f, fs, kern{Name: "gost", Version: "3.3.0"})
+	in := f.installer(t.TempDir(), func(c *Config) { c.AllowHTTP = true })
+	if err := in.LoadManifest(f.sign(k)); err != nil {
+		t.Fatal(err)
+	}
+	mustEnsure(t, in, "gost", "3.3.0")
+	if fs.hitCount("/gost-3.3.0.bin") == 0 {
+		t.Error("the http source was never contacted")
+	}
+}
+
 func TestRangeResumeAfterInterruption(t *testing.T) {
 	f := newFixture(t)
 	fs := newFileServer(t)

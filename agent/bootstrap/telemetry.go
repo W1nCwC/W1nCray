@@ -236,6 +236,7 @@ func localPolicy(cfg *agentcfg.Config, openWrt bool) wsproto.Policy {
 		Terminal: cfg.TerminalEnabled(),
 		Modules:  wsproto.ModulePolicy{XrayNodes: cfg.XrayNodesEnabled()},
 		Firewall: wsproto.FirewallPolicy{AutoOpen: cfg.FirewallAutoOpen(openWrt)},
+		Kernels:  wsproto.KernelsPolicy{AllowHTTP: cfg.KernelsAllowHTTP()},
 	}
 	if cfg != nil && cfg.Files != nil {
 		pol.Files = wsproto.FilesPolicy{

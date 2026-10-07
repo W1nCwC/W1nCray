@@ -76,6 +76,10 @@ type Config struct {
 	// OpenWrt the agent opens the WAN ports of the instances it runs; anywhere
 	// else it never touches the firewall.
 	Firewall *FirewallConfig `mapstructure:"Firewall"`
+	// Kernels is the local kernel-source switch (D-M1): it permits plain
+	// http:// mirrors for the signed manifest's assets. It is off by default
+	// and only a local file can turn it on.
+	Kernels *KernelsConfig `mapstructure:"Kernels"`
 
 	// dir is the directory the relative paths were resolved against and
 	// excludedFiles are the paths that are never reachable through
@@ -289,6 +293,29 @@ type ModuleConfig struct {
 // firewall, whatever the field says.
 type FirewallConfig struct {
 	AutoOpen *bool `mapstructure:"AutoOpen"`
+}
+
+// KernelsConfig is the local kernel-source policy (D-M1). AllowHTTP permits
+// plain http:// sources for the assets of the signed kernel manifest.
+//
+// It is a LOCAL switch on purpose: the panel pushes a desired state and never
+// agent configuration, so it cannot turn this on remotely. Integrity does not
+// depend on it — the manifest is signed and every asset is checked against the
+// sha256 the manifest carries — which is exactly why an operator with a
+// self-hosted, internal-only mirror (no TLS) may want it. The default is off:
+// https only.
+type KernelsConfig struct {
+	AllowHTTP bool `mapstructure:"AllowHTTP"`
+}
+
+// KernelsAllowHTTP returns the effective Kernels.AllowHTTP value. The zero
+// value is false (https only), so a missing section, a nil Config and a Config
+// that was never resolved all keep the fail-closed default.
+func (c *Config) KernelsAllowHTTP() bool {
+	if c == nil || c.Kernels == nil {
+		return false
+	}
+	return c.Kernels.AllowHTTP
 }
 
 // FirewallAutoOpen returns the effective value of Firewall.AutoOpen for a
