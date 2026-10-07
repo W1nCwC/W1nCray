@@ -50,7 +50,20 @@ type Firewall interface {
 	// Sync makes the firewall match the given instances and returns, per
 	// instance id, whether that instance's public ports are open. It must only
 	// touch the rules it owns.
+	//
+	// An error leaves the open map unusable. An error whose value reports
+	// RulesPersisted() true means the rules were saved but could not be
+	// activated (see firewallPersisted).
 	Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, error)
+}
+
+// firewallPersisted is implemented by a Sync error that committed the rules but
+// could not activate them. It is matched structurally so this package does not
+// import agent/fwopen.
+type firewallPersisted interface {
+	// RulesPersisted reports that the firewall rules are saved in the
+	// configuration and will take effect on the next successful reload.
+	RulesPersisted() bool
 }
 
 // Defaults for the optional Reconciler fields.
@@ -528,6 +541,10 @@ func (r *Reconciler) apply(ctx context.Context, d spec.Desired) (Report, error) 
 // failure is a warning, never a rollback: the instances are running and local
 // forwarding works, so tearing them down would make the machine worse. The
 // affected instances then report firewall_open false.
+//
+// The report also carries a state the panel cannot see in firewall_open alone,
+// without a new protocol field: rules that were saved but could not be
+// activated because the reload failed.
 func (r *Reconciler) syncFirewall(ctx context.Context, instances []spec.Instance, rep *Report) {
 	if r.Firewall == nil {
 		return
@@ -535,15 +552,29 @@ func (r *Reconciler) syncFirewall(ctx context.Context, instances []spec.Instance
 	open, err := r.Firewall.Sync(ctx, instances)
 	if err != nil {
 		r.logf("warn", "firewall: %v", err)
-		if rep.Message != "" {
-			rep.Message += "; "
+		var persisted firewallPersisted
+		if errors.As(err, &persisted) && persisted.RulesPersisted() {
+			appendMessage(rep, "firewall rules are saved but not active yet (they take effect on the next successful reload): "+err.Error())
+		} else {
+			appendMessage(rep, "firewall rules could not be applied: "+err.Error())
 		}
-		rep.Message += "firewall rules could not be applied: " + err.Error()
+		// The open map is unusable on error: report every instance closed.
+		for i := range rep.Instances {
+			rep.Instances[i].FirewallOpen = false
+		}
 		return
 	}
 	for i := range rep.Instances {
 		rep.Instances[i].FirewallOpen = open[rep.Instances[i].ID]
 	}
+}
+
+// appendMessage adds one clause to the report message.
+func appendMessage(rep *Report, clause string) {
+	if rep.Message != "" {
+		rep.Message += "; "
+	}
+	rep.Message += clause
 }
 
 // ReconcileFirewall re-applies the firewall rules of the last applied state.

@@ -105,6 +105,34 @@ func TestFirewallFailureDoesNotRollBack(t *testing.T) {
 	}
 }
 
+// persistedErr models the firewall error that committed the rules but could not
+// activate them (fwopen.ReloadError), matched structurally by the reconciler.
+type persistedErr struct{}
+
+func (persistedErr) Error() string        { return "reload failed after 3 attempt(s)" }
+func (persistedErr) RulesPersisted() bool { return true }
+
+// TestFirewallPersistedButInactive: a reload failure after the commit is
+// reported as saved-but-not-active, not as a lost configuration, while the
+// instances still report their ports closed.
+func TestFirewallPersistedButInactive(t *testing.T) {
+	e := newEnv(t)
+	e.r.Firewall = &fakeFirewall{err: persistedErr{}}
+	rep, err := e.apply(desired(1, fwd(t, "a", "xray")))
+	if err != nil || rep.Status != StatusApplied {
+		t.Fatalf("a firewall failure must not fail the apply: %v %s", err, dumpReport(rep))
+	}
+	if inst(rep, "a").FirewallOpen {
+		t.Fatalf("firewall_open = true while the reload failed")
+	}
+	if !strings.Contains(rep.Message, "saved but not active") {
+		t.Fatalf("message = %q, want the saved-but-not-active wording", rep.Message)
+	}
+	if !strings.Contains(rep.Message, "next successful reload") {
+		t.Fatalf("message = %q, want it to say when the rules take effect", rep.Message)
+	}
+}
+
 // TestFirewallFollowsRollback: a failed apply restores the last good state, and
 // the firewall is re-synced with the instances that are running again.
 func TestFirewallFollowsRollback(t *testing.T) {
