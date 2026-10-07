@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/filesync"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
@@ -73,8 +74,23 @@ func (f *filesCmds) filesApply(ctx context.Context, req Request, complete Comple
 	if ops == nil {
 		return Result{}, errNoFiles
 	}
+	var args struct {
+		// Revision is the desired revision the panel published the files in
+		// (optional; older panels send no args).
+		Revision int64 `json:"revision"`
+	}
+	if err := decodeArgs(req.Args, &args); err != nil {
+		return Result{}, err
+	}
 	f.reg.logf().Infof("opscmd: files_apply accepted")
 	go func() {
+		if args.Revision > 0 {
+			if err := f.waitDesired(ctx, args.Revision); err != nil {
+				f.reg.logf().Warnf("opscmd: files_apply: %v", err)
+				complete(StatusFailed, nil, err)
+				return
+			}
+		}
 		res, err := ops.Apply(ctx)
 		if err != nil {
 			f.reg.logf().Warnf("opscmd: files_apply failed: %v", err)
@@ -88,6 +104,35 @@ func (f *filesCmds) filesApply(ctx context.Context, req Request, complete Comple
 		complete(StatusDone, filesApplyResult(res), nil)
 	}()
 	return accepted(), nil
+}
+
+// desiredWait bounds how long files_apply waits for its revision to arrive.
+var desiredWait = 30 * time.Second
+
+// waitDesired returns once the applied desired state is at least rev, pulling
+// immediately instead of waiting for the next poll. Without a desired-state
+// view it returns nil (the apply then uses what the agent has, as before).
+func (f *filesCmds) waitDesired(ctx context.Context, rev int64) error {
+	s := f.reg.desiredSync()
+	if s == nil {
+		return nil
+	}
+	deadline := time.Now().Add(desiredWait)
+	for {
+		have := s.DesiredRevision()
+		if have >= rev {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return coded("stale_desired", fmt.Errorf("desired revision %d has not been applied on this machine (it has %d); the managed files were not applied", rev, have))
+		}
+		s.RequestRefresh()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 }
 
 // filesApplyResult renders the apply outcome. applied_pending is the contract's

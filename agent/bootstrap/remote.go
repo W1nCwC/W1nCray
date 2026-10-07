@@ -106,6 +106,22 @@ func (s filesSource) DesiredFiles() []spec.FileRef {
 	return s.rt.Reconciler.LastDesired().Files
 }
 
+// desiredSync adapts the runtime and the panel runner to opscmd.DesiredSync:
+// the revision the reconciler last applied, and an immediate pull.
+type desiredSync struct {
+	rt     *Runtime
+	runner *panelclient.Runner
+}
+
+func (d desiredSync) DesiredRevision() int64 {
+	if d.rt == nil || d.rt.Reconciler == nil {
+		return 0
+	}
+	return d.rt.Reconciler.LastDesired().Revision
+}
+
+func (d desiredSync) RequestRefresh() { d.runner.RequestRefresh() }
+
 // blobFetcher adapts the panel HTTP client to filesync.BlobFetcher. The client
 // validates the sha256, sends If-None-Match and enforces the transport limit;
 // the applier re-hashes what comes back before anything is written.
@@ -302,6 +318,7 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	late := &lateResult{runner: runner, log: log}
 	if r.Ops != nil {
 		r.Ops.SetSink(late)
+		r.Ops.SetDesiredSync(desiredSync{rt: r, runner: runner})
 	}
 
 	if o.WS {

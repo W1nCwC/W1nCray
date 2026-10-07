@@ -170,7 +170,9 @@ type Registry struct {
 	// the panel link is built; until then the file commands answer
 	// "not_supported" instead of running half-wired.
 	files FilesOps
-	log   driver.Logger
+	// desired lets files_apply wait for the revision it was enqueued for.
+	desired DesiredSync
+	log     driver.Logger
 }
 
 var _ panelclient.CommandRunner = (*Registry)(nil)
@@ -268,6 +270,28 @@ func (r *Registry) SetFiles(f FilesOps) {
 	r.mu.Lock()
 	r.files = f
 	r.mu.Unlock()
+}
+
+// DesiredSync is the agent's view of the desired state it last applied, plus
+// a way to pull now. files_apply uses it: the panel publishes a revision and
+// enqueues the apply right away, and the command can arrive before the pull
+// that brings the revision's file list (PLAN v10 e2e finding).
+type DesiredSync interface {
+	DesiredRevision() int64
+	RequestRefresh()
+}
+
+// SetDesiredSync installs the desired-state view (bootstrap, with the panel link).
+func (r *Registry) SetDesiredSync(s DesiredSync) {
+	r.mu.Lock()
+	r.desired = s
+	r.mu.Unlock()
+}
+
+func (r *Registry) desiredSync() DesiredSync {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.desired
 }
 
 // filesOps returns the installed managed-file implementation (nil when none).
