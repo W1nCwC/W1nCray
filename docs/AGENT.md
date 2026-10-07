@@ -817,7 +817,7 @@ type Service interface {
 `agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它。X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。X2 起由 `agent/xraykern` 实现它：
 
 - `Status` 读 `/run/W1nCray/xray.sock`（旧内核的 `<config 目录>/xray.sock` 仍然接受；Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
-- `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。
+- `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。解析不整段 `json.Unmarshal`：stdout 里混入的日志行（Xray-core loader 自己打的）会被跳过，取**最后一个完整 JSON 对象**（`lastJSONObject`，尊重字符串与转义）；这是 agent 侧的防御，因为 agent 必须兼容清单里任意新旧的内核构建，而独立输出通道要求两边同步升级（R1-3）。
 - `WaitReloaded` 在 `files_apply` 写入受管文件后，等待状态接口的 `config_fingerprint` 变成**写入后文件的指纹**，超时 30 s。指纹用 `config.Fingerprint` 对 `config.WatchedFiles` 计算——与内核（`xraynode`）**同一份代码**，所以两边不可能不一致；超时即 `files_apply` 失败，走既有的 `last_good` 回滚路径（§13.6 的 `files_apply` 行）。
 
 ### 13.5.1 服务管理（`agent/xraysvc`）
