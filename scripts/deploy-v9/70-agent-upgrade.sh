@@ -264,6 +264,9 @@ fi
 
 # ---------------------------------------------------------------------------
 # split layout (agent.yml) via `W1nCray link`
+# NOTE: a machine whose nodes are already in machine mode (no static node left) needs
+# `W1nCray link --split` (v0.5.2+), the layout-only move of the existing Agent: block;
+# the node-converting `link` refuses it with "Nodes: 段里没有节点条目".
 # ---------------------------------------------------------------------------
 log ""
 info "split layout migration (agent.yml)"
