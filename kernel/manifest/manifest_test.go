@@ -344,6 +344,27 @@ func TestValidateRejects(t *testing.T) {
 	}
 }
 
+// TestTargetKeyOpenWrtSuffix covers PLAN v11 §E: an OpenWrt-specific target key
+// is "linux/<arch>+openwrt", and that is the only accepted suffix.
+func TestTargetKeyOpenWrtSuffix(t *testing.T) {
+	m := sample()
+	amd := *m.Kernels[0].Targets["linux/amd64"]
+	m.Kernels[0].Targets["linux/amd64+openwrt"] = &amd
+	if err := m.Validate(); err != nil {
+		t.Fatalf("a +openwrt target key must be accepted: %v", err)
+	}
+	if tg, st := m.Kernels[0].Lookup("linux/amd64+openwrt"); st != TargetPresent || tg == nil {
+		t.Fatalf("Lookup(linux/amd64+openwrt) = %v, %v", tg, st)
+	}
+	for _, key := range []string{"linux/amd64+foo", "linux/amd64+openwrt+openwrt", "linux/amd64+OpenWrt", "+openwrt", "linux/amd64+"} {
+		bad := sample()
+		bad.Kernels[0].Targets[key] = nil
+		if err := bad.Validate(); !errors.Is(err, kernel.ErrManifestInvalid) {
+			t.Errorf("target key %q: want ErrManifestInvalid, got %v", key, err)
+		}
+	}
+}
+
 func TestSignRefusesInvalid(t *testing.T) {
 	_, priv := keypair(t)
 	m := sample()

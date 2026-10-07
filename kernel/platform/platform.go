@@ -32,16 +32,40 @@ type Info struct {
 	Float string
 	// Libc is "musl", "glibc" or "" (unknown or not Linux).
 	Libc string
+	// OpenWrt is true on an OpenWrt/ImmortalWrt system (/etc/openwrt_release).
+	// It makes the OpenWrt-specific manifest target keys (linux/<arch>+openwrt)
+	// the first candidates, so a lite build is preferred there.
+	OpenWrt bool
 }
+
+// OpenWrtSuffix marks the OpenWrt-specific manifest target keys. The manifest
+// accepts exactly this one suffix (kernel/manifest reTarget).
+const OpenWrtSuffix = "+openwrt"
 
 // Key is the primary manifest target key, e.g. "linux/amd64",
 // "linux/armv7", "linux/mipsle".
 func (i Info) Key() string { return i.Keys()[0] }
 
-// Keys lists acceptable manifest target keys in order of preference. For ARM
-// the lower levels follow: a GOARM=5 binary also runs on a v7 CPU, so a
-// kernel without an armv7 build can fall back to armv6/armv5.
+// Keys lists acceptable manifest target keys in order of preference. On OpenWrt
+// each platform key is tried with the +openwrt suffix first, then without it,
+// so an OpenWrt lite build wins over the generic one and a manifest without it
+// still installs. For ARM the lower levels follow: a GOARM=5 binary also runs
+// on a v7 CPU, so a kernel without an armv7 build can fall back to
+// armv6/armv5.
 func (i Info) Keys() []string {
+	base := i.baseKeys()
+	if !i.OpenWrt {
+		return base
+	}
+	out := make([]string, 0, len(base)*2)
+	for _, k := range base {
+		out = append(out, k+OpenWrtSuffix, k)
+	}
+	return out
+}
+
+// baseKeys lists the platform keys without the OpenWrt preference.
+func (i Info) baseKeys() []string {
 	if i.GOARCH == "arm" {
 		lv := i.ARM
 		if lv < 5 || lv > 7 {
@@ -158,6 +182,7 @@ func DetectEnv(e Env) Info {
 	}
 	if e.GOOS == "linux" {
 		info.Libc = detectLibc(e)
+		info.OpenWrt = e.Exists("/etc/openwrt_release")
 	}
 	return info
 }
