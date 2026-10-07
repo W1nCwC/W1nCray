@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -386,19 +387,38 @@ func (m *Manager) Restart(ctx context.Context) error {
 // Remove stops and disables the service, deletes its service file and removes
 // every installed version of the kernel. config.yml and the managed files are
 // kept: reinstalling restores the service.
-func (m *Manager) Remove(ctx context.Context) error {
+//
+// It is idempotent (D-M2). A machine where the service was never installed, or
+// where it is already gone, answers success with removed=false: a missing
+// service is never an error, because "not installed" is exactly the state the
+// caller asked for. The rest of the cleanup still runs (an init-script entry in
+// /etc/sysupgrade.conf, kernel files left behind by a partial removal).
+func (m *Manager) Remove(ctx context.Context) (removed bool, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// "Removed something" is decided before the cleanup: a service file that is
+	// really there, or any installed version. The agent backend has no unit
+	// file of its own (unitPath is ""), so only the kernel list counts there.
+	removed = m.backend.unitPath() != "" && m.backend.exists()
+	if list, lerr := m.opts.Kernels.List(); lerr == nil {
+		for _, e := range list {
+			if e.Name == xrayapi.KernelName {
+				removed = true
+				break
+			}
+		}
+	}
 
 	derr := m.deactivate(ctx)
 	rerr := m.opts.Kernels.Remove(xrayapi.KernelName, "")
 	if rerr != nil && !errors.Is(rerr, kernel.ErrNotInstalled) {
 		if derr != nil {
-			return fmt.Errorf("%v；删除内核文件: %w", derr, rerr)
+			return removed, fmt.Errorf("%v；删除内核文件: %w", derr, rerr)
 		}
-		return rerr
+		return removed, rerr
 	}
-	return derr
+	return removed, derr
 }
 
 // activate writes the service definition, enables the service, starts it (or
@@ -431,18 +451,42 @@ func (m *Manager) activate(ctx context.Context, inst driver.Installed, restart b
 
 // deactivate stops and disables the service and removes its service file. The
 // errors are joined but a failure never stops the removal from continuing.
+//
+// A service that is not there cannot be stopped or disabled: systemd answers
+// "Unit ... not loaded", OpenRC "service ... does not exist" and procd
+// "not found", and all three mean the desired state already holds (D-M2). The
+// skip is by the service file, and serviceAbsent covers a stale init-system
+// view of a file that was just deleted.
 func (m *Manager) deactivate(ctx context.Context) error {
 	var errs []error
-	if err := m.backend.stop(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("停止 %s 服务: %w", ServiceName, err))
-	}
-	if err := m.backend.disable(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("禁用 %s 服务: %w", ServiceName, err))
+	if m.backend.unitPath() != "" && !m.backend.exists() {
+		m.log.Infof("xraysvc: %s 服务不存在，跳过 stop/disable（幂等卸载）", ServiceName)
+	} else {
+		if err := m.backend.stop(ctx); err != nil && !serviceAbsent(err) {
+			errs = append(errs, fmt.Errorf("停止 %s 服务: %w", ServiceName, err))
+		}
+		if err := m.backend.disable(ctx); err != nil && !serviceAbsent(err) {
+			errs = append(errs, fmt.Errorf("禁用 %s 服务: %w", ServiceName, err))
+		}
 	}
 	if err := m.backend.removeUnit(); err != nil {
 		errs = append(errs, fmt.Errorf("删除 %s 服务文件: %w", ServiceName, err))
 	}
 	return errors.Join(errs...)
+}
+
+// serviceAbsent reports whether a stop/disable failure only means the init
+// system does not know the service. That is the desired state of a removal, not
+// an error to report (D-M2); anything else (a permission problem, a broken
+// init system) stays fatal.
+func serviceAbsent(err error) bool {
+	s := strings.ToLower(err.Error())
+	for _, phrase := range []string{"not loaded", "not-found", "not found", "does not exist", "unrecognized service", "no such service"} {
+		if strings.Contains(s, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // labelKernels applies the SELinux label the kernel binaries need before the

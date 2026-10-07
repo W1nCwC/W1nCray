@@ -68,6 +68,9 @@ type fakeXray struct {
 	calls  []string
 	err    error
 	status xraysvc.Status
+	// removed is what Remove reports: false means "nothing was installed"
+	// (the D-M2 already-absent answer).
+	removed bool
 }
 
 func (f *fakeXray) Install(_ context.Context, version string) error {
@@ -86,9 +89,9 @@ func (f *fakeXray) Restart(context.Context) error {
 	f.calls = append(f.calls, "restart")
 	return f.err
 }
-func (f *fakeXray) Remove(context.Context) error {
+func (f *fakeXray) Remove(context.Context) (bool, error) {
 	f.calls = append(f.calls, "remove")
-	return f.err
+	return f.removed, f.err
 }
 func (f *fakeXray) Status(context.Context) (xraysvc.Status, error) {
 	return f.status, f.err

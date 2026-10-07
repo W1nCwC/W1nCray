@@ -318,8 +318,13 @@ func xrayRemoveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := mgr.Remove(cmd.Context()); err != nil {
+			removed, err := mgr.Remove(cmd.Context())
+			if err != nil {
 				return err
+			}
+			if !removed {
+				fmt.Printf("%s 本就未安装（无需卸载）\n", xraysvc.ServiceName)
+				return nil
 			}
 			fmt.Printf("%s 已卸载（配置与受管文件保留）\n", xraysvc.ServiceName)
 			return nil

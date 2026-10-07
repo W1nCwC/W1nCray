@@ -544,7 +544,7 @@ Agent:
 |---|---|---|
 | `kernel_list` | `{}` | 回 `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}`。`kernels` 是**已安装**的版本（事实，读内核目录）；`catalog` 只列已签名清单里**本机可用**的版本。没有加载清单时 `catalog: []`，`kernels` 照常返回。 |
 | `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。 |
-| `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`。 |
+| `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`；**幂等**：目标本来就没装（或已经删掉）时同样 `done`，结果里带 `already_absent: true`（D-M2）。`name=xray` 不需要 `version`：整服务卸载，服务本就不存在时也回 `already_absent`。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 一律拒绝（见下）；`xray` 走 Xray 内核服务（§13.5.1），服务未托管时回 `not_supported`。 |
 | `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。`mode` 是八进制权限串，`mtime` 是 Unix 秒。 |
@@ -807,7 +807,7 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 - `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动 → 健康检查（状态接口 30 s 内 `running=true`）。健康检查失败会停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
 - `Upgrade`：装新版本 → 改服务指向 → 重启 → 健康检查；失败自动 `kernelx` 回滚到上一版本并重启，报告里带上失败原因与回滚结果。
-- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。
+- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
 
 面板命令接入：`kernel_install`（已装过则走 `Upgrade`，带自动回滚）、`kernel_remove`（不需要版本号，整服务删除）、`kernel_rollback`、`component_restart` 在 `name=xray` 时都走这一套。`kernel_list` / `hello.kernel_entries` 里 xray 与其它内核格式一致，并附 `service`（`backend`、`state`、`managed_by`）；`state ∈ running/stopped/failed/installing/not_installed`。遥测的 `components` 里 xray 项来自状态接口：state、version、每个节点一项（在线数）、`last_error`。
 

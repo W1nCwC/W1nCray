@@ -137,7 +137,10 @@ type XrayService interface {
 	Upgrade(ctx context.Context, version string) error
 	Rollback(ctx context.Context) error
 	Restart(ctx context.Context) error
-	Remove(ctx context.Context) error
+	// Remove stops and deletes the service and every installed version. It
+	// reports whether anything was actually there, so kernel_remove can answer
+	// an already-absent machine with success (D-M2).
+	Remove(ctx context.Context) (removed bool, err error)
 	Status(ctx context.Context) (xraysvc.Status, error)
 }
 

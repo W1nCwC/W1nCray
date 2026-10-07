@@ -82,9 +82,12 @@ type KernelRemoveArgs struct {
 	Version string `json:"version"`
 }
 
-// KernelRemoveResult is the result of a successful kernel_remove.
+// KernelRemoveResult is the result of a successful kernel_remove. AlreadyAbsent
+// is true when there was nothing to remove: kernel_remove is idempotent, so an
+// already-absent target is a success, not a failure (D-M2).
 type KernelRemoveResult struct {
-	FreedBytes int64 `json:"freed_bytes"`
+	FreedBytes    int64 `json:"freed_bytes"`
+	AlreadyAbsent bool  `json:"already_absent,omitempty"`
 }
 
 // KernelRollbackArgs is the args of kernel_rollback.

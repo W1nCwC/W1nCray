@@ -88,7 +88,16 @@ func (f *fakeKernels) Remove(name, version string) error {
 	return nil
 }
 
-func (f *fakeKernels) List() ([]install.Entry, error) { return nil, nil }
+func (f *fakeKernels) List() ([]install.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.curErr != nil || f.current.Version == "" {
+		return nil, nil
+	}
+	return []install.Entry{{
+		Name: "xray", Version: f.current.Version, Current: true, Path: f.current.Path,
+	}}, nil
+}
 
 // fakeStatus is the kernel status endpoint.
 type fakeStatus struct {
@@ -549,7 +558,7 @@ func TestProcdInstallAndSysupgradeDedupe(t *testing.T) {
 	}
 
 	// Remove drops the init-script entry again but keeps the kernel dir.
-	if err := f.manager.Remove(ctx); err != nil {
+	if _, err := f.manager.Remove(ctx); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 	sc, err = os.ReadFile(filepath.Join(f.root, "etc", "sysupgrade.conf"))
@@ -561,8 +570,66 @@ func TestProcdInstallAndSysupgradeDedupe(t *testing.T) {
 	}
 }
 
-func TestUpgradeHealthFailureRollsBack(t *testing.T) {
+// TestRemoveIsIdempotentWhenTheServiceIsGone covers D-M2: on a machine where
+// the service was never installed (or was already removed), Remove must answer
+// success. systemd refuses to stop a unit that is not loaded, and that refusal
+// is exactly the state the caller asked for -- not a failure to report.
+func TestRemoveIsIdempotentWhenTheServiceIsGone(t *testing.T) {
 	f := newFixture(t, "run/systemd/system/")
+	unitPath := filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	// systemd's real behaviour: stop/disable of a unit whose file does not
+	// exist fails with "Unit ... not loaded".
+	f.run.respond = func(name string, args []string) ([]byte, error) {
+		if name == "systemctl" && len(args) > 0 && (args[0] == "stop" || args[0] == "disable") {
+			if _, err := os.Stat(unitPath); err != nil {
+				return []byte("Failed to " + args[0] + " " + ServiceName + ".service: Unit " + ServiceName + ".service not loaded."), errors.New("exit status 5")
+			}
+		}
+		return nil, nil
+	}
+
+	removed, err := f.manager.Remove(context.Background())
+	if err != nil {
+		t.Fatalf("Remove without an installed service must succeed, got: %v", err)
+	}
+	if removed {
+		t.Error("Remove reported a removal although nothing was installed")
+	}
+	// Idempotent: a second call is a no-op too.
+	if removed, err := f.manager.Remove(context.Background()); err != nil || removed {
+		t.Fatalf("second Remove = (%v, %v), want (false, nil)", removed, err)
+	}
+	if got := f.run.seq(); contains(got, "systemctl stop "+ServiceName) || contains(got, "systemctl disable "+ServiceName) {
+		t.Errorf("Remove ran stop/disable for a service that does not exist: %v", got)
+	}
+}
+
+// TestServiceAbsentRecognisesEveryInitSystem pins the phrases that mean "the
+// service is not there" for the three supported init systems. Anything else
+// stays fatal: idempotency must not swallow a real failure (D-M2).
+func TestServiceAbsentRecognisesEveryInitSystem(t *testing.T) {
+	for _, msg := range []string{
+		"systemctl stop W1nCray-xray: exit status 5: Failed to stop W1nCray-xray.service: Unit W1nCray-xray.service not loaded.",
+		"systemctl disable W1nCray-xray: exit status 1: Failed to disable unit: Unit W1nCray-xray.service does not exist",
+		"rc-service W1nCray-xray stop: exit status 1: rc-service: service `W1nCray-xray' does not exist",
+		"/etc/init.d/W1nCray-xray stop: exit status 1: not found",
+		"systemctl stop W1nCray-xray: Unit W1nCray-xray.service not-found",
+	} {
+		if !serviceAbsent(errors.New(msg)) {
+			t.Errorf("serviceAbsent(%q) = false, want true", msg)
+		}
+	}
+	for _, msg := range []string{
+		"systemctl stop W1nCray-xray: exit status 1: Operation not permitted",
+		"systemctl stop W1nCray-xray: exit status 1: Failed to connect to bus",
+	} {
+		if serviceAbsent(errors.New(msg)) {
+			t.Errorf("serviceAbsent(%q) = true, want false", msg)
+		}
+	}
+}
+
+func TestUpgradeHealthFailureRollsBack(t *testing.T) {	f := newFixture(t, "run/systemd/system/")
 	oldBin := installedKernel(t, f.root, "1.0.0")
 	newBin := installedKernel(t, f.root, "2.0.0")
 	f.kern.current = driver.Installed{Path: oldBin, Version: "1.0.0"}
@@ -636,14 +703,27 @@ func TestRemoveKeepsConfiguration(t *testing.T) {
 	bin := installedKernel(t, f.root, "1.0.0")
 	f.kern.current = driver.Installed{Path: bin, Version: "1.0.0"}
 	f.kern.curErr = nil
+	// The service file is there (the machine was installed at some point), so
+	// Remove really has to stop and disable it.
+	unitPath := filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte("unit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	route := filepath.Join(f.root, "route.json")
 	if err := os.WriteFile(route, []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.manager.Remove(context.Background()); err != nil {
+	removed, err := f.manager.Remove(context.Background())
+	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(f.root, "etc", "systemd", "system", "W1nCray-xray.service")); !os.IsNotExist(err) {
+	if !removed {
+		t.Error("Remove did not report the removal of an installed service")
+	}
+	if _, err := os.Stat(unitPath); !os.IsNotExist(err) {
 		t.Fatalf("the unit file was not removed: %v", err)
 	}
 	if _, err := os.Stat(f.config); err != nil {

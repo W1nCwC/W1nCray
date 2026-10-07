@@ -317,6 +317,66 @@ func TestKernelRemoveRefusesTheVersionInUseAndRemovesPrevious(t *testing.T) {
 	}
 }
 
+// TestKernelRemoveIsIdempotent covers D-M2 for the supervised kernels: a
+// version that is not installed (never was, or already removed) is the desired
+// state of kernel_remove, so the command succeeds and says already_absent
+// instead of failing the whole call.
+func TestKernelRemoveIsIdempotent(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.addVersion("2.0.0")
+	rig.ensure("1.0.0")
+	rig.ensure("2.0.0")
+	reg := mustRegistry(t, Deps{Kernels: rig.ops("", false)})
+	ctx := context.Background()
+
+	remove := func(id, version string) (string, json.RawMessage) {
+		t.Helper()
+		return reg.Execute(ctx, panelclient.Command{
+			ID: id, Type: panelclient.CmdKernelRemove,
+			Args: json.RawMessage(`{"name":"gost","version":"` + version + `"}`),
+		})
+	}
+	decode := func(res json.RawMessage) panelclient.KernelRemoveResult {
+		t.Helper()
+		var out panelclient.KernelRemoveResult
+		if err := json.Unmarshal(res, &out); err != nil {
+			t.Fatalf("remove result %s: %v", res, err)
+		}
+		return out
+	}
+
+	status, res := remove("i1", "1.0.0")
+	if status != panelclient.ResultDone {
+		t.Fatalf("first remove = (%q, %s), want done", status, res)
+	}
+	if out := decode(res); out.AlreadyAbsent {
+		t.Errorf("a real removal reported already_absent: %+v", out)
+	}
+
+	status, res = remove("i2", "1.0.0")
+	if status != panelclient.ResultDone {
+		t.Fatalf("second remove = (%q, %s), want done", status, res)
+	}
+	if out := decode(res); !out.AlreadyAbsent || out.FreedBytes != 0 {
+		t.Errorf("second remove = %+v, want already_absent with no bytes freed", out)
+	}
+
+	status, res = remove("i3", "9.9.9")
+	if status != panelclient.ResultDone {
+		t.Fatalf("never-installed version = (%q, %s), want done", status, res)
+	}
+	if out := decode(res); !out.AlreadyAbsent {
+		t.Errorf("never-installed version = %+v, want already_absent", out)
+	}
+
+	// Idempotency never weakens in_use: the current version is still refused.
+	status, res = remove("i4", "2.0.0")
+	if status != panelclient.ResultFailed || decodeFailure(t, res).Code != "in_use" {
+		t.Errorf("removing the current version = (%q, %s), want failed/in_use", status, res)
+	}
+}
+
 // TestKernelRemoveRefusesAVersionThatIsStillRunning covers the process check:
 // a rollback moves the pointer without restarting anything, so the version a
 // live process executes must be refused even when it is no longer current.

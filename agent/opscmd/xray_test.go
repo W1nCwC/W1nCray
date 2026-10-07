@@ -57,7 +57,7 @@ func TestKernelInstallXrayRoutesToTheServiceManager(t *testing.T) {
 }
 
 func TestKernelRemoveXrayRemovesTheService(t *testing.T) {
-	x := &fakeXray{}
+	x := &fakeXray{removed: true}
 	reg := mustRegistry(t, Deps{Xray: x})
 	status, res := reg.Execute(context.Background(), panelclient.Command{
 		ID: "x2", Type: panelclient.CmdKernelRemove,
@@ -68,6 +68,39 @@ func TestKernelRemoveXrayRemovesTheService(t *testing.T) {
 	}
 	if len(x.calls) != 1 || x.calls[0] != "remove" {
 		t.Fatalf("service calls = %v, want [remove]", x.calls)
+	}
+	var out panelclient.KernelRemoveResult
+	if err := json.Unmarshal(res, &out); err != nil {
+		t.Fatalf("result %s: %v", res, err)
+	}
+	if out.AlreadyAbsent {
+		t.Errorf("a real service removal reported already_absent: %+v", out)
+	}
+}
+
+// TestKernelRemoveXrayIsIdempotent covers D-M2's xray half: when the service
+// manager has nothing to remove (never installed, or already removed), the
+// command answers done with already_absent instead of the "Unit not loaded"
+// failure the matrix reported.
+func TestKernelRemoveXrayIsIdempotent(t *testing.T) {
+	x := &fakeXray{} // removed=false: there was nothing to remove
+	reg := mustRegistry(t, Deps{Xray: x})
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "x6", Type: panelclient.CmdKernelRemove,
+		Args: json.RawMessage(`{"name":"xray"}`),
+	})
+	if status != panelclient.ResultDone {
+		t.Fatalf("kernel_remove xray = (%q, %s), want done", status, res)
+	}
+	if len(x.calls) != 1 || x.calls[0] != "remove" {
+		t.Fatalf("service calls = %v, want [remove]", x.calls)
+	}
+	var out panelclient.KernelRemoveResult
+	if err := json.Unmarshal(res, &out); err != nil {
+		t.Fatalf("result %s: %v", res, err)
+	}
+	if !out.AlreadyAbsent {
+		t.Errorf("kernel_remove on an absent service = %s, want already_absent", res)
 	}
 }
 
