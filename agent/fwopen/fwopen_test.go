@@ -3,6 +3,7 @@ package fwopen
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -70,7 +71,7 @@ func fwd(id, addr, ports string, network ...string) spec.Instance {
 // and reloaded.
 func TestSyncAddsRule(t *testing.T) {
 	m, f := newManager(t, "")
-	open, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +104,7 @@ func TestSyncUpdatesChangedField(t *testing.T) {
 		"firewall.w1ncray_fwd1.dest_port='8443'\n" +
 		"firewall.w1ncray_fwd1.target='ACCEPT'\n"
 	m, f := newManager(t, show)
-	open, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "9443")})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "9443")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +132,7 @@ func TestSyncUnchangedRunsNothing(t *testing.T) {
 		"firewall.w1ncray_fwd1.dest_port='8443'\n" +
 		"firewall.w1ncray_fwd1.target='ACCEPT'\n"
 	m, f := newManager(t, show)
-	open, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +155,7 @@ func TestSyncDeletesStaleRule(t *testing.T) {
 		"firewall.user_rule=rule\n" +
 		"firewall.user_rule.name='keep me'\n"
 	m, f := newManager(t, show)
-	open, err := m.Sync(context.Background(), nil)
+	open, _, err := m.Sync(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +191,7 @@ func TestSyncReconcilesAtStartup(t *testing.T) {
 		"firewall.w1ncray_gone.name='W1nCray gone'\n"
 	m, f := newManager(t, show)
 	in := fwd("keep", "0.0.0.0", "20000-20009")
-	open, err := m.Sync(context.Background(), []spec.Instance{in})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{in})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +213,7 @@ func TestSyncReconcilesAtStartup(t *testing.T) {
 // tcp+udp instance as "tcp udp" on one rule.
 func TestSyncRangeAndBothProtocols(t *testing.T) {
 	m, f := newManager(t, "")
-	_, err := m.Sync(context.Background(), []spec.Instance{
+	_, _, err := m.Sync(context.Background(), []spec.Instance{
 		fwd("range", "0.0.0.0", "20000-20009"),
 		fwd("both", "0.0.0.0", "8443", "tcp", "udp"),
 	})
@@ -243,7 +244,7 @@ func TestLoopbackIsNeverOpened(t *testing.T) {
 		Listen: &spec.Listen{Ports: "9003"},
 	}
 	m, f := newManager(t, "")
-	open, err := m.Sync(context.Background(), []spec.Instance{off, v6loop, v4loop, bridge})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{off, v6loop, v4loop, bridge})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +265,7 @@ func TestTunnelExitOpensTunnelListen(t *testing.T) {
 		Tunnel: &spec.Tunnel{Type: "tls", Listen: "0.0.0.0:9443"},
 	}
 	m, f := newManager(t, "")
-	open, err := m.Sync(context.Background(), []spec.Instance{in})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{in})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +282,7 @@ func TestTunnelExitOpensTunnelListen(t *testing.T) {
 	loop.ID, loop.Name = "loopexit", "loopexit"
 	loop.Tunnel = &spec.Tunnel{Type: "tls", Listen: "127.0.0.1:9444"}
 	m2, f2 := newManager(t, "")
-	if _, err := m2.Sync(context.Background(), []spec.Instance{loop}); err != nil {
+	if _, _, err := m2.Sync(context.Background(), []spec.Instance{loop}); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(f2.calls, []string{"uci show firewall"}) {
@@ -300,7 +301,7 @@ func TestDisabledOrNotOpenWrtDoesNothing(t *testing.T) {
 		if m.Enabled() {
 			t.Fatalf("Enabled() = true for %+v", o)
 		}
-		open, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+		open, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -318,7 +319,7 @@ func TestDisabledOrNotOpenWrtDoesNothing(t *testing.T) {
 func TestWrongSectionTypeIsRecreated(t *testing.T) {
 	show := "firewall.w1ncray_fwd1=zone\nfirewall.w1ncray_fwd1.name='W1nCray fwd1'\n"
 	m, f := newManager(t, show)
-	if _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")}); err != nil {
+	if _, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")}); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
@@ -342,7 +343,7 @@ func TestWrongSectionTypeIsRecreated(t *testing.T) {
 func TestCommandFailureStopsTheSync(t *testing.T) {
 	m, f := newManager(t, "")
 	f.fail = map[string]error{"uci commit firewall": errors.New("boom")}
-	open, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 	if err == nil {
 		t.Fatal("Sync succeeded despite a failing commit")
 	}
@@ -362,6 +363,16 @@ func countCalls(calls []string, line string) int {
 	return n
 }
 
+// captureLog records the warning lines the manager emits.
+type captureLog struct{ warns []string }
+
+func (*captureLog) Debugf(string, ...any) {}
+func (*captureLog) Infof(string, ...any)  {}
+func (l *captureLog) Warnf(format string, args ...any) {
+	l.warns = append(l.warns, fmt.Sprintf(format, args...))
+}
+func (*captureLog) Errorf(string, ...any) {}
+
 // TestReloadTransientFailureIsRetried: a reload that fails once is retried and
 // the apply succeeds, so a single fw4 hiccup does not leave the ports closed
 // until the next apply.
@@ -371,12 +382,15 @@ func TestReloadTransientFailureIsRetried(t *testing.T) {
 	m.reloadWait = time.Millisecond
 	m.reloadCap = time.Second
 
-	open, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+	open, skipped, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 	if err != nil {
 		t.Fatalf("Sync after a transient reload failure: %v", err)
 	}
 	if !open["fwd1"] {
 		t.Fatalf("fwd1 not reported open after a successful retry: %v", open)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %v, want none", skipped)
 	}
 	if got := countCalls(f.calls, "fw4 reload"); got != 2 {
 		t.Fatalf("reload ran %d time(s), want 2 (one failure + one retry): %v", got, f.calls)
@@ -393,7 +407,7 @@ func TestReloadFailureIsReportedAsPersisted(t *testing.T) {
 	m.reloadWait = time.Millisecond
 	m.reloadCap = time.Second
 
-	open, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+	open, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 	if err == nil {
 		t.Fatal("Sync succeeded despite a permanently failing reload")
 	}
@@ -428,7 +442,7 @@ func TestReloadBudgetBoundsTheRetries(t *testing.T) {
 	m.reloadCap = 20 * time.Millisecond
 
 	start := time.Now()
-	_, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+	_, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 	if err == nil {
 		t.Fatal("Sync succeeded despite a permanently failing reload")
 	}
@@ -441,6 +455,44 @@ func TestReloadBudgetBoundsTheRetries(t *testing.T) {
 	}
 	if got := countCalls(f.calls, "fw4 reload"); got > 2 {
 		t.Fatalf("reload ran %d time(s): the budget must stop the retries", got)
+	}
+}
+
+// TestUnparseablePortsAreReportedNotSilentlyDropped: an instance whose port
+// declaration does not parse gets no rule, and Sync returns why instead of
+// dropping it without a trace.
+func TestUnparseablePortsAreReportedNotSilentlyDropped(t *testing.T) {
+	log := &captureLog{}
+	f := &fakeExec{}
+	m := New(Options{
+		OpenWrt:  true,
+		AutoOpen: true,
+		Exec:     f,
+		Reload:   []string{"fw4", "reload"},
+		Log:      log,
+	})
+
+	open, skipped, err := m.Sync(context.Background(), []spec.Instance{fwd("bad", "0.0.0.0", "0")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open = %v, want none: no rule can be derived", open)
+	}
+	reason, ok := skipped["bad"]
+	if !ok {
+		t.Fatalf("skipped = %v, want an entry for bad", skipped)
+	}
+	if !strings.Contains(reason, `listen ports "0"`) {
+		t.Fatalf("reason = %q, want it to name the port declaration", reason)
+	}
+	if len(log.warns) == 0 || !strings.Contains(strings.Join(log.warns, "\n"), "bad") {
+		t.Fatalf("warnings = %v, want one naming the instance", log.warns)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "w1ncray_bad") {
+			t.Fatalf("a rule was written for an unparseable port: %v", f.calls)
+		}
 	}
 }
 
@@ -512,7 +564,7 @@ func TestNoReloadCommandFailsReadably(t *testing.T) {
 	f := &fakeExec{}
 	m := New(Options{OpenWrt: true, AutoOpen: true, Exec: f, Reload: nil})
 	m.reload = nil
-	_, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
+	_, _, err := m.Sync(context.Background(), []spec.Instance{fwd("fwd1", "0.0.0.0", "8443")})
 	if err == nil || !strings.Contains(err.Error(), "reload") {
 		t.Fatalf("err = %v", err)
 	}

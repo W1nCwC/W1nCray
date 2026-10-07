@@ -168,7 +168,8 @@ func (r rule) fields() [][2]string {
 }
 
 // Sync makes the firewall sections match the public listeners of instances. It
-// is a no-op on a machine where Enabled is false (open is then empty).
+// is a no-op on a machine where Enabled is false (open is then empty and
+// skipped is nil).
 //
 // It returns:
 //
@@ -176,25 +177,45 @@ func (r rule) fields() [][2]string {
 //     section of an instance whose ports are open is reported true even when
 //     nothing had to change. A failure leaves this map unusable (nil): the
 //     caller must treat every instance as not opened.
+//   - skipped: per instance id, why no rule could be derived for it, i.e. a
+//     port declaration the agent could not parse. A warning is logged for every
+//     entry; the caller can surface them in its own report. A skipped instance
+//     is absent from open.
 //   - err: a command failed. A *ReloadError means the configuration was
 //     committed but the firewall was not reloaded: the rules are persisted yet
 //     not active.
-func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, error) {
+func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, map[string]string, error) {
 	open := map[string]bool{}
 	if !m.Enabled() {
-		return open, nil
+		return open, nil, nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	want := desiredRules(instances)
+	want, skips := desiredRules(instances)
+	skipped := make(map[string]string, len(skips))
+	for _, s := range skips {
+		skipped[s.instance] = s.reason
+	}
+	if len(skips) > 0 {
+		// Sorted so the warning order of two identical applies is the same.
+		ids := make([]string, 0, len(skips))
+		for _, s := range skips {
+			ids = append(ids, s.instance)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			m.log.Warnf("fwopen: instance %s has no firewall rule: %s", id, skipped[id])
+		}
+	}
+
 	wantBySection := make(map[string]rule, len(want))
 	for _, r := range want {
 		wantBySection[r.section] = r
 	}
 	have, err := m.show(ctx)
 	if err != nil {
-		return nil, err
+		return nil, skipped, err
 	}
 
 	changed := false
@@ -208,15 +229,15 @@ func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[stri
 				// A section of the wrong type cannot be turned into a rule;
 				// remove it first so the recreate cannot fail halfway.
 				if _, err := m.run(ctx, "uci", "delete", "firewall."+r.section); err != nil {
-					return nil, err
+					return nil, skipped, err
 				}
 			}
 			if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"=rule"); err != nil {
-				return nil, err
+				return nil, skipped, err
 			}
 			for _, kv := range r.fields() {
 				if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"."+kv[0]+"="+kv[1]); err != nil {
-					return nil, err
+					return nil, skipped, err
 				}
 			}
 			changed = true
@@ -226,7 +247,7 @@ func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[stri
 					continue
 				}
 				if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"."+kv[0]+"="+kv[1]); err != nil {
-					return nil, err
+					return nil, skipped, err
 				}
 				changed = true
 			}
@@ -243,22 +264,22 @@ func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[stri
 	sort.Strings(stale)
 	for _, section := range stale {
 		if _, err := m.run(ctx, "uci", "delete", "firewall."+section); err != nil {
-			return nil, err
+			return nil, skipped, err
 		}
 		changed = true
 	}
 
 	if !changed {
-		return open, nil
+		return open, skipped, nil
 	}
 	if _, err := m.run(ctx, "uci", "commit", "firewall"); err != nil {
-		return nil, err
+		return nil, skipped, err
 	}
 	if err := m.reloadFirewall(ctx); err != nil {
-		return nil, err
+		return nil, skipped, err
 	}
 	m.log.Infof("fwopen: firewall updated (%d rule(s) open, %d removed)", len(want), len(stale))
-	return open, nil
+	return open, skipped, nil
 }
 
 // show reads the firewall configuration and returns the agent-owned sections,
@@ -315,12 +336,23 @@ func unquote(s string) string {
 	return s
 }
 
+// skip is one instance that got no rule because its port declaration could not
+// be parsed. It is reported in the Sync result instead of being dropped
+// silently.
+type skip struct {
+	instance string // instance id, for the report
+	reason   string // why no rule was derived ("listen ports ...: ...")
+}
+
 // desiredRules extracts the firewall rule of every instance that accepts user
-// traffic on a non-loopback address. Instances without such a listener produce
-// no rule: a disabled instance, a loopback-only listener, and a reverse_bridge
-// (it dials out; the public port belongs to the portal instance).
-func desiredRules(instances []spec.Instance) []rule {
+// traffic on a non-loopback address, together with the instances it had to
+// skip because their port declaration does not parse. Instances without such a
+// listener produce no rule and no skip: a disabled instance, a loopback-only
+// listener, and a reverse_bridge (it dials out; the public port belongs to the
+// portal instance).
+func desiredRules(instances []spec.Instance) ([]rule, []skip) {
 	var out []rule
+	var skips []skip
 	seen := map[string]bool{}
 	for _, in := range instances {
 		if !in.Enabled {
@@ -332,7 +364,13 @@ func desiredRules(instances []spec.Instance) []rule {
 		}
 		lo, hi, err := portledger.ParsePorts(ports)
 		if err != nil {
-			continue // the validator rejects this long before we run
+			// The validator rejects this long before we run, so this branch is
+			// defence in depth: never drop a rule without saying so.
+			skips = append(skips, skip{
+				instance: in.ID,
+				reason:   fmt.Sprintf("listen ports %q: %v", ports, err),
+			})
+			continue
 		}
 		dest := strconv.Itoa(lo)
 		if hi != lo {
@@ -354,7 +392,7 @@ func desiredRules(instances []spec.Instance) []rule {
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].section < out[j].section })
-	return out
+	return out, skips
 }
 
 // publicListener returns the address and port spec an instance listens on for
