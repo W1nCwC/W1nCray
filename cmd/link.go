@@ -39,6 +39,9 @@ type linkOptions struct {
 	// Force allows link to replace an existing agent.yml. The old file is
 	// backed up first.
 	Force bool
+	// Split is the layout-only migration (runSplit): move the existing Agent:
+	// block to agent.yml without converting any node.
+	Split bool
 }
 
 func init() {
@@ -65,6 +68,9 @@ func init() {
 				return err
 			}
 			setAssetLocation(path)
+			if opts.Split {
+				return runSplit(path, opts, os.Stdout)
+			}
 			return runLink(path, opts, os.Stdout)
 		},
 	}
@@ -79,6 +85,7 @@ func init() {
 	c.Flags().BoolVar(&opts.SkipCheck, "skip-check", false, "write the converted config without validating it first")
 	c.Flags().BoolVar(&opts.NoTerminal, "noterminal", false, "write Terminal: {Enabled: false} to agent.yml (the terminal is ON by default)")
 	c.Flags().BoolVar(&opts.Force, "force", false, "replace an existing agent.yml (a backup is written first)")
+	c.Flags().BoolVar(&opts.Split, "split", false, "layout only: move the existing Agent: block of config.yml to agent.yml (machines already in machine mode); ignores --panel/--machine/--token")
 	rootCmd.AddCommand(c)
 }
 

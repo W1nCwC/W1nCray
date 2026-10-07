@@ -129,6 +129,7 @@ Modules:
 
 - 目标目录没有 `agent.yml`：写出一份新的 `agent.yml`（**原子写**：同目录临时文件 + rename，权限 0600），`config.yml` 只保留 xray 内核的配置。
 - `config.yml` 里还有旧的 `Agent:` 块：该块被**迁移**进 `agent.yml`——本机设置（`Policy`、`DesiredPath`、`Terminal`、`Files`、`Modules` 等）原样保留（所以已经本地关闭终端的机器迁移后仍然是关闭的）；`Panel` 段按本次 `link` 的参数重写，但 link 不负责的 Panel 键（`ManifestSync`、`PullIntervalSec`、`NodeController` 模板等）同样保留，不会被悄悄改回默认值；`config.yml` 原处留一行 `# Agent: 段已迁移到 agent.yml …` 注释。迁移后的配置能通过 `W1nCray check`。
+- **节点早已转成机器模式、只剩 `Agent:` 块的机器**（例如由 v0.4 的 `link` 转换过的落地机）：普通 `link` 会因"Nodes: 段里没有节点条目"拒绝。改用纯布局拆分 `W1nCray link --split [--noterminal] [--dry-run] [--force]`：把现有 `Agent:` 块**原样**搬进 `agent.yml`（不需要也不接受 `--panel/--machine/--token`，令牌与连接信息都在块里），`config.yml` 原处留一行注释。写入前校验"拆出的 `agent.yml` 与原块解析结果完全一致"且能独立加载；写入后若完整离线检查出现原配置没有的问题，自动恢复原文件。两份原文件都会先备份；完成后 `W1nCray check` 再 `W1nCray restart`。
 - `agent.yml` 已经存在：**拒绝覆盖**并给出明确错误（不会动任何文件）；只有 `link --force` 才覆盖，且**先备份**为 `agent.yml.bak-<时间戳>`。
 - `--dry-run` 依然不写任何文件（`config.yml`、`agent.yml`、令牌、备份都不写）。
 - 写入前仍做「只比较本次转换**新增**的失败项」的基线校验；`--skip-check` 跳过它。
