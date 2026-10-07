@@ -106,6 +106,21 @@ type Policy struct {
 	Terminal bool         `json:"terminal"`
 	Files    FilesPolicy  `json:"files"`
 	Modules  ModulePolicy `json:"modules"`
+	// Instances is the local instance policy (agent.yml Policy). The panel
+	// uses it to pick ports inside the permitted range and to explain a
+	// listen address the machine will refuse (PLAN v10 WP-D); the agent still
+	// enforces it on every apply.
+	Instances *InstancePolicy `json:"instances,omitempty"`
+}
+
+// InstancePolicy mirrors spec.Policy for display and planning.
+type InstancePolicy struct {
+	AllowListen     []string `json:"allow_listen"`
+	PortRange       [2]int   `json:"port_range"`
+	PrivilegedPorts bool     `json:"privileged_ports"`
+	DenyPorts       []int    `json:"deny_ports"`
+	MaxInstances    int      `json:"max_instances"`
+	AllowEngines    []string `json:"allow_engines"`
 }
 
 type FilesPolicy struct {

@@ -234,6 +234,17 @@ func localPolicy(cfg *agentcfg.Config) wsproto.Policy {
 			Unrestricted: cfg.UnrestrictedEnabled(),
 		}
 	}
+	if cfg != nil {
+		sp := cfg.PolicySpec()
+		pol.Instances = &wsproto.InstancePolicy{
+			AllowListen:     append([]string(nil), sp.AllowListen...),
+			PortRange:       sp.PortRange,
+			PrivilegedPorts: sp.PrivilegedPorts,
+			DenyPorts:       append([]int(nil), sp.DenyPorts...),
+			MaxInstances:    sp.MaxInstances,
+			AllowEngines:    append([]string(nil), sp.AllowEngines...),
+		}
+	}
 	return pol
 }
 

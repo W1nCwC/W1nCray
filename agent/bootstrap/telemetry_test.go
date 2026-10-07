@@ -134,6 +134,12 @@ func TestPolicyComesFromTheLocalAgentConfig(t *testing.T) {
 	if pol.Modules.XrayNodes {
 		t.Error("xray_nodes must follow Modules.XrayNodes")
 	}
+	// The instance policy is reported so the panel can plan ports (PLAN v10).
+	withPolicy := &agentcfg.Config{Policy: &agentcfg.Policy{AllowListen: []string{"0.0.0.0"}, PortRange: []int{30001, 39999}}}
+	ip := rt.Streams(nil, withPolicy).Policy().Instances
+	if ip == nil || ip.PortRange != [2]int{30001, 39999} || len(ip.AllowListen) != 1 || ip.AllowListen[0] != "0.0.0.0" {
+		t.Errorf("instances policy = %+v", ip)
+	}
 	// Mutating the reported roots must not reach into the config.
 	pol.Files.Roots[0] = "/tmp"
 	if again := rt.Streams(nil, cfg).Policy(); again.Files.Roots[0] != "/etc/W1nCray" {
