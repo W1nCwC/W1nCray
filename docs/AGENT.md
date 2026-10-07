@@ -728,7 +728,7 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 | `W1nCray link` / `link --split` / `migrate` | 与 v10 相同；写入前的离线检查改为调用外部内核（见下） |
 | `W1nCray agent-apply -f desired.json` | 只支持外部引擎（gost / frp / realm）；`engine: xray` 被拒绝 |
 | `W1nCray xray status\|start\|stop\|restart\|install [version]\|remove` | 本机管理 Xray 内核服务，调用与面板路径**同一套** `agent/xraysvc`（见 §13.5） |
-| `W1nCray xray install --file <文件或 .gz> --sha256 <hex>` | 离线安装本地 Xray 内核构建（见 §13.7.2） |
+| `W1nCray xray install --file <文件或 .gz> --sha256 <hex>` | 离线安装本地 Xray 内核构建（见 §13.8.3） |
 
 `link` / `link --split` 的**写入前校验**需要 Xray 侧的检查：加 `--xray-bin <路径>`，或在 `W1nCray` 同目录 / `PATH` 找到 `W1nCray-xray` 时，会执行 `<W1nCray-xray> check -c <配置>` 并把输出里以 `✗` 开头的行当作失败项参与基线比较；找不到内核时**跳过该检查并打印说明**（agent 侧仍会校验机器模式的证书模式等问题）。
 
@@ -763,8 +763,10 @@ openssl s_client -connect <出口IP>:<tunnel.listen 端口> -servername <sni> </
 
 `W1nCray-xray run` 在本机提供只读状态接口：
 
-- Unix 系统：`<config 目录>/xray.sock`（Unix 套接字，权限 0600）。
+- Unix 系统：`/run/W1nCray/xray.sock`（Unix 套接字，权限 0600；目录可用 `W1NCRAY_RUNTIME_DIR` 覆盖，测试与非 root 开发用它）。
 - Windows：`127.0.0.1` 上的随机端口，端口写入 `<config 目录>/xray.addr`。
+
+套接字**不**放在配置目录里：配置目录在 `/etc/W1nCray`（SELinux 类型 `etc_t`），而内核服务在 SELinux 机器上的域不允许在 `etc_t` 里创建套接字（见 §13.7）。`/run/W1nCray` 由 systemd 的 `RuntimeDirectory=W1nCray` 创建，OpenRC / procd 的 init 脚本与内核自己也会创建它；目录不可用时内核退回 `<config 目录>/xray.sock`，agent 两边都读，所以升级中的旧内核也照常工作。
 
 `GET /status` 返回：
 
@@ -797,7 +799,7 @@ type Service interface {
 
 `agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它。X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。X2 起由 `agent/xraykern` 实现它：
 
-- `Status` 读 `<config 目录>/xray.sock`（Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
+- `Status` 读 `/run/W1nCray/xray.sock`（旧内核的 `<config 目录>/xray.sock` 仍然接受；Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
 - `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。
 - `WaitReloaded` 在 `files_apply` 写入受管文件后，等待状态接口的 `config_fingerprint` 变成**写入后文件的指纹**，超时 30 s。指纹用 `config.Fingerprint` 对 `config.WatchedFiles` 计算——与内核（`xraynode`）**同一份代码**，所以两边不可能不一致；超时即 `files_apply` 失败，走既有的 `last_good` 回滚路径（§13.6 的 `files_apply` 行）。
 
@@ -807,9 +809,9 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 | 后端 | 探测 | 服务文件 |
 |---|---|---|
-| systemd | `/run/systemd/system` 存在 | `/etc/systemd/system/W1nCray-xray.service`：`ExecStart=<当前版本二进制绝对路径> run -c <config.yml 绝对路径>`、`Restart=always`、`RestartSec=5`、`LimitNOFILE=1048576`、`WorkingDirectory=<配置目录>`；`systemctl daemon-reload`、`enable`、`start` |
-| OpenRC | `/sbin/openrc-run` 存在 | `/etc/init.d/W1nCray-xray`（`supervisor="supervise-daemon"`）；`rc-update add W1nCray-xray default`、`rc-service W1nCray-xray start` |
-| procd | `/sbin/procd` 与 `/etc/rc.common` 存在 | `/etc/init.d/W1nCray-xray`（`USE_PROCD=1`、`respawn`）；`enable`、`start`；内核目录与 init 脚本追加进 `/etc/sysupgrade.conf`（去重） |
+| systemd | `/run/systemd/system` 存在 | `/etc/systemd/system/W1nCray-xray.service`：`ExecStart=<当前版本二进制绝对路径> run -c <config.yml 绝对路径>`、`Restart=always`、`RestartSec=5`、`LimitNOFILE=1048576`、`WorkingDirectory=<配置目录>`、`RuntimeDirectory=W1nCray`（状态套接字目录，见 §13.4/§13.7）；`systemctl daemon-reload`、`enable`、`start` |
+| OpenRC | `/sbin/openrc-run` 存在 | `/etc/init.d/W1nCray-xray`（`supervisor="supervise-daemon"`，`start_pre` 里 `mkdir -p /run/W1nCray`）；`rc-update add W1nCray-xray default`、`rc-service W1nCray-xray start` |
+| procd | `/sbin/procd` 与 `/etc/rc.common` 存在 | `/etc/init.d/W1nCray-xray`（`USE_PROCD=1`、`respawn`，`start_service` 里 `mkdir -p /run/W1nCray`）；`enable`、`start`；内核目录与 init 脚本追加进 `/etc/sysupgrade.conf`（去重） |
 | agent 子进程 | 三者都没有 | 由 agent supervisor 运行（与 gost 相同），状态里 `managed_by: "agent"`，面板据此提示「此系统 Xray 会随 agent 重启」 |
 
 服务名固定为 `W1nCray-xray`。`Install`/`Upgrade`/`Rollback`/`Restart`/`Remove` 都幂等、带超时、失败可读：
@@ -851,9 +853,28 @@ W1nCray xray stop
 
 拆分后 `config.yml` 同时属于两个程序：`W1nCray` 只读它的 `Agent:` 块，`W1nCray-xray` 读 Xray 部分并按上面的表监听重载。
 
-### 13.7 发布产物与清单条目（WP-X3）
+### 13.7 SELinux（CentOS/RHEL 系，enforcing）
 
-#### 13.7.1 `release/build.sh` 的产物
+内核二进制装在 agent 的 state 目录（`/etc/W1nCray/state/kernels/kernels/<名字>/<版本>/`），**默认类型是 `etc_t`**——因为它在 `/etc` 下。systemd（`init_t`）执行 `etc_t` 文件时**不会**转到 `unconfined_service_t`（`/usr/local` 下的 agent 二进制是 `usr_t`，会转），进程留在 `init_t`；而 `init_t` 不允许在 `etc_t` 目录里创建套接字：
+
+```
+type=AVC msg=audit(...): avc:  denied  { create } for  pid=... comm="W1nCray-xray"
+  name="xray.sock" scontext=system_u:system_r:init_t:s0
+  tcontext=system_u:object_r:etc_t:s0 tclass=sock_file permissive=0
+```
+
+结果是服务启动即退出（`Error: status socket /etc/W1nCray/xray.sock: listen unix ...: bind: permission denied`），`Restart=always` 让它反复重启，健康检查永远不通过。修复分两层：
+
+1. **状态套接字搬出配置目录**（§13.4）：`/run/W1nCray/xray.sock`。`/run/W1nCray` 是 `var_run_t`，不是配置树的一部分；systemd 用 `RuntimeDirectory=` 创建，OpenRC / procd 的 init 脚本创建，agent 的 fallback 后端与内核自己也会创建。
+2. **内核二进制标为 `bin_t`**（`agent/selinux`）：`bin_t` 让 systemd 把进程放进 `unconfined_service_t`（与 agent 同域）。有 `semanage` 时对内核树加一条持久 fcontext 规则（`<KernelsDir>/kernels(/.*)?` → `bin_t`）再 `restorecon -R -F`；没有 `semanage` 时退回 `chcon -R -t bin_t`；两个工具都没有时只记一条警告——缺工具绝不能让安装失败（服务随后会以可读的错误报出来）。
+
+打标签的时机：`kernelx` 在 `Ensure`（安装/升级）、`Rollback` 与 `InstallLocal`（本地文件安装，§13.8.3）成功后给整棵树打标签（尽力而为，只记日志）；`xraysvc` 在写服务文件、启动之前再确认一次（这里失败即中止启动）；`supervisor` 在每次启动 gost/realm/frp 子进程前确认该二进制（同一进程内按路径去重，已被整棵树覆盖的二进制直接跳过，所以不会为每个版本堆积 fcontext 规则）。`install.sh` 在安装时也做一次（`selinux_prepare`，卸载时 `selinux_forget` 删掉规则）。
+
+SELinux 关闭时这些路径全是空操作（`agent/selinux` 先读 `/sys/fs/selinux/enforce`）；因此非 SELinux 机器与 Windows 不受影响。
+
+### 13.8 发布产物与清单条目（WP-X3）
+
+#### 13.8.1 `release/build.sh` 的产物
 
 `bash release/build.sh [vX.Y.Z] [arch ...]` 为 12 个架构各产出两个程序，同一个版本号注入两个程序（agent 的 `cmd.version`、内核的 `xraynode.Version`）：
 
@@ -867,7 +888,7 @@ W1nCray xray stop
 
 `SHA256SUMS` 覆盖以上全部产物。构建矩阵断言除原有的架构/PTY 检查外，还对每个产物做 `file(1)` 架构检查、在本机架构上执行 `version` 自检（交叉架构跳过并注明），并用 `go version -m` 检查 **agent 产物不含 `github.com/xtls/xray-core`**、内核产物必须含它。
 
-#### 13.7.2 清单条目（`tools/manifestgen/examples/v11.yaml`）
+#### 13.8.2 清单条目（`tools/manifestgen/examples/v11.yaml`）
 
 agent 与 Xray 内核都是本地构建（`local:` 条目从 `dist/` 计算哈希，需要一个 mirror 提供下载地址），上游 gost/realm/frp 仍从各自 GitHub Release 取：
 
@@ -890,18 +911,18 @@ agent 与 Xray 内核都是本地构建（`local:` 条目从 `dist/` 计算哈�
 - `manifestgen build -kernels xray` 只重建选定的内核条目，便于 agent/内核重新构建后单独发布，而不必重新下载全部上游资产。
 - 第二个 Xray 版本（升级/回滚测试用）在示例里是**注释掉的占位条目**：本仓库没有旧构建，`release/build.sh` 只产出当前版本；用旧 tag 构建到 `dist/old/` 后取消注释即可。不要把它指向当前 `dist/` 文件——内核自检会发现版本不符。
 
-#### 13.7.3 本地文件安装（`W1nCray xray install --file`）
+#### 13.8.3 本地文件安装（`W1nCray xray install --file`）
 
 `W1nCray xray install --file <W1nCray-xray 文件或 .gz> --sha256 <hex>` 用于 install.sh 的迁移和离线环境：
 
 1. 校验文件的 sha256（必填，缺失或不是 64 位十六进制即拒绝）；
 2. 解包（gzip 魔数判断，裸文件也接受）到内核目录的暂存区，执行 `version` 自检得到版本；
 3. 用**与按清单安装完全相同**的 `commit` 写入 `<kernels>/xray/<版本>/` 与 `.installed.json`、`current`/`previous` 指针，因此 `kernel_list`、升级、回滚、卸载都能识别它；
-4. 复用 `agent/xraysvc` 写服务并启动（与面板路径同一套实现）。
+4. 复用 `agent/xraysvc` 写服务并启动（与面板路径同一套实现）；安装成功后与按清单安装一样给内核树打 SELinux `bin_t` 标签（§13.7，尽力而为），启动前 `xraysvc` 再确认一次，所以本地安装的 Xray 内核与清单安装的走完全相同的 SELinux 与 `/run/W1nCray/xray.sock` 路径。
 
-`install.sh` 的 `update` 在检测到「0.5.x 及以前的单一程序 + 配置里有 Xray 节点」时自动执行这一串步骤（见 §13.8）。
+`install.sh` 的 `update` 在检测到「0.5.x 及以前的单一程序 + 配置里有 Xray 节点」时自动执行这一串步骤（见 §13.9）。
 
-### 13.8 install.sh 的三条路径（v11）
+### 13.9 install.sh 的三条路径（v11）
 
 | 路径 | 行为 |
 |---|---|

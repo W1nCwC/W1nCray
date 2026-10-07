@@ -22,6 +22,14 @@ const (
 	StatusAddrName = "xray.addr"
 	// StatusPath is the HTTP path the status document is served on.
 	StatusPath = "/status"
+	// RuntimeDirName is the directory under /run that holds the kernel's
+	// runtime files. The systemd unit asks systemd to create it
+	// (RuntimeDirectory=W1nCray); the kernel creates it itself when it is not
+	// there (OpenRC, procd, the agent's fallback supervisor).
+	RuntimeDirName = "W1nCray"
+	// RuntimeDirEnv overrides the runtime directory. Tests and unprivileged
+	// development runs use it; production never sets it.
+	RuntimeDirEnv = "W1NCRAY_RUNTIME_DIR"
 )
 
 // Status is the JSON body of GET /status on the kernel's local endpoint (a

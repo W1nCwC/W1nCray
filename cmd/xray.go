@@ -22,6 +22,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/bootstrap"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
+	"github.com/W1nCwC/W1nCray/agent/selinux"
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 	"github.com/W1nCwC/W1nCray/agent/xraysvc"
@@ -105,13 +106,14 @@ func xrayManager() (*xraysvc.Manager, *kernelx.Ensurer, error) {
 		ManifestKeysPath: keys,
 		AgentVersion:     agentd.AgentVersion,
 		XrayConfigPath:   path,
+		Labeler:          selinux.New(selinux.Options{Log: log.StandardLogger()}),
 		Log:              log.StandardLogger(),
 	}
 	kern, err := bootstrap.KernelInstaller(o)
 	if err != nil {
 		return nil, nil, err
 	}
-	sup := supervisor.New(supervisor.Options{Log: o.Log, PIDDir: filepath.Join(stateDir, "pid")})
+	sup := supervisor.New(supervisor.Options{Log: o.Log, PIDDir: filepath.Join(stateDir, "pid"), Labeler: o.Labeler})
 	mgr, _, err := bootstrap.XrayManager(o, kern, sup)
 	return mgr, kern, err
 }

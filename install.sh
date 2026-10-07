@@ -737,6 +737,49 @@ ensure_geo() {
 	done
 }
 
+# selinux_prepare makes an SELinux host ready for the kernel binaries: the
+# runtime directory the Xray kernel publishes its status socket in, and the
+# bin_t label on the kernel tree.
+#
+# Without the label a kernel installed under /etc/W1nCray/state keeps the etc_t
+# type; systemd then starts it in init_t instead of unconfined_service_t, and
+# init_t may not create the status socket in the etc_t configuration directory
+# (CentOS Stream 9: "bind: permission denied" + an AVC on xray.sock). semanage
+# makes the label survive a relabel and a reboot; chcon is the fallback; a host
+# with neither tool is left alone with a warning, never a failed installation.
+selinux_prepare() {
+	[ -e /sys/fs/selinux/enforce ] || return 0
+	_mode="$(cat /sys/fs/selinux/enforce 2>/dev/null)"
+	case "$_mode" in 0 | 1) ;; *) return 0 ;; esac
+	# systemd creates this with RuntimeDirectory=W1nCray; OpenRC, procd and the
+	# agent's own supervisor rely on it already existing.
+	mkdir -p "$ROOT/run/W1nCray" 2>/dev/null || true
+	_kd="$CONF_DIR/state/kernels/kernels"
+	mkdir -p "$_kd" 2>/dev/null || return 0
+	if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then
+		semanage fcontext -a -t bin_t "$_kd(/.*)?" >/dev/null 2>&1 || true
+		restorecon -R -F "$_kd" >/dev/null 2>&1 || true
+		green "SELinux: 内核目录 $_kd 已持久标记为 bin_t"
+	elif command -v chcon >/dev/null 2>&1; then
+		chcon -R -t bin_t "$_kd" >/dev/null 2>&1 || true
+		yellow "SELinux: 内核目录 $_kd 已用 chcon 标记为 bin_t（未装 semanage，全盘 relabel 后需重新执行）"
+	else
+		yellow "SELinux 已启用，但 semanage 与 chcon 都不可用；内核服务可能被 SELinux 拒绝（请安装 policycoreutils 与 policycoreutils-python-utils）"
+	fi
+	return 0
+}
+
+# selinux_forget removes the persistent fcontext rule selinux_prepare added.
+# The kernel files themselves are removed by the agent (or by --purge), so only
+# the local customisation has to go; a machine without semanage has nothing to
+# forget.
+selinux_forget() {
+	command -v semanage >/dev/null 2>&1 || return 0
+	_kd="$CONF_DIR/state/kernels/kernels"
+	semanage fcontext -d -t bin_t "$_kd(/.*)?" >/dev/null 2>&1 || true
+	return 0
+}
+
 # OpenWRT's sysupgrade only keeps /etc/config and listed files.
 keep_on_sysupgrade() {
 	is_openwrt || return 0
@@ -1202,6 +1245,7 @@ cmd_install() {
 	mkdir -p "$CONF_DIR"
 	save_env
 	self_copy
+	selinux_prepare
 
 	# Machine mode: the token goes to its own 0600 file and never into
 	# config.yml, the logs or any subprocess argument.
@@ -1527,6 +1571,7 @@ cmd_uninstall() {
 	rm -f "$BIN" "$BIN_DIR/install.sh" "$MGR"
 	rmdir "$BIN_DIR" 2>/dev/null || true
 	drop_sysupgrade_entries "$_purge"
+	selinux_forget
 	# The machine token is a secret: never leave it behind. Only the expected
 	# config directory is touched (same guard as --purge below).
 	case "$CONF_DIR" in

@@ -90,6 +90,13 @@ type Supervisor interface {
 	Status(id string) driver.ProcStatus
 }
 
+// Labeler makes the installed kernel binaries executable on an SELinux
+// machine (bin_t) before the service is started. *kernelx.Ensurer implements
+// it; nil disables labelling (tests, non-Linux builds).
+type Labeler interface {
+	LabelKernels(ctx context.Context) error
+}
+
 // Options configures a Manager. Kernels and ConfigPath are required.
 type Options struct {
 	// Root prefixes every service-file path ("" is "/"). Tests use a temporary
@@ -112,6 +119,10 @@ type Options struct {
 	// Sup is the agent supervisor for the fallback backend. Nil makes the
 	// agent backend unusable on a machine with no init system.
 	Sup Supervisor
+	// Labeler makes the kernel binaries bin_t on an SELinux machine, without
+	// which the service starts in init_t and cannot bind its status socket
+	// (agent/selinux). Nil skips it.
+	Labeler Labeler
 	// Runner executes service-manager commands (default ExecRunner).
 	Runner Runner
 	// Log receives the manager's events.
@@ -357,6 +368,9 @@ func (m *Manager) Restart(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("%s 服务未安装", ServiceName)
 	}
+	if err := m.labelKernels(ctx); err != nil {
+		return err
+	}
 	if _, err := m.backend.writeUnit(cur.Path, m.opts.ConfigPath, m.ConfigDir()); err != nil {
 		return err
 	}
@@ -394,6 +408,11 @@ func (m *Manager) activate(ctx context.Context, inst driver.Installed, restart b
 	if inst.Path == "" {
 		return errors.New("xraysvc: 内核版本没有可执行文件路径")
 	}
+	// The label must be in place before the service starts: a kernel binary
+	// under /etc keeps the etc_t type and would run in init_t (agent/selinux).
+	if err := m.labelKernels(ctx); err != nil {
+		return err
+	}
 	if _, err := m.backend.writeUnit(inst.Path, m.opts.ConfigPath, m.ConfigDir()); err != nil {
 		return err
 	}
@@ -424,6 +443,19 @@ func (m *Manager) deactivate(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("删除 %s 服务文件: %w", ServiceName, err))
 	}
 	return errors.Join(errs...)
+}
+
+// labelKernels applies the SELinux label the kernel binaries need before the
+// service can start. A machine with SELinux off, or without the labelling
+// tools, is a no-op (agent/selinux decides).
+func (m *Manager) labelKernels(ctx context.Context) error {
+	if m.opts.Labeler == nil {
+		return nil
+	}
+	if err := m.opts.Labeler.LabelKernels(ctx); err != nil {
+		return fmt.Errorf("设置内核 SELinux 标签: %w", err)
+	}
+	return nil
 }
 
 // waitHealthy polls the kernel's status endpoint until it reports running.

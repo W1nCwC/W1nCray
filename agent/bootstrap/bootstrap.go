@@ -29,6 +29,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/selfupdate"
+	"github.com/W1nCwC/W1nCray/agent/selinux"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/state"
 	"github.com/W1nCwC/W1nCray/agent/supervisor"
@@ -101,6 +102,10 @@ type Options struct {
 	FileOps fileops.Options
 	// Log receives driver, supervisor, kernel and reconciler events.
 	Log driver.Logger
+	// Labeler applies the SELinux bin_t label to the kernel tree and to every
+	// kernel binary before it is started. Nil makes Boot build the production
+	// one (agent/selinux); a machine with SELinux off is a no-op.
+	Labeler *selinux.Labeler
 	// Resume makes Boot re-apply the persisted last good state before it
 	// returns, so forwarding comes back after a restart without waiting for the
 	// panel. A failed resume never fails Boot: it is logged and kept for
@@ -197,6 +202,12 @@ func Boot(opts Options) (*Runtime, error) {
 	if opts.StateDir == "" || opts.KernelsDir == "" {
 		return nil, fmt.Errorf("bootstrap: StateDir and KernelsDir are required")
 	}
+	// One labeler for the whole runtime: the kernel installer, the Xray service
+	// manager and the supervisor all share its per-path cache, so a kernel is
+	// labelled once per process and not on every driver apply.
+	if opts.Labeler == nil {
+		opts.Labeler = selinux.New(selinux.Options{Log: log})
+	}
 	st, err := state.Open(opts.StateDir)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
@@ -205,7 +216,7 @@ func Boot(opts Options) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
-	sup := supervisor.New(supervisor.Options{Log: log, PIDDir: filepath.Join(opts.StateDir, "pid")})
+	sup := supervisor.New(supervisor.Options{Log: log, PIDDir: filepath.Join(opts.StateDir, "pid"), Labeler: opts.Labeler})
 	// The Xray kernel service (PLAN v11 §2.2): its status client, its service
 	// manager and the managed-file validator/reloader are built here, where the
 	// kernel installer, the supervisor and the configuration path are all in
@@ -383,6 +394,7 @@ func KernelInstaller(o Options) (*kernelx.Ensurer, error) {
 		KeysPath:     o.ManifestKeysPath,
 		AgentVersion: o.AgentVersion,
 		AllowHTTP:    o.AllowHTTP,
+		Labeler:      o.Labeler,
 		// The pid directory is how the kernel commands tell "installed" from
 		// "actually running" (kernelx.RunningVersion).
 		PIDDir: filepath.Join(o.StateDir, "pid"),
@@ -413,6 +425,7 @@ func XrayManager(o Options, kern *kernelx.Ensurer, sup *supervisor.Supervisor) (
 		StateDir:   o.StateDir,
 		Status:     client,
 		Sup:        sup,
+		Labeler:    kern,
 		Log:        o.Log,
 	})
 	if err != nil {

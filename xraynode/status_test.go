@@ -53,6 +53,9 @@ func getStatus(t *testing.T, s *StatusServer) xrayapi.Status {
 // reloaded.
 func TestStatusEndpointReportsRunningAndFingerprint(t *testing.T) {
 	dir := t.TempDir()
+	// The socket lives in the runtime directory; keep the test off the real
+	// /run/W1nCray (and off a real kernel's socket).
+	t.Setenv(xrayapi.RuntimeDirEnv, t.TempDir())
 	configPath := filepath.Join(dir, "config.yml")
 	body := "Log: {Level: warning}\nAgent:\n  Enabled: true\n"
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
@@ -117,9 +120,52 @@ func TestStatusEndpointReportsRunningAndFingerprint(t *testing.T) {
 	}
 }
 
+// TestStatusSocketLivesInTheRuntimeDirectory is the SELinux layout requirement:
+// the socket is not created next to config.yml any more, so a service domain
+// that may not create files in the etc_t configuration directory can still
+// publish its status (agent/selinux has the AVC this avoids).
+func TestStatusSocketLivesInTheRuntimeDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows publishes a loopback address file instead of a socket")
+	}
+	dir := t.TempDir()
+	rt := t.TempDir()
+	t.Setenv(xrayapi.RuntimeDirEnv, rt)
+	configPath := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configPath, []byte("Log: {Level: warning}\nAgent:\n  Enabled: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(configPath, cfg)
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer svc.Close()
+	srv, err := NewStatusServer(svc, dir)
+	if err != nil {
+		t.Fatalf("NewStatusServer: %v", err)
+	}
+	defer srv.Close()
+
+	sock := filepath.Join(rt, xrayapi.StatusSocketName)
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("the socket is not in the runtime directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, xrayapi.StatusSocketName)); !os.IsNotExist(err) {
+		t.Fatalf("a socket was left next to config.yml: %v", err)
+	}
+	if srv.addr != sock {
+		t.Fatalf("addr = %q, want %q", srv.addr, sock)
+	}
+}
+
 // TestStatusEndpointRejectsOtherMethods: the endpoint is read-only.
 func TestStatusEndpointRejectsOtherMethods(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv(xrayapi.RuntimeDirEnv, t.TempDir())
 	configPath := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(configPath, []byte("Log: {Level: warning}\nAgent:\n  Enabled: true\n"), 0o600); err != nil {
 		t.Fatal(err)

@@ -14,12 +14,23 @@ import (
 )
 
 // statusEndpoint builds the HTTP client and URL of the kernel's status
-// endpoint. On Unix-like systems it is the Unix socket next to config.yml
-// (mode 0600, so only the agent, running as the same user, can read it).
+// endpoint. On Unix-like systems it is the Unix socket in the runtime directory
+// (/run/W1nCray/xray.sock, mode 0600, so only the agent — running as the same
+// user — can read it). A socket left by a kernel up to v0.6.0 next to
+// config.yml is still accepted, so an in-place upgrade keeps reporting status
+// until the running kernel is restarted.
 func statusEndpoint(configPath string) (*http.Client, string, error) {
-	sock := filepath.Join(filepath.Dir(configPath), xrayapi.StatusSocketName)
-	if _, err := os.Stat(sock); err != nil {
-		return nil, "", fmt.Errorf("Xray 内核状态接口不可用（%s 不存在）", sock)
+	dir := filepath.Dir(configPath)
+	candidates := []string{xrayapi.SocketPath(dir), xrayapi.LegacySocketPath(dir)}
+	sock := ""
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			sock = c
+			break
+		}
+	}
+	if sock == "" {
+		return nil, "", fmt.Errorf("Xray 内核状态接口不可用（%s 不存在）", candidates[0])
 	}
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

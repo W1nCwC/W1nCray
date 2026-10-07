@@ -16,7 +16,7 @@ import (
 // endpoint. Windows has no Unix socket the standard library can serve, so the
 // kernel writes its loopback address to <configDir>/xray.addr.
 func statusEndpoint(configPath string) (*http.Client, string, error) {
-	addrPath := filepath.Join(filepath.Dir(configPath), xrayapi.StatusAddrName)
+	addrPath := xrayapi.AddrPath(filepath.Dir(configPath))
 	b, err := os.ReadFile(addrPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("Xray 内核状态接口不可用（读取 %s: %v）", addrPath, err)

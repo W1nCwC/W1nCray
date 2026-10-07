@@ -50,12 +50,12 @@ func serveStatus(t *testing.T, dir string, h http.Handler) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, xrayapi.StatusAddrName), []byte(u.Host+"\n"), 0o600); err != nil {
+		if err := os.WriteFile(xrayapi.AddrPath(dir), []byte(u.Host+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return
 	}
-	sock := filepath.Join(dir, xrayapi.StatusSocketName)
+	sock := xrayapi.SocketPath(dir)
 	_ = os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
@@ -69,10 +69,13 @@ func serveStatus(t *testing.T, dir string, h http.Handler) {
 	})
 }
 
-// newClient builds a Client for a config file inside a fresh directory.
+// newClient builds a Client for a config file inside a fresh directory. The
+// directory doubles as the kernel's runtime directory (W1NCRAY_RUNTIME_DIR), so
+// the test never reads a real kernel's socket on the machine running it.
 func newClient(t *testing.T, k CurrentKernel, r Runner) (*Client, string) {
 	t.Helper()
 	dir := t.TempDir()
+	t.Setenv(xrayapi.RuntimeDirEnv, dir)
 	config := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(config, []byte("Log: {Level: warning}\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -108,6 +111,9 @@ func TestStatusWithoutKernel(t *testing.T) {
 		t.Fatal("Status without an endpoint must fail")
 	}
 }
+
+// TestStatusFallsBackToTheLegacySocket lives in client_legacy_unix_test.go: the
+// legacy location only exists on Unix.
 
 func TestCheckStagedRunsTheInstalledBinary(t *testing.T) {
 	run := &fakeRunner{out: []byte(`{"ok":false,"errors":[{"file":"route.json","message":"bad rule"}]}`), err: errors.New("exit status 1")}
