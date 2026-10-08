@@ -10,6 +10,27 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 )
 
+// restartDelaySeconds is the pause every service backend waits before it starts
+// the Xray kernel again after a crash. All three service definitions render it
+// from here so that a kernel crash interrupts the same number of seconds on
+// systemd, OpenRC and procd machines (T1 measured OpenRC/procd at 10 s versus
+// systemd's 5 s).
+//
+// Each backend spells the pause differently:
+//
+//   - systemd: RestartSec=<pause> is the delay before Restart=always starts the
+//     unit again.
+//   - OpenRC supervise-daemon: respawn_delay=<pause> is the delay between
+//     restarts; respawn_max=0 means the restarts are unlimited.
+//   - procd: respawn <threshold> <timeout> <retry>; threshold is the window
+//     after which the retry counter resets (3600 s), timeout is the delay
+//     before the process is restarted (the pause) and retry=0 means unlimited
+//     retries.
+//
+// Only the pause is shared: the procd threshold and the unlimited-retry
+// semantics of both respawn settings stay exactly as they were.
+const restartDelaySeconds = 5
+
 // systemdUnit renders the systemd unit of the Xray kernel. The ExecStart names
 // the kernel binary of the current version and the "run -c" subcommand
 // explicitly, so the unit never depends on the program's default action.
@@ -31,7 +52,7 @@ User=root
 WorkingDirectory=%s
 ExecStart=%s run -c %s
 Restart=always
-RestartSec=5
+RestartSec=%s
 LimitNOFILE=1048576
 Environment=XRAY_LOCATION_ASSET=%s
 RuntimeDirectory=%s
@@ -39,7 +60,7 @@ RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
-`, configDir, bin, configPath, configDir, xrayapi.RuntimeDirName)
+`, configDir, bin, configPath, strconv.Itoa(restartDelaySeconds), configDir, xrayapi.RuntimeDirName)
 }
 
 // openrcScript renders the OpenRC init script (Alpine), with supervise-daemon
@@ -56,8 +77,8 @@ command="%s"
 command_args="run -c %s"
 directory="%s"
 
-# Restart after a crash, forever, 10 s apart.
-respawn_delay=10
+# Restart after a crash, forever, %s s apart.
+respawn_delay=%s
 respawn_max=0
 
 rc_ulimit="-n 1048576"
@@ -83,7 +104,7 @@ start_pre() {
 	fi
 	return 0
 }
-`, ServiceName, bin, configPath, configDir, ServiceName, ServiceName, configDir, xrayapi.RuntimeDirName)
+`, ServiceName, bin, configPath, configDir, strconv.Itoa(restartDelaySeconds), strconv.Itoa(restartDelaySeconds), ServiceName, ServiceName, configDir, xrayapi.RuntimeDirName)
 }
 
 // procdScript renders the procd init script (OpenWrt), exactly like
@@ -109,14 +130,14 @@ start_service() {
 	procd_set_param command "%s" run -c "%s"
 	procd_set_param env %s
 	procd_set_param limits nofile="1048576 1048576"
-	# Restart after a crash, forever, 10 s apart.
-	procd_set_param respawn 3600 10 0
+	# Restart after a crash, forever, %s s apart (threshold, timeout, retry).
+	procd_set_param respawn 3600 %s 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param term_timeout 10
 	procd_close_instance
 }
-`, xrayapi.RuntimeDirName, bin, configPath, env)
+`, xrayapi.RuntimeDirName, bin, configPath, env, strconv.Itoa(restartDelaySeconds), strconv.Itoa(restartDelaySeconds))
 }
 
 // gomemLimit returns the GOMEMLIMIT setting for a router with less than 1 GiB

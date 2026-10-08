@@ -444,6 +444,35 @@ func TestBackendDetection(t *testing.T) {
 	}
 }
 
+// TestRenderRestartDelayIsUniform pins the crash-restart pause rendered into
+// every service definition to 5 s. T1 measured OpenRC and procd waiting 10 s
+// while systemd waited 5 s; the pause is now shared. The procd threshold
+// (3600 s) and the unlimited-restart semantics (respawn_max=0, procd retry=0)
+// must not change.
+func TestRenderRestartDelayIsUniform(t *testing.T) {
+	const (
+		bin        = "/kernels/xray/1.0.0/W1nCray-xray"
+		configPath = "/etc/W1nCray/config.yml"
+		configDir  = "/etc/W1nCray"
+	)
+	unit := systemdUnit(bin, configPath, configDir)
+	if !strings.Contains(unit, "RestartSec=5\n") {
+		t.Errorf("systemd unit does not restart 5 s after a crash:\n%s", unit)
+	}
+
+	openrc := openrcScript(bin, configPath, configDir)
+	for _, want := range []string{"respawn_delay=5\n", "respawn_max=0\n"} {
+		if !strings.Contains(openrc, want) {
+			t.Errorf("OpenRC script lacks %q:\n%s", want, openrc)
+		}
+	}
+
+	procd := procdScript(bin, configPath, configDir, "")
+	if !strings.Contains(procd, "procd_set_param respawn 3600 5 0\n") {
+		t.Errorf("procd script does not use the shared 5 s respawn timeout:\n%s", procd)
+	}
+}
+
 func TestSystemdInstall(t *testing.T) {
 	f := newFixture(t, "run/systemd/system/")
 	bin := installedKernel(t, f.root, "1.0.0")
@@ -789,6 +818,8 @@ func TestOpenRCInstall(t *testing.T) {
 		`command="` + bin + `"`,
 		`command_args="run -c ` + f.config + `"`,
 		`rc_ulimit="-n 1048576"`,
+		"respawn_delay=5",
+		"respawn_max=0",
 		"mkdir -p /run/W1nCray",
 	} {
 		if !strings.Contains(script, want) {
@@ -837,7 +868,7 @@ func TestProcdInstallAndSysupgradeDedupe(t *testing.T) {
 		"#!/bin/sh /etc/rc.common",
 		"USE_PROCD=1",
 		`procd_set_param command "` + bin + `" run -c "` + f.config + `"`,
-		"procd_set_param respawn",
+		"procd_set_param respawn 3600 5 0",
 		"mkdir -p /run/W1nCray",
 	} {
 		if !strings.Contains(script, want) {

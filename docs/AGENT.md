@@ -833,9 +833,11 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 | 后端 | 探测 | 服务文件 |
 |---|---|---|
 | systemd | `/run/systemd/system` 存在 | `/etc/systemd/system/W1nCray-xray.service`：`ExecStart=<当前版本二进制绝对路径> run -c <config.yml 绝对路径>`、`Restart=always`、`RestartSec=5`、`LimitNOFILE=1048576`、`WorkingDirectory=<配置目录>`、`RuntimeDirectory=W1nCray`（状态套接字目录，见 §13.4/§13.7）；`systemctl daemon-reload`、`enable`、`start` |
-| OpenRC | `/sbin/openrc-run` 存在 | `/etc/init.d/W1nCray-xray`（`supervisor="supervise-daemon"`，`start_pre` 里 `mkdir -p /run/W1nCray`）；`rc-update add W1nCray-xray default`、`rc-service W1nCray-xray start` |
-| procd | `/sbin/procd` 与 `/etc/rc.common` 存在 | `/etc/init.d/W1nCray-xray`（`USE_PROCD=1`、`respawn`，`start_service` 里 `mkdir -p /run/W1nCray`）；`enable`、`start`；内核目录与 init 脚本追加进 `/etc/sysupgrade.conf`（去重） |
+| OpenRC | `/sbin/openrc-run` 存在 | `/etc/init.d/W1nCray-xray`（`supervisor="supervise-daemon"`、`respawn_delay=5`、`respawn_max=0`（不限次数）、`start_pre` 里 `mkdir -p /run/W1nCray`）；`rc-update add W1nCray-xray default`、`rc-service W1nCray-xray start` |
+| procd | `/sbin/procd` 与 `/etc/rc.common` 存在 | `/etc/init.d/W1nCray-xray`（`USE_PROCD=1`、`procd_set_param respawn 3600 5 0`（三个参数依次是 threshold / timeout / retry，timeout 即重启间隔）、`start_service` 里 `mkdir -p /run/W1nCray`）；`enable`、`start`；内核目录与 init 脚本追加进 `/etc/sysupgrade.conf`（去重） |
 | agent 子进程 | 三者都没有 | 由 agent supervisor 运行（与 gost 相同），状态里 `managed_by: "agent"`，面板据此提示「此系统 Xray 会随 agent 重启」 |
+
+三种后端的崩溃重启间隔统一为 **5 s**（`render.go` 的 `restartDelaySeconds`）：T1 实测 OpenRC/procd 原先等 10 s，路由器上 Xray 崩溃会比 systemd 机器多中断 5 s。只统一这个间隔，procd 的 threshold（3600 s）与两者的「不限次数」语义不变。
 
 服务名固定为 `W1nCray-xray`。`Install`/`Upgrade`/`Rollback`/`Restart`/`Remove` 都幂等、带超时、失败可读：
 
