@@ -174,6 +174,51 @@ func TestFrpReadyTimeoutIsAnOptionalLocalOverride(t *testing.T) {
 	}
 }
 
+// TestGostReadyTimeoutIsAnOptionalLocalOverride covers F6's configuration half:
+// Drivers.Gost.ReadyTimeoutSec mirrors the frp override, is absent by default
+// (the shared driver default applies) and refuses a negative value.
+func TestGostReadyTimeoutIsAnOptionalLocalOverride(t *testing.T) {
+	var nilCfg *Config
+	if d, ok := nilCfg.GostReadyTimeout(); ok || d != 0 {
+		t.Errorf("nil Config = (%s, %v), want (0, false)", d, ok)
+	}
+	if _, ok := (&Config{}).GostReadyTimeout(); ok {
+		t.Error("a Config without a Drivers section must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{}}).GostReadyTimeout(); ok {
+		t.Error("a Drivers section without Gost must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{Gost: &GostConfig{}}}).GostReadyTimeout(); ok {
+		t.Error("ReadyTimeoutSec 0 must mean the driver default")
+	}
+	if d, ok := (&Config{Drivers: &DriversConfig{Gost: &GostConfig{ReadyTimeoutSec: 45}}}).GostReadyTimeout(); !ok || d != 45*time.Second {
+		t.Errorf("explicit override = (%s, %v), want (45s, true)", d, ok)
+	}
+
+	// Both drivers are read from the same agent.yml section, independently.
+	dir := t.TempDir()
+	path := writeFile(t, filepath.Join(dir, FileName), "Enabled: true\nDrivers:\n  Frp:\n    ReadyTimeoutSec: 45\n  Gost:\n    ReadyTimeoutSec: 90\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := cfg.GostReadyTimeout(); !ok || d != 90*time.Second {
+		t.Errorf("agent.yml gost override = (%s, %v), want (1m30s, true)", d, ok)
+	}
+	if d, ok := cfg.FrpReadyTimeout(); !ok || d != 45*time.Second {
+		t.Errorf("agent.yml frp override = (%s, %v), want (45s, true)", d, ok)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	// A negative value is refused instead of silently ignored.
+	bad := &Config{Enabled: true, Drivers: &DriversConfig{Gost: &GostConfig{ReadyTimeoutSec: -1}}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "Gost.ReadyTimeoutSec") {
+		t.Errorf("Validate(negative) = %v, want a Gost.ReadyTimeoutSec error", err)
+	}
+}
+
 func TestResolvePrecedence(t *testing.T) {
 	t.Run("agent.yml wins as a whole", func(t *testing.T) {
 		dir, path := configPath(t)

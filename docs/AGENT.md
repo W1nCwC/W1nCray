@@ -120,7 +120,9 @@ Kernels:
   AllowHTTP: false # 允许清单资产走明文 http:// 镜像（缺省 false = 只允许 https；仅本机可配）
 Drivers:
   Frp:
-    ReadyTimeoutSec: 0 # 0 = 按架构缺省（amd64/arm64 15s，其它架构 60s）
+    ReadyTimeoutSec: 0 # 0 = 按架构与 OpenWrt 缺省（见「驱动就绪等待」）
+  Gost:
+    ReadyTimeoutSec: 0 # 同上；两个驱动各自独立
 ```
 
 | 段 | 字段 |
@@ -133,7 +135,7 @@ Drivers:
 | `Modules` | `XrayNodes`（缺省 true；false 时本机永不启动节点控制器） |
 | `Firewall` | `AutoOpen`（**三态**，见「路由器防火墙自动放行」：OpenWrt 上缺省 true，其它系统恒为 false） |
 | `Kernels` | `AllowHTTP`（缺省 **false**：内核清单的资产只允许 `https://`；见「内网 http 镜像」） |
-| `Drivers` | `Frp.ReadyTimeoutSec`（frp 实例就绪等待上限；**0 = 按架构缺省**：amd64/arm64 15s，其它架构 60s；见「frp 就绪等待」） |
+| `Drivers` | `Frp.ReadyTimeoutSec`、`Gost.ReadyTimeoutSec`（frp / gost 实例就绪等待上限；**0 = 按架构与 OpenWrt 缺省**：amd64/arm64 且非 OpenWrt 15s，其它一律 60s；见「驱动就绪等待」） |
 
 **迁移（旧布局 → `agent.yml`）**：`W1nCray link` 现在把连接信息写进 `agent.yml`，不再写 `config.yml`：
 
@@ -209,26 +211,28 @@ Kernels:
 - **只影响 scheme**：签名、有效期、吊销、序号防回滚、`min_agent`、平台 target、archive/成员哈希校验一律照旧（fail-closed 不变）。https 与 http 源可以混在同一个清单里，按清单顺序尝试。
 - `W1nCray check` 会打印该开关；`W1nCray xray install` 与常驻服务读同一份配置、同一个值。
 
-### frp 就绪等待（`Drivers.Frp.ReadyTimeoutSec`，D4）
+### 驱动就绪等待（`Drivers.Frp.ReadyTimeoutSec` / `Drivers.Gost.ReadyTimeoutSec`，D4/F6）
 
-frp 驱动每启动一个实例（portal 的 `frps`、bridge 的 `frpc`）都要等它就绪：管理 API 能应答，portal 还要控制链路建立。这个等待上限是**按架构**的：
+frp 驱动每启动一个实例（portal 的 `frps`、bridge 的 `frpc`）都要等它就绪：管理 API 能应答，portal 还要控制链路建立。gost 驱动同样要等 gost 进程起来、REST API 能应答（旧上限是写死的 10 s）。两个驱动的等待上限现在共用同一张表：
 
-| 架构 | 缺省上限 |
-|---|---|
-| `amd64`、`arm64` | **15 s** |
-| 其它（`mips`/`mipsle`、`arm`、`386`、`riscv64` …） | **60 s** |
+| 架构 | 非 OpenWrt | OpenWrt |
+|---|---|---|
+| `amd64`、`arm64` | **15 s** | **60 s** |
+| 其它（`mips`/`mipsle`、`arm`、`386`、`riscv64` …） | **60 s** | **60 s** |
 
-慢设备（MIPS / ARM 路由器，或 QEMU 模拟）上 15 s 明显偏紧：v11 D4 的模拟机测试里 frps 在 15 s 内没起来就被判失败、重启，进而拖垮一批用例。按架构放宽后这些设备无需改配置即可工作。
+也就是说只有「64 位 x86/ARM 且不是 OpenWrt」才走 15 s 快档。路由器 CPU 比它的 GOARCH 看起来弱得多（arm64 的 MT7981 / Cortex-A53 不是 arm64 服务器）：v11 D4 的模拟机测试里 frps 在 15 s 内没起来就被判失败、重启，进而拖垮一批用例；T2 复测显示模拟 arm64 上仍有 3 次就绪超时，gost 也仍受它自己写死的 10 s 影响。按架构 + 是否 OpenWrt 放宽后，这些设备无需改配置即可工作。
 
-比架构缺省更慢的机器可以本机覆盖（单位秒，**只能本地配置**）：
+比缺省还慢的机器可以本机覆盖（单位秒，**只能本地配置**，两个驱动各自独立）：
 
 ```yaml
 Drivers:
   Frp:
-    ReadyTimeoutSec: 90 # 0（或不写）= 按架构缺省；负值会被配置校验拒绝
+    ReadyTimeoutSec: 90 # 0（或不写）= 按上表缺省；负值会被配置校验拒绝
+  Gost:
+    ReadyTimeoutSec: 120
 ```
 
-超时的报错形如 `frp: frps-rp did not become ready in time (see the log of instance rp)`；看到它说明该实例在 `ReadyTimeoutSec` 内没起来，先看实例日志（端口占用、证书、token），确实只是启动慢再调大这个值。
+超时的报错形如 `frp: frps-rp did not become ready in time (see the log of instance rp)` 或 `gost: process did not become ready: api not ready: …`；看到它说明该实例在对应上限内没起来，先看实例日志（端口占用、证书、token），确实只是启动慢再调大这个值。
 
 ### `config.yml` 的 `Agent:` 块（旧布局）
 
@@ -256,7 +260,8 @@ Agent:
 | `StateDir` | 配置文件所在目录下的 `state` | Agent 状态目录：已应用/上次可用的期望状态、冻结记录、各驱动的私有目录、PID 目录。文件权限 0600（含 `secret`） |
 | `KernelsDir` | `StateDir/kernels` | 外部内核安装目录 |
 | `Kernels.AllowHTTP` | `false` | 允许内核清单的资产走明文 `http://` 镜像（本机开关，见「内网 http 镜像」；签名与 sha256 校验不受影响） |
-| `Drivers.Frp.ReadyTimeoutSec` | `0`（按架构） | frp 实例就绪等待上限（秒）；0 = amd64/arm64 15s、其它架构 60s（见「frp 就绪等待」） |
+| `Drivers.Frp.ReadyTimeoutSec` | `0`（按架构与 OpenWrt） | frp 实例就绪等待上限（秒）；0 = amd64/arm64 且非 OpenWrt 15s，其它一律 60s（见「驱动就绪等待」） |
+| `Drivers.Gost.ReadyTimeoutSec` | `0`（按架构与 OpenWrt） | gost 实例就绪等待上限（秒）；0 = 与 frp 同一张表（见「驱动就绪等待」）；负值被配置校验拒绝 |
 | `Policy` | 见 §4 | 本地根信任策略 |
 
 校验：`PortRange` 必须恰好两个元素 `[lo, hi]`；`Policy.AllowEngines` 只能出现 `auto` / `xray` / `gost` / `frp` / `realm`（`xray` 只是保留的名字，写了也会在校验阶段被拒）。**建议留空**：留空表示不限制引擎，面板下发的实例可选任一引擎，实际可用性由已签名清单决定（gost / frp / realm 由 agent 按需下载安装，见 §3 与 §4）。
@@ -667,7 +672,7 @@ Agent:
 | `realm tunnels carry TCP only …` | realm 隧道不承载 UDP | `network` 改 `["tcp"]` |
 | `no signed kernel manifest loaded (set Agent.ManifestPath)` | 外部内核需要已签名清单 | 配置 `ManifestPath`（及 `ManifestKeysPath`）并重启/重载 |
 | `download failed: all 1 sources failed: http://…: scheme not allowed` | 清单里的资产是明文 `http://`，而本机没开 `Kernels.AllowHTTP` | 用 https 镜像；确需内网 http 镜像时在 `agent.yml` 写 `Kernels: {AllowHTTP: true}`（只能本机配置，面板不能下发） |
-| `frp: frps-… did not become ready in time (see the log of instance …)` | 实例在就绪上限内没起来（慢设备，或端口/证书/token 有问题） | 先看该实例日志；确实只是启动慢时调大 `Drivers.Frp.ReadyTimeoutSec`（缺省 amd64/arm64 15s、其它架构 60s） |
+| `frp: frps-… did not become ready in time (see the log of instance …)` / `gost: process did not become ready: api not ready: …` | 实例在就绪上限内没起来（慢设备，或端口/证书/token 有问题） | 先看该实例日志；确实只是启动慢时调大 `Drivers.Frp.ReadyTimeoutSec` / `Drivers.Gost.ReadyTimeoutSec`（缺省：amd64/arm64 且非 OpenWrt 15s，其它一律 60s） |
 | `json: unknown field "listn"` | 字段名拼错；解码是严格的 | 对照 §5 改字段名；JSON 里不能有注释 |
 | `status: rolled_back` + `blocked` | 应用中途失败已回滚，这份内容被冻结 | 看 `message` 里的具体原因，**改内容**（改 revision 不算）后再应用 |
 

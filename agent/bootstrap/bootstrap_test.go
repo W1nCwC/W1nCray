@@ -245,7 +245,7 @@ func dialOK(addr string) bool {
 func TestBootApplyFileReportShutdown(t *testing.T) {
 	fd := newFakeDriver()
 	orig := driverBuilder
-	driverBuilder = func(pol spec.Policy, cfg *agentcfg.Config, log driver.Logger) (map[string]driver.Driver, error) {
+	driverBuilder = func(pol spec.Policy, cfg *agentcfg.Config, openWrt bool, log driver.Logger) (map[string]driver.Driver, error) {
 		return map[string]driver.Driver{spec.EngineGost: fd}, nil
 	}
 	t.Cleanup(func() { driverBuilder = orig })
@@ -335,7 +335,7 @@ func (l *recLog) warnText() string {
 func useFake(t *testing.T, fd *fakeDriver) {
 	t.Helper()
 	orig := driverBuilder
-	driverBuilder = func(pol spec.Policy, cfg *agentcfg.Config, log driver.Logger) (map[string]driver.Driver, error) {
+	driverBuilder = func(pol spec.Policy, cfg *agentcfg.Config, openWrt bool, log driver.Logger) (map[string]driver.Driver, error) {
 		return map[string]driver.Driver{spec.EngineGost: fd}, nil
 	}
 	t.Cleanup(func() { driverBuilder = orig })

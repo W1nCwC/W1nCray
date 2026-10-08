@@ -99,14 +99,21 @@ Firewall:
 Kernels:
   AllowHTTP: false
 
-# ---- 驱动计时（D4）------------------------------------------------------------
-# frp 每启动一个实例都要等它就绪（管理 API 能应答，portal 还要控制链路建立）。
-# 缺省上限按架构：amd64/arm64 是 15 秒，其它架构（mips/arm/386/riscv64…）是 60 秒，
-# 因为路由器 CPU 启动 frps 慢得多。比架构缺省还慢的机器可以在本机调大（单位秒）：
+# ---- 驱动计时（D4 / F6）--------------------------------------------------------
+# frp 每启动一个实例（frps/frpc）都要等它就绪（管理 API 能应答，portal 还要控制
+# 链路建立）；gost 同样要等进程起来、REST API 能应答。两个驱动共用一张缺省表：
+#   amd64/arm64 且非 OpenWrt -> 15 秒；
+#   其它（mips/arm/386/riscv64…，以及 OpenWrt 上的任何架构）-> 60 秒，
+#   因为路由器 CPU 比它的 GOARCH 看起来弱得多（arm64 的 MT7981 不是 arm64 服务器）。
+# 比缺省还慢的机器可以在本机调大（单位秒，两个驱动各自独立）：
 #   Drivers:
 #     Frp:
 #       ReadyTimeoutSec: 90
-# 0（或不写这一段）= 用架构缺省；负值会被配置校验拒绝。
+#     Gost:
+#       ReadyTimeoutSec: 120
+# 0（或不写这一段）= 用缺省；负值会被配置校验拒绝。
 Drivers:
   Frp:
+    ReadyTimeoutSec: 0
+  Gost:
     ReadyTimeoutSec: 0

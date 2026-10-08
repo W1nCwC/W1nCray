@@ -320,32 +320,59 @@ func (c *Config) KernelsAllowHTTP() bool {
 	return c.Kernels.AllowHTTP
 }
 
-// DriversConfig holds the local driver timing overrides (D4). Every field is
-// optional; a zero value means "use the driver's own default", which is
-// per-architecture where that matters.
+// DriversConfig holds the local driver timing overrides (D4, F6). Every field
+// is optional; a zero value means "use the driver's own default", which is
+// per-architecture and per-OpenWrt where that matters
+// (driver.DefaultReadyTimeout).
 type DriversConfig struct {
-	Frp *FrpConfig `mapstructure:"Frp"`
+	Frp  *FrpConfig  `mapstructure:"Frp"`
+	Gost *GostConfig `mapstructure:"Gost"`
 }
 
 // FrpConfig overrides the frp driver's readiness limit (D4).
 type FrpConfig struct {
 	// ReadyTimeoutSec bounds how long the driver waits for a started frps/frpc
 	// instance to answer before it reports that instance as failed. 0 means
-	// the architecture default (frp.DefaultReadyTimeout): 15s on amd64/arm64,
-	// 60s on the slower targets. Raise it on a device that is slower than its
-	// architecture suggests; the value is a local one, never pushed by the
-	// panel.
+	// the shared default (driver.DefaultReadyTimeout): 15s on amd64/arm64 off
+	// OpenWrt, 60s on the slower targets and on every architecture running
+	// OpenWrt. Raise it on a device that is slower than its architecture
+	// suggests; the value is a local one, never pushed by the panel.
+	ReadyTimeoutSec int `mapstructure:"ReadyTimeoutSec"`
+}
+
+// GostConfig overrides the gost driver's readiness limit (F6). It is
+// symmetrical with FrpConfig: the same shared default and the same local-only
+// override, because the T2 run measured gost's old hard-coded 10s limit timing
+// out on MIPS just like frp's 15s one.
+type GostConfig struct {
+	// ReadyTimeoutSec bounds how long the driver waits for the gost process
+	// and each of its services to answer before it reports the instance as
+	// failed. 0 means the shared default (driver.DefaultReadyTimeout): 15s on
+	// amd64/arm64 off OpenWrt, 60s on the slower targets and on every
+	// architecture running OpenWrt. The value is a local one, never pushed by
+	// the panel.
 	ReadyTimeoutSec int `mapstructure:"ReadyTimeoutSec"`
 }
 
 // FrpReadyTimeout returns the configured frp readiness limit and whether it was
 // set at all. A nil Config, a missing section and a non-positive value all mean
-// "use the architecture default" (frp.DefaultReadyTimeout).
+// "use the shared default" (driver.DefaultReadyTimeout).
 func (c *Config) FrpReadyTimeout() (time.Duration, bool) {
 	if c == nil || c.Drivers == nil || c.Drivers.Frp == nil || c.Drivers.Frp.ReadyTimeoutSec <= 0 {
 		return 0, false
 	}
 	return time.Duration(c.Drivers.Frp.ReadyTimeoutSec) * time.Second, true
+}
+
+// GostReadyTimeout returns the configured gost readiness limit and whether it
+// was set at all. A nil Config, a missing section and a non-positive value all
+// mean "use the shared default" (driver.DefaultReadyTimeout). It is the gost
+// mirror of FrpReadyTimeout (F6).
+func (c *Config) GostReadyTimeout() (time.Duration, bool) {
+	if c == nil || c.Drivers == nil || c.Drivers.Gost == nil || c.Drivers.Gost.ReadyTimeoutSec <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.Drivers.Gost.ReadyTimeoutSec) * time.Second, true
 }
 
 // FirewallAutoOpen returns the effective value of Firewall.AutoOpen for a
@@ -398,9 +425,15 @@ func (c *Config) Validate() error {
 		return nil
 	}
 	// A local timing override is validated even when the agent is disabled: a
-	// value that silently does nothing is worse than a clear refusal.
-	if c.Drivers != nil && c.Drivers.Frp != nil && c.Drivers.Frp.ReadyTimeoutSec < 0 {
-		return fmt.Errorf("config: Agent.Drivers.Frp.ReadyTimeoutSec must not be negative")
+	// value that silently does nothing is worse than a clear refusal. Both
+	// drivers share one rule (frp D4, gost F6).
+	if c.Drivers != nil {
+		if c.Drivers.Frp != nil && c.Drivers.Frp.ReadyTimeoutSec < 0 {
+			return fmt.Errorf("config: Agent.Drivers.Frp.ReadyTimeoutSec must not be negative")
+		}
+		if c.Drivers.Gost != nil && c.Drivers.Gost.ReadyTimeoutSec < 0 {
+			return fmt.Errorf("config: Agent.Drivers.Gost.ReadyTimeoutSec must not be negative")
+		}
 	}
 	if !c.Enabled {
 		if c.Panel != nil && (c.Panel.Enabled || c.Panel.MachineNodes) {
