@@ -418,7 +418,7 @@ func (u *Updater) Stage(ctx context.Context, version string) (Staged, error) {
 	if p, ok := u.Pending(); ok {
 		return Staged{}, fmt.Errorf("%w (version %s committed at %s)", ErrPending, p.Version, p.At.UTC().Format(time.RFC3339))
 	}
-	stagedDir := filepath.Join(u.dir, "staged", version)
+	stagedDir := u.stagedVersionDir(version)
 	if err := os.RemoveAll(stagedDir); err != nil {
 		return Staged{}, err
 	}

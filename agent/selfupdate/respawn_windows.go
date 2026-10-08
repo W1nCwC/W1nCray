@@ -19,4 +19,4 @@ func processAlive(int) bool { return false }
 
 // stopAgentProcess cannot signal a process on this platform; self_update is
 // refused on Windows, so the watchdog never runs and never rolls back.
-func stopAgentProcess(int, driver.Logger) {}
+func stopAgentProcess(int, AgentIdentity, driver.Logger) {}

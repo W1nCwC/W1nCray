@@ -232,10 +232,17 @@ func RunHelper(ctx context.Context, h HelperOptions, log driver.Logger) error {
 // single-instance lock holding the pid of the process that just exited. The
 // lock stays as the fallback for a process that started before the marker
 // existed or could not write it.
+//
+// A live pid is not enough: the pid has to be running an agent executable.
+// The lock file and the ready marker are both on-disk records that outlive the
+// process they name, and the kernel hands a freed pid to whatever is started
+// next, so a stale record can point at an unrelated program (F3b). A pid that
+// fails the identity check is reported as "no agent", never as a live one.
 func (u *Updater) agentProbe() AgentProbe {
+	isAgent := u.agentIdentity(u.log)
 	return func() (int, bool) {
 		if m, ok := u.ReadyMarker(); ok {
-			if p, pending := u.Pending(); pending && m.Version == p.Version && processAlive(m.PID) {
+			if p, pending := u.Pending(); pending && m.Version == p.Version && processAlive(m.PID) && isAgent(m.PID) {
 				return m.PID, true
 			}
 			// A marker whose version does not match the pending update is
@@ -243,10 +250,10 @@ func (u *Updater) agentProbe() AgentProbe {
 			// at all: never treat it as the new version.
 		}
 		pid := lockPID(u.lockPath)
-		if pid <= 0 {
+		if pid <= 0 || !processAlive(pid) || !isAgent(pid) {
 			return 0, false
 		}
-		return pid, processAlive(pid)
+		return pid, true
 	}
 }
 
@@ -385,11 +392,16 @@ func runWatchdog(ctx context.Context, h HelperOptions, probe AgentProbe, now fun
 // installed file" behind (D-M7). Before restarting the agent it stops the
 // W1nCray-xray service, so a rollback to the in-process-Xray 0.5.x agent never
 // finds the 0.6 service holding the node ports (R1-16).
+//
+// The pid is verified to be an agent before any signal is sent: the watchdog
+// runs as root and a stale lock or ready marker can name a pid the kernel has
+// since reused for an unrelated process (F3b).
 func rollbackAndRestart(up *Updater, h HelperOptions, reason string, log driver.Logger) error {
-	newPID := liveAgentPID(up, h)
+	isAgent := up.agentIdentity(log)
+	newPID := liveAgentPID(up, h, log)
 	if newPID > 0 {
 		log.Warnf("selfupdate: %s; stopping agent pid %d before the rollback", reason, newPID)
-		stopAgentProcess(newPID, log)
+		stopAgentProcess(newPID, isAgent, log)
 	}
 	stopXrayService(log)
 	if err := up.Rollback(reason); err != nil {
@@ -397,10 +409,11 @@ func rollbackAndRestart(up *Updater, h HelperOptions, reason string, log driver.
 	}
 	// The service manager may have brought the new binary back while the
 	// rollback ran (its respawn does not know about the swap). Stop it once
-	// more so the next start picks the restored file.
+	// more so the next start picks the restored file. stopAgentProcess verifies
+	// the pid again, so a process that already exited is not signalled.
 	if newPID > 0 && processAlive(newPID) {
 		log.Warnf("selfupdate: agent pid %d came back during the rollback; stopping it again", newPID)
-		stopAgentProcess(newPID, log)
+		stopAgentProcess(newPID, isAgent, log)
 	}
 	log.Warnf("selfupdate: %s; restored %s", reason, up.ExePath())
 	restartService(h, log)
@@ -410,13 +423,18 @@ func rollbackAndRestart(up *Updater, h HelperOptions, reason string, log driver.
 // liveAgentPID is the pid of the process running the new version right now: the
 // ready marker when its version matches the pending update, else the
 // single-instance lock. It is the process a rollback has to stop first.
-func liveAgentPID(up *Updater, h HelperOptions) int {
+//
+// It only returns a pid that is both alive and verified to be running an agent
+// executable (F3b). A pid the kernel has reused for an unrelated process is
+// reported as 0 ("no agent"), so the rollback never signals it.
+func liveAgentPID(up *Updater, h HelperOptions, log driver.Logger) int {
+	isAgent := up.agentIdentity(log)
 	if m, ok := up.ReadyMarker(); ok {
-		if p, pending := up.Pending(); pending && m.Version == p.Version && processAlive(m.PID) {
+		if p, pending := up.Pending(); pending && m.Version == p.Version && processAlive(m.PID) && isAgent(m.PID) {
 			return m.PID
 		}
 	}
-	if pid := lockPID(h.LockPath); pid > 0 && processAlive(pid) {
+	if pid := lockPID(h.LockPath); pid > 0 && processAlive(pid) && isAgent(pid) {
 		return pid
 	}
 	return 0

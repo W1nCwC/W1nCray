@@ -5,7 +5,7 @@ package selfupdate
 import (
 	"context"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -26,27 +26,38 @@ func TestSelfUpdateSleeperProcess(t *testing.T) {
 // process) when the watchdog rolls back, so the watchdog must stop that process
 // before it restores the previous binary. It failed before the fix, leaving the
 // process running from an unlinked image.
+//
+// F3b: the stand-in agent really runs from the install path (ExePath), so the
+// identity check recognizes it; the pid a rollback signals is never assumed to
+// be the agent any more.
 func TestRollbackStopsTheNewProcessBeforeRestoringTheBinary(t *testing.T) {
-	up, exe, state := watchdogFixture(t)
-
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(self, "-test.run=TestSelfUpdateSleeperProcess")
-	cmd.Env = append(os.Environ(), "W1NCRAY_SELFUPDATE_SLEEP=1")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting the stand-in new agent: %v", err)
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "W1nCray")
+	staged := filepath.Join(dir, "staged")
+	if err := copyFile(self, exe, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	reaped := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(reaped) }()
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		select {
-		case <-reaped:
-		case <-time.After(10 * time.Second):
-		}
+	if err := copyFile(self, staged, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(dir, "state")
+	up, err := New(Options{
+		ExePath: exe, StateDir: state, Log: nopLog{}, Ready: func(string) error { return nil },
+		AgentVersion: "0.5.0",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := up.Commit(Staged{Version: "0.6.0", Path: staged, SHA256: sha(mustRead(t, staged))}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	oldSum := sha(mustRead(t, up.OldPath()))
+
+	cmd := startFakeAgent(t, exe)
 	pid := cmd.Process.Pid
 	if !processAlive(pid) {
 		t.Fatal("the stand-in process is not alive")
@@ -69,7 +80,7 @@ func TestRollbackStopsTheNewProcessBeforeRestoringTheBinary(t *testing.T) {
 	if processAlive(pid) {
 		t.Error("the new process is still running after the rollback: the running executable is no longer the installed file")
 	}
-	if got := readFile(t, exe); got != "OLD-BINARY" {
-		t.Errorf("exe = %q, want the previous binary restored", got)
+	if got := sha(mustRead(t, exe)); got != oldSum {
+		t.Errorf("exe was not restored to the previous binary")
 	}
 }

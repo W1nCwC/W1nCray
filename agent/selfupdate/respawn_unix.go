@@ -125,8 +125,17 @@ const stopGrace = 5 * time.Second
 // within stopGrace, forcefully. A rollback must never replace the executable
 // file of a process that is still running: that is what leaves the running
 // image and the install path pointing at different files (D-M7).
-func stopAgentProcess(pid int, log driver.Logger) {
+//
+// The pid's identity is verified again before each signal. The watchdog runs as
+// root, and the pid comes from an on-disk lock or ready marker, so by the time
+// the signal is sent the process may have exited and the kernel may have handed
+// its pid to an unrelated program (F3b). A pid that is not a verified agent is
+// left alone and the refusal is logged.
+func stopAgentProcess(pid int, isAgent AgentIdentity, log driver.Logger) {
 	if pid <= 0 {
+		return
+	}
+	if !agentIdentityVerified(isAgent, pid, log, "SIGTERM") {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGTERM)
@@ -136,8 +145,30 @@ func stopAgentProcess(pid int, log driver.Logger) {
 	if log != nil {
 		log.Warnf("selfupdate: agent pid %d did not exit within %s; killing it", pid, stopGrace)
 	}
+	// The wait gave the process time to exit; verify once more so a pid that
+	// has just been reused is not killed with SIGKILL.
+	if !agentIdentityVerified(isAgent, pid, log, "SIGKILL") {
+		return
+	}
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 	_ = waitForProcessExit(pid, 2*time.Second)
+}
+
+// agentIdentityVerified reports whether pid may be signalled with sig. A
+// process that is already gone needs no signal and produces no warning; a live
+// pid that is not a verified agent has the signal withheld and the refusal is
+// logged.
+func agentIdentityVerified(isAgent AgentIdentity, pid int, log driver.Logger, sig string) bool {
+	if !processAlive(pid) {
+		return false
+	}
+	if isAgent != nil && isAgent(pid) {
+		return true
+	}
+	if log != nil {
+		log.Warnf("selfupdate: not sending %s to pid %d: it is not a verified W1nCray agent", sig, pid)
+	}
+	return false
 }
 
 // waitForProcessExit reports whether pid left before the timeout. A zombie

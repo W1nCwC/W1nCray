@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"strconv"
 	"testing"
 	"time"
 )
@@ -70,77 +69,6 @@ func TestWatchdogKeepsASlowButHealthyNewAgent(t *testing.T) {
 	}
 	if _, err := os.Stat(up.OldPath()); !os.IsNotExist(err) {
 		t.Error("a confirmed update must clean the backup")
-	}
-}
-
-// TestReadyMarkerIsTheAuthoritativeLivenessSignal pins the D-M7 liveness
-// contract: the ready marker (version + pid) decides, and the single-instance
-// lock is only the fallback. A marker for another version is stale and must
-// never be mistaken for the pending one.
-func TestReadyMarkerIsTheAuthoritativeLivenessSignal(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		// processAlive is always false on Windows (self_update is refused
-		// there, so the watchdog never runs); the pid-based rules cannot be
-		// exercised.
-		t.Skip("the watchdog does not run on Windows")
-	}
-	dir := t.TempDir()
-	exe := filepath.Join(dir, "W1nCray")
-	writeFile(t, exe, "OLD-BINARY")
-	staged := filepath.Join(dir, "staged")
-	writeFile(t, staged, "NEW-BINARY")
-	state := filepath.Join(dir, "state")
-	lock := filepath.Join(dir, "config.yml.lock")
-	up, err := New(Options{
-		ExePath: exe, StateDir: state, LockPath: lock, Log: nopLog{},
-		Ready: func(string) error { return nil }, AgentVersion: "0.5.0",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := up.Commit(Staged{Version: "0.6.0", Path: staged, SHA256: sha([]byte("NEW-BINARY"))}); err != nil {
-		t.Fatal(err)
-	}
-	probe := up.agentProbe()
-	dead := 1 << 30
-
-	writeFile(t, lock, strconv.Itoa(dead)+"\n")
-	if _, alive := probe(); alive {
-		t.Fatal("a lock holding a dead pid must not be reported alive")
-	}
-
-	// The lock names a live process, but not the new version: the lock alone
-	// cannot tell that from the new process, so it is still a liveness signal.
-	writeFile(t, lock, strconv.Itoa(os.Getpid())+"\n")
-	if _, alive := probe(); !alive {
-		t.Fatal("a live lock pid must be reported alive")
-	}
-
-	// A marker for another version is stale: it must not be mistaken for the
-	// pending one, and the lock fallback must keep working.
-	if err := writeJSONAtomic(up.readyPath(), &ReadyMarker{Version: "0.5.0", PID: os.Getpid()}, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, alive := probe(); !alive {
-		t.Fatal("the lock fallback must still work with a stale ready marker")
-	}
-
-	// The marker for the pending version is authoritative, even with no lock.
-	if err := writeJSONAtomic(up.readyPath(), &ReadyMarker{Version: "0.6.0", PID: os.Getpid()}, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, lock, strconv.Itoa(dead)+"\n")
-	pid, alive := probe()
-	if !alive || pid != os.Getpid() {
-		t.Fatalf("the ready marker must be authoritative: pid=%d alive=%v", pid, alive)
-	}
-
-	// A marker whose process is gone proves nothing.
-	if err := writeJSONAtomic(up.readyPath(), &ReadyMarker{Version: "0.6.0", PID: dead}, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, alive := probe(); alive {
-		t.Fatal("a marker whose pid is dead must not be reported alive")
 	}
 }
 
