@@ -302,6 +302,7 @@ Agent:
 - **认证**：请求头 `X-Machine-Id: <MachineID>` + `Authorization: Bearer <令牌>`；令牌**绝不**出现在 URL、日志或报错里。面板返回 401 `bad_credentials` / 403 `machine_disabled` / 404 `unknown_node` 时，分别映射为凭据错误、机器被禁用、未知节点（错误里保留 HTTP 状态码）。
 - **发现失败不影响静态节点**：面板不可达或令牌错误时，静态 `Nodes` 照常启动，只记一条 warn（`machine nodes: … (static nodes keep running; retrying)`），并在后台延时 30 s 通过重载机制重试。
 - **节点变化自动生效**：启动后每 60 s 查询一次节点列表的 `version`，变化即触发一次整体重载（`reloading: machine nodes changed`）：新增的节点被拉起，移除的节点被关闭。
+- **面板可以要求立即刷新**：`hint{what:"nodes"}` 到达 agent 后，agent 通过内核本地接口（§13.4 的 `GET /nodes/sync`）让**内核立刻重跑一次**上面的「取 version → 变了才重载」。绑定/解绑节点不再需要等最长 60 s 的轮询；列表没变时空转的 hint 不触发重载。内核未安装、内核太旧（没有该路由，返回 404）或调用失败（面板不可达、超时）时，agent 只记一条 warn（`bootstrap: xray nodes hint: …; falling back to the kernel's 60s machine-node poll`）并退回 60 s 轮询，**不会**让命令失败或崩溃。`policy.modules.xray_nodes` 仍是本机闸门：为假时 hint 直接拒绝（§3 的 `Modules`）。
 - **机器节点不启用 WebSocket**：面板 WS 握手会把令牌放进 URL，违反「令牌不进 URL」，所以机器节点只走 HTTP 轮询（debug 日志 `machine mode: websocket disabled, using HTTP polling`）。
 - **`W1nCray check`**：离线时打印机器 ID 与「节点由面板下发」；加 `--online` 才联网，列出节点数与列表版本。有本地覆盖时还会列出被覆盖的节点 ID（只有 ID，没有任何内容）。
 - 机器节点的 tag 形如 `node<节点ID>@machine<机器ID>`，与静态节点的 `node<节点ID>@<主机>` 不会重名。
@@ -637,6 +638,7 @@ Agent:
 - **幂等**：磁盘上已是同一 `sha256` 的文件不下载、不替换、不重载（`files[].skipped=true`、`bytes=0`），并把该集合记进 `<StateDir>/filesync/applied.json`。
 - **健康判定在面板侧**：agent **不在进程内等健康**。`files_apply` 在重载发起后回 `done{applied_pending:true}`，随后由面板按 `hello`/`telemetry`（60 s 内）与 `components.xray.state=running` 判定，必要时下发 `files_rollback`（契约 §7-9）。
 - **`hint{what:"files"}`** 触发同一套同步（等价于 `files_apply`）；本机没有受管文件层时回 `error{code:"not_supported"}`，不静默忽略（契约 §7-5）。
+- **`hint{what:"nodes"}`** 让本机 Xray 内核**立刻**重跑一次机器节点发现（内核本地 `GET /nodes/sync`，见 §13.4），不再等 60 s 轮询；内核未装/太旧/调用失败只记 warn 并退回轮询。`Modules.XrayNodes` 为假时拒绝（本机闸门，契约 §7-6/§7-13）。
 - **事件**：应用成功发 `event{kind:"files.applied"}`，回滚发 `event{kind:"files.rolled_back"}`（契约 §7-10，只走 WebSocket）。
 
 ## 8 常见拒绝原因与排错
@@ -809,6 +811,10 @@ Agent:
 
 `config_fingerprint` 就是 v10 的被监听文件内容指纹（重载成功后更新）；`running` 表示 Xray 实例是否在跑；`last_error` 是最近一次重载/启动错误。
 
+同一个监听上还有一条**无参数**的写路由（不新增任何监听、不暴露到网络，只在本地端点上）：
+
+`GET /nodes/sync` — 让内核**立刻**重跑一次机器节点发现（与 60 s 轮询同一套「取 version → 变了才 `requestReload`」），返回 `{"changed": bool, "version": "…"}`。`changed=false` 表示列表没变、没有重载；机器模式关闭时也是 `changed=false`（没有列表可刷新）。面板不可达时返回 `502`，运行中的节点列表保持不变。请求不接受任何路径、命令或节点数据，只接受 `GET`（其它方法 `405`）。它存在的唯一理由是 `hint{what:"nodes"}` 的降级路径：agent 调不到它（内核未装/太旧/失败）就退回轮询（§2 机器模式、§13.5）。
+
 ### 13.5 agent ↔ 内核的接入点（X2）
 
 agent 通过 `agent/xrayapi` 的接口访问内核，**不导入任何 Xray-core 包**：
@@ -816,6 +822,7 @@ agent 通过 `agent/xrayapi` 的接口访问内核，**不导入任何 Xray-core
 ```go
 type Service interface {
 	Status(ctx context.Context) (Status, error)
+	SyncMachineNodes(ctx context.Context) (changed bool, err error)
 	CheckStaged(ctx context.Context, dir string, files []string) (StagedResult, error)
 	WaitReloaded(ctx context.Context, fingerprint string) error
 }
@@ -824,6 +831,7 @@ type Service interface {
 `agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它。X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。X2 起由 `agent/xraykern` 实现它：
 
 - `Status` 读 `/run/W1nCray/xray.sock`（旧内核的 `<config 目录>/xray.sock` 仍然接受；Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
+- `SyncMachineNodes` 读同一端点的 `GET /nodes/sync`，超时 10 s（`DefaultSyncTimeout`；比 `Status` 的 2 s 长，因为内核要替它走一次面板往返，但仍短到不会长时间占住 WebSocket 的帧读取协程）。旧内核没有该路由会返回 404，客户端把它当错误上报，调用方（`bootstrap.xrayNodeHint`）只记 warn 并退回内核的 60 s 轮询。请求不带任何参数。
 - `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。解析不整段 `json.Unmarshal`：stdout 里混入的日志行（Xray-core loader 自己打的）会被跳过，取**最后一个完整 JSON 对象**（`lastJSONObject`，尊重字符串与转义）；这是 agent 侧的防御，因为 agent 必须兼容清单里任意新旧的内核构建，而独立输出通道要求两边同步升级（R1-3）。
 - `WaitReloaded` 在 `files_apply` 写入受管文件后，等待状态接口的 `config_fingerprint` 变成**写入后文件的指纹**，超时 30 s。指纹用 `config.Fingerprint` 对 `config.WatchedFiles` 计算——与内核（`xraynode`）**同一份代码**，所以两边不可能不一致；超时即 `files_apply` 失败，走既有的 `last_good` 回滚路径（§13.6 的 `files_apply` 行）。
 
