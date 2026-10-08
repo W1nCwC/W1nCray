@@ -296,6 +296,12 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	// It is idempotent (D-M2): a machine where the service was never installed
 	// answers done with already_absent, never a "Unit not loaded" failure.
 	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
+		// The service manager removes every installed version at once, so the
+		// freed bytes are the sum over them. Like the supervised kernels below
+		// the declared installed size is read *before* the removal, because
+		// afterwards the entries are gone (REG2 observation 1: this branch used
+		// to answer freed_bytes=0).
+		freed := k.installedSizeOf(xrayapi.KernelName, "")
 		removed, err := k.deps.Xray.Remove(ctx)
 		if err != nil {
 			return Result{}, err
@@ -304,9 +310,9 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 			k.reg.logf().Infof("opscmd: kernel_remove xray: nothing installed (already absent)")
 			return done(panelclient.KernelRemoveResult{AlreadyAbsent: true}), nil
 		}
-		k.reg.logf().Infof("opscmd: kernel_remove xray done (service and files removed; configuration kept)")
+		k.reg.logf().Infof("opscmd: kernel_remove xray done (%d bytes freed; service and files removed; configuration kept)", freed)
 		k.reg.event("kernel.removed", "info", "kernel xray removed (service and files; configuration kept)")
-		return done(panelclient.KernelRemoveResult{}), nil
+		return done(panelclient.KernelRemoveResult{FreedBytes: freed}), nil
 	}
 	if a.Version == "" {
 		return Result{}, coded("invalid_args", errors.New("version is required"))
@@ -317,15 +323,7 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	}
 	// The declared installed size is what the version occupied; it is read
 	// before the removal because afterwards the entry is gone.
-	var freed int64
-	if list, err := k.deps.Kernels.List(); err == nil {
-		for _, e := range list {
-			if e.Name == a.Name && e.Version == version {
-				freed = e.Size
-				break
-			}
-		}
-	}
+	freed := k.installedSizeOf(a.Name, version)
 	if err := k.deps.Kernels.Remove(a.Name, version); err != nil {
 		// An already removed version is the desired state of kernel_remove:
 		// report success with already_absent instead of failing the command
@@ -339,6 +337,29 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	k.reg.logf().Infof("opscmd: kernel_remove %s@%s done (%d bytes freed)", a.Name, version, freed)
 	k.reg.event("kernel.removed", "info", fmt.Sprintf("kernel %s@%s removed", a.Name, version))
 	return done(panelclient.KernelRemoveResult{FreedBytes: freed}), nil
+}
+
+// installedSizeOf returns the declared installed size of one kernel version, or
+// of every installed version of the kernel when version is empty (the Xray
+// service is removed as a whole). It is read *before* a removal because
+// afterwards the entries are gone: this is what kernel_remove reports as
+// freed_bytes, the manifest-declared size and not a du measurement (the same
+// number for gost, realm, frp and xray).
+func (k *kernelCmds) installedSizeOf(name, version string) int64 {
+	list, err := k.deps.Kernels.List()
+	if err != nil {
+		return 0
+	}
+	var freed int64
+	for _, e := range list {
+		if e.Name != name {
+			continue
+		}
+		if version == "" || e.Version == version {
+			freed += e.Size
+		}
+	}
+	return freed
 }
 
 // kernelRollback answers kernel_rollback: current and previous swap.

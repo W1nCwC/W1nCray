@@ -780,6 +780,27 @@ t_manager_dispatch() {
 	has "installer without arguments prints usage" "$(dispatch </dev/null 2>&1)" "W1nCray 管理命令"
 }
 
+t_log_hint() {
+	mock_backend
+	BACKEND=systemd
+	eq "systemd log" "$(log_hint)" "journalctl -u W1nCray"
+	eq "systemd follow" "$(log_hint follow)" "journalctl -u W1nCray -f"
+	BACKEND=openrc
+	eq "OpenRC log" "$(log_hint)" "tail -n 100 $ROOT/var/log/W1nCray.log"
+	eq "OpenRC follow" "$(log_hint follow)" "tail -f $ROOT/var/log/W1nCray.log"
+	BACKEND=procd
+	eq "procd log" "$(log_hint)" "logread -e W1nCray"
+	eq "procd follow" "$(log_hint follow)" "logread -f -e W1nCray"
+	# The hints must never name a `log` subcommand the program does not have
+	# (REG2 observation 2): they name the detected backend's real command.
+	hasnt "panel hint does not name a log subcommand" "$(panel_hint https://panel.example 7 0 2>&1)" "W1nCray log"
+	has "panel hint names the backend command" "$(panel_hint https://panel.example 7 0 2>&1)" "logread -f -e W1nCray"
+	has "usage names the backend command" "$(usage 2>&1)" "logread -f -e W1nCray"
+	hasnt "usage does not advertise a log subcommand" "$(usage 2>&1)" "W1nCray log"
+	# The Xray kernel's own commands are not agent subcommands.
+	hasnt "usage does not pass x25519 to the agent" "$(usage 2>&1)" "W1nCray x25519"
+}
+
 t_menu() {
 	mock_backend
 	mkdir -p "$BIN_DIR"
@@ -1191,7 +1212,7 @@ for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_veri
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
 	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
 	t_update_migrates_single_program t_update_agent_only t_uninstall_removes_xray t_uninstall_xray_backend_fallback t_xray_dispatch \
-	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
+	t_manager_dispatch t_log_hint t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
 	t_install_panel t_install_panel_missing_args t_install_panel_bad_id t_install_panel_http \
 	t_install_panel_token_file t_install_panel_keeps_config t_install_panel_static_nodes t_install_panel_agent_yml t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
 	run "$t"

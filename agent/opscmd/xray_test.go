@@ -79,6 +79,64 @@ func TestKernelRemoveXrayRemovesTheService(t *testing.T) {
 	}
 }
 
+// TestKernelRemoveXrayReportsTheFreedBytes covers REG2 observation 1: removing
+// the Xray kernel through the service manager answered freed_bytes=0 while the
+// supervised kernels reported the declared installed size. The service manager
+// deletes every installed version at once, so the freed bytes are the sum over
+// them, read before the removal exactly like the gost/realm/frp branch does.
+// Before the fix this command returned {"freed_bytes":0}.
+func TestKernelRemoveXrayReportsTheFreedBytes(t *testing.T) {
+	x := &fakeXray{removed: true}
+	reg := mustRegistry(t, Deps{
+		Kernels: fakeKernels{list: []install.Entry{
+			{Name: "xray", Version: "0.6.3", Current: true, Size: 41_000_000},
+			{Name: "xray", Version: "0.6.2", Size: 40_000_000},
+			// Another kernel on the machine must never leak into the sum.
+			{Name: "gost", Version: "3.3.0", Size: 7_000_000},
+		}},
+		Xray: x,
+	})
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "x8", Type: panelclient.CmdKernelRemove,
+		Args: json.RawMessage(`{"name":"xray"}`),
+	})
+	if status != panelclient.ResultDone {
+		t.Fatalf("kernel_remove xray = (%q, %s), want done", status, res)
+	}
+	var out panelclient.KernelRemoveResult
+	if err := json.Unmarshal(res, &out); err != nil {
+		t.Fatalf("result %s: %v", res, err)
+	}
+	if out.AlreadyAbsent {
+		t.Errorf("a real removal reported already_absent: %s", res)
+	}
+	if out.FreedBytes != 81_000_000 {
+		t.Errorf("freed_bytes = %d, want 81000000 (every installed xray version, gost excluded)", out.FreedBytes)
+	}
+}
+
+// TestKernelRemoveXrayAbsentReportsNoFreedBytes pins the idempotent half: with
+// nothing installed the command still answers already_absent and must not
+// invent freed bytes.
+func TestKernelRemoveXrayAbsentReportsNoFreedBytes(t *testing.T) {
+	x := &fakeXray{} // removed=false: there was nothing to remove
+	reg := mustRegistry(t, Deps{Xray: x})
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "x9", Type: panelclient.CmdKernelRemove,
+		Args: json.RawMessage(`{"name":"xray"}`),
+	})
+	if status != panelclient.ResultDone {
+		t.Fatalf("kernel_remove xray = (%q, %s), want done", status, res)
+	}
+	var out panelclient.KernelRemoveResult
+	if err := json.Unmarshal(res, &out); err != nil {
+		t.Fatalf("result %s: %v", res, err)
+	}
+	if !out.AlreadyAbsent || out.FreedBytes != 0 {
+		t.Errorf("kernel_remove on an absent service = %s, want already_absent with freed_bytes 0", res)
+	}
+}
+
 // TestKernelRemoveXrayIsIdempotent covers D-M2's xray half: when the service
 // manager has nothing to remove (never installed, or already removed), the
 // command answers done with already_absent instead of the "Unit not loaded"

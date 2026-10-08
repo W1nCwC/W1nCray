@@ -630,6 +630,41 @@ be_none_log() { no_backend; }
 be_none_follow() { no_backend; }
 be_none_levels() { :; }
 
+# log_hint [follow] prints the command that reads this machine's agent log. The
+# program itself has no `log` subcommand (running it directly answers
+# `unknown command "log"`), so every hint names the real command of the detected
+# backend: journalctl on systemd, the file the OpenRC supervise-daemon writes
+# (be_openrc_install sets output_log/error_log), logread on procd. "follow"
+# asks for the live view. With no service manager the log is the terminal.
+log_hint() {
+	case "$BACKEND" in
+	systemd)
+		if [ "${1:-}" = follow ]; then
+			printf 'journalctl -u W1nCray -f'
+		else
+			printf 'journalctl -u W1nCray'
+		fi
+		;;
+	openrc)
+		if [ "${1:-}" = follow ]; then
+			printf 'tail -f %s' "$ROOT/var/log/W1nCray.log"
+		else
+			printf 'tail -n 100 %s' "$ROOT/var/log/W1nCray.log"
+		fi
+		;;
+	procd)
+		if [ "${1:-}" = follow ]; then
+			printf 'logread -f -e W1nCray'
+		else
+			printf 'logread -e W1nCray'
+		fi
+		;;
+	*)
+		printf '%s -c %s' "$BIN" "$CONF"
+		;;
+	esac
+}
+
 # daemon_pids prints the PIDs of the running program. busybox pidof also matches
 # scripts by name, which would include this manager script itself.
 daemon_pids() {
@@ -1113,7 +1148,7 @@ panel_hint() {
 	else
 		green "已关联面板 $1（机器 ID $2），agent 将自动领取节点与转发规则"
 	fi
-	yellow "查看日志：W1nCray log（实时）或 W1nCray status"
+	yellow "查看日志：$(log_hint follow)（实时）或 W1nCray status"
 }
 
 cmd_install() {
@@ -1466,7 +1501,7 @@ cmd_install() {
 	elif [ "$_failed" -eq 0 ]; then
 		svc enable W1nCray
 		svc start W1nCray
-		green "W1nCray 已启动并设为开机自启。管理命令: W1nCray（菜单）、W1nCray status、W1nCray log"
+		green "W1nCray 已启动并设为开机自启。管理命令: W1nCray（菜单）、W1nCray status、查看日志: $(log_hint follow)"
 	fi
 	panel_hint "$_panel" "$_machine" "$_panel_pending"
 	if [ "$_migrate_xray" -ne 1 ]; then
@@ -1559,7 +1594,7 @@ cmd_start() {
 	need_root
 	require_bin
 	svc start W1nCray
-	stable_running W1nCray "$WAIT_START" && green "已启动" || red "启动后未能保持运行，请查看日志: W1nCray log"
+	stable_running W1nCray "$WAIT_START" && green "已启动" || red "启动后未能保持运行，请查看日志: $(log_hint)"
 }
 cmd_stop() {
 	need_root
@@ -1570,7 +1605,7 @@ cmd_restart() {
 	need_root
 	require_bin
 	svc restart W1nCray
-	stable_running W1nCray "$WAIT_START" && green "已重启" || red "重启后未能保持运行，请查看日志: W1nCray log"
+	stable_running W1nCray "$WAIT_START" && green "已重启" || red "重启后未能保持运行，请查看日志: $(log_hint)"
 }
 cmd_enable() {
 	need_root
@@ -1711,7 +1746,6 @@ W1nCray 管理命令
   W1nCray                    打开管理菜单
   W1nCray start|stop|restart 启动 / 停止 / 重启服务
   W1nCray status             版本、运行状态、开机自启、WebSocket 与最近错误
-  W1nCray log [-n 行数]      实时查看日志（加 -n 只看最近若干行）
   W1nCray check              检查配置并向面板验证每个节点
   W1nCray config             编辑配置文件，保存后可立即检查
   W1nCray enable|disable     开机自启 开 / 关
@@ -1725,7 +1759,8 @@ W1nCray 管理命令
   W1nCray xray install --file <W1nCray-xray 文件或 .gz> --sha256 <hex>
                              离线安装 Xray 内核（sha256 必填）
   W1nCray run                前台运行（已有实例在运行时会被拒绝）
-  W1nCray version | x25519 | init ...  程序本体的命令
+  W1nCray version | init ...  程序本体的命令
+  W1nCray-xray x25519 | version | check ...  Xray 内核程序本体的命令
 
 首次安装:
   sh install.sh install [--lite|--full] [--prefix DIR] [--with-geo]
@@ -1760,6 +1795,9 @@ W1nCray 管理命令
   已有静态 Nodes 时按提示先在面板绑定这些节点，再用 W1nCray link ... --dry-run 迁移
   （link 把静态节点与旧的 Agent: 段迁移到 agent.yml，由你手动执行）。
 EOF
+	# The log command depends on the service backend; print it live instead of
+	# advertising a `log` subcommand the program itself does not have.
+	printf '\n查看日志（服务后端 %s）: %s\n' "$BACKEND" "$(log_hint follow)"
 }
 
 menu() {
@@ -1818,8 +1856,10 @@ EOF
 }
 
 # dispatch COMMAND [ARGS...]. Run as the `W1nCray` command, anything that is
-# not a management command goes to the program itself (W1nCray migrate --from
-# ..., W1nCray x25519, W1nCray -c config.yml); the installer script rejects it.
+# not a management command goes to the agent program itself (W1nCray migrate
+# --from ..., W1nCray agent-apply -f desired.json, W1nCray -c config.yml); the
+# installer script rejects it. The Xray kernel program's own commands
+# (W1nCray-xray x25519 ...) are not reachable through this script.
 dispatch() {
 	_cmd="${1:-}"
 	[ $# -gt 0 ] && shift

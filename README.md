@@ -70,7 +70,6 @@ sh install.sh install --binary ./W1nCray-linux-amd64
 ```bash
 W1nCray                      # 管理菜单
 W1nCray status               # 版本、运行状态、开机自启、节点数、最近错误
-W1nCray log [-n 100]         # 实时日志（-n 只看最近若干行）
 W1nCray check                # 检查配置并向面板验证每个节点
 W1nCray start|stop|restart   # 服务控制
 W1nCray enable|disable       # 开机自启
@@ -86,7 +85,15 @@ W1nCray xray install --file <W1nCray-xray 文件或 .gz> --sha256 <hex>
 W1nCray uninstall [--purge]  # 卸载（同时停止并删除 Xray 内核服务；--purge 再删除配置）
 ```
 
-其余子命令（`version`、`x25519`、`init`、带参数的 `migrate` / `check` 等）原样交给程序本体。
+查看日志（agent 程序本体**没有** `log` 子命令，按服务后端来）：
+
+```bash
+journalctl -u W1nCray -f         # systemd
+tail -f /var/log/W1nCray.log     # OpenRC（supervise-daemon 写的文件）
+logread -f -e W1nCray            # procd（OpenWRT）
+```
+
+其余 agent 子命令（`version`、`init`、`agent-apply`、带参数的 `migrate` / `check` 等）原样交给程序本体；`x25519` 属于 Xray 内核程序（`W1nCray-xray x25519`），agent 里没有。
 
 ### Alpine / OpenWRT 说明
 
@@ -105,7 +112,7 @@ W1nCray check -c /etc/W1nCray/config.yml [--online]    # 检查配置（--online
 W1nCray link --panel https://panel.example.com --machine 12 --token <T>  # 把静态节点转成机器模式（--dry-run 只预览）
 W1nCray init --dir /etc/W1nCray                        # 写入默认配置
 W1nCray version                                        # agent 版本与构建类型（不含 Xray-core；内核版本用 W1nCray-xray version）
-W1nCray x25519                                         # 生成 REALITY 密钥对
+W1nCray-xray x25519                                    # 生成 REALITY 密钥对（Xray 内核程序；agent 本体没有该命令）
 ```
 
 面板路由中使用 `geosite:` / `geoip:` 时需要 `geosite.dat`、`geoip.dat`（默认从配置文件所在目录查找，也可用环境变量 `XRAY_LOCATION_ASSET` 指定）。
