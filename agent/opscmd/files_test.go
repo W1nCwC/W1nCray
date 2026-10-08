@@ -322,3 +322,82 @@ func TestFilesEventsAreEmitted(t *testing.T) {
 		t.Errorf("events = %v, want files.applied then files.rolled_back", kinds)
 	}
 }
+
+type fakeDesired struct {
+	mu       sync.Mutex
+	rev      int64
+	refresh  int
+	arriveAt int // the revision arrives after this many refresh requests
+	next     int64
+}
+
+func (d *fakeDesired) DesiredRevision() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.rev
+}
+
+func (d *fakeDesired) RequestRefresh() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.refresh++
+	if d.arriveAt > 0 && d.refresh >= d.arriveAt {
+		d.rev = d.next
+	}
+}
+
+// TestFilesApplyWaitsForItsRevision: the panel publishes revision N and
+// enqueues files_apply{revision:N} at once; the command may arrive before the
+// pull that brings N. It must pull and apply N, not the previous file list.
+func TestFilesApplyWaitsForItsRevision(t *testing.T) {
+	files := &fakeFiles{applyRes: filesync.Result{Status: filesync.StatusDone, Reload: filesync.ReloadReloaded}}
+	sink := &recordingSink{}
+	reg := mustRegistry(t, Deps{Files: files})
+	reg.SetSink(sink)
+	d := &fakeDesired{rev: 7, arriveAt: 2, next: 8}
+	reg.SetDesiredSync(d)
+
+	status, _ := reg.Execute(context.Background(), panelclient.Command{ID: "c1", Type: panelclient.CmdFilesApply, Args: json.RawMessage(`{"revision":8}`)})
+	if status != panelclient.ResultAccepted {
+		t.Fatalf("status = %q", status)
+	}
+	got := sink.wait(t, 1)
+	if got[0].status != panelclient.ResultDone {
+		t.Fatalf("late result = %+v", got[0])
+	}
+	d.mu.Lock()
+	refreshed := d.refresh
+	d.mu.Unlock()
+	if refreshed < 2 {
+		t.Errorf("refresh requests = %d, want the pull to be forced", refreshed)
+	}
+	if n, _, _ := files.counts(); n != 1 {
+		t.Errorf("applies = %d, want 1 (after the revision arrived)", n)
+	}
+}
+
+// TestFilesApplyFailsWhenItsRevisionNeverArrives: no silent "already current"
+// on the old file list.
+func TestFilesApplyFailsWhenItsRevisionNeverArrives(t *testing.T) {
+	old := desiredWait
+	desiredWait = 700 * time.Millisecond
+	defer func() { desiredWait = old }()
+	files := &fakeFiles{applyRes: filesync.Result{Status: filesync.StatusDone}}
+	sink := &recordingSink{}
+	reg := mustRegistry(t, Deps{Files: files})
+	reg.SetSink(sink)
+	reg.SetDesiredSync(&fakeDesired{rev: 7})
+
+	reg.Execute(context.Background(), panelclient.Command{ID: "c1", Type: panelclient.CmdFilesApply, Args: json.RawMessage(`{"revision":8}`)})
+	got := sink.wait(t, 1)
+	if got[0].status != panelclient.ResultFailed {
+		t.Fatalf("late result = %+v, want failed", got[0])
+	}
+	if n, _, _ := files.counts(); n != 0 {
+		t.Errorf("applies = %d, want 0", n)
+	}
+	// An unknown argument is still refused (strict args).
+	if status, _ := reg.Execute(context.Background(), panelclient.Command{ID: "c2", Type: panelclient.CmdFilesApply, Args: json.RawMessage(`{"rev":8}`)}); status == panelclient.ResultAccepted {
+		t.Error("an unknown argument was accepted")
+	}
+}

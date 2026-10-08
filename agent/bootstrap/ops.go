@@ -76,6 +76,13 @@ type lateResult struct {
 const deliverTimeout = 15 * time.Second
 
 func (l *lateResult) Deliver(id, status string, data json.RawMessage) {
+	// The final result must never overtake the accepted answer: the panel
+	// stores the accepted payload on top of whatever result the command row
+	// already has, so a failure delivered first would be erased (status failed,
+	// result null, D-M3). The wait is released by the channel that sent the
+	// accepted answer and is bounded, so a channel that never reports cannot
+	// wedge the command.
+	l.runner.WaitAccepted(context.Background(), id)
 	if l.ws != nil && l.ws.Connected() {
 		env, err := ws.Encode(wsproto.TypeCmdResult, id, wsproto.CmdResult{Status: status, Result: json.RawMessage(data)})
 		if err == nil {

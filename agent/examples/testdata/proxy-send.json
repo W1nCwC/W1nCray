@@ -6,7 +6,7 @@
       "id": "proxy-send",
       "name": "发送PROXY协议v2：目标服务据此看到真实客户端IP",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": { "addr": "0.0.0.0", "ports": "20600" },
       "network": ["tcp"],

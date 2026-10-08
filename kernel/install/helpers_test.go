@@ -200,6 +200,7 @@ type kern struct {
 	Archive       []byte // the archive served
 	Members       map[string][]byte
 	Extract       map[string]string // member -> to
+	RunBinary     string            // manifest run.binary; "gost" when empty
 	URLs          []string
 	Variant       string
 	Null          bool // target null for the fixture platform
@@ -223,6 +224,9 @@ func (f *fixture) build(k kern) (manifest.Kernel, []byte) {
 	}
 	if k.Mode == "" {
 		k.Mode = "0755"
+	}
+	if k.RunBinary == "" {
+		k.RunBinary = "gost"
 	}
 	archive := k.Archive
 	if archive == nil {
@@ -248,7 +252,7 @@ func (f *fixture) build(k kern) (manifest.Kernel, []byte) {
 	mk := manifest.Kernel{
 		Name: k.Name, Version: k.Version, Channel: "stable", MinAgent: k.MinAgent,
 		License: manifest.License{SPDX: "MIT", SourceURL: "https://example.com/src"},
-		Run:     manifest.Run{Binary: "gost", VersionCmd: []string{"-V"}},
+		Run:     manifest.Run{Binary: k.RunBinary, VersionCmd: []string{"-V"}},
 		Targets: map[string]*manifest.Target{},
 		Revoked: k.Revoked,
 	}

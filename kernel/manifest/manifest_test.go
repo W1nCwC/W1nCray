@@ -5,12 +5,16 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/W1nCwC/W1nCray/kernel"
+	"github.com/W1nCwC/W1nCray/kernel/platform"
 )
 
 var now = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
@@ -341,6 +345,208 @@ func TestValidateRejects(t *testing.T) {
 		if !errors.Is(err, kernel.ErrManifestInvalid) {
 			t.Errorf("%s: want ErrManifestInvalid, got %v", name, err)
 		}
+	}
+}
+
+// TestTargetKeyOpenWrtSuffix covers the legacy OpenWrt-specific target key
+// "linux/<arch>+openwrt": it stays accepted and selectable, while every key
+// shape that is neither a plain "os/arch" nor a well-formed "+suffix" is still
+// rejected.
+func TestTargetKeyOpenWrtSuffix(t *testing.T) {
+	m := sample()
+	amd := *m.Kernels[0].Targets["linux/amd64"]
+	m.Kernels[0].Targets["linux/amd64+openwrt"] = &amd
+	if err := m.Validate(); err != nil {
+		t.Fatalf("a +openwrt target key must be accepted: %v", err)
+	}
+	if tg, st := m.Kernels[0].Lookup("linux/amd64+openwrt"); st != TargetPresent || tg == nil {
+		t.Fatalf("Lookup(linux/amd64+openwrt) = %v, %v", tg, st)
+	}
+	for _, key := range []string{
+		"linux/amd64+openwrt+openwrt", "linux/amd64+OpenWrt", "+openwrt",
+		"linux/amd64+", "linux/amd64+waytoolongsuffix1", "linux/amd64/extra", "Linux AMD",
+	} {
+		bad := sample()
+		bad.Kernels[0].Targets[key] = nil
+		if err := bad.Validate(); !errors.Is(err, kernel.ErrManifestInvalid) {
+			t.Errorf("target key %q: want ErrManifestInvalid, got %v", key, err)
+		}
+	}
+}
+
+// TestUnknownTargetSuffixIsIgnored covers the forward-compatibility rule: a
+// well-formed "os/arch+<unknown suffix>" key must not reject the document. It
+// is reported by ValidateReport and is never selectable, so a future platform
+// extension cannot lock an older agent out of every kernel the way "+openwrt"
+// locks v0.5.2 out of a v11 manifest.
+func TestUnknownTargetSuffixIsIgnored(t *testing.T) {
+	m := sample()
+	amd := *m.Kernels[0].Targets["linux/amd64"]
+	m.Kernels[0].Targets["linux/amd64+futureos"] = &amd
+
+	rep, err := m.ValidateReport()
+	if err != nil {
+		t.Fatalf("an unknown suffix must not invalidate the manifest: %v", err)
+	}
+	if len(rep.IgnoredTargets) != 1 {
+		t.Fatalf("IgnoredTargets = %+v, want one entry", rep.IgnoredTargets)
+	}
+	n := rep.IgnoredTargets[0]
+	if n.Kernel != "gost@3.3.0" || n.Key != "linux/amd64+futureos" || n.Reason == "" {
+		t.Fatalf("notice = %+v", n)
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("Validate must agree with ValidateReport: %v", err)
+	}
+	if tg, st := m.Kernels[0].Lookup("linux/amd64+futureos"); tg != nil || st != TargetAbsent {
+		t.Fatalf("an ignored target must not be selectable: %v %v", tg, st)
+	}
+	// A kernel whose only build carries an unknown suffix has no usable build,
+	// so Run need not be complete.
+	only := sample()
+	only.Kernels[0].Targets = map[string]*Target{"linux/amd64+futureos": &amd}
+	only.Kernels[0].Run = Run{}
+	if err := only.Validate(); err != nil {
+		t.Fatalf("a kernel with no selectable build must still validate: %v", err)
+	}
+}
+
+// TestOpenWrtTargets covers the new field: keys are plain "os/arch" (no
+// suffix) and every value goes through the same checks as Targets.
+func TestOpenWrtTargets(t *testing.T) {
+	m := sample()
+	amd := *m.Kernels[0].Targets["linux/amd64"]
+	m.Kernels[0].OpenWrtTargets = map[string]*Target{"linux/amd64": &amd}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("a plain openwrt_targets key must be accepted: %v", err)
+	}
+	if tg, st := m.Kernels[0].LookupOpenWrt("linux/amd64"); st != TargetPresent || tg == nil {
+		t.Fatalf("LookupOpenWrt = %v, %v", tg, st)
+	}
+	if tg, st := m.Kernels[0].LookupOpenWrt("linux/riscv64"); tg != nil || st != TargetAbsent {
+		t.Fatalf("LookupOpenWrt(riscv64) = %v, %v", tg, st)
+	}
+	// The field exists precisely to keep targets free of suffixes, so a
+	// suffixed or otherwise malformed key there is refused.
+	for _, key := range []string{"linux/amd64+openwrt", "Linux/AMD64", "linux/amd64/extra", "+openwrt"} {
+		bad := sample()
+		bad.Kernels[0].OpenWrtTargets = map[string]*Target{key: &amd}
+		if err := bad.Validate(); !errors.Is(err, kernel.ErrManifestInvalid) {
+			t.Errorf("openwrt_targets key %q: want ErrManifestInvalid, got %v", key, err)
+		}
+	}
+	// A broken value is rejected exactly like one in targets.
+	bad := sample()
+	broken := amd
+	broken.Archive = "rar"
+	bad.Kernels[0].OpenWrtTargets = map[string]*Target{"linux/amd64": &broken}
+	if err := bad.Validate(); !errors.Is(err, kernel.ErrManifestInvalid) {
+		t.Errorf("a broken openwrt_targets value was accepted: %v", err)
+	}
+	// A kernel with only openwrt_targets still has a build, so Run must be
+	// complete for it.
+	only := sample()
+	only.Kernels[0].Targets = nil
+	only.Kernels[0].OpenWrtTargets = map[string]*Target{"linux/amd64": &amd}
+	if err := only.Validate(); err != nil {
+		t.Fatalf("openwrt-only kernel: %v", err)
+	}
+	only.Kernels[0].Run.VersionCmd = nil
+	if err := only.Validate(); !errors.Is(err, kernel.ErrManifestInvalid) {
+		t.Errorf("openwrt-only kernel without run.version_cmd was accepted: %v", err)
+	}
+}
+
+// TestOpenWrtSuffixAgreesWithPlatform keeps the two spellings of the legacy
+// suffix in step without making this package depend on kernel/platform.
+func TestOpenWrtSuffixAgreesWithPlatform(t *testing.T) {
+	if OpenWrtSuffix != platform.OpenWrtSuffix {
+		t.Fatalf("manifest.OpenWrtSuffix %q != platform.OpenWrtSuffix %q", OpenWrtSuffix, platform.OpenWrtSuffix)
+	}
+}
+
+// ---- v0.5.2 acceptance replica ---------------------------------------------
+
+// The production landing machines run the v0.5.2 agent, whose manifest parser
+// refuses the whole document when any target key does not match its regex:
+//
+//	git show v0.5.2:kernel/manifest/manifest.go
+//	  reTarget = ^[a-z0-9]{2,16}/[a-z0-9]{2,16}$
+//	  Kernel.validate(): a non-matching target key returns ErrManifestInvalid
+//	  (the entire manifest is rejected, the entry is not skipped)
+//
+// v0.5.2 also decodes with encoding/json into a struct and does not call
+// DisallowUnknownFields (sign.go, json.NewDecoder), so a field it does not
+// know ("openwrt_targets") is silently ignored.
+//
+// manifestV052 and legacyV052Validate are the minimal faithful replica of that
+// behaviour: decoding into a struct with no openwrt_targets field, then
+// rejecting the whole document on the first bad target key.
+var reTargetV052 = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`)
+
+type manifestV052 struct {
+	Kernels []struct {
+		Name    string                     `json:"name"`
+		Version string                     `json:"version"`
+		Targets map[string]json.RawMessage `json:"targets"`
+	} `json:"kernels"`
+}
+
+func legacyV052Validate(raw []byte) error {
+	var m manifestV052
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return err
+	}
+	if len(m.Kernels) == 0 {
+		return errors.New("no kernels")
+	}
+	for _, k := range m.Kernels {
+		if len(k.Targets) == 0 {
+			return fmt.Errorf("%s@%s: no targets", k.Name, k.Version)
+		}
+		for key := range k.Targets {
+			if !reTargetV052.MatchString(key) {
+				return fmt.Errorf("%s@%s: target key %q invalid", k.Name, k.Version, key)
+			}
+		}
+	}
+	return nil
+}
+
+// TestV052RulesAcceptNewFormat proves, at the unit-test level, that a manifest
+// in the new format (OpenWrt lite builds under openwrt_targets, every targets
+// key plain) is accepted by the v0.5.2 rules, and that the replica is
+// meaningful: the legacy "+openwrt" format is rejected by exactly those rules.
+func TestV052RulesAcceptNewFormat(t *testing.T) {
+	m := sample()
+	amd := *m.Kernels[0].Targets["linux/amd64"]
+	lite := amd
+	m.Kernels[0].OpenWrtTargets = map[string]*Target{"linux/amd64": &lite}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("new format invalid under v11 rules: %v", err)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "+openwrt") {
+		t.Fatalf("the new format must not carry a +openwrt key:\n%s", raw)
+	}
+	if err := legacyV052Validate(raw); err != nil {
+		t.Fatalf("v0.5.2 rules rejected the new format: %v", err)
+	}
+
+	// The same document in the old format (the lite build as a suffixed key in
+	// targets) must fail the replica: this is what REG3-1 observed on a real
+	// v0.5.2 agent, and it is why the replica is a real assertion.
+	old := sample()
+	old.Kernels[0].Targets["linux/amd64+openwrt"] = &amd
+	rawOld, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyV052Validate(rawOld); err == nil {
+		t.Fatal("the v0.5.2 replica accepted a +openwrt target key: it is not faithful")
 	}
 }
 

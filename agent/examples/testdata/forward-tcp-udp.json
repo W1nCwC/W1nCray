@@ -6,7 +6,7 @@
       "id": "game-27015",
       "name": "TCP加UDP同端口转发（游戏服务器）",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": { "addr": "0.0.0.0", "ports": "27015" },
       "network": ["tcp", "udp"],

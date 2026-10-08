@@ -71,7 +71,7 @@ func bootWithPersistedManifest(t *testing.T, raw []byte, log *recLog) *Runtime {
 		KernelsDir:       filepath.Join(dir, "kernels"),
 		ManifestKeysPath: keysPath,
 		Log:              log,
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestBootRestoresPersistedManifest(t *testing.T) {
 		StateDir:         stateDir,
 		KernelsDir:       filepath.Join(dir, "kernels"),
 		ManifestKeysPath: keysPath,
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}

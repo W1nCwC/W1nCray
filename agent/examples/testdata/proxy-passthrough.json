@@ -6,7 +6,7 @@
       "id": "proxy-pass",
       "name": "PROXY透传：回环接收头，再向目标发送v2头，保留真实来源",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": { "addr": "127.0.0.1", "ports": "20620" },
       "network": ["tcp"],

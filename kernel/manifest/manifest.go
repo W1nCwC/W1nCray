@@ -71,12 +71,27 @@ type Kernel struct {
 	Capabilities map[string]any `json:"capabilities,omitempty"`
 	Run          Run            `json:"run"`
 	// Targets maps a platform key ("linux/amd64", "linux/mipsle",
-	// "linux/armv7", ...) to a build. A key present with a null value means
-	// "no build exists for that platform"; a missing key means the manifest
-	// says nothing about it. Both make the kernel unavailable there, but
-	// callers can tell them apart with Kernel.Lookup.
+	// "linux/armv7", "linux/amd64+openwrt", ...) to a build. A key present with
+	// a null value means "no build exists for that platform"; a missing key
+	// means the manifest says nothing about it. Both make the kernel
+	// unavailable there, but callers can tell them apart with Kernel.Lookup.
+	//
+	// Keys must be a plain "os/arch" or carry the legacy "+openwrt" suffix
+	// (platform.OpenWrtSuffix). A key with any other suffix is accepted but
+	// ignored (ValidateReport lists it): it is a platform extension this agent
+	// does not implement, and rejecting the whole document for it would lock
+	// older agents out of every kernel, exactly as v0.5.2 is locked out by
+	// "+openwrt" (see docs/PLAN-v11-xray-kernel.md). New OpenWrt lite builds
+	// belong in OpenWrtTargets instead.
 	Targets map[string]*Target `json:"targets"`
-	Revoked []Revocation       `json:"revoked,omitempty"`
+	// OpenWrtTargets maps a plain "os/arch" key (no suffix) to the
+	// OpenWrt-specific (lite) build of the kernel. It is a separate field so
+	// that every key in Targets stays a plain "os/arch" key, which is the only
+	// shape an old (v0.5.x) agent's parser accepts; an unknown field is
+	// ignored by that parser, so this document loads there. The builds here are
+	// selected only on OpenWrt, and never on any other system.
+	OpenWrtTargets map[string]*Target `json:"openwrt_targets,omitempty"`
+	Revoked        []Revocation       `json:"revoked,omitempty"`
 }
 
 // License records what a mirror must ship alongside the binary.
@@ -127,12 +142,27 @@ type Revocation struct {
 	Reason  string `json:"reason,omitempty"`
 }
 
+// OpenWrtSuffix is the legacy OpenWrt-specific target-key suffix. It is the
+// same constant as platform.OpenWrtSuffix (a manifest test asserts they agree);
+// it is spelled out here to keep this package free of a dependency on
+// kernel/platform. New manifests put OpenWrt lite builds in
+// Kernel.OpenWrtTargets instead of a suffixed key.
+const OpenWrtSuffix = "+openwrt"
+
 var (
 	reName    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 	reVersion = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$`)
-	reTarget  = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`)
-	reSHA256  = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	reFile    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
+	// reTargetKey is a plain manifest platform key, "linux/amd64". It is also
+	// exactly the v0.5.2 rule (^[a-z0-9]{2,16}/[a-z0-9]{2,16}$), so every key
+	// manifestgen writes into Kernel.Targets must match it.
+	reTargetKey = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`)
+	// reTarget is a platform key with an optional "+suffix". "+openwrt" is
+	// selectable; any other well-formed suffix is accepted but ignored, so a
+	// future platform extension cannot make this agent reject the whole
+	// manifest the way "+openwrt" makes v0.5.2 reject it.
+	reTarget = regexp.MustCompile(`^[a-z0-9]{2,16}/[a-z0-9]{2,16}(?:\+[a-z0-9]{1,16})?$`)
+	reSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	reFile   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
 )
 
 // reservedNames are file names the installer uses inside a version directory.
@@ -152,40 +182,65 @@ func invalid(format string, args ...any) error {
 	return kernel.Newf(kernel.ErrManifestInvalid, "", "", format, args...)
 }
 
+// TargetNotice is one target key Validate accepted but will never select, so
+// callers can log it instead of failing the whole document. Today it is a
+// "os/arch+<unknown suffix>" key in Kernel.Targets: a platform extension this
+// agent does not implement.
+type TargetNotice struct {
+	Kernel string // "name@version"
+	Key    string
+	Reason string
+}
+
+// ValidationReport holds the non-fatal findings of ValidateReport.
+type ValidationReport struct {
+	// IgnoredTargets are target keys that passed the key-shape check but are
+	// not selectable here (an unknown "+suffix").
+	IgnoredTargets []TargetNotice
+}
+
 // Validate checks the structure and every limit. It does not look at the
 // signature, clock or sequence (see Verify).
 func (m *Manifest) Validate() error {
+	_, err := m.ValidateReport()
+	return err
+}
+
+// ValidateReport is Validate plus the non-fatal findings. A manifest with an
+// ignored target key is valid; the caller decides whether to log the notice.
+func (m *Manifest) ValidateReport() (*ValidationReport, error) {
+	rep := &ValidationReport{}
 	if m.Schema != SchemaVersion {
-		return invalid("unsupported schema %d (want %d)", m.Schema, SchemaVersion)
+		return nil, invalid("unsupported schema %d (want %d)", m.Schema, SchemaVersion)
 	}
 	if m.Sequence <= 0 {
-		return invalid("sequence must be positive")
+		return nil, invalid("sequence must be positive")
 	}
 	if m.IssuedAt.IsZero() || m.ExpiresAt.IsZero() {
-		return invalid("issued_at and expires_at are required")
+		return nil, invalid("issued_at and expires_at are required")
 	}
 	if !m.ExpiresAt.After(m.IssuedAt) {
-		return invalid("expires_at must be after issued_at")
+		return nil, invalid("expires_at must be after issued_at")
 	}
 	if len(m.Kernels) == 0 {
-		return invalid("no kernels")
+		return nil, invalid("no kernels")
 	}
 	seen := map[string]bool{}
 	for i := range m.Kernels {
 		k := &m.Kernels[i]
-		if err := k.validate(); err != nil {
-			return err
+		if err := k.validate(rep); err != nil {
+			return nil, err
 		}
 		id := k.Name + "@" + k.Version
 		if seen[id] {
-			return invalid("duplicate kernel entry %s", id)
+			return nil, invalid("duplicate kernel entry %s", id)
 		}
 		seen[id] = true
 	}
-	return nil
+	return rep, nil
 }
 
-func (k *Kernel) validate() error {
+func (k *Kernel) validate(rep *ValidationReport) error {
 	id := k.Name + "@" + k.Version
 	if !reName.MatchString(k.Name) {
 		return invalid("kernel name %q invalid", k.Name)
@@ -199,17 +254,39 @@ func (k *Kernel) validate() error {
 	if k.License.SPDX == "" {
 		return invalid("%s: license.spdx is required", id)
 	}
-	if len(k.Targets) == 0 {
+	if len(k.Targets) == 0 && len(k.OpenWrtTargets) == 0 {
 		return invalid("%s: no targets", id)
 	}
 	for key, t := range k.Targets {
 		if !reTarget.MatchString(key) {
 			return invalid("%s: target key %q invalid", id, key)
 		}
+		if suffix := targetSuffix(key); suffix != "" && suffix != OpenWrtSuffix {
+			// Forward compatible: a well-formed key for a platform extension
+			// this agent does not implement is ignored, never selected. It
+			// must not reject the whole manifest: that is what locks v0.5.2
+			// out of every kernel in a manifest that carries "+openwrt".
+			rep.IgnoredTargets = append(rep.IgnoredTargets, TargetNotice{
+				Kernel: id, Key: key,
+				Reason: "unknown target suffix " + strconv.Quote(suffix) + "; the target is not selectable",
+			})
+			continue
+		}
 		if t == nil {
 			continue
 		}
 		if err := t.validate(id+" "+key, k.Run); err != nil {
+			return err
+		}
+	}
+	for key, t := range k.OpenWrtTargets {
+		if !reTargetKey.MatchString(key) {
+			return invalid("%s: openwrt_targets key %q invalid (must be a plain os/arch key)", id, key)
+		}
+		if t == nil {
+			continue
+		}
+		if err := t.validate(id+" openwrt_targets["+key+"]", k.Run); err != nil {
 			return err
 		}
 	}
@@ -242,8 +319,29 @@ func (k *Kernel) validate() error {
 	return nil
 }
 
+// targetSuffix returns the "+suffix" of a target key, or "" when the key
+// carries none. reTarget guarantees at most one '+'.
+func targetSuffix(key string) string {
+	if i := strings.IndexByte(key, '+'); i >= 0 {
+		return key[i:]
+	}
+	return ""
+}
+
+// ignoredTargetKey reports whether a Targets key is well-formed but carries an
+// unknown suffix, i.e. accepted-but-never-selected.
+func ignoredTargetKey(key string) bool {
+	suffix := targetSuffix(key)
+	return suffix != "" && suffix != OpenWrtSuffix
+}
+
 func (k *Kernel) hasBuild() bool {
-	for _, t := range k.Targets {
+	for key, t := range k.Targets {
+		if t != nil && !ignoredTargetKey(key) {
+			return true
+		}
+	}
+	for _, t := range k.OpenWrtTargets {
 		if t != nil {
 			return true
 		}
@@ -370,9 +468,24 @@ const (
 )
 
 // Lookup returns the target for a platform key and says whether it is
-// present, explicitly null, or absent.
+// present, explicitly null, or absent. A key with an unknown "+suffix" is
+// never selectable, so it always reports TargetAbsent (ValidateReport names
+// it); the legacy "+openwrt" key is looked up normally.
 func (k *Kernel) Lookup(key string) (*Target, TargetState) {
-	t, ok := k.Targets[key]
+	if ignoredTargetKey(key) {
+		return nil, TargetAbsent
+	}
+	return lookup(k.Targets, key)
+}
+
+// LookupOpenWrt is Lookup against OpenWrtTargets, whose keys are plain
+// "os/arch" keys. A target here is selectable only on OpenWrt.
+func (k *Kernel) LookupOpenWrt(key string) (*Target, TargetState) {
+	return lookup(k.OpenWrtTargets, key)
+}
+
+func lookup(m map[string]*Target, key string) (*Target, TargetState) {
+	t, ok := m[key]
 	switch {
 	case !ok:
 		return nil, TargetAbsent

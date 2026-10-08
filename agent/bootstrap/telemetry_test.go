@@ -115,13 +115,23 @@ func TestPolicyComesFromTheLocalAgentConfig(t *testing.T) {
 	if pol.Terminal || !pol.Modules.XrayNodes || pol.Files.Unrestricted || len(pol.Files.Roots) != 0 {
 		t.Errorf("nil-config policy = %+v", pol)
 	}
+	// The firewall automation is only ever on on OpenWrt (PLAN v11 D2); the
+	// test host is not one, so the effective value is false even when the
+	// configuration asks for it.
+	if pol.Firewall.AutoOpen {
+		t.Errorf("firewall.auto_open must be false off OpenWrt: %+v", pol)
+	}
+	asked := rt.Streams(nil, &agentcfg.Config{Firewall: &agentcfg.FirewallConfig{AutoOpen: boolPtr(true)}}).Policy()
+	if asked.Firewall.AutoOpen {
+		t.Errorf("firewall.auto_open must stay false off OpenWrt even when requested: %+v", asked)
+	}
 	if zero := rt.Streams(nil, &agentcfg.Config{}).Policy(); !zero.Terminal {
 		t.Errorf("zero-config policy must keep the terminal default on: %+v", zero)
 	}
 
 	cfg := &agentcfg.Config{
 		Terminal: &agentcfg.TerminalConfig{Enabled: boolPtr(false)},
-		Files:    &agentcfg.FilesConfig{Roots: []string{"/etc/W1nCray"}, Unrestricted: true},
+		Files:    &agentcfg.FilesConfig{Roots: []string{"/etc/W1nCray"}, Unrestricted: boolPtr(true)},
 		Modules:  &agentcfg.ModuleConfig{XrayNodes: boolPtr(false)},
 	}
 	pol = rt.Streams(nil, cfg).Policy()
@@ -134,10 +144,38 @@ func TestPolicyComesFromTheLocalAgentConfig(t *testing.T) {
 	if pol.Modules.XrayNodes {
 		t.Error("xray_nodes must follow Modules.XrayNodes")
 	}
+	// The instance policy is reported so the panel can plan ports (PLAN v10).
+	withPolicy := &agentcfg.Config{Policy: &agentcfg.Policy{AllowListen: []string{"0.0.0.0"}, PortRange: []int{30001, 39999}}}
+	ip := rt.Streams(nil, withPolicy).Policy().Instances
+	if ip == nil || ip.PortRange != [2]int{30001, 39999} || len(ip.AllowListen) != 1 || ip.AllowListen[0] != "0.0.0.0" {
+		t.Errorf("instances policy = %+v", ip)
+	}
 	// Mutating the reported roots must not reach into the config.
 	pol.Files.Roots[0] = "/tmp"
 	if again := rt.Streams(nil, cfg).Policy(); again.Files.Roots[0] != "/etc/W1nCray" {
 		t.Error("Policy() aliased the config's roots")
+	}
+}
+
+// TestPolicyReportsTheLocalKernelSwitch covers D-M1's reporting half:
+// hello.policy.kernels.allow_http is the machine's own Kernels.AllowHTTP value,
+// so the panel can display it (and must never try to turn it on remotely).
+func TestPolicyReportsTheLocalKernelSwitch(t *testing.T) {
+	rt, _ := bootCycle(t, t.TempDir(), false, nil)
+
+	if pol := rt.Streams(nil, nil).Policy(); pol.Kernels.AllowHTTP {
+		t.Errorf("a nil config must report allow_http false: %+v", pol.Kernels)
+	}
+	if pol := rt.Streams(nil, &agentcfg.Config{}).Policy(); pol.Kernels.AllowHTTP {
+		t.Errorf("a zero config must report allow_http false: %+v", pol.Kernels)
+	}
+	on := &agentcfg.Config{Kernels: &agentcfg.KernelsConfig{AllowHTTP: true}}
+	if pol := rt.Streams(nil, on).Policy(); !pol.Kernels.AllowHTTP {
+		t.Errorf("Kernels.AllowHTTP: true must be reported: %+v", pol.Kernels)
+	}
+	off := &agentcfg.Config{Kernels: &agentcfg.KernelsConfig{AllowHTTP: false}}
+	if pol := rt.Streams(nil, off).Policy(); pol.Kernels.AllowHTTP {
+		t.Errorf("Kernels.AllowHTTP: false must be reported: %+v", pol.Kernels)
 	}
 }
 

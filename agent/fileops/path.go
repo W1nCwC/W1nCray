@@ -14,46 +14,7 @@ import (
 // files. It is the single entry point every operation uses (design section
 // 3.9).
 func (o *Ops) Resolve(root, rel string) (string, error) {
-	if rel == "" {
-		return "", fmt.Errorf("%w: empty path", ErrBadPath)
-	}
-	if strings.ContainsRune(rel, 0) {
-		return "", fmt.Errorf("%w: NUL in path", ErrBadPath)
-	}
-	rel = normalizeSeparators(rel)
-	if strings.ContainsRune(rel, '\\') {
-		// On Unix a backslash is a legal file name character, not a
-		// separator. Refusing it keeps one rule for both platforms: a path
-		// written with Windows separators is rejected instead of silently
-		// naming a different file.
-		return "", fmt.Errorf("%w: backslash in path %q", ErrBadPath, rel)
-	}
-
-	var base string
-	if o.opts.Unrestricted {
-		abs := filepath.Clean(rel)
-		if !filepath.IsAbs(abs) {
-			return "", fmt.Errorf("%w: Files.Unrestricted needs an absolute path, got %q", ErrBadPath, rel)
-		}
-		// The volume root is the base and the rest is the relative path, so
-		// the segment walk below works the same way on Windows.
-		base = filepath.VolumeName(abs) + string(filepath.Separator)
-		rel = strings.TrimPrefix(strings.TrimPrefix(abs, filepath.VolumeName(abs)), string(filepath.Separator))
-	} else {
-		r, ok := o.roots[root]
-		if !ok {
-			if len(o.roots) == 0 {
-				return "", fmt.Errorf("%w: file operations have no roots", ErrNoRoots)
-			}
-			return "", fmt.Errorf("%w: %q (configured: %s)", ErrUnknownRoot, root, strings.Join(o.RootNames(), ", "))
-		}
-		base = r.Path
-	}
-	if filepath.IsAbs(rel) {
-		return "", fmt.Errorf("%w: absolute path %q", ErrBadPath, rel)
-	}
-
-	segs, err := splitSegments(rel)
+	base, segs, err := o.resolveBase(root, rel)
 	if err != nil {
 		return "", err
 	}
@@ -78,13 +39,70 @@ func (o *Ops) Resolve(root, rel string) (string, error) {
 	if err := o.checkSegment(full, false); err != nil {
 		return "", err
 	}
-	if !o.opts.Unrestricted && !within(base, full) {
+	if !o.opts.IsUnrestricted() && !within(base, full) {
 		return "", fmt.Errorf("%w: %s is not inside %s", ErrOutsideRoots, full, base)
 	}
 	if err := o.checkExcluded(full); err != nil {
 		return "", err
 	}
 	return full, nil
+}
+
+// resolveBase is the filesystem-free half of Resolve: it applies the syntax
+// rules, the root lookup and the unrestricted rule, and returns the base
+// directory (the root, or the volume root when unrestricted) with the cleaned
+// relative segments. A caller that must create the path (Mkdir) uses it
+// directly; Resolve adds the existence and symlink walk on top.
+func (o *Ops) resolveBase(root, rel string) (string, []string, error) {
+	if rel == "" {
+		return "", nil, fmt.Errorf("%w: empty path", ErrBadPath)
+	}
+	if strings.ContainsRune(rel, 0) {
+		return "", nil, fmt.Errorf("%w: NUL in path", ErrBadPath)
+	}
+	rel = normalizeSeparators(rel)
+	if strings.ContainsRune(rel, '\\') {
+		// On Unix a backslash is a legal file name character, not a
+		// separator. Refusing it keeps one rule for both platforms: a path
+		// written with Windows separators is rejected instead of silently
+		// naming a different file.
+		return "", nil, fmt.Errorf("%w: backslash in path %q", ErrBadPath, rel)
+	}
+
+	var base string
+	if r, named := o.roots[root]; named && root != "" {
+		// A named root ("xray", "state") keeps meaning a root plus a relative
+		// path in unrestricted mode too: the panel's managed-file views use
+		// it. Unrestricted only adds the empty root with an absolute path.
+		base = r.Path
+	} else if o.opts.IsUnrestricted() {
+		abs := filepath.Clean(rel)
+		if !filepath.IsAbs(abs) {
+			return "", nil, fmt.Errorf("%w: Files.Unrestricted needs an absolute path, got %q", ErrBadPath, rel)
+		}
+		// The volume root is the base and the rest is the relative path, so
+		// the segment walk below works the same way on Windows.
+		base = filepath.VolumeName(abs) + string(filepath.Separator)
+		rel = strings.TrimPrefix(strings.TrimPrefix(abs, filepath.VolumeName(abs)), string(filepath.Separator))
+	} else {
+		r, ok := o.roots[root]
+		if !ok {
+			if len(o.roots) == 0 {
+				return "", nil, fmt.Errorf("%w: file operations have no roots", ErrNoRoots)
+			}
+			return "", nil, fmt.Errorf("%w: %q (configured: %s)", ErrUnknownRoot, root, strings.Join(o.RootNames(), ", "))
+		}
+		base = r.Path
+	}
+	if filepath.IsAbs(rel) {
+		return "", nil, fmt.Errorf("%w: absolute path %q", ErrBadPath, rel)
+	}
+
+	segs, err := splitSegments(rel)
+	if err != nil {
+		return "", nil, err
+	}
+	return base, segs, nil
 }
 
 // checkSegment verifies one path component: no symlink, and a directory when

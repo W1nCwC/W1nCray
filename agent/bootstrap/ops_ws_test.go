@@ -50,7 +50,7 @@ func TestWebSocketKernelCommandsAndEvents(t *testing.T) {
 	writeFakeKernel(t, kernelsDir, "gost", "1.0.0", 4096)
 
 	useFake(t, newFakeDriver())
-	rt, err := Boot(Options{StateDir: filepath.Join(dir, "state"), KernelsDir: kernelsDir}, nil)
+	rt, err := Boot(Options{StateDir: filepath.Join(dir, "state"), KernelsDir: kernelsDir})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}

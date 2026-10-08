@@ -11,6 +11,7 @@
 // The package owns four markers under <StateDir>/update:
 //
 //	pending.json   a commit happened and the new process has not confirmed yet
+//	ready.json     the new process is up: its version and pid (see ReadyMarker)
 //	rollback.json  the watchdog rolled the swap back (reported on the next start)
 //	staged/        verified next versions, waiting for Commit
 //	archive/       downloaded archives, verified before use
@@ -43,17 +44,45 @@ const DefaultAgentName = "agent"
 const (
 	DefaultAttempts = 3
 	// DefaultAliveWindow is how long the watchdog tolerates "no agent alive"
-	// after the update before it rolls back.
-	DefaultAliveWindow = 10 * time.Second
+	// after the update before it rolls back, on a fast architecture
+	// (amd64/arm64).
+	//
+	// It has to cover the whole gap between "the agent that committed the
+	// update exited" and "the new process took the single-instance lock":
+	// the service manager's respawn delay (procd, OpenRC supervise-daemon,
+	// systemd RestartSec) plus the new process's own start-up (runtime init,
+	// config discovery). 10 s was not enough on a 2 vCPU OpenWrt 25.12
+	// (D-M7): a healthy new agent was declared dead and rolled back.
+	DefaultAliveWindow = 60 * time.Second
+	// DefaultAliveWindowSlow is the same budget on the targets that are
+	// slower than their service manager's restart delay suggests (MIPS, ARM
+	// 32-bit, 386): TCG emulation and small routers routinely need minutes.
+	DefaultAliveWindowSlow = 180 * time.Second
 	// DefaultDeadline bounds the whole observation. Past it, an agent that is
 	// alive and stable but never confirmed is only reported as stalled.
-	DefaultDeadline = 90 * time.Second
-	// DefaultPollInterval is how often the watchdog probes the single-instance
-	// lock.
+	DefaultDeadline = 3 * time.Minute
+	// DefaultDeadlineSlow is the total budget on the slower targets.
+	DefaultDeadlineSlow = 8 * time.Minute
+	// DefaultPollInterval is how often the watchdog probes the agent.
 	DefaultPollInterval  = 2 * time.Second
 	DefaultConfirmWindow = 10 * time.Minute
 	parentWaitTimeout    = 60 * time.Second
 )
+
+// DefaultWatchdogWindows returns the watchdog's "no agent alive" window and
+// total budget for a GOARCH. The caller passes runtime.GOARCH: the watchdog is
+// a copy of the agent, so it always runs on the same architecture as the
+// process it watches. A machine that is slower than its architecture suggests
+// raises them locally with Agent.SelfUpdate.AliveWindowSec / DeadlineSec
+// (agent.yml, never pushed by the panel).
+func DefaultWatchdogWindows(goarch string) (alive, deadline time.Duration) {
+	switch goarch {
+	case "amd64", "arm64":
+		return DefaultAliveWindow, DefaultDeadline
+	default:
+		return DefaultAliveWindowSlow, DefaultDeadlineSlow
+	}
+}
 
 var (
 	// ErrNotSupported is returned when this build or platform cannot replace
@@ -167,6 +196,24 @@ type Rollback struct {
 	At      time.Time `json:"at"`
 	ExePath string    `json:"exe_path"`
 	OldPath string    `json:"old_path"`
+}
+
+// ReadyMarker is the authoritative "the new version is really running" signal
+// (D-M7). The process that comes out of a committed update writes it at
+// start-up with its own build version and pid; the watchdog accepts it only
+// when the version matches the pending update and that pid is alive. The
+// single-instance lock alone cannot tell "the service manager has not started
+// the new process yet" from "the new process cannot start", and a stale lock
+// (the pid of the process that just exited) looks exactly like a dead one.
+type ReadyMarker struct {
+	// Version is the build version of the process that wrote the marker. The
+	// watchdog requires it to equal Pending.Version.
+	Version string `json:"version"`
+	// PID is that process's pid.
+	PID int `json:"pid"`
+	// ExePath is the executable it is running from (diagnostics only).
+	ExePath string    `json:"exe_path,omitempty"`
+	At      time.Time `json:"at"`
 }
 
 type nopLog struct{}
@@ -312,6 +359,41 @@ func (u *Updater) installWatchdogCopy(old string) error {
 // ConfirmWindow is how long a new process may run without confirming.
 func (u *Updater) ConfirmWindow() time.Duration { return u.confirmWindow }
 
+// ReadyMarkerPath is <StateDir>/update/ready.json: the marker the new process
+// writes and the watchdog reads.
+func (u *Updater) ReadyMarkerPath() string { return u.readyPath() }
+
+// MarkReady writes the ready marker for this process: its build version, its
+// pid and the executable it runs from. A process that came out of a committed
+// self-update calls it at start-up, before it judges Ready, so the watchdog has
+// an authoritative signal even when the install path has already been swapped
+// under it (D-M7). It is harmless to call at any other time.
+func (u *Updater) MarkReady() error {
+	m := ReadyMarker{Version: u.version, PID: os.Getpid(), ExePath: u.exe, At: u.now().UTC()}
+	if err := writeJSONAtomic(u.readyPath(), &m, 0o600); err != nil {
+		return fmt.Errorf("selfupdate: writing %s: %w", u.readyPath(), err)
+	}
+	u.log.Infof("selfupdate: ready marker for version %q (pid %d)", m.Version, m.PID)
+	return nil
+}
+
+// ReadyMarker reads the marker a self-updated process wrote at start-up. The
+// second result is false when the marker is missing or unusable.
+func (u *Updater) ReadyMarker() (ReadyMarker, bool) {
+	var m ReadyMarker
+	if err := readJSON(u.readyPath(), &m); err != nil || m.PID <= 0 {
+		return ReadyMarker{}, false
+	}
+	return m, true
+}
+
+// readyPath is <StateDir>/update/ready.json.
+func (u *Updater) readyPath() string { return filepath.Join(u.dir, "ready.json") }
+
+// clearReady removes the ready marker. It is called when the update is
+// confirmed or rolled back: after that, no watchdog is watching it any more.
+func (u *Updater) clearReady() { _ = os.Remove(u.readyPath()) }
+
 // Ready reports whether this updater can replace the executable in place:
 // the platform supports the swap and a service manager runs exactly this
 // executable (see Ready). It is the honest input of the "upgrade" capability.
@@ -336,7 +418,7 @@ func (u *Updater) Stage(ctx context.Context, version string) (Staged, error) {
 	if p, ok := u.Pending(); ok {
 		return Staged{}, fmt.Errorf("%w (version %s committed at %s)", ErrPending, p.Version, p.At.UTC().Format(time.RFC3339))
 	}
-	stagedDir := filepath.Join(u.dir, "staged", version)
+	stagedDir := u.stagedVersionDir(version)
 	if err := os.RemoveAll(stagedDir); err != nil {
 		return Staged{}, err
 	}
@@ -503,6 +585,8 @@ func (u *Updater) Rollback(reason string) error {
 	if err := os.Remove(u.pendingPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	// The ready marker has done its job: the update is proven.
+	u.clearReady()
 	// The old binary is the executable again, so the watchdog copy of it is
 	// redundant. Removing the file while the watchdog runs from it is safe on
 	// every platform this supports. A failure here is logged, not returned:
@@ -528,7 +612,11 @@ func (u *Updater) Confirm() error {
 	// The watchdog sees the pending marker disappear and stops on its own; the
 	// copy it runs from is cleaned here too so a watchdog that never started
 	// (or was killed with the machine) leaves nothing behind.
-	return u.CleanupWatchdog()
+	if err := u.CleanupWatchdog(); err != nil {
+		return err
+	}
+	u.clearReady()
+	return nil
 }
 
 // Pending reports the committed update that has not been confirmed yet.

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "revision": 1,
+  "instances": [
+    {
+      "id": "tun-self",
+      "name": "隧道入口（机器A）：wss加tls_self，两端由secret派生同一张自签证书，与exit文件成对",
+      "enabled": true,
+      "engine": "gost",
+      "kind": "tunnel_entry",
+      "listen": { "addr": "0.0.0.0", "ports": "20710" },
+      "network": ["tcp"],
+      "targets": [{ "host": "203.0.113.71", "ports": "443" }],
+      "tunnel": {
+        "type": "wss",
+        "server": "198.51.100.7:20711",
+        "host": "relay.example.com",
+        "sni": "relay.example.com",
+        "path": "/w1n",
+        "security": "tls_self"
+      },
+      "secret": "CHANGE-ME-32-chars-minimum-secret"
+    }
+  ]
+}

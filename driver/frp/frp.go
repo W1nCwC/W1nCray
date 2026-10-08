@@ -5,9 +5,11 @@
 //
 // # Kernel layout
 //
-// rt.Kernel.Path is the absolute path of the frps binary of an installed frp
-// version directory. frpc lives next to it (see Binaries). Both binaries must
-// be the same release.
+// rt.Kernel.Path is the absolute path of one of the two binaries of an
+// installed frp version directory. The other binary is its sibling in the same
+// directory (see Binaries): the kernel manifest declares run.binary = frpc, so
+// kernel/install hands that path over, while a reverse_portal needs the frps
+// next to it. Both binaries must be the same release.
 //
 // # Process model (verified against frp v0.71.0)
 //
@@ -59,6 +61,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -75,7 +78,13 @@ const Name = spec.EngineFrp
 const driverVersion = "w1ncray-frp-driver/1"
 
 // Binaries returns the paths of frps and frpc for the kernel path handed over
-// in driver.Runtime (kernelPath is the frps binary).
+// in driver.Runtime. kernelPath may name either binary of an installed frp
+// version directory; the other one is derived from the same directory, which is
+// where the installer always puts the pair (both manifest extract entries use
+// plain file names, see kernel/install and the frp manifest). Accepting both
+// names is what makes the real chain work: the manifest's run.binary is frpc,
+// so driver.Installed.Path is .../frpc, but a reverse_portal must run frps.
+// Only those two file names are accepted; any other path is still refused.
 func Binaries(kernelPath string) (frps, frpc string, err error) {
 	if kernelPath == "" {
 		return "", "", errors.New("frp: kernel path is empty")
@@ -83,11 +92,11 @@ func Binaries(kernelPath string) (frps, frpc string, err error) {
 	base := filepath.Base(kernelPath)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
-	if stem != "frps" {
-		return "", "", errors.New("frp: kernel path must point at the frps binary")
+	if stem != "frps" && stem != "frpc" {
+		return "", "", errors.New("frp: kernel path must point at the frps or frpc binary")
 	}
 	dir := filepath.Dir(kernelPath)
-	return kernelPath, filepath.Join(dir, "frpc"+ext), nil
+	return filepath.Join(dir, "frps"+ext), filepath.Join(dir, "frpc"+ext), nil
 }
 
 // Driver implements driver.Driver for frp. The zero value is not usable; call
@@ -115,16 +124,39 @@ type timing struct {
 	verify      time.Duration
 }
 
+// Options configures a Driver. The zero value is usable.
+type Options struct {
+	// ReadyTimeout bounds how long Apply waits for a started frps/frpc to
+	// answer before it reports that instance as failed. 0 means
+	// driver.DefaultReadyTimeout(runtime.GOARCH, OpenWrt). It is what
+	// agent.yml's Drivers.Frp.ReadyTimeoutSec overrides (D4).
+	ReadyTimeout time.Duration
+	// OpenWrt is the platform fact of the machine the agent runs on
+	// (platform.Info.OpenWrt). It only selects the default readiness limit:
+	// every architecture on OpenWrt is a router CPU and takes the 60s slow
+	// path (F6), never the 15s one. It is ignored when ReadyTimeout is set.
+	OpenWrt bool
+}
+
 // New returns a ready driver.
-func New() *Driver {
+func New(opts Options) *Driver {
+	ready := opts.ReadyTimeout
+	if ready <= 0 {
+		ready = driver.DefaultReadyTimeout(runtime.GOARCH, opts.OpenWrt)
+	}
 	return &Driver{
 		admins:  map[string]adminInfo{},
 		stats:   map[string]*instStats{},
 		current: map[string]*unit{},
 		now:     time.Now,
-		timing:  timing{ready: 15 * time.Second, reloadSettl: 3 * time.Second, verify: 15 * time.Second},
+		timing:  timing{ready: ready, reloadSettl: 3 * time.Second, verify: 15 * time.Second},
 	}
 }
+
+// ReadyTimeout reports the readiness limit in force: the shared architecture
+// default unless Options.ReadyTimeout (agent.yml Drivers.Frp.ReadyTimeoutSec)
+// overrode it. It is what Apply waits for a started instance to answer (D4).
+func (d *Driver) ReadyTimeout() time.Duration { return d.timing.ready }
 
 var _ driver.Driver = (*Driver)(nil)
 

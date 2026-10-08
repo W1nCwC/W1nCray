@@ -35,7 +35,7 @@ Unknown `t` → the receiver replies `{"t":"error","id":<same>,"d":{"code":"unkn
 | `term.data` | `{session, data:"<base64>"}` | PTY output |
 | `term.exit` | `{session, code, reason?}` | shell exited / closed / limit hit |
 | `term.error` | `{session, code, message}` | e.g. `terminal_disabled` |
-| `event` | `{kind, level, message, data?}` | e.g. `kernel.installed`, `apply.rejected`, `self_update.started` |
+| `event` | `{kind, level, message, data?}` | e.g. `kernel.installed`, `apply.rejected`, `self_update.started`; buffered up to 64 frames while offline and replayed in order after the next `hello.ok` (ruling 14) |
 | `ping`/`pong` | `{}` | |
 
 ### HostInfo (static-ish, sent in `hello`, refreshed on change)
@@ -59,7 +59,7 @@ pid?, uptime_s?, restarts?, cpu_pct?, rss?, instances:[{id, state, conns?, up_by
 | `t` | `d` | notes |
 |---|---|---|
 | `hello.ok` | `{server_time, intervals:{telemetry_s, components_s}, session:"<id>"}` | answer to `hello` |
-| `hint` | `{what:"desired"|"files"|"nodes"|"manifest"}` | agent pulls the named resource over HTTP now (no payload) |
+| `hint` | `{what:"desired"|"files"|"nodes"|"manifest"}` | agent pulls the named resource over HTTP now (no payload). `nodes`: the agent makes the local Xray kernel re-fetch this machine's node list from the panel now instead of at its next 60 s poll (the kernel reloads only when the list version changed). Wire format unchanged |
 | `cmd` | `{type, args, ttl_s}` with `id` | agent answers `cmd.result` with the same `id`; unanswered after `ttl_s` = expired |
 | `term.open` | `{session, cols, rows}` | requires local policy `terminal=true`, else `term.error terminal_disabled` |
 | `term.input` | `{session, data:"<base64>"}` | ≤ 64 KiB |
@@ -74,18 +74,35 @@ pid?, uptime_s?, restarts?, cpu_pct?, rss?, instances:[{id, state, conns?, up_by
 | `dump_state` | `{}` | redacted state dump |
 | `kernel_list` | `{}` | `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}` |
 | `kernel_install` | `{name, version?}` | installs from the signed manifest (empty version = newest) |
-| `kernel_remove` | `{name, version}` | refuses the version in use; result lists freed bytes |
+| `kernel_remove` | `{name, version}` | deletes exactly the named installed version; refuses the version in use; result `{freed_bytes, already_absent?, uninstalled?}`. `xray` is the single exception, see below |
 | `kernel_rollback` | `{name}` | |
 | `component_restart` | `{name}` | restarts a kernel process (not the agent) |
 | `self_update` | `{version}` | version listed for `agent` in the signed manifest; verified; swap + restart; auto-rollback |
-| `file_list` | `{root, path}` | `{entries:[{name,type,size,mode,mtime}]}` |
-| `file_read` | `{root, path, offset?, limit?}` | `{data:"<base64>", size, eof}` (limit ≤ 1 MiB) |
-| `file_write` | `{root, path, data:"<base64>", mode?, sha256?}` | atomic write; refuses outside roots |
-| `file_delete` | `{root, path}` | |
+| `file_list` | `{root, path}` | `{entries:[{name,type,size,mode,mtime}], roots:[…]}` (`mode` octal string, `mtime` Unix seconds) |
+| `file_read` | `{root, path, offset?, limit?}` | `{data:"<base64>", size, eof}` (limit ≤ 128 KiB) |
+| `file_write` | `{root, path, data:"<base64>", mode?, sha256?, append?}` | `append` absent/false: atomic whole-file replace; `append:true`: append the chunk to an **existing** file (`not_found` otherwise), `mode` unused. Result `{path, sha256, size, created, append?}` where `sha256`/`size` describe the **whole file after the write** (chunked-upload verification); `sha256` in the args is always the payload's |
+| `file_delete` | `{root, path}` | `{path, deleted:true}`; one regular file, never a directory |
+| `file_mkdir` | `{root, path, mode?}` | `mkdir -p`; `mode` (octal string, default `0755`) applies to the last component, allowed: `0700`/`0750`/`0755`; result `{path, created}` |
+| `file_rename` | `{root, path, to}` | move inside the same root; the target must not exist (`already_exists`); result `{path, to, renamed:true}` |
 | `files_apply` | `{}` | same as `hint files` but reports the apply outcome (validate → swap → reload → confirm/rollback) |
+
+`kernel_remove {name, version}` deletes exactly the named installed version and leaves the other versions alone.
+A version that is in use (the current pointer names it, or a live process executes it) is refused with `failed` +
+`result.code="in_use"`. **The single exception is `name="xray"`**: the Xray kernel runs as a service, so naming its
+**current** version means uninstalling the kernel — the service is stopped and disabled, its unit file and every
+installed version are removed (`config.yml` and the managed files stay) and the result carries `uninstalled: true`.
+Naming an older xray version deletes only that version and never touches the running service. The panel itself
+refuses `kernel_remove xray` with HTTP 409 `xray_in_use` while nodes are still bound to the machine, so the
+uninstall path is only reachable once nothing is bound. An empty `version` (not allowed by this protocol, kept
+only for backward compatibility) is handled as the uninstall and logged as a warning. An agent that does not
+manage the Xray service at all (no configured Xray config path) keeps the plain file-kernel behaviour for `xray`.
 
 All file commands are confined to the roots in the agent's local policy (`policy.files.roots`), unless
 `policy.files.unrestricted` is set locally. Path traversal, symlink escapes and non-regular files are refused.
+`policy.files.unrestricted` is a **three-state** local switch (`Files.Unrestricted`): not written means "follow
+`policy.terminal`" (a machine with the terminal on has a root shell anyway), so an unrestricted machine is addressed with
+an **empty `root` and an absolute `path`** (the `root` argument is ignored); a confined machine keeps the root-name +
+relative-path form. `policy.files.unrestricted` always reports the **effective** value.
 
 ## 5 browser ⇄ panel
 Browser messages (after a valid ticket):
@@ -111,16 +128,23 @@ A browser may hold at most one terminal session per machine; the panel enforces 
    Phase 1 adds no desired key.
 2. **`telemetry.conns` may be `null`** (not readable on this platform); `components` of the embedded engine (`xray`) carry
    no `pid/cpu_pct/rss` (it shares the agent process).
-3. **No replay.** `telemetry`/`components` are live data: nothing is queued while disconnected, nothing is resent on reconnect.
+3. **No replay for live data.** `telemetry`/`components` are live data: nothing is queued while disconnected, nothing is resent on reconnect.
+   `event` frames are the documented exception (ruling 14).
 4. **`cpu_cores`** = physical cores, **`cpu_threads`** = logical CPUs.
 5. **`hint` for something the agent does not support** is answered with `error{code:"not_supported"}`, never silently ignored.
 6. **`policy.modules.xray_nodes` is a LOCAL gate** (agent.yml, default on). The panel asks for nodes with `hint{what:"nodes"}`;
    the agent then pulls the machine's node list: empty = stop all node controllers, otherwise start those (per node, no full reload).
+   The agent does not fetch the list itself: it asks the local Xray kernel to re-run its machine-node discovery now (a local
+   endpoint request that carries no parameter), and the kernel reloads only when the list version changed. A kernel that is not
+   installed, predates that route, or cannot reach the panel is logged and the agent degrades to the kernel's own 60 s poll;
+   the hint is never answered with an error for those cases.
 7. **Long commands** answer immediately with `cmd.result{status:"accepted"}` (within `ttl_s`), then a final `done|failed`.
    The panel keeps the command `pending` until the final result; the WS push never marks it `sent` (HTTP fallback may deliver
    the same command again: the agent de-duplicates by command id).
 8. **Size limits:** `file_read.limit` and `file_write` payload are each **≤ 128 KiB raw** (fits the 256 KiB frame after base64).
-   Anything larger goes through the managed-files blob download over HTTPS.
+   A file larger than one frame is uploaded with `file_write{append:true}` chunks (each ≤ 128 KiB); the result of every chunk
+   carries the whole file's `size` and `sha256`, so the panel can verify the assembled file. Other large payloads go through
+   the managed-files blob download over HTTPS.
 9. **New commands:** `files_validate {}` (stage + `core.CheckFiles`/`LoadConfig`, no write, no reload) and
    `files_rollback {}` (restore the last good managed files and reload). `files_apply` answers `accepted`, then
    `done{applied_pending:true}` once the reload was initiated; the **panel** judges health (a `hello`/`telemetry` within 60 s and
@@ -135,6 +159,14 @@ A browser may hold at most one terminal session per machine; the panel enforces 
     "Started but cannot reach the panel" is only reported (`self_update.stalled`), never auto-rolled back.
 12. **High-risk operations** (issuing a terminal ticket, `self_update`, writes outside managed files) require the admin to
     re-enter their password (`confirm_password`, checked server side, rate limited).
-13. **Local gates the panel can never relax:** `Terminal.Enabled` (**default true** by the owner's decision; a machine opts out locally with `Terminal.Enabled: false`, installer/`link` flag `--noterminal`), `Files.Roots`, `Files.Unrestricted`,
+13. **Local gates the panel can never relax:** `Terminal.Enabled` (**default true** by the owner's decision; a machine opts out locally with `Terminal.Enabled: false`, installer/`link` flag `--noterminal`), `Files.Roots`, `Files.Unrestricted` (**three-state**: not written follows `Terminal.Enabled`, `true`/`false` are explicit),
     `Files.AllowExec` (refuse writes with an exec bit), `Modules.XrayNodes`. `agent.yml` and the agent state files
     (`desired.json`, `last_good.json`) are never inside any root.
+14. **Events survive a disconnect.** Ruling 3 covers `telemetry`/`components` only. `event` frames are buffered by the agent:
+    a frame produced before `hello.ok` — the watchdog's `self_update.rolled_back` is emitted by a process that has not
+    handshaken yet — or while the socket is down waits in a **bounded backlog of 64 frames** and is replayed **in order**
+    once the session starts. When the backlog is full the **oldest** frame is dropped, logged and counted; a frame whose
+    send fails keeps its place and is retried on the next flush, and is dropped (logged and counted) after **3** failed
+    attempts, so one dead frame can never stall the queue. The wire format is unchanged: a replayed frame is
+    byte-identical to the one that was queued (`event` has no timestamp field and none is invented), so the panel needs
+    no change to receive it.

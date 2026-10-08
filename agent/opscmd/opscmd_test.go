@@ -11,6 +11,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
 
@@ -26,8 +27,11 @@ type fakeKernels struct {
 	running   string
 	exact     bool
 	ensureFn  func(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
-	removeFn  func(name, version string) error
-	rollFn    func(name string) (driver.Installed, error)
+	// ensureForceFn is the operator-initiated install path (D-M3). nil falls
+	// back to ensureFn.
+	ensureForceFn func(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
+	removeFn      func(name, version string) error
+	rollFn        func(name string) (driver.Installed, error)
 }
 
 func (f fakeKernels) List() ([]install.Entry, error) {
@@ -48,6 +52,16 @@ func (f fakeKernels) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Ins
 	}
 	return driver.Installed{Version: pin.Version}, nil
 }
+
+// EnsureForce is the operator-initiated install the kernel_install command
+// uses (D-M3). Without a dedicated hook it falls back to Ensure, so a test
+// that does not care about the back-off keeps its old behaviour.
+func (f fakeKernels) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	if f.ensureForceFn != nil {
+		return f.ensureForceFn(ctx, pin)
+	}
+	return f.Ensure(ctx, pin)
+}
 func (f fakeKernels) Remove(name, version string) error {
 	if f.removeFn != nil {
 		return f.removeFn(name, version)
@@ -61,6 +75,40 @@ func (f fakeKernels) Rollback(name string) (driver.Installed, error) {
 	return driver.Installed{Version: "1.0.0"}, nil
 }
 func (f fakeKernels) RunningVersion(name string) (string, bool) { return f.running, f.exact }
+
+// fakeXray is the XrayService surface.
+type fakeXray struct {
+	calls  []string
+	err    error
+	status xraysvc.Status
+	// removed is what Remove reports: false means "nothing was installed"
+	// (the D-M2 already-absent answer).
+	removed bool
+}
+
+func (f *fakeXray) Install(_ context.Context, version string) error {
+	f.calls = append(f.calls, "install "+version)
+	return f.err
+}
+func (f *fakeXray) Upgrade(_ context.Context, version string) error {
+	f.calls = append(f.calls, "upgrade "+version)
+	return f.err
+}
+func (f *fakeXray) Rollback(context.Context) error {
+	f.calls = append(f.calls, "rollback")
+	return f.err
+}
+func (f *fakeXray) Restart(context.Context) error {
+	f.calls = append(f.calls, "restart")
+	return f.err
+}
+func (f *fakeXray) Remove(context.Context) (bool, error) {
+	f.calls = append(f.calls, "remove")
+	return f.removed, f.err
+}
+func (f *fakeXray) Status(context.Context) (xraysvc.Status, error) {
+	return f.status, f.err
+}
 
 func mustRegistry(t *testing.T, d Deps) *Registry {
 	t.Helper()
@@ -299,7 +347,8 @@ func (c *fakeComp) Restart(ctx context.Context, name string) (int, error) {
 }
 
 // TestComponentRestartRefusesAgentAndXray pins the two refusals: the agent is
-// not a kernel process, and the embedded xray engine shares the agent process.
+// not a kernel process, and a machine where the Xray kernel service is not
+// managed by this agent answers not_supported.
 func TestComponentRestartRefusesAgentAndXray(t *testing.T) {
 	comp := &fakeComp{}
 	reg := mustRegistry(t, Deps{Comp: comp})
@@ -317,8 +366,8 @@ func TestComponentRestartRefusesAgentAndXray(t *testing.T) {
 		t.Fatalf("xray restart status = %q, want failed (%s)", status, res)
 	}
 	f := decodeFailure(t, res)
-	if f.Code != "embedded" || !strings.Contains(f.Error, "embedded") {
-		t.Errorf("xray restart failure = %+v, want code embedded", f)
+	if f.Code != "not_supported" || !strings.Contains(f.Error, "Xray") {
+		t.Errorf("xray restart failure = %+v, want code not_supported", f)
 	}
 	if len(comp.calls) != 0 {
 		t.Errorf("a refused restart reached the component layer: %v", comp.calls)

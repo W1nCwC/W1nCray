@@ -14,8 +14,11 @@ import (
 	"path/filepath"
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
+	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/filesync"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
+	"github.com/W1nCwC/W1nCray/config"
 )
 
 // FilesOptions is the local policy of the managed-file layer, translated from
@@ -67,15 +70,17 @@ func newFilesRuntime(o Options) *FilesRuntime {
 		MaxBytes:        f.MaxBytes,
 		MaxGeoBytes:     f.MaxGeoBytes,
 		// Fetch, Validate, Reload and Source are installed later: the fetcher
-		// is the panel HTTP client and the validator/reloader belong to the
-		// panel. The placeholders keep the applier constructible and make an
-		// unwired call fail with a clear message instead of a nil panic.
+		// is the panel HTTP client. The validator is the Xray kernel when it
+		// is installed (Options.Xray) and a nil-safe refusal otherwise, so an
+		// unwired call fails with a clear message instead of a nil panic.
 		Fetch: filesync.BlobFetcherFunc(func(context.Context, string) ([]byte, bool, error) {
 			return nil, false, errors.New("filesync: the panel link is not up yet")
 		}),
-		Validate: filesync.ValidatorFunc(func(context.Context, string, []filesync.FileRef) []error {
-			return []error{errors.New("filesync: no validator is wired")}
-		}),
+		Validate: filesValidator(o.Xray),
+		// The reloader waits for the kernel to report the fingerprint of the
+		// files just written (PLAN v11 §C). Without a kernel service there is
+		// nothing to wait for and the layer refuses a reload that needs one.
+		Reload: filesReloader(o.Xray, f.ConfigPath, o.Log),
 		Source: filesync.SourceFunc(func() []spec.FileRef { return nil }),
 		Log:    o.Log,
 	})
@@ -88,6 +93,84 @@ func newFilesRuntime(o Options) *FilesRuntime {
 		return nil
 	}
 	return &FilesRuntime{applier: applier, cfg: o.AgentConfig}
+}
+
+// filesValidator returns the managed-file validator: the Xray kernel service
+// when it is installed, and a nil-safe refusal otherwise. A machine without the
+// kernel must answer with an explicit reason instead of half-applying a file
+// set no running instance would pick up.
+func filesValidator(svc xrayapi.Service) filesync.Validator {
+	if svc == nil {
+		return filesync.ValidatorFunc(func(context.Context, string, []filesync.FileRef) []error {
+			return []error{errors.New("Xray 内核未安装")}
+		})
+	}
+	return xrayValidator{svc: svc}
+}
+
+// xrayValidator adapts the Xray kernel service to the managed-file validator:
+// the kernel pre-checks a staged file set with its own configuration loader.
+type xrayValidator struct{ svc xrayapi.Service }
+
+// ValidateStaged asks the kernel to check the staged files and flattens its
+// JSON error list into the validator's []error.
+func (v xrayValidator) ValidateStaged(ctx context.Context, dir string, files []filesync.FileRef) []error {
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	res, err := v.svc.CheckStaged(ctx, dir, names)
+	if err != nil {
+		return []error{err}
+	}
+	if res.OK {
+		return nil
+	}
+	errs := make([]error, 0, len(res.Errors))
+	for _, e := range res.Errors {
+		if e.File == "" {
+			errs = append(errs, errors.New(e.Message))
+			continue
+		}
+		errs = append(errs, fmt.Errorf("%s: %s", e.File, e.Message))
+	}
+	if len(errs) == 0 {
+		errs = append(errs, errors.New("the Xray kernel refused the staged files"))
+	}
+	return errs
+}
+
+// filesReloader returns the managed-file reloader: the Xray kernel service
+// when it is installed, and nil (a reload is then refused) otherwise.
+func filesReloader(svc xrayapi.Service, configPath string, log driver.Logger) filesync.Reloader {
+	if svc == nil || configPath == "" {
+		return nil
+	}
+	return xrayReloader{svc: svc, configPath: configPath, log: log}
+}
+
+// xrayReloader waits for the kernel to pick up the managed files it just
+// received. It computes the content fingerprint of the kernel's watched files
+// with exactly the code the kernel uses (config.Fingerprint over
+// config.WatchedFiles), so the two can never disagree, and waits (30s) for the
+// kernel's status endpoint to report it.
+type xrayReloader struct {
+	svc        xrayapi.Service
+	configPath string
+	log        driver.Logger
+}
+
+// Reload implements filesync.Reloader.
+func (r xrayReloader) Reload(ctx context.Context, reason string) error {
+	cfg, err := config.LoadConfigFile(r.configPath)
+	if err != nil {
+		return fmt.Errorf("读取 %s 以计算配置指纹: %w", r.configPath, err)
+	}
+	fp := config.Fingerprint(cfg.WatchedFiles(r.configPath))
+	if r.log != nil {
+		r.log.Infof("filesync: 等待 Xray 内核重载配置（%s）", reason)
+	}
+	return r.svc.WaitReloaded(ctx, fp)
 }
 
 // applierOrNil returns the applier, or an error when the managed-file layer is

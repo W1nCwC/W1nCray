@@ -33,6 +33,7 @@
 package gost
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
@@ -62,8 +63,15 @@ type Options struct {
 	// APITimeout bounds every API request. Default 5 s.
 	APITimeout time.Duration
 	// ReadyTimeout bounds waits for the process or a service to become
-	// ready. Default 10 s.
+	// ready. 0 means driver.DefaultReadyTimeout(runtime.GOARCH, OpenWrt):
+	// 15 s on amd64/arm64 off OpenWrt, 60 s everywhere else. It is what
+	// agent.yml's Drivers.Gost.ReadyTimeoutSec overrides (F6).
 	ReadyTimeout time.Duration
+	// OpenWrt is the platform fact of the machine the agent runs on
+	// (platform.Info.OpenWrt). It only selects the default readiness limit:
+	// every architecture on OpenWrt is a router CPU and takes the 60 s slow
+	// path, never the 15 s one (F6). It is ignored when ReadyTimeout is set.
+	OpenWrt bool
 }
 
 func (o *Options) setDefaults() {
@@ -77,7 +85,7 @@ func (o *Options) setDefaults() {
 		o.APITimeout = 5 * time.Second
 	}
 	if o.ReadyTimeout <= 0 {
-		o.ReadyTimeout = 10 * time.Second
+		o.ReadyTimeout = driver.DefaultReadyTimeout(runtime.GOARCH, o.OpenWrt)
 	}
 }
 
@@ -93,6 +101,12 @@ func New(opts Options) *Driver {
 	opts.setDefaults()
 	return &Driver{opts: opts, rt: newRuntimeState()}
 }
+
+// ReadyTimeout reports the readiness limit in force: the shared
+// architecture/OpenWrt default unless Options.ReadyTimeout (agent.yml
+// Drivers.Gost.ReadyTimeoutSec) overrode it. It is what Apply waits for the
+// gost process and each service to answer (F6).
+func (d *Driver) ReadyTimeout() time.Duration { return d.opts.ReadyTimeout }
 
 var _ driver.Driver = (*Driver)(nil)
 

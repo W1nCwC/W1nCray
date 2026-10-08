@@ -51,7 +51,7 @@ func mustCompile(t *testing.T, in spec.Instance) *unit {
 
 func mustRejectWith(t *testing.T, in spec.Instance, substr string) {
 	t.Helper()
-	err := New().Validate(in)
+	err := New(Options{}).Validate(in)
 	if err == nil {
 		t.Fatalf("Validate accepted the instance, want error containing %q", substr)
 	}

@@ -28,6 +28,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 	"github.com/W1nCwC/W1nCray/kernel"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
@@ -88,7 +89,13 @@ type SinkFunc func(id, status string, data json.RawMessage)
 func (f SinkFunc) Deliver(id, status string, data json.RawMessage) { f(id, status, data) }
 
 // EventSink reports a local event to the panel (event frames, audit). It is
-// best effort: events are live data and are never replayed.
+// best effort: Event never blocks the caller. Events are not live-only data,
+// though: the WebSocket agent keeps a bounded backlog of up to 64 undelivered
+// frames and replays them, in order, after the next hello.ok
+// (docs/WS-PROTOCOL.md section 7 ruling 14; the eventBacklog in
+// agent/ws/agentclient.go), so an event produced before the handshake or while
+// the socket is down still reaches the panel. Only a full backlog (the oldest
+// frame is evicted) or three failed sends drop one.
 type EventSink interface {
 	Event(kind, level, message string)
 }
@@ -110,6 +117,11 @@ type KernelOps interface {
 	// Ensure installs the pin if needed and makes it current (empty version =
 	// newest the manifest offers).
 	Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
+	// EnsureForce is Ensure for an operator-initiated install (kernel_install
+	// from the panel): it bypasses and clears the automatic retry back-off, so
+	// a version an administrator explicitly asks for is really attempted
+	// (D-M3). The reconcile loop keeps using Ensure and its back-off.
+	EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error)
 	// Remove deletes one installed version.
 	Remove(name, version string) error
 	// Rollback makes the previous version current again.
@@ -128,6 +140,21 @@ type ComponentOps interface {
 	Restart(ctx context.Context, name string) (int, error)
 }
 
+// XrayService is the Xray kernel service manager (agent/xraysvc). The xray
+// kernel runs as a service of its own, so its kernel_* commands install,
+// remove and roll back the service, not just the files.
+type XrayService interface {
+	Install(ctx context.Context, version string) error
+	Upgrade(ctx context.Context, version string) error
+	Rollback(ctx context.Context) error
+	Restart(ctx context.Context) error
+	// Remove stops and deletes the service and every installed version. It
+	// reports whether anything was actually there, so kernel_remove can answer
+	// an already-absent machine with success (D-M2).
+	Remove(ctx context.Context) (removed bool, err error)
+	Status(ctx context.Context) (xraysvc.Status, error)
+}
+
 // Deps configures the registry.
 type Deps struct {
 	// Kernels is required: without a kernel manager the kernel_* commands
@@ -135,6 +162,9 @@ type Deps struct {
 	Kernels KernelOps
 	// Comp serves component_restart. Nil answers it with not_supported.
 	Comp ComponentOps
+	// Xray is the Xray kernel service manager. Nil keeps the plain kernel_*
+	// behaviour for the xray name too (files only, no service).
+	Xray XrayService
 	// Files serves files_apply / files_validate / files_rollback, the MANAGED
 	// xray files (D4/D5). Nil answers them with not_supported (protocol ruling
 	// 5: never silently ignored).
@@ -170,7 +200,9 @@ type Registry struct {
 	// the panel link is built; until then the file commands answer
 	// "not_supported" instead of running half-wired.
 	files FilesOps
-	log   driver.Logger
+	// desired lets files_apply wait for the revision it was enqueued for.
+	desired DesiredSync
+	log     driver.Logger
 }
 
 var _ panelclient.CommandRunner = (*Registry)(nil)
@@ -268,6 +300,28 @@ func (r *Registry) SetFiles(f FilesOps) {
 	r.mu.Lock()
 	r.files = f
 	r.mu.Unlock()
+}
+
+// DesiredSync is the agent's view of the desired state it last applied, plus
+// a way to pull now. files_apply uses it: the panel publishes a revision and
+// enqueues the apply right away, and the command can arrive before the pull
+// that brings the revision's file list (PLAN v10 e2e finding).
+type DesiredSync interface {
+	DesiredRevision() int64
+	RequestRefresh()
+}
+
+// SetDesiredSync installs the desired-state view (bootstrap, with the panel link).
+func (r *Registry) SetDesiredSync(s DesiredSync) {
+	r.mu.Lock()
+	r.desired = s
+	r.mu.Unlock()
+}
+
+func (r *Registry) desiredSync() DesiredSync {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.desired
 }
 
 // filesOps returns the installed managed-file implementation (nil when none).

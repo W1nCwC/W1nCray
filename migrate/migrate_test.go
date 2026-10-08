@@ -3,6 +3,7 @@ package migrate
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -11,8 +12,7 @@ import (
 	"time"
 
 	"github.com/W1nCwC/W1nCray/common/cert"
-	"github.com/W1nCwC/W1nCray/core"
-	"github.com/W1nCwC/W1nCray/panel"
+	"github.com/W1nCwC/W1nCray/config"
 )
 
 // A typical XrayR config for a V2board/Xboard panel. {{FROM}} is the XrayR
@@ -198,7 +198,7 @@ func TestMigrate(t *testing.T) {
 		}
 	}
 
-	cfg, err := panel.LoadConfig(filepath.Join(to, "config.yml"))
+	cfg, err := config.Load(filepath.Join(to, "config.yml"))
 	if err != nil {
 		t.Fatalf("migrated config does not load: %v", err)
 	}
@@ -247,14 +247,21 @@ func TestMigrate(t *testing.T) {
 		}
 	}
 
-	// The migrated JSON files build with the new kernel.
-	opts := core.Options{
-		DNSConfigPath:      cfg.DnsConfigPath,
-		RouteConfigPath:    cfg.RouteConfigPath,
-		OutboundConfigPath: cfg.OutboundConfigPath,
-	}
-	if errs := core.CheckFiles(opts); len(errs) > 0 {
-		t.Fatalf("migrated files rejected by Xray: %v", errs)
+	// The migrated JSON files are syntactically valid. The Xray semantic check
+	// moved to the kernel program (`W1nCray-xray check`): the agent no longer
+	// links Xray-core, so this test only asserts what it can still own.
+	for _, p := range []string{cfg.DnsConfigPath, cfg.RouteConfigPath, cfg.OutboundConfigPath} {
+		if p == "" {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("migrated file %s: %v", p, err)
+		}
+		var v any
+		if err := json.Unmarshal(b, &v); err != nil {
+			t.Fatalf("migrated file %s is not valid JSON: %v", p, err)
+		}
 	}
 }
 
@@ -304,24 +311,11 @@ func TestMigrateXrayRExampleOnlySSpanel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := panel.LoadConfig(r.Config); err != nil {
+	if _, err := config.Load(r.Config); err != nil {
 		t.Fatalf("migrated example does not load: %v", err)
 	}
 }
 
-// XrayR's default route.json never ran (Xray rejects its empty rule); check
-// must name the file and the rule.
-func TestCheckNamesBrokenFile(t *testing.T) {
-	route := filepath.Join("testdata", "xrayr-v0.9.4", "route.json")
-	errs := core.CheckFiles(core.Options{RouteConfigPath: route})
-	found := false
-	for _, e := range errs {
-		t.Log(e)
-		if strings.Contains(e.Error(), "route.json") && strings.Contains(e.Error(), "rules[2]") && strings.Contains(e.Error(), "no effective fields") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("broken rule not reported: %v", errs)
-	}
-}
+// TestCheckNamesBrokenFile moved to xraynode (TestCoreValidatorNamesTheBrokenRouteRule):
+// the Xray file check is the kernel program's, and the agent no longer links
+// Xray-core.

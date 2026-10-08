@@ -6,7 +6,7 @@
       "id": "proxy-accept",
       "name": "接收PROXY协议：仅回环监听，前置的nginx或haproxy送入",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": { "addr": "127.0.0.1", "ports": "20610" },
       "network": ["tcp"],

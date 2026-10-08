@@ -102,14 +102,22 @@ func newKernelRig(t *testing.T) *kernelRig {
 // addVersion publishes one signed, downloadable version of the "gost" kernel.
 func (r *kernelRig) addVersion(version string) {
 	r.t.Helper()
+	r.addKernelVersion("gost", version)
+}
+
+// addKernelVersion publishes one signed, downloadable version of any kernel.
+// The Xray lifecycle test needs the same rig for name "xray", whose service
+// manager drives the very same installer.
+func (r *kernelRig) addKernelVersion(name, version string) {
+	r.t.Helper()
 	bin := []byte("#!/bin/sh\n# FAKEKERNEL version=" + version + "\n" + strings.Repeat("x", 512))
-	archive := tarGz(r.t, "gost", bin)
-	path := "/gost-" + version + ".tar.gz"
+	archive := tarGz(r.t, name, bin)
+	path := "/" + name + "-" + version + ".tar.gz"
 	r.blobs[path] = archive
 	r.kernels = append(r.kernels, manifest.Kernel{
-		Name: "gost", Version: version, Channel: "stable",
+		Name: name, Version: version, Channel: "stable",
 		License: manifest.License{SPDX: "MIT"},
-		Run:     manifest.Run{Binary: "gost", VersionCmd: []string{"-V"}},
+		Run:     manifest.Run{Binary: name, VersionCmd: []string{"-V"}},
 		Targets: map[string]*manifest.Target{
 			r.plat.Key(): {
 				URLs:          []string{r.srv.URL + path},
@@ -117,7 +125,7 @@ func (r *kernelRig) addVersion(version string) {
 				ArchiveSHA256: sha256Hex(archive),
 				ArchiveSize:   int64(len(archive)),
 				Extract: []manifest.Extract{{
-					From: "gost", To: "gost", SHA256: sha256Hex(bin), Size: int64(len(bin)), Mode: "0755",
+					From: name, To: name, SHA256: sha256Hex(bin), Size: int64(len(bin)), Mode: "0755",
 				}},
 			},
 		},
@@ -150,6 +158,16 @@ func (r *kernelRig) ensure(version string) driver.Installed {
 // this rig talks to kernel/install directly so the command layer is exercised
 // against the installer that actually refuses and swaps.)
 func (r *kernelRig) ensurePin(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return r.ensurePinWith(ctx, pin, r.in.Ensure)
+}
+
+// ensurePinForce is ensurePin through install.EnsureForce: the operator path
+// bypasses and clears the automatic retry back-off (D-M3).
+func (r *kernelRig) ensurePinForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return r.ensurePinWith(ctx, pin, r.in.EnsureForce)
+}
+
+func (r *kernelRig) ensurePinWith(ctx context.Context, pin spec.KernelPin, ensure func(context.Context, spec.KernelPin) (driver.Installed, error)) (driver.Installed, error) {
 	if pin.Version == "" {
 		m := r.in.Manifest()
 		if m == nil {
@@ -169,20 +187,21 @@ func (r *kernelRig) ensurePin(ctx context.Context, pin spec.KernelPin) (driver.I
 		}
 		pin.Version = best
 	}
-	return r.in.Ensure(ctx, pin)
+	return ensure(ctx, pin)
 }
 
 // ops exposes the installer through the opscmd surface. running/exact stand in
 // for the process check: the rig never runs a kernel binary.
 func (r *kernelRig) ops(running string, exact bool) KernelOps {
 	return fakeKernels{
-		running:   running,
-		exact:     exact,
-		listFn:    r.in.List,
-		catalogFn: r.in.Catalog,
-		ensureFn:  r.ensurePin,
-		removeFn:  r.in.Remove,
-		rollFn:    r.in.Rollback,
+		running:       running,
+		exact:         exact,
+		listFn:        r.in.List,
+		catalogFn:     r.in.Catalog,
+		ensureFn:      r.ensurePin,
+		ensureForceFn: r.ensurePinForce,
+		removeFn:      r.in.Remove,
+		rollFn:        r.in.Rollback,
 	}
 }
 
@@ -271,6 +290,53 @@ func TestKernelInstallIsLongAndInstallsTheNewestVersion(t *testing.T) {
 	}
 }
 
+// TestKernelInstallBypassesTheRollbackBackoff covers D-M3: a rollback marks the
+// version it rolled away from as failed with an exponential back-off, but an
+// administrator explicitly installing it again must not be refused by that
+// timer -- the back-off exists for the automatic retries only.
+func TestKernelInstallBypassesTheRollbackBackoff(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.addVersion("2.0.0")
+	rig.ensure("1.0.0")
+	rig.ensure("2.0.0")
+	// The rollback makes 1.0.0 current again and records 2.0.0 as failed.
+	if _, err := rig.in.Rollback("gost"); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if e, _ := rig.entry("2.0.0"); e.Bad == nil {
+		t.Fatal("the rollback did not put 2.0.0 in back-off")
+	}
+
+	calls := make(chan sinkCall, 4)
+	reg := mustRegistry(t, Deps{
+		Kernels: rig.ops("", false),
+		Sink: SinkFunc(func(id, status string, data json.RawMessage) {
+			calls <- sinkCall{id: id, status: status, data: data}
+		}),
+	})
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "bk1", Type: panelclient.CmdKernelInstall, Args: json.RawMessage(`{"name":"gost","version":"2.0.0"}`),
+	})
+	if status != panelclient.ResultAccepted {
+		t.Fatalf("kernel_install first answer = (%q, %s), want accepted", status, res)
+	}
+	select {
+	case c := <-calls:
+		if c.id != "bk1" || c.status != panelclient.ResultDone {
+			t.Fatalf("reinstall after rollback = %+v, want done (a back-off refusal is the D-M3 bug)", c)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("kernel_install never finished")
+	}
+	if e, ok := rig.entry("2.0.0"); !ok || !e.Current {
+		t.Errorf("2.0.0 = %+v (present=%v), want current after the forced reinstall", e, ok)
+	}
+	if e, _ := rig.entry("2.0.0"); e.Bad != nil {
+		t.Errorf("2.0.0 is still in back-off after a successful forced install: %+v", e.Bad)
+	}
+}
+
 // TestKernelRemoveRefusesTheVersionInUseAndRemovesPrevious covers the removal
 // contract against the real installer: the current version is refused with a
 // recognisable code, the previous version is removed and its pointer cleared.
@@ -314,6 +380,66 @@ func TestKernelRemoveRefusesTheVersionInUseAndRemovesPrevious(t *testing.T) {
 	}
 	if e, ok := rig.entry("2.0.0"); !ok || e.Previous {
 		t.Errorf("2.0.0 = %+v (present=%v), want the previous pointer cleared", e, ok)
+	}
+}
+
+// TestKernelRemoveIsIdempotent covers D-M2 for the supervised kernels: a
+// version that is not installed (never was, or already removed) is the desired
+// state of kernel_remove, so the command succeeds and says already_absent
+// instead of failing the whole call.
+func TestKernelRemoveIsIdempotent(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.addVersion("2.0.0")
+	rig.ensure("1.0.0")
+	rig.ensure("2.0.0")
+	reg := mustRegistry(t, Deps{Kernels: rig.ops("", false)})
+	ctx := context.Background()
+
+	remove := func(id, version string) (string, json.RawMessage) {
+		t.Helper()
+		return reg.Execute(ctx, panelclient.Command{
+			ID: id, Type: panelclient.CmdKernelRemove,
+			Args: json.RawMessage(`{"name":"gost","version":"` + version + `"}`),
+		})
+	}
+	decode := func(res json.RawMessage) panelclient.KernelRemoveResult {
+		t.Helper()
+		var out panelclient.KernelRemoveResult
+		if err := json.Unmarshal(res, &out); err != nil {
+			t.Fatalf("remove result %s: %v", res, err)
+		}
+		return out
+	}
+
+	status, res := remove("i1", "1.0.0")
+	if status != panelclient.ResultDone {
+		t.Fatalf("first remove = (%q, %s), want done", status, res)
+	}
+	if out := decode(res); out.AlreadyAbsent {
+		t.Errorf("a real removal reported already_absent: %+v", out)
+	}
+
+	status, res = remove("i2", "1.0.0")
+	if status != panelclient.ResultDone {
+		t.Fatalf("second remove = (%q, %s), want done", status, res)
+	}
+	if out := decode(res); !out.AlreadyAbsent || out.FreedBytes != 0 {
+		t.Errorf("second remove = %+v, want already_absent with no bytes freed", out)
+	}
+
+	status, res = remove("i3", "9.9.9")
+	if status != panelclient.ResultDone {
+		t.Fatalf("never-installed version = (%q, %s), want done", status, res)
+	}
+	if out := decode(res); !out.AlreadyAbsent {
+		t.Errorf("never-installed version = %+v, want already_absent", out)
+	}
+
+	// Idempotency never weakens in_use: the current version is still refused.
+	status, res = remove("i4", "2.0.0")
+	if status != panelclient.ResultFailed || decodeFailure(t, res).Code != "in_use" {
+		t.Errorf("removing the current version = (%q, %s), want failed/in_use", status, res)
 	}
 }
 

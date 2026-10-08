@@ -1,13 +1,17 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,9 +21,9 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
-	"github.com/W1nCwC/W1nCray/common/cert"
-	"github.com/W1nCwC/W1nCray/node"
-	"github.com/W1nCwC/W1nCray/panel"
+	"github.com/W1nCwC/W1nCray/common/certcfg"
+	"github.com/W1nCwC/W1nCray/config"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 // linkOptions configures `W1nCray link`.
@@ -42,6 +46,9 @@ type linkOptions struct {
 	// Split is the layout-only migration (runSplit): move the existing Agent:
 	// block to agent.yml without converting any node.
 	Split bool
+	// XrayBin is the W1nCray-xray executable used for the offline Xray check
+	// ("" = search the default locations).
+	XrayBin string
 }
 
 func init() {
@@ -67,7 +74,9 @@ func init() {
 			if err != nil {
 				return err
 			}
-			setAssetLocation(path)
+			// The offline Xray check is served by the kernel program; resolve
+			// it once per run ("" = not installed, the check is skipped).
+			linkXrayBin = resolveXrayBin(opts.XrayBin)
 			if opts.Split {
 				return runSplit(path, opts, os.Stdout)
 			}
@@ -86,6 +95,7 @@ func init() {
 	c.Flags().BoolVar(&opts.NoTerminal, "noterminal", false, "write Terminal: {Enabled: false} to agent.yml (the terminal is ON by default)")
 	c.Flags().BoolVar(&opts.Force, "force", false, "replace an existing agent.yml (a backup is written first)")
 	c.Flags().BoolVar(&opts.Split, "split", false, "layout only: move the existing Agent: block of config.yml to agent.yml (machines already in machine mode); ignores --panel/--machine/--token")
+	c.Flags().StringVar(&opts.XrayBin, "xray-bin", "", "W1nCray-xray executable used for the offline Xray check (default: next to this binary, then PATH)")
 	rootCmd.AddCommand(c)
 }
 
@@ -99,16 +109,90 @@ type linkValidation struct {
 	added []string
 }
 
-// checkConfigFailures runs the full offline validation of one config and
-// returns its failure items. The items are the ones `W1nCray check` prints
-// with a "✗", plus the machine-mode controller problems that only matter once
-// the node runs and that the offline check therefore does not look at.
-func checkConfigFailures(path string) []string {
-	failures, _ := panel.CheckReport(path, false, io.Discard)
-	if cfg, err := panel.LoadConfig(path); err == nil {
+// linkXrayBin is the W1nCray-xray executable the offline Xray check runs
+// ("" = not found: the check is skipped and explained once per run).
+var linkXrayBin string
+
+// linkXrayNotice suppresses the repeated "kernel not found" line: the check
+// runs twice (baseline and converted config).
+var linkXrayNotice bool
+
+// checkConfigFailures runs the offline validation of one config and returns its
+// failure items. The Xray side is checked by the W1nCray-xray program (the
+// agent does not link Xray-core): its `check` prints the same "✗" lines the
+// old in-process check did, so the baseline comparison keeps working. When the
+// kernel is not installed the Xray check is skipped and explained; the
+// machine-mode controller problems the kernel check does not look at are
+// always reported.
+func checkConfigFailures(path string, out io.Writer) []string {
+	var failures []string
+	if linkXrayBin == "" {
+		if !linkXrayNotice {
+			linkXrayNotice = true
+			fmt.Fprintln(out, "  ! 未找到 W1nCray-xray（可用 --xray-bin <路径> 指定）：跳过 Xray 内核离线检查")
+		}
+	} else {
+		items, err := runXrayCheck(linkXrayBin, path)
+		if err != nil {
+			failures = append(failures, "✗ Xray 内核检查: "+err.Error())
+		}
+		failures = append(failures, items...)
+	}
+	if cfg, err := config.Load(path); err == nil {
 		failures = append(failures, linkMachineNodeFailures(cfg)...)
 	}
 	return failures
+}
+
+// runXrayCheck runs `<bin> check -c <config>` and returns the failure items it
+// printed (the lines starting with "✗"). A non-zero exit with no item is
+// reported as one error.
+func runXrayCheck(bin, configPath string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "check", "-c", configPath)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	runErr := cmd.Run()
+	out := buf.String()
+	var items []string
+	for _, line := range strings.Split(out, "\n") {
+		s := strings.TrimSpace(line)
+		if strings.HasPrefix(s, "✗") {
+			items = append(items, s)
+		}
+	}
+	if runErr != nil && len(items) == 0 {
+		return nil, fmt.Errorf("%s check: %w: %s", bin, runErr, strings.TrimSpace(out))
+	}
+	return items, nil
+}
+
+// resolveXrayBin finds the W1nCray-xray executable: the --xray-bin path when
+// given, then next to this binary, then on PATH. It returns "" when there is
+// none (the offline Xray check is then skipped).
+func resolveXrayBin(explicit string) string {
+	if explicit != "" {
+		if abs, err := filepath.Abs(explicit); err == nil {
+			return abs
+		}
+		return explicit
+	}
+	name := "W1nCray-xray"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if exe, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(exe), name)
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand
+		}
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	return ""
 }
 
 // linkMachineNodeFailures reports the machine-mode controller settings the
@@ -118,7 +202,7 @@ func checkConfigFailures(path string) []string {
 // generated NodeControllers entry so a value machine mode cannot use is
 // reported as a problem the conversion introduced instead of being written
 // silently. It never prints credentials.
-func linkMachineNodeFailures(cfg *panel.Config) []string {
+func linkMachineNodeFailures(cfg *config.Config) []string {
 	if cfg.Agent == nil || cfg.Agent.Panel == nil {
 		return nil
 	}
@@ -150,12 +234,12 @@ func linkPanelCertModeFailures(pc *agentcfg.PanelConfig) []string {
 
 // linkCertModeFailure reports an unusable CertConfig.CertMode ("" when the
 // mode is one of the supported values or the config has no certificate).
-func linkCertModeFailure(where string, cc *node.Config) string {
+func linkCertModeFailure(where string, cc *nodecfg.Config) string {
 	if cc == nil || cc.CertConfig == nil {
 		return ""
 	}
 	switch strings.ToLower(strings.TrimSpace(cc.CertConfig.CertMode)) {
-	case "", cert.ModeNone, cert.ModeFile, cert.ModeContent, cert.ModeSelf, cert.ModeHTTP, cert.ModeTLS, cert.ModeDNS:
+	case "", certcfg.ModeNone, certcfg.ModeFile, certcfg.ModeContent, certcfg.ModeSelf, certcfg.ModeHTTP, certcfg.ModeTLS, certcfg.ModeDNS:
 		return ""
 	}
 	return fmt.Sprintf("✗ %s.CertConfig.CertMode: 不支持的证书模式 %q（可选 none/file/content/self/http/tls/dns）", where, cc.CertConfig.CertMode)
@@ -169,7 +253,7 @@ func linkCertModeFailure(where string, cc *node.Config) string {
 // The comparison key of an item strips the volatile parts of a single run (the
 // two temporary file names, any timestamp), so a problem the original config
 // already had compares equal and does not block the conversion.
-func validateLinkOutput(configPath string, raw []byte, newPath string) (linkValidation, error) {
+func validateLinkOutput(configPath string, raw []byte, newPath string, out io.Writer) (linkValidation, error) {
 	basePath, cleanup, err := writeBaselineCopy(configPath, raw)
 	if err != nil {
 		return linkValidation{}, err
@@ -177,8 +261,8 @@ func validateLinkOutput(configPath string, raw []byte, newPath string) (linkVali
 	defer cleanup()
 
 	volatile := []string{basePath, newPath}
-	baseFailures := dedupeFailures(checkConfigFailures(basePath))
-	newFailures := checkConfigFailures(newPath)
+	baseFailures := dedupeFailures(checkConfigFailures(basePath, out))
+	newFailures := checkConfigFailures(newPath, out)
 
 	inBaseline := make(map[string]bool, len(baseFailures))
 	for _, f := range baseFailures {
@@ -207,7 +291,7 @@ func validateLinkWrite(configPath string, raw []byte, newPath string, skipCheck 
 		fmt.Fprintln(out, "⚠ 已跳过写入前校验（--skip-check）：生成的配置未经验证")
 		return nil
 	}
-	res, err := validateLinkOutput(configPath, raw, newPath)
+	res, err := validateLinkOutput(configPath, raw, newPath, out)
 	if err != nil {
 		return fmt.Errorf("写入前校验失败，未改动任何文件: %w", err)
 	}

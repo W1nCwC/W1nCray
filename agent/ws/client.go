@@ -524,7 +524,9 @@ func (c *Client) connect(ctx context.Context) error {
 
 	// This connection owns its queue: frames queued for the previous one are
 	// dropped, and frames queued here are dropped when it ends. Live data is
-	// never replayed (docs/WS-PROTOCOL.md section 7 ruling 3).
+	// never replayed (docs/WS-PROTOCOL.md section 7 ruling 3); the Agent's
+	// event backlog (ruling 14) lives one layer above this queue and replays
+	// through Send, not through a previous connection's channel.
 	queue := make(chan []byte, c.queueSize)
 	c.mu.Lock()
 	c.queue = queue

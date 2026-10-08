@@ -1,7 +1,8 @@
-// Package cmd implements the W1nCray command line.
+// Package cmd implements the W1nCray agent command line.
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,15 +12,14 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"github.com/W1nCwC/W1nCray/agent/selfupdate"
-	"github.com/W1nCwC/W1nCray/panel"
+	"github.com/W1nCwC/W1nCray/agentd"
 )
 
 var configFile string
 
 var rootCmd = &cobra.Command{
 	Use:   "W1nCray",
-	Short: "Xboard node backend built on the official Xray-core",
+	Short: "W1nCray agent: panel link, forwarding kernels, terminal and files",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return run()
 	},
@@ -28,6 +28,14 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "config file (default: ./config.yml, /etc/W1nCray/config.yml)")
+	// `run` is explicit as well as the default action, so service units and
+	// operators can always name it.
+	rootCmd.AddCommand(&cobra.Command{
+		Use:          "run",
+		Short:        "Run the agent (same as running W1nCray with no subcommand)",
+		RunE:         func(cmd *cobra.Command, args []string) error { return run() },
+		SilenceUsage: true,
+	})
 }
 
 // Execute runs the root command.
@@ -53,38 +61,28 @@ func findConfig() (string, error) {
 	return "", fmt.Errorf("no config file found; use -c to set one")
 }
 
-// setAssetLocation lets Xray find geoip.dat/geosite.dat next to the config
-// unless the location is set explicitly.
-func setAssetLocation(configPath string) {
-	if os.Getenv("XRAY_LOCATION_ASSET") == "" && os.Getenv("xray.location.asset") == "" {
-		os.Setenv("XRAY_LOCATION_ASSET", filepath.Dir(configPath))
-	}
-}
-
 func run() error {
 	showVersion()
 	path, err := findConfig()
 	if err != nil {
 		return err
 	}
-	setAssetLocation(path)
 	lock, err := acquireInstanceLock(path)
 	if err != nil {
 		return err
 	}
 	defer lock.release()
-	cfg, err := panel.LoadConfig(path)
+	cfg, err := agentd.LoadConfig(path)
 	if err != nil {
 		return err
 	}
 
 	// A committed self_update asks the process to exit so the self-update
 	// watchdog (or the service manager) brings the binary that was put in place
-	// back up. The signal is the existing, graceful shutdown path: kernels are
-	// stopped and Xray is closed before this process returns.
+	// back up. The signal is the existing, graceful shutdown path.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	panel.RequestRestart = func() {
+	agentd.RequestRestart = func() {
 		select {
 		case sig <- syscall.SIGTERM:
 		default:
@@ -94,57 +92,27 @@ func run() error {
 	// With a panel link the bootstrap layer owns the start-up watchdog: it has
 	// the event channel and the "the panel answered" hook. Without one there is
 	// nothing to reach, so the update is confirmed here.
-	startup := selfUpdateStartup(cfg)
+	startup := agentd.SelfUpdateStartup(cfg)
 
-	p := panel.New(path, cfg)
-	if err := p.Start(); err != nil {
+	// The Xray kernel runs in its own process (W1nCray-xray). X1 leaves the
+	// service handle nil: the agent degrades to "Xray 内核未安装" for managed
+	// Xray files. X2 installs the kernel and provides the handle here.
+	d := agentd.New(path, cfg, agentd.Options{})
+	if err := d.Start(); err != nil {
 		return err
 	}
 	if startup != nil {
 		if err := startup.Confirm(); err != nil {
 			log.Warnf("agent: confirming the self-update: %v", err)
 		}
+		// No panel link: the pending self-update is confirmed now, so the
+		// start-up migration (PLAN v11 §2.6) may bring the Xray kernel service
+		// up. With a panel link, bootstrap runs it once the panel answered.
+		d.EnsureXray(context.Background())
 	}
 
 	<-sig
 	log.Info("shutting down")
-	p.Close()
+	d.Close()
 	return nil
-}
-
-// selfUpdateStartup prepares the start-up side of a committed self_update for
-// an agent with no panel link. It returns nil when there is nothing to do
-// (agent disabled, no state directory, or a panel is configured: bootstrap
-// then owns the watchdog).
-func selfUpdateStartup(cfg *panel.Config) *selfupdate.Startup {
-	a := cfg.Agent
-	if a == nil || !a.Enabled || a.StateDir == "" {
-		return nil
-	}
-	if a.Panel != nil && a.Panel.Enabled {
-		return nil
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		return nil
-	}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
-	}
-	up, err := selfupdate.New(selfupdate.Options{
-		ExePath:  exe,
-		StateDir: a.StateDir,
-		Log:      log.StandardLogger(),
-	})
-	if err != nil {
-		log.Warnf("agent: self-update start-up check skipped: %v", err)
-		return nil
-	}
-	st := up.BeginStartup()
-	if rb, ok := st.TakeRollback(); ok {
-		log.Warnf("agent: self_update.rolled_back: version %s: %s", rb.Version, rb.Reason)
-	}
-	// A local-only agent has no panel to wait for; a watchdog would report
-	// self_update.stalled against a link that was never configured.
-	return st
 }

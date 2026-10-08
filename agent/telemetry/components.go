@@ -16,6 +16,11 @@ type ComponentProbe interface {
 	SupervisedProcesses() []SupervisedProcess
 	// InstalledKernels lists the kernel binaries installed on this machine.
 	InstalledKernels() []wsproto.KernelEntry
+	// ServiceComponents lists the kernels that run as their own service (the
+	// Xray kernel), with the state the service manager reports and the node
+	// list the kernel's status endpoint reports. A machine without such a
+	// kernel returns nil.
+	ServiceComponents() []wsproto.Component
 }
 
 // SupervisedProcess is one kernel instance as the agent runtime sees it.
@@ -91,9 +96,31 @@ func (c *Collector) componentsFrom(now time.Time) []wsproto.Component {
 		}
 	}
 
+	// A kernel that runs as its own service (the Xray kernel) has no
+	// supervised process; its component comes from the service manager and the
+	// kernel's status endpoint instead.
+	var services []wsproto.Component
+	c.field("service components", func() { services = c.probe.ServiceComponents() })
+	serviceByName := make(map[string]wsproto.Component, len(services))
+	for _, comp := range services {
+		if comp.Name == "" {
+			continue
+		}
+		serviceByName[comp.Name] = comp
+		if _, ok := byDriver[comp.Name]; !ok {
+			if _, ok := installed[comp.Name]; !ok {
+				names = append(names, comp.Name)
+			}
+		}
+	}
+
 	sort.Strings(names)
 	for _, name := range names {
 		c.field("component "+name, func() {
+			if comp, ok := serviceByName[name]; ok {
+				items = append(items, comp)
+				return
+			}
 			items = append(items, componentFor(name, byDriver[name], installed[name], now))
 		})
 	}

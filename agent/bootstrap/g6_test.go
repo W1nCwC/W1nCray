@@ -79,7 +79,7 @@ func TestTerminalCapabilityFollowsTheManager(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: true, Shell: terminal.DefaultShell},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestTerminalDisabledKeepsTheCapabilityOut(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: false},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 	}
 
 	// Without roots.
-	rt, err := Boot(Options{StateDir: filepath.Join(dir, "state"), KernelsDir: filepath.Join(dir, "kernels")}, nil)
+	rt, err := Boot(Options{StateDir: filepath.Join(dir, "state"), KernelsDir: filepath.Join(dir, "kernels")})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		FileOps:    fileops.Options{Roots: []fileops.Root{{Name: "xray", Path: root}}},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 			LayoutSeparated: true,
 		},
 		FileOps: fileops.Options{Roots: []fileops.Root{{Name: "xray", Path: root}}},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -225,6 +225,89 @@ func TestFilesCapabilityFollowsTheRoots(t *testing.T) {
 	}
 	if !hasCapability(rt3.Streams(nil, cfg3).Capabilities(), wsproto.CapFiles) {
 		t.Error("the files capability is missing while both file features are live")
+	}
+}
+
+// TestUnrestrictedFilesWithoutRoots is PLAN v10 requirement 2 at the wiring
+// level: a machine with Files.Unrestricted and NO root at all still gets the
+// file_* commands and the "files" capability, and the panel addresses it with
+// an empty root plus an absolute path.
+func TestUnrestrictedFilesWithoutRoots(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &agentcfg.Config{Files: &agentcfg.FilesConfig{Unrestricted: boolPtr(true)}}
+	rt, err := Boot(Options{
+		StateDir:    filepath.Join(dir, "state"),
+		KernelsDir:  filepath.Join(dir, "kernels"),
+		AgentConfig: cfg,
+		Files: &FilesOptions{
+			ConfigDir:       filepath.Join(dir, "xray"),
+			ConfigPath:      filepath.Join(dir, "config.yml"),
+			LayoutSeparated: true,
+		},
+		FileOps: fileops.Options{Unrestricted: boolPtr(true)},
+	})
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	defer func() { _ = rt.Shutdown(context.Background()) }()
+	if rt.FileOps == nil {
+		t.Fatal("an unrestricted machine without roots has no file manager")
+	}
+	if !rt.FileOps.Unrestricted() || len(rt.FileOps.RootNames()) != 0 {
+		t.Errorf("FileOps unrestricted=%v roots=%v", rt.FileOps.Unrestricted(), rt.FileOps.RootNames())
+	}
+	if !rt.fileCmdsCapable() {
+		t.Error("the file_* commands are not capable on an unrestricted machine")
+	}
+	if !rt.filesCapable() {
+		t.Error("the files capability is withheld although both file features are live")
+	}
+	if !hasCapability(rt.Streams(nil, cfg).Capabilities(), wsproto.CapFiles) {
+		t.Error("the files capability is missing")
+	}
+	for _, typ := range []string{
+		panelclient.CmdFileList, panelclient.CmdFileRead, panelclient.CmdFileWrite,
+		panelclient.CmdFileDelete, panelclient.CmdFileMkdir, panelclient.CmdFileRename,
+	} {
+		if !rt.Ops.Has(typ) {
+			t.Errorf("%s is not registered", typ)
+		}
+	}
+	// The policy reports the effective value and the (defaulted) roots.
+	pol := rt.Streams(nil, cfg).Policy()
+	if !pol.Files.Unrestricted {
+		t.Errorf("policy.files = %+v, want unrestricted", pol.Files)
+	}
+	// End to end: an empty root and an absolute path.
+	target := filepath.Join(dir, "unrestricted.txt")
+	status, res := rt.Ops.Execute(context.Background(), panelclient.Command{
+		Type: panelclient.CmdFileWrite,
+		Args: json.RawMessage(`{"root":"","path":"` + filepath.ToSlash(target) + `","data":"aGk="}`),
+	})
+	if status != panelclient.ResultDone {
+		t.Fatalf("file_write status = %s, body %s", status, res)
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "hi" {
+		t.Errorf("the file was not written: %q %v", b, err)
+	}
+	// mkdir and rename work the same way, and a relative path is still refused.
+	if status, res = rt.Ops.Execute(context.Background(), panelclient.Command{
+		Type: panelclient.CmdFileMkdir,
+		Args: json.RawMessage(`{"root":"","path":"` + filepath.ToSlash(filepath.Join(dir, "sub")) + `"}`),
+	}); status != panelclient.ResultDone {
+		t.Fatalf("file_mkdir status = %s, body %s", status, res)
+	}
+	if status, res = rt.Ops.Execute(context.Background(), panelclient.Command{
+		Type: panelclient.CmdFileRename,
+		Args: json.RawMessage(`{"root":"","path":"` + filepath.ToSlash(target) + `","to":"` + filepath.ToSlash(filepath.Join(dir, "moved.txt")) + `"}`),
+	}); status != panelclient.ResultDone {
+		t.Fatalf("file_rename status = %s, body %s", status, res)
+	}
+	if status, res = rt.Ops.Execute(context.Background(), panelclient.Command{
+		Type: panelclient.CmdFileList,
+		Args: json.RawMessage(`{"root":"","path":"relative"}`),
+	}); status != panelclient.ResultFailed || !strings.Contains(string(res), "invalid_args") {
+		t.Errorf("a relative path was accepted: %s %s", status, res)
 	}
 }
 
@@ -324,7 +407,7 @@ func TestWSTerminalAdapter(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: true, Shell: terminal.DefaultShell},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
@@ -380,7 +463,7 @@ func TestBootShutdownClosesTheTerminal(t *testing.T) {
 		StateDir:   filepath.Join(dir, "state"),
 		KernelsDir: filepath.Join(dir, "kernels"),
 		Terminal:   terminal.Options{Enabled: true, Shell: terminal.DefaultShell},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}

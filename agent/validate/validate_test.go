@@ -57,8 +57,10 @@ func exit() spec.Instance {
 func portal() spec.Instance {
 	return spec.Instance{
 		ID: "por", Enabled: true, Engine: "xray", Kind: spec.KindReversePortal,
-		Listen:  &spec.Listen{Addr: "127.0.0.1", Ports: "9100"},
-		Tunnel:  &spec.Tunnel{Type: "tcp", Listen: "127.0.0.1:9101", Security: "vless_enc"},
+		Listen: &spec.Listen{Addr: "127.0.0.1", Ports: "9100"},
+		// vless_enc was the embedded xray engine's security and was removed
+		// with it (PLAN v11 §2.5); the portal baseline uses the default now.
+		Tunnel:  &spec.Tunnel{Type: "tcp", Listen: "127.0.0.1:9101"},
 		Reverse: &spec.Reverse{Domain: goodDomain, Link: "br"},
 		Secret:  goodSecret,
 	}
@@ -104,7 +106,38 @@ func (f *fakeResolver) LookupNetIP(ctx context.Context, network, host string) ([
 	return out, nil
 }
 
-func opts() Options { return Options{Resolver: &fakeResolver{m: map[string][]string{}}} }
+// testEngines keeps the historical expectations of this file testable: most
+// cases below are about fields other than the engine name, so they run with
+// the xray engine still accepted. TestXrayEngineRemoved covers the production
+// default (no override), where engine=xray is refused.
+var testEngines = []string{spec.EngineAuto, spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
+
+func opts() Options {
+	return Options{Resolver: &fakeResolver{m: map[string][]string{}}, Engines: testEngines}
+}
+
+// defaultOpts is the production validator: no engine-name override.
+func defaultOpts() Options { return Options{Resolver: &fakeResolver{m: map[string][]string{}}} }
+
+// TestXrayEngineRemoved pins PLAN v11 §2.5: the forwarding engine no longer
+// supports xray, and vless_enc (its tunnel security) is gone with it.
+func TestXrayEngineRemoved(t *testing.T) {
+	in := fwd()
+	in.Engine = spec.EngineXray
+	errs := Desired(desired(in), policy(), defaultOpts())
+	if !find(errs, "engine", "xray 转发引擎已移除，请使用 gost 或 realm") {
+		t.Errorf("engine=xray is not refused with the removal message:%s", dump(errs))
+	}
+	if errs := Desired(desired(in), policy(), opts()); len(errs) != 0 {
+		t.Errorf("the engine-name override should accept the test engine:%s", dump(errs))
+	}
+	enc := entry()
+	enc.Tunnel.Security = "vless_enc"
+	errs = Desired(desired(enc), policy(), defaultOpts())
+	if !find(errs, "tunnel.security", "vless_enc 已随 xray 转发引擎移除") {
+		t.Errorf("vless_enc is not refused with the removal message:%s", dump(errs))
+	}
+}
 
 func find(errs []Error, field, substr string) bool {
 	for _, e := range errs {
@@ -127,6 +160,23 @@ func TestValidBaselines(t *testing.T) {
 	for _, in := range []spec.Instance{fwd(), entry(), exit(), portal(), bridge()} {
 		if errs := Desired(desired(in), policy(), opts()); len(errs) != 0 {
 			t.Errorf("%s should be valid:%s", in.Kind, dump(errs))
+		}
+	}
+	// tls_self is accepted by the engines that can derive and verify it: xray
+	// on any carrier, gost on a TLS one, and "auto" (the selector picks one).
+	for _, tc := range []struct {
+		engine, typ string
+	}{
+		{"auto", "tls"}, {"xray", "tls"}, {"xray", "tcp"}, {"gost", "tls"}, {"gost", "wss"}, {"gost", "grpc"},
+	} {
+		in := entry()
+		in.Engine, in.Tunnel.Type, in.Tunnel.Security = tc.engine, tc.typ, "tls_self"
+		in.Tunnel.SNI = "tun.example.com"
+		if tc.typ != "wss" {
+			in.Tunnel.Host, in.Tunnel.Path = "", ""
+		}
+		if errs := Desired(desired(in), policy(), opts()); len(errs) != 0 {
+			t.Errorf("%s/%s tls_self should be valid:%s", tc.engine, tc.typ, dump(errs))
 		}
 	}
 	all := desired(fwd(), entry(), exit(), portal(), bridge())
@@ -264,8 +314,8 @@ func TestInstanceRules(t *testing.T) {
 		// tunnel type / security
 		{"tunnel type unknown", entry, func(i *spec.Instance) { i.Tunnel.Type = "ssh" }, "tunnel.type", "unknown tunnel type"},
 		{"security unknown", entry, func(i *spec.Instance) { i.Tunnel.Security = "magic" }, "tunnel.security", "unknown security"},
-		{"vless_enc on gost", entry, func(i *spec.Instance) { i.Engine = "gost"; i.Tunnel.Security = "vless_enc" }, "tunnel.security", "only supported by the xray"},
-		{"vless_enc on realm", entry, func(i *spec.Instance) { i.Engine = "realm"; i.Tunnel.Security = "vless_enc" }, "tunnel.security", "only supported by the xray"},
+		{"vless_enc on gost", entry, func(i *spec.Instance) { i.Engine = "gost"; i.Tunnel.Security = "vless_enc" }, "tunnel.security", "已随 xray 转发引擎移除"},
+		{"vless_enc on realm", entry, func(i *spec.Instance) { i.Engine = "realm"; i.Tunnel.Security = "vless_enc" }, "tunnel.security", "已随 xray 转发引擎移除"},
 		{"wss with none", entry, func(i *spec.Instance) { i.Tunnel.Type = "wss"; i.Tunnel.Security = "none" }, "tunnel.security", "contradictory"},
 		{"tls with vless_enc", entry, func(i *spec.Instance) { i.Engine = "xray"; i.Tunnel.Type = "tls"; i.Tunnel.Security = "vless_enc" }, "tunnel.security", "contradictory"},
 		{"tls_pin no pin", entry, func(i *spec.Instance) { i.Tunnel.Security = "tls_pin" }, "tunnel.pin_sha256", "64 hex"},
@@ -275,6 +325,27 @@ func TestInstanceRules(t *testing.T) {
 			i.Tunnel.PinSHA256 = strings.Repeat("g", 64)
 		}, "tunnel.pin_sha256", "64 hex"},
 		{"pin without tls_pin", entry, func(i *spec.Instance) { i.Tunnel.PinSHA256 = strings.Repeat("a", 64) }, "tunnel.pin_sha256", "only meaningful"},
+		{"tls_self with a pin", entry, func(i *spec.Instance) {
+			i.Engine = "xray"
+			i.Tunnel.Security = "tls_self"
+			i.Tunnel.PinSHA256 = strings.Repeat("a", 64)
+		}, "tunnel.pin_sha256", "derives the pin"},
+		{"tls_self with a cert", exit, func(i *spec.Instance) {
+			i.Engine = "xray"
+			i.Tunnel.Security = "tls_self"
+			i.Tunnel.Cert = &spec.Cert{Mode: "self"}
+		}, "tunnel.cert", "derives the certificate"},
+		{"tls_self without a secret", entry, func(i *spec.Instance) {
+			i.Engine = "xray"
+			i.Tunnel.Security = "tls_self"
+			i.Secret = ""
+		}, "secret", "required"},
+		{"tls_self on realm", entry, func(i *spec.Instance) { i.Engine = "realm"; i.Tunnel.Security = "tls_self" }, "tunnel.security", "realm"},
+		{"tls_self on gost tcp", entry, func(i *spec.Instance) {
+			i.Engine = "gost"
+			i.Tunnel.Type = "tcp"
+			i.Tunnel.Security = "tls_self"
+		}, "tunnel.security", "TLS carrier"},
 
 		// tunnel text fields (hostile)
 		{"host space", entry, func(i *spec.Instance) { i.Tunnel.Host = "a b" }, "tunnel.host", "invalid host"},

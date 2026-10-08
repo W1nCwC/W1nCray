@@ -64,14 +64,32 @@ lib() {
 
 # ---- fixtures ---------------------------------------------------------------
 
+# make_fake_bin PATH [flavor] writes a stand-in for the v11 agent: `version`
+# prints the split format "(agent, <flavor>)", every other command echoes its
+# arguments, and every call is appended to $W1NCRAY_ROOT/bin.log so a test can
+# check the order of the steps.
 make_fake_bin() { # path [flavor]
 	cat >"$1" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >>"${W1NCRAY_ROOT:-/dev/null}/bin.log" 2>/dev/null || true
 case "$1" in
-version) echo "W1nCray vTEST (Xray-core 26.3.27, ${FAKE_FLAVOR:-full})" ;;
+version) echo "W1nCray vTEST (agent, ${FAKE_FLAVOR:-full})" ;;
 init) mkdir -p "$3" && echo "Nodes: []" >"$3/config.yml" && echo "init $3" ;;
 migrate) [ -n "$FAKE_NOWRITE" ] && { echo "ARGS: $*"; exit 0; }; mkdir -p "$5" && echo "migrated" >"$5/config.yml" && echo "migrate $*" ;;
 check) echo "check ok ARGS: $*"; exit "${FAKE_CHECK_RC:-0}" ;;
+*) echo "ARGS: $*" ;;
+esac
+EOF
+	chmod 755 "$1"
+}
+
+# make_single_bin PATH writes a stand-in for a pre-v11 single program: `version`
+# prints the old "(Xray-core ...)" format, which is what marks it for migration.
+make_single_bin() {
+	cat >"$1" <<'EOF'
+#!/bin/sh
+case "$1" in
+version) echo "W1nCray v0.5.3 (Xray-core 26.3.27, full)" ;;
 *) echo "ARGS: $*" ;;
 esac
 EOF
@@ -372,6 +390,8 @@ t_install_fresh() {
 	has "service started" "$(cat "$CALLS")" "start W1nCray"
 	check "geo files downloaded off OpenWRT" test -s "$CONF_DIR/geoip.dat"
 	hasnt "no temp download dir left behind" "$(ls -a "$BIN_DIR")" ".dl."
+	hasnt "a fresh install does not install the Xray kernel" "$(cat "$CALLS")" "W1nCray-xray"
+	has "a fresh install points at the Xray kernel" "$out" "W1nCray xray install"
 }
 
 t_install_xrayr_present() {
@@ -548,6 +568,117 @@ t_update_version_shorthand() {
 	has "update --version still works" "$(cat "$DL_LOG")" "/releases/download/v1.2.4/W1nCray-linux-amd64.gz"
 }
 
+# A pre-v11 single program with Xray nodes migrates to agent + kernel: both
+# downloads happen before the old service stops, and the kernel service starts
+# before the agent comes back.
+t_update_migrates_single_program() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	mkdir -p "$BIN_DIR" "$CONF_DIR"
+	make_single_bin "$BIN"
+	printf 'Nodes:\n  - ApiConfig:\n      ApiHost: "a"\n    NodeID: 173\n' >"$CONF"
+	: >"$ST/W1nCray.exists"
+	: >"$ST/W1nCray.active"
+	: >"$ST/W1nCray.enabled"
+	# The new agent logs its own invocations into the same calls.log, so the
+	# order of the whole sequence is observable in one file.
+	cat >"$W1NCRAY_ROOT/newbin" <<'EOF'
+#!/bin/sh
+printf 'bin %s\n' "$*" >>"$W1NCRAY_ROOT/calls.log"
+case "$1" in
+version) echo "W1nCray vTEST (agent, full)" ;;
+*) echo "ARGS: $*" ;;
+esac
+EOF
+	chmod 755 "$W1NCRAY_ROOT/newbin"
+	publish W1nCray-linux-amd64.gz "$W1NCRAY_ROOT/newbin"
+	make_fake_bin "$W1NCRAY_ROOT/xraybin"
+	publish W1nCray-xray-linux-amd64.gz "$W1NCRAY_ROOT/xraybin"
+	: >"$DL_LOG"
+	: >"$CALLS"
+	out="$(cmd_install --version v1.2.3 --no-geo 2>&1)"
+	has "migration downloads the agent" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/W1nCray-linux-amd64.gz"
+	has "migration downloads the Xray kernel" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/W1nCray-xray-linux-amd64.gz"
+	has "the kernel is installed from the file" "$(cat "$CALLS")" "xray install --file"
+	has "the sha256 is passed through" "$(cat "$CALLS")" "--sha256"
+	has "the interruption is explained" "$out" "中断"
+	_stop="$(grep -n '^stop W1nCray$' "$CALLS" | head -n1 | cut -d: -f1)"
+	_kern="$(grep -n 'bin .*xray install' "$CALLS" | head -n1 | cut -d: -f1)"
+	_restart="$(grep -n '^restart W1nCray$' "$CALLS" | head -n1 | cut -d: -f1)"
+	if [ -n "$_stop" ] && [ -n "$_kern" ] && [ -n "$_restart" ] && [ "$_stop" -lt "$_kern" ] && [ "$_kern" -lt "$_restart" ]; then
+		pass "order: stop old -> install Xray kernel -> start agent"
+	else
+		fail "order: stop old -> install Xray kernel -> start agent (stop=$_stop kernel=$_kern restart=$_restart)"
+	fi
+}
+
+# A v11 agent with nodes only updates the agent: the Xray kernel asset is never
+# downloaded and no kernel install is attempted.
+t_update_agent_only() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	mkdir -p "$BIN_DIR" "$CONF_DIR"
+	make_fake_bin "$BIN"
+	printf 'Nodes:\n  - ApiConfig:\n      ApiHost: "a"\n    NodeID: 173\n' >"$CONF"
+	: >"$ST/W1nCray.exists"
+	: >"$ST/W1nCray.active"
+	publish W1nCray-linux-amd64.gz "$W1NCRAY_ROOT/fakebin"
+	: >"$DL_LOG"
+	: >"$W1NCRAY_ROOT/bin.log"
+	cmd_install --version v1.2.3 --no-geo >/dev/null 2>&1
+	has "the agent is downloaded" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/W1nCray-linux-amd64.gz"
+	hasnt "no Xray kernel asset is downloaded" "$(cat "$DL_LOG")" "W1nCray-xray-linux"
+	hasnt "no Xray kernel is installed" "$(cat "$W1NCRAY_ROOT/bin.log")" "xray install"
+}
+
+# Uninstall stops and removes the Xray kernel service through the program's own
+# command; when that command fails the script cleans the service up by backend.
+t_uninstall_removes_xray() {
+	mock_backend
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	: >"$W1NCRAY_ROOT/bin.log"
+	cmd_uninstall -y >/dev/null 2>&1
+	has "uninstall runs the program's xray remove" "$(cat "$W1NCRAY_ROOT/bin.log")" "xray remove"
+	refute "binary removed" test -e "$BIN"
+}
+
+t_uninstall_xray_backend_fallback() {
+	mock_backend
+	W1NCRAY_SELF="$SCRIPT"
+	cat >"$W1NCRAY_ROOT/fakebin" <<'EOF'
+#!/bin/sh
+case "$1" in
+version) echo "W1nCray vTEST (agent, full)" ;;
+init) mkdir -p "$3" && echo "Nodes: []" >"$3/config.yml" ;;
+check) exit 0 ;;
+*) exit 1 ;;
+esac
+EOF
+	chmod 755 "$W1NCRAY_ROOT/fakebin"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	: >"$CALLS"
+	cmd_uninstall -y >/dev/null 2>&1
+	has "fallback stops the Xray service" "$(cat "$CALLS")" "stop W1nCray-xray"
+	has "fallback removes the Xray service file" "$(cat "$CALLS")" "remove W1nCray-xray"
+}
+
+t_xray_dispatch() {
+	mock_backend
+	mkdir -p "$BIN_DIR"
+	make_fake_bin "$BIN"
+	AS_MANAGER=1
+	eq "xray status passes through with the config" "$(dispatch xray status 2>&1)" "ARGS: -c $CONF xray status"
+	eq "xray install passes its flags through" "$(dispatch xray install --file /tmp/x.gz --sha256 ab 2>&1)" "ARGS: -c $CONF xray install --file /tmp/x.gz --sha256 ab"
+}
+
 t_space_check() {
 	unset W1NCRAY_SKIP_SPACE_CHECK
 	df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/x 1000000 990000 5000 99%% /\n'; }
@@ -649,6 +780,27 @@ t_manager_dispatch() {
 	has "installer without arguments prints usage" "$(dispatch </dev/null 2>&1)" "W1nCray 管理命令"
 }
 
+t_log_hint() {
+	mock_backend
+	BACKEND=systemd
+	eq "systemd log" "$(log_hint)" "journalctl -u W1nCray"
+	eq "systemd follow" "$(log_hint follow)" "journalctl -u W1nCray -f"
+	BACKEND=openrc
+	eq "OpenRC log" "$(log_hint)" "tail -n 100 $ROOT/var/log/W1nCray.log"
+	eq "OpenRC follow" "$(log_hint follow)" "tail -f $ROOT/var/log/W1nCray.log"
+	BACKEND=procd
+	eq "procd log" "$(log_hint)" "logread -e W1nCray"
+	eq "procd follow" "$(log_hint follow)" "logread -f -e W1nCray"
+	# The hints must never name a `log` subcommand the program does not have
+	# (REG2 observation 2): they name the detected backend's real command.
+	hasnt "panel hint does not name a log subcommand" "$(panel_hint https://panel.example 7 0 2>&1)" "W1nCray log"
+	has "panel hint names the backend command" "$(panel_hint https://panel.example 7 0 2>&1)" "logread -f -e W1nCray"
+	has "usage names the backend command" "$(usage 2>&1)" "logread -f -e W1nCray"
+	hasnt "usage does not advertise a log subcommand" "$(usage 2>&1)" "W1nCray log"
+	# The Xray kernel's own commands are not agent subcommands.
+	hasnt "usage does not pass x25519 to the agent" "$(usage 2>&1)" "W1nCray x25519"
+}
+
 t_menu() {
 	mock_backend
 	mkdir -p "$BIN_DIR"
@@ -659,6 +811,7 @@ t_menu() {
 	has "menu shows the title" "$out" "W1nCray 管理菜单"
 	has "menu shows the state" "$out" "运行中"
 	has "choice 4 runs status" "$out" "服务管理器: mock"
+	has "menu lists the Xray kernel" "$out" "Xray 内核"
 	has "invalid choices are rejected" "$out" "无效的选择"
 	out="$(printf '2\n0\n' | menu 2>&1)"
 	refute "choice 2 stops the service" be_mock_active W1nCray
@@ -1058,7 +1211,8 @@ run() { # name
 for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_verify_opt_out t_generated_scripts \
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
 	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
-	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
+	t_update_migrates_single_program t_update_agent_only t_uninstall_removes_xray t_uninstall_xray_backend_fallback t_xray_dispatch \
+	t_manager_dispatch t_log_hint t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
 	t_install_panel t_install_panel_missing_args t_install_panel_bad_id t_install_panel_http \
 	t_install_panel_token_file t_install_panel_keeps_config t_install_panel_static_nodes t_install_panel_agent_yml t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
 	run "$t"

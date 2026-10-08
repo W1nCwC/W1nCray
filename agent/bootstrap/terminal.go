@@ -321,10 +321,12 @@ func (a terminalAuditor) TerminalEvent(e terminal.AuditEvent) {
 }
 
 // newFileOps builds the confined file manager from the resolved roots. It
-// returns nil when no root is configured: the file_* commands then do not exist
-// and the "files" capability is not declared.
+// returns nil when the machine can serve nothing: no root at all AND not
+// unrestricted. An unrestricted machine (Files.Unrestricted, or the terminal
+// default that follows from it) needs no root — the panel names absolute paths
+// — so its file_* commands exist with an empty root list.
 func newFileOps(o fileops.Options, log driver.Logger) (*fileops.Ops, error) {
-	if len(o.Roots) == 0 {
+	if len(o.Roots) == 0 && !o.IsUnrestricted() {
 		return nil, nil
 	}
 	o.Log = log

@@ -68,6 +68,11 @@ type Controller struct {
 	ws      atomic.Pointer[xboard.WSClient]
 	devices *deviceSignal
 	started time.Time
+
+	// lastErr is the most recent pull/apply error, published for the kernel
+	// status report (xraynode). It is best-effort: a nil value means "no error
+	// observed since the controller started".
+	lastErr atomic.Pointer[string]
 }
 
 // New creates a controller.
@@ -106,7 +111,7 @@ func New(opts Options) *Controller {
 		pullEvery: defaultInterval,
 		pushEvery: defaultInterval,
 	}
-	if al := c.cfg.autoSpeedLimit(); al != nil {
+	if al := c.cfg.AutoSpeedLimit(); al != nil {
 		c.auto = newAutoLimit(al)
 	}
 	c.warnDeprecated()
@@ -303,6 +308,7 @@ func (c *Controller) pull() {
 	}
 	if err != nil {
 		c.log.Errorf("fetch node config: %v", err)
+		c.setLastError(err)
 		return
 	}
 	users, err := c.api.GetUsers(ctx)
@@ -315,6 +321,7 @@ func (c *Controller) pull() {
 		if nc != nil {
 			c.api.ResetETags()
 		}
+		c.setLastError(err)
 		return
 	}
 
@@ -322,11 +329,17 @@ func (c *Controller) pull() {
 		if err := c.applyNode(nc, users); err != nil {
 			c.log.Errorf("apply node config: %v", err)
 			c.api.ResetETags()
+			c.setLastError(err)
+		} else {
+			c.clearLastError()
 		}
 	} else if usersChanged {
 		if err := c.applyUsers(users); err != nil {
 			c.log.Errorf("apply users: %v", err)
 			c.api.ResetETags()
+			c.setLastError(err)
+		} else {
+			c.clearLastError()
 		}
 	}
 

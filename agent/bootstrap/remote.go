@@ -61,8 +61,10 @@ type RemoteOptions struct {
 	// WSCommands overrides the shared command entry point (tests). nil uses the
 	// Runner, so the HTTP and WS channels share one whitelist and one id space.
 	WSCommands ws.Commands
-	// WSNodes overrides the xray-nodes hint hook (tests). nil uses the local
-	// module gate; batch 1 only pulls the desired state again.
+	// WSNodes overrides the xray-nodes hint hook (tests). nil uses the runtime's
+	// kernel client and the local module gate: the hint makes the kernel
+	// re-fetch the machine's node list now, and degrades to its 60 s poll when
+	// the kernel is absent, too old, or the call fails.
 	WSNodes ws.NodeToggle
 
 	// ManifestSync enables the signed kernel manifest sync loop: the link
@@ -105,6 +107,22 @@ func (s filesSource) DesiredFiles() []spec.FileRef {
 	}
 	return s.rt.Reconciler.LastDesired().Files
 }
+
+// desiredSync adapts the runtime and the panel runner to opscmd.DesiredSync:
+// the revision the reconciler last applied, and an immediate pull.
+type desiredSync struct {
+	rt     *Runtime
+	runner *panelclient.Runner
+}
+
+func (d desiredSync) DesiredRevision() int64 {
+	if d.rt == nil || d.rt.Reconciler == nil {
+		return 0
+	}
+	return d.rt.Reconciler.LastDesired().Revision
+}
+
+func (d desiredSync) RequestRefresh() { d.runner.RequestRefresh() }
 
 // blobFetcher adapts the panel HTTP client to filesync.BlobFetcher. The client
 // validates the sha256, sends If-None-Match and enforces the transport limit;
@@ -231,12 +249,15 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		// (design section 3.3).
 		SuppressHost: func() bool { return wsClient != nil && wsClient.Connected() },
 		OnConnected: func() {
-			if startup == nil {
-				return
+			if startup != nil {
+				if err := startup.Confirm(); err != nil {
+					log.Warnf("bootstrap: confirming the self-update: %v", err)
+				}
 			}
-			if err := startup.Confirm(); err != nil {
-				log.Warnf("bootstrap: confirming the self-update: %v", err)
-			}
+			// The pending self-update (if any) is confirmed: the Xray kernel
+			// service may be brought up now (PLAN v11 §2.6). Boot already did
+			// it when nothing was pending, and EnsureXray is idempotent.
+			go func() { _ = r.EnsureXray(context.Background()) }()
 		},
 	}
 	// The operations registry serves every command the Runner does not
@@ -302,6 +323,7 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	late := &lateResult{runner: runner, log: log}
 	if r.Ops != nil {
 		r.Ops.SetSink(late)
+		r.Ops.SetDesiredSync(desiredSync{rt: r, runner: runner})
 	}
 
 	if o.WS {
@@ -324,10 +346,12 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 			agentOpts.Files = r.Files
 		}
 		// The nodes hint is always wired, so it is never silently ignored; the
-		// local module gate lives inside the hook (ruling 6).
+		// local module gate lives inside the hook (ruling 6). The hook makes
+		// the kernel re-fetch the machine's node list now (r.Xray is nil on a
+		// machine without the kernel, which degrades to the kernel's poll).
 		agentOpts.Nodes = o.WSNodes
 		if agentOpts.Nodes == nil {
-			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), refresh: runner.RequestRefresh, log: log}
+			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), xray: r.Xray, log: log}
 		}
 		// The interactive terminal is wired only when this machine really has
 		// one; a nil sink is what answers term.error{terminal_disabled}
@@ -392,12 +416,11 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	// A pending update that never reaches the panel is reported, never rolled
 	// back (protocol ruling 11).
 	if startup != nil {
-		go startup.WatchStalled(runCtx, func(kind, level, message string) {
-			log.Warnf("bootstrap: %s: %s", kind, message)
-			if r.Ops != nil {
-				r.Ops.EmitEvent(kind, level, message)
-			}
-		})
+		version := ""
+		if p, ok := startup.Pending(); ok {
+			version = p.Version
+		}
+		go startup.WatchStalled(runCtx, r.selfUpdateStalledReporter(version))
 	}
 
 	runnerDone := make(chan struct{})
@@ -510,11 +533,20 @@ func (c *wsCommands) Execute(ctx context.Context, id string, cmd wsproto.Cmd, ex
 	}
 	if sendErr := c.client.SendWait(ctx, env, ws.CommandQueueTimeout); sendErr != nil {
 		c.log.Warnf("bootstrap: cmd.result for %q not delivered over the WebSocket: %v", id, sendErr)
+		// The accepted answer never reached the panel: release the ordering
+		// gate so the final result (the only answer the panel will see) is not
+		// held back (D-M3).
+		c.runner.AcceptedSent(id)
 		// Not remembered: a redelivery (over either channel) is answered.
 		return "", nil, ws.ErrAnswered
 	}
 	if status != panelclient.ResultAccepted {
 		c.runner.MarkAnswered(id)
+	} else {
+		// A long command keeps its in-flight slot until its final result is
+		// delivered (lateResult), and the accepted answer is now on the wire,
+		// so the final result may follow it (D-M3).
+		c.runner.AcceptedSent(id)
 	}
 	// A long command keeps its in-flight slot until its final result is
 	// delivered (lateResult), so a redelivery in between is dropped instead of

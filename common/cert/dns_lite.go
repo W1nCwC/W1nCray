@@ -12,10 +12,12 @@ import (
 	"github.com/go-acme/lego/v4/providers/dns/godaddy"
 	"github.com/go-acme/lego/v4/providers/dns/namesilo"
 	"github.com/go-acme/lego/v4/providers/dns/tencentcloud"
+
+	"github.com/W1nCwC/W1nCray/common/certcfg"
 )
 
 // BuildFlavor, see dns_full.go.
-const BuildFlavor = "lite"
+const BuildFlavor = certcfg.BuildFlavor
 
 // liteProviders are named exactly like lego's registry
 // (providers/dns/zz_gen_dns_providers.go) so configs stay valid.
@@ -71,8 +73,6 @@ func newDNSProvider(name string) (challenge.Provider, error) {
 	return nil, fmt.Errorf("DNS 供应商 %q 不在当前构建（lite 版，仅含 alidns / cloudflare / dnspod / godaddy / namesilo / tencentcloud）中；请安装完整版: W1nCray update --full", name)
 }
 
-// DNSProviderSupported reports whether DNS-01 can use the provider in this build.
-func DNSProviderSupported(name string) bool {
-	_, ok := liteProviders[name]
-	return ok
-}
+// DNSProviderSupported reports whether DNS-01 can use the provider in this
+// build.
+func DNSProviderSupported(name string) bool { return certcfg.DNSProviderSupported(name) }

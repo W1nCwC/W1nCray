@@ -106,6 +106,42 @@ type Policy struct {
 	Terminal bool         `json:"terminal"`
 	Files    FilesPolicy  `json:"files"`
 	Modules  ModulePolicy `json:"modules"`
+	// Firewall reports whether the agent opens the WAN ports of the instances
+	// it runs (PLAN v11 D2). It is only ever true on OpenWrt with the local
+	// Firewall.AutoOpen switch on; the panel must read an instance's
+	// firewall_open against it, because false there also means "this machine
+	// does not manage its firewall".
+	Firewall FirewallPolicy `json:"firewall"`
+	// Kernels reports the local kernel-source switch (Kernels.AllowHTTP, D-M1).
+	// It is only ever true when the machine's own configuration permits plain
+	// http:// mirrors for the signed manifest's assets; the panel may display
+	// it and must never assume it can be turned on remotely.
+	Kernels KernelsPolicy `json:"kernels"`
+	// Instances is the local instance policy (agent.yml Policy). The panel
+	// uses it to pick ports inside the permitted range and to explain a
+	// listen address the machine will refuse (PLAN v10 WP-D); the agent still
+	// enforces it on every apply.
+	Instances *InstancePolicy `json:"instances,omitempty"`
+}
+
+// FirewallPolicy mirrors the effective local firewall automation switch.
+type FirewallPolicy struct {
+	AutoOpen bool `json:"auto_open"`
+}
+
+// KernelsPolicy mirrors the local kernel-source switch (Kernels.AllowHTTP).
+type KernelsPolicy struct {
+	AllowHTTP bool `json:"allow_http"`
+}
+
+// InstancePolicy mirrors spec.Policy for display and planning.
+type InstancePolicy struct {
+	AllowListen     []string `json:"allow_listen"`
+	PortRange       [2]int   `json:"port_range"`
+	PrivilegedPorts bool     `json:"privileged_ports"`
+	DenyPorts       []int    `json:"deny_ports"`
+	MaxInstances    int      `json:"max_instances"`
+	AllowEngines    []string `json:"allow_engines"`
 }
 
 type FilesPolicy struct {
@@ -219,6 +255,9 @@ type Component struct {
 	CPUPct    float64             `json:"cpu_pct,omitempty"`
 	RSS       uint64              `json:"rss,omitempty"`
 	Instances []ComponentInstance `json:"instances"`
+	// LastError is the last error the component reported (the Xray kernel's
+	// status endpoint); empty when there is none.
+	LastError string `json:"last_error,omitempty"`
 }
 
 type ComponentInstance struct {
@@ -239,6 +278,20 @@ type KernelEntry struct {
 	SizeBytes   int64  `json:"size_bytes,omitempty"`
 	InstalledAt int64  `json:"installed_at,omitempty"`
 	InUse       bool   `json:"in_use"`
+	// Service describes the service a kernel runs as, when it is not an agent
+	// child process (the Xray kernel). It is omitted for the supervised
+	// kernels (gost/realm/frp).
+	Service *KernelService `json:"service,omitempty"`
+}
+
+// KernelService is the service-manager view of a kernel that runs as its own
+// service: which backend owns it and what state it is in.
+type KernelService struct {
+	Backend string `json:"backend"` // systemd | openrc | procd | agent
+	State   string `json:"state"`   // running | stopped | failed | installing | not_installed
+	// ManagedBy is "service" when an init system owns the kernel and "agent"
+	// when the agent's supervisor does.
+	ManagedBy string `json:"managed_by,omitempty"`
 }
 
 // Cmd is the payload of a panel -> agent command.

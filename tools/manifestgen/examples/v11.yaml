@@ -1,0 +1,293 @@
+# manifestgen build description for the v11 kernel manifest (PLAN v11 WP-X3).
+#
+# Two differences from kernels.example.yaml:
+#
+#   1. the Xray kernel is our own program (name "xray", binary W1nCray-xray,
+#      built by release/build.sh from ./cmd/w1ncray-xray), not the upstream
+#      XTLS/Xray-core zip the single v0.5 program embedded;
+#   2. every upstream kernel carries two versions, so the panel's upgrade and
+#      rollback paths can be exercised against a real second version.
+#
+# The agent and the Xray kernel are local builds: their hashes come from the
+# files release/build.sh wrote into dist/, and a mirror must serve them because
+# a local file has no upstream URL. The Xray kernel also has an OpenWrt lite
+# build (-tags dnslite,fallbackroots): it is published in openwrt_targets under
+# a plain linux/<arch> key (never a "+openwrt" key in targets, which a v0.5.x
+# agent rejects as invalid and then has no manifest at all), and the agent
+# prefers it on OpenWrt. See tools/manifestgen/README.md.
+#
+#   bash release/build.sh v0.6.0                       # all 12 architectures
+#   manifestgen build -config tools/manifestgen/examples/v11.yaml -out unsigned.json -sequence 110
+#   manifestgen sign  -key keys/manifest-1.key -in unsigned.json -out manifest.json
+#
+# Replace <mirror> with the host that serves the gz files. Asset names and
+# checksum files were checked against the GitHub release listings on
+# 2026-10-07 (api.github.com/repos/<repo>/releases/tags/<tag>); gost v3.2.6 is
+# the newest 3.2.x.
+#
+# min_agent is deliberately empty. The Xray kernel must stay installable by a
+# 0.5.x agent: the documented migration (PLAN v11 section 2.6) installs the
+# kernel with the old agent first, then switches the agent to 0.6.
+
+sequence: 110
+valid_days: 90
+min_agent: ""
+
+kernels:
+  # ---------------------------------------------------------------- agent
+  # The agent's own entry (WP-X3): a single build per architecture, hashed
+  # from dist/. It is what self_update installs.
+  - name: agent
+    version: "0.6.0"
+    license: {spdx: MIT}
+    capabilities: {self_update: true}
+    run:
+      binary: W1nCray
+      version_cmd: ["version"]
+      version_regex: "W1nCray v?([0-9][0-9.]*)"
+    mirrors: ["https://<mirror>/W1nCray/{version}/{asset}"]
+    local:
+      - {file: dist/W1nCray-linux-amd64.gz,    target: linux/amd64,    to: W1nCray}
+      - {file: dist/W1nCray-linux-386.gz,      target: linux/386,      to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-arm64.gz,    target: linux/arm64,    to: W1nCray}
+      - {file: dist/W1nCray-linux-armv7.gz,    target: linux/armv7,    to: W1nCray, variant: hardfloat}
+      - {file: dist/W1nCray-linux-armv6.gz,    target: linux/armv6,    to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-armv5.gz,    target: linux/armv5,    to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mips.gz,     target: linux/mips,     to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mipsle.gz,   target: linux/mipsle,   to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mips64.gz,   target: linux/mips64,   to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-mips64le.gz, target: linux/mips64le, to: W1nCray, variant: softfloat}
+      - {file: dist/W1nCray-linux-riscv64.gz,  target: linux/riscv64,  to: W1nCray}
+      - {file: dist/W1nCray-linux-loong64.gz,  target: linux/loong64,  to: W1nCray}
+
+  # ----------------------------------------------------------------- xray
+  # Our Xray kernel. One manifest version per release; the OpenWrt lite build
+  # (dist/...-lite.gz, -tags dnslite,fallbackroots) goes in openwrt_targets
+  # under the same plain linux/<arch> key as the full build, which stays in
+  # targets. Every "targets" key is therefore a plain "os/arch" key that a
+  # v0.5.x agent's parser accepts (a "+openwrt" key there would make it reject
+  # the whole manifest); openwrt_targets is an unknown field to it and is
+  # ignored. Both entries extract the same single member, the raw gz stream of
+  # the binary, exactly like the agent entry.
+  - name: xray
+    version: "0.6.0"
+    license: {spdx: MIT}
+    capabilities:
+      reload: hot
+      stats: counters
+      service: true
+    run:
+      binary: W1nCray-xray
+      version_cmd: ["version"]
+      version_regex: "W1nCray-xray v?([0-9][0-9.]*)"
+    mirrors: ["https://<mirror>/W1nCray-xray/{version}/{asset}"]
+    local:
+      - {file: dist/W1nCray-xray-linux-amd64.gz,         target: linux/amd64,    to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-amd64-lite.gz,    target: linux/amd64,    to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+      - {file: dist/W1nCray-xray-linux-386.gz,           target: linux/386,      to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-386-lite.gz,      target: linux/386,      to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-arm64.gz,         target: linux/arm64,    to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-arm64-lite.gz,    target: linux/arm64,    to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+      - {file: dist/W1nCray-xray-linux-armv7.gz,         target: linux/armv7,    to: W1nCray-xray, variant: hardfloat}
+      - {file: dist/W1nCray-xray-linux-armv7-lite.gz,    target: linux/armv7,    to: W1nCray-xray, variant: "hardfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-armv6.gz,         target: linux/armv6,    to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-armv6-lite.gz,    target: linux/armv6,    to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-armv5.gz,         target: linux/armv5,    to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-armv5-lite.gz,    target: linux/armv5,    to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mips.gz,          target: linux/mips,     to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mips-lite.gz,     target: linux/mips,     to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mipsle.gz,        target: linux/mipsle,   to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mipsle-lite.gz,   target: linux/mipsle,   to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mips64.gz,        target: linux/mips64,   to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mips64-lite.gz,   target: linux/mips64,   to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mips64le.gz,      target: linux/mips64le, to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mips64le-lite.gz, target: linux/mips64le, to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-riscv64.gz,       target: linux/riscv64,  to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-riscv64-lite.gz,  target: linux/riscv64,  to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+      - {file: dist/W1nCray-xray-linux-loong64.gz,       target: linux/loong64,  to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-loong64-lite.gz,  target: linux/loong64,  to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+
+  # A second Xray kernel version is what exercises upgrade/rollback against a
+  # real older build. There is no such build in this tree (release/build.sh
+  # always produces the current version), so the entry is a documented
+  # placeholder rather than an active one: uncomment it after building the old
+  # tag into dist/old/ (for example with `git worktree add /tmp/w1n-v059 v0.5.9`
+  # and `bash release/build.sh v0.5.9` there), and edit the file paths. Do not
+  # point it at the current dist/ files: the agent's version self-check would
+  # then reject the install, because the binary would report 0.6.0.
+  #
+  # - name: xray
+  #   version: "0.5.9"
+  #   license: {spdx: MIT}
+  #   capabilities: {reload: hot, stats: counters, service: true}
+  #   run:
+  #     binary: W1nCray-xray
+  #     version_cmd: ["version"]
+  #     version_regex: "W1nCray-xray v?([0-9][0-9.]*)"
+  #   mirrors: ["https://<mirror>/W1nCray-xray/{version}/{asset}"]
+  #   local:
+  #     - {file: dist/old/W1nCray-xray-linux-amd64.gz,      target: linux/amd64, to: W1nCray-xray}
+  #     - {file: dist/old/W1nCray-xray-linux-amd64-lite.gz, target: linux/amd64, to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+  #     # ... the other architectures ...
+
+  # ---------------------------------------------------------------- gost
+  # 3.2.x, kept so a machine on 3.2.6 can be upgraded to 3.3.0 and rolled back.
+  - name: gost
+    version: "3.2.6"
+    repo: go-gost/gost
+    license: {spdx: MIT, file: LICENSE}
+    capabilities:
+      reload: api
+      stats: prometheus
+      tunnels: ws,wss,mws,tls,kcp,quic,h2,grpc
+      disrupts_on_change: unverified
+    run: {binary: gost, version_cmd: ["-V"]}
+    checksums: {asset: checksums.txt}
+    extract:
+      - {from: gost, to: gost}
+    targets:
+      linux/386:      {asset: gost_3.2.6_linux_386.tar.gz, variant: sse2}   # upstream does not set GO386=softfloat
+      linux/amd64:    {asset: gost_3.2.6_linux_amd64.tar.gz}
+      linux/arm64:    {asset: gost_3.2.6_linux_arm64.tar.gz}
+      linux/armv5:    {asset: gost_3.2.6_linux_armv5.tar.gz}
+      linux/armv6:    {asset: gost_3.2.6_linux_armv6.tar.gz}
+      linux/armv7:    {asset: gost_3.2.6_linux_armv7.tar.gz}
+      linux/loong64:  {asset: gost_3.2.6_linux_loong64.tar.gz}
+      linux/mips:     {asset: gost_3.2.6_linux_mips_softfloat.tar.gz, variant: softfloat}
+      linux/mipsle:   {asset: gost_3.2.6_linux_mipsle_softfloat.tar.gz, variant: softfloat}
+      linux/mips64:   {asset: gost_3.2.6_linux_mips64_hardfloat.tar.gz, variant: hardfloat}
+      linux/mips64le: {asset: gost_3.2.6_linux_mips64le_hardfloat.tar.gz, variant: hardfloat}
+      linux/riscv64:  {asset: gost_3.2.6_linux_riscv64.tar.gz}
+
+  - name: gost
+    version: "3.3.0"
+    repo: go-gost/gost
+    license: {spdx: MIT, file: LICENSE}
+    capabilities:
+      reload: api
+      stats: prometheus
+      tunnels: ws,wss,mws,tls,kcp,quic,h2,grpc
+      disrupts_on_change: unverified
+    run: {binary: gost, version_cmd: ["-V"]}
+    checksums: {asset: checksums.txt}
+    extract:
+      - {from: gost, to: gost}
+    targets:
+      linux/386:      {asset: gost_3.3.0_linux_386.tar.gz, variant: sse2}
+      linux/amd64:    {asset: gost_3.3.0_linux_amd64.tar.gz}
+      linux/arm64:    {asset: gost_3.3.0_linux_arm64.tar.gz}
+      linux/armv5:    {asset: gost_3.3.0_linux_armv5.tar.gz}
+      linux/armv6:    {asset: gost_3.3.0_linux_armv6.tar.gz}
+      linux/armv7:    {asset: gost_3.3.0_linux_armv7.tar.gz}
+      linux/loong64:  {asset: gost_3.3.0_linux_loong64.tar.gz}
+      linux/mips:     {asset: gost_3.3.0_linux_mips_softfloat.tar.gz, variant: softfloat}
+      linux/mipsle:   {asset: gost_3.3.0_linux_mipsle_softfloat.tar.gz, variant: softfloat}
+      linux/mips64:   {asset: gost_3.3.0_linux_mips64_hardfloat.tar.gz, variant: hardfloat}
+      linux/mips64le: {asset: gost_3.3.0_linux_mips64le_hardfloat.tar.gz, variant: hardfloat}
+      linux/riscv64:  {asset: gost_3.3.0_linux_riscv64.tar.gz}
+
+  # --------------------------------------------------------------- realm
+  # Only the non-slim musl builds: slim lacks PROXY protocol, LB and ws.
+  - name: realm
+    version: "2.9.5"
+    repo: zhboner/realm
+    license: {spdx: MIT, file: LICENSE}
+    capabilities:
+      reload: none
+      stats: none
+      disrupts_on_change: true
+    run: {binary: realm, version_cmd: ["-v"]}
+    extract:
+      - {from: realm, to: realm}
+    targets:
+      linux/386:      null
+      linux/amd64:    {asset: realm-x86_64-unknown-linux-musl.tar.gz, variant: musl-full}
+      linux/arm64:    {asset: realm-aarch64-unknown-linux-musl.tar.gz, variant: musl-full}
+      linux/armv5:    null
+      linux/armv6:    {asset: realm-arm-unknown-linux-musleabihf.tar.gz, variant: musl-full}
+      linux/armv7:    {asset: realm-armv7-unknown-linux-musleabihf.tar.gz, variant: musl-full}
+      linux/loong64:  null
+      linux/mips:     {asset: realm-mips-unknown-linux-musl.tar.gz, variant: "musl-full softfloat"}
+      linux/mipsle:   {asset: realm-mipsel-unknown-linux-musl.tar.gz, variant: "musl-full softfloat"}
+      linux/mips64:   {asset: realm-mips64-unknown-linux-muslabi64.tar.gz, variant: "musl-full hardfloat"}
+      linux/mips64le: {asset: realm-mips64el-unknown-linux-muslabi64.tar.gz, variant: "musl-full hardfloat"}
+      linux/riscv64:  null
+
+  - name: realm
+    version: "2.9.6"
+    repo: zhboner/realm
+    license: {spdx: MIT, file: LICENSE}
+    capabilities:
+      reload: none
+      stats: none
+      disrupts_on_change: true
+    run: {binary: realm, version_cmd: ["-v"]}
+    extract:
+      - {from: realm, to: realm}
+    targets:
+      linux/386:      null
+      linux/amd64:    {asset: realm-x86_64-unknown-linux-musl.tar.gz, variant: musl-full}
+      linux/arm64:    {asset: realm-aarch64-unknown-linux-musl.tar.gz, variant: musl-full}
+      linux/armv5:    null
+      linux/armv6:    {asset: realm-arm-unknown-linux-musleabihf.tar.gz, variant: musl-full}
+      linux/armv7:    {asset: realm-armv7-unknown-linux-musleabihf.tar.gz, variant: musl-full}
+      linux/loong64:  null
+      linux/mips:     {asset: realm-mips-unknown-linux-musl.tar.gz, variant: "musl-full softfloat"}
+      linux/mipsle:   {asset: realm-mipsel-unknown-linux-musl.tar.gz, variant: "musl-full softfloat"}
+      linux/mips64:   {asset: realm-mips64-unknown-linux-muslabi64.tar.gz, variant: "musl-full hardfloat"}
+      linux/mips64le: {asset: realm-mips64el-unknown-linux-muslabi64.tar.gz, variant: "musl-full hardfloat"}
+      linux/riscv64:  null
+
+  # ----------------------------------------------------------------- frp
+  # frpc and frps ship in one archive; the version check runs frpc.
+  - name: frp
+    version: "0.70.0"
+    repo: fatedier/frp
+    license: {spdx: Apache-2.0, file: LICENSE}
+    capabilities:
+      reverse: true
+      proxy_protocol_in: false
+    run: {binary: frpc, version_cmd: ["-v"]}
+    checksums: {asset: frp_sha256_checksums.txt}
+    extract:
+      - {from: "{asset_base}/frpc", to: frpc}
+      - {from: "{asset_base}/frps", to: frps}
+    targets:
+      linux/386:      null
+      linux/amd64:    {asset: frp_0.70.0_linux_amd64.tar.gz}
+      linux/arm64:    {asset: frp_0.70.0_linux_arm64.tar.gz}
+      linux/armv5:    {asset: frp_0.70.0_linux_arm.tar.gz}
+      linux/armv6:    null
+      linux/armv7:    {asset: frp_0.70.0_linux_arm_hf.tar.gz}
+      linux/loong64:  {asset: frp_0.70.0_linux_loong64.tar.gz}
+      linux/mips:     {asset: frp_0.70.0_linux_mips.tar.gz, variant: softfloat}
+      linux/mipsle:   {asset: frp_0.70.0_linux_mipsle.tar.gz, variant: softfloat}
+      linux/mips64:   {asset: frp_0.70.0_linux_mips64.tar.gz, variant: hardfloat}
+      linux/mips64le: {asset: frp_0.70.0_linux_mips64le.tar.gz, variant: hardfloat}
+      linux/riscv64:  {asset: frp_0.70.0_linux_riscv64.tar.gz}
+
+  - name: frp
+    version: "0.71.0"
+    repo: fatedier/frp
+    license: {spdx: Apache-2.0, file: LICENSE}
+    capabilities:
+      reverse: true
+      proxy_protocol_in: false
+    run: {binary: frpc, version_cmd: ["-v"]}
+    checksums: {asset: frp_sha256_checksums.txt}
+    extract:
+      - {from: "{asset_base}/frpc", to: frpc}
+      - {from: "{asset_base}/frps", to: frps}
+    targets:
+      linux/386:      null
+      linux/amd64:    {asset: frp_0.71.0_linux_amd64.tar.gz}
+      linux/arm64:    {asset: frp_0.71.0_linux_arm64.tar.gz}
+      linux/armv5:    {asset: frp_0.71.0_linux_arm.tar.gz}
+      linux/armv6:    null
+      linux/armv7:    {asset: frp_0.71.0_linux_arm_hf.tar.gz}
+      linux/loong64:  {asset: frp_0.71.0_linux_loong64.tar.gz}
+      linux/mips:     {asset: frp_0.71.0_linux_mips.tar.gz, variant: softfloat}
+      linux/mipsle:   {asset: frp_0.71.0_linux_mipsle.tar.gz, variant: softfloat}
+      linux/mips64:   {asset: frp_0.71.0_linux_mips64.tar.gz, variant: hardfloat}
+      linux/mips64le: {asset: frp_0.71.0_linux_mips64le.tar.gz, variant: hardfloat}
+      linux/riscv64:  {asset: frp_0.71.0_linux_riscv64.tar.gz}

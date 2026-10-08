@@ -158,7 +158,7 @@ func runSplit(configPath string, opts linkOptions, out io.Writer) error {
 
 	baseline := map[string]bool{}
 	if !opts.SkipCheck {
-		for _, f := range checkConfigFailures(configPath) {
+		for _, f := range checkConfigFailures(configPath, out) {
 			baseline[linkFailureKey(f, configPath)] = true
 		}
 	}
@@ -178,7 +178,7 @@ func runSplit(configPath string, opts linkOptions, out io.Writer) error {
 
 	if !opts.SkipCheck {
 		var added []string
-		for _, f := range dedupeFailures(checkConfigFailures(configPath)) {
+		for _, f := range dedupeFailures(checkConfigFailures(configPath, out)) {
 			if !baseline[linkFailureKey(f, configPath)] {
 				added = append(added, f)
 			}

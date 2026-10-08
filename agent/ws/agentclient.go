@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
@@ -37,10 +38,94 @@ const capabilityReconnectThrottle = 30 * time.Second
 // (docs/WS-PROTOCOL.md section 7 ruling 7), so the Agent then sends nothing.
 var ErrAnswered = errors.New("ws: command already answered")
 
-// eventQueueSize is how many local events may wait for a connection. Events are
-// best effort: when the queue is full the oldest are simply lost, which is
-// correct for live data that is never replayed.
+// eventQueueSize is the hand-off buffer between the event producers (the
+// runtime, the dispatcher) and the sender goroutine. It is deliberately small:
+// the sender drains it into the eventBacklog below, which is what survives a
+// missing session.
 const eventQueueSize = 16
+
+// pendingEventLimit caps how many event frames may wait for a session. Events
+// are the one stream that is replayed after a reconnect (docs/WS-PROTOCOL.md
+// section 7 ruling 14): a rollback reported by a process that has not
+// handshaken yet must still reach the panel. Beyond the limit the oldest frame
+// is dropped and counted, so a long outage cannot grow the agent without bound.
+const pendingEventLimit = 64
+
+// maxEventSendAttempts bounds the retries of one queued event. A frame whose
+// send fails is retried on the next flush; after this many failed attempts it
+// is dropped, so a single dead frame can never stall every later event.
+const maxEventSendAttempts = 3
+
+// pendingEvent is one event frame waiting for a session, with the number of
+// failed send attempts it already cost.
+type pendingEvent struct {
+	env      wsproto.Envelope
+	attempts int
+}
+
+// eventBacklog is the sender's bounded queue of event frames that could not be
+// delivered yet: no session is up, or the send failed. Only the sender
+// goroutine touches items, so it needs no lock; dropped is atomic because
+// DroppedEvents reads it from another goroutine.
+type eventBacklog struct {
+	limit   int
+	maxTry  int
+	items   []pendingEvent
+	dropped atomic.Int64
+}
+
+func newEventBacklog() *eventBacklog {
+	return &eventBacklog{limit: pendingEventLimit, maxTry: maxEventSendAttempts}
+}
+
+// push queues env for the next session. When the backlog is full the oldest
+// frame is evicted (the freshest event is the useful one) and returned so the
+// caller can log it; the eviction is counted.
+func (b *eventBacklog) push(env wsproto.Envelope) (evicted *wsproto.Envelope) {
+	if b.limit <= 0 {
+		return nil
+	}
+	if len(b.items) >= b.limit {
+		old := b.items[0].env
+		evicted = &old
+		b.items = b.items[1:]
+		b.dropped.Add(1)
+	}
+	b.items = append(b.items, pendingEvent{env: env})
+	return evicted
+}
+
+// flush sends queued frames in order until the backlog is empty or a send
+// fails. A failed frame keeps its place at the head and is retried on the next
+// flush; after maxTry failures it is dropped (returned) and counted, so one
+// frame whose send keeps failing cannot block the queue forever.
+func (b *eventBacklog) flush(send func(wsproto.Envelope) bool) (dropped []wsproto.Envelope) {
+	for len(b.items) > 0 {
+		it := b.items[0]
+		if send(it.env) {
+			b.items = b.items[1:]
+			continue
+		}
+		it.attempts++
+		if b.maxTry > 0 && it.attempts >= b.maxTry {
+			dropped = append(dropped, it.env)
+			b.dropped.Add(1)
+			b.items = b.items[1:]
+			continue
+		}
+		b.items[0] = it
+		return dropped
+	}
+	return dropped
+}
+
+// length is the number of frames waiting for a session.
+func (b *eventBacklog) length() int {
+	if b == nil {
+		return 0
+	}
+	return len(b.items)
+}
 
 // Streams is what the WS layer needs from the agent runtime. bootstrap
 // implements it; the interface keeps ws free of bootstrap/panel imports.
@@ -140,6 +225,13 @@ type Agent struct {
 
 	events chan wsproto.Envelope
 
+	// backlog holds event frames that could not be delivered yet: the session
+	// is not up, or a send failed. It is replayed in order once a session
+	// starts, so an event produced before the handshake (the watchdog's
+	// self_update.rolled_back) is not lost. Only the sender goroutine touches
+	// it.
+	backlog *eventBacklog
+
 	// wake tells the sender that a new session started, so the first telemetry
 	// frame is sent immediately instead of waiting for a tick.
 	wake chan struct{}
@@ -183,6 +275,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		instanceID: a.InstanceID,
 		version:    a.AgentVersion,
 		events:     make(chan wsproto.Envelope, eventQueueSize),
+		backlog:    newEventBacklog(),
 		wake:       make(chan struct{}, 1),
 		telemetry:  time.Duration(DefaultTelemetryIntervalS) * time.Second,
 		comp:       time.Duration(DefaultComponentsIntervalS) * time.Second,
@@ -258,9 +351,21 @@ func (a *Agent) Run(ctx context.Context) error {
 	return err
 }
 
-// SendEvent pushes an "event" frame (best effort; dropped when offline).
+// SendEvent pushes an "event" frame. An event produced while no session is up
+// is buffered (bounded) and replayed in order after the next handshake; only
+// overflow beyond the backlog limit is dropped.
 func (a *Agent) SendEvent(kind, level, message string) {
 	a.queueEvent(kind, level, message)
+}
+
+// DroppedEvents reports how many event frames the sender has given up on:
+// evicted because the backlog was full, or dropped after too many failed
+// sends. A delivered frame is never counted.
+func (a *Agent) DroppedEvents() int64 {
+	if a.backlog == nil {
+		return 0
+	}
+	return a.backlog.dropped.Load()
 }
 
 // queueEvent encodes a local event and hands it to the sender. It never blocks
@@ -278,9 +383,48 @@ func (a *Agent) queueEvent(kind, level, message string) {
 	select {
 	case a.events <- env:
 	default:
-		// Best effort: events are live data and are not replayed.
-		a.logf().Debugf("ws: dropping event %s (queue full)", kind)
+		// The sender is behind by a whole hand-off buffer: this frame is lost.
+		// The backlog itself is bounded and counts its own drops; this path is
+		// only reachable when the sender goroutine is not draining at all.
+		a.logf().Warnf("ws: dropping event %s (sender is behind)", kind)
 	}
+}
+
+// enqueueEvent moves one event frame into the backlog that survives a missing
+// session. It replaces the old "consume and drop while offline" behaviour that
+// lost the watchdog's self_update.rolled_back (REG3-2).
+func (a *Agent) enqueueEvent(env wsproto.Envelope) {
+	if a.backlog == nil {
+		return
+	}
+	if evicted := a.backlog.push(env); evicted != nil {
+		a.logf().Warnf("ws: event backlog full (%d), dropping oldest event %s",
+			a.backlog.limit, eventKind(*evicted))
+	}
+}
+
+// flushEvents replays the backlog, in order, now that a session is up. A frame
+// whose send fails keeps its place and is retried on the next flush; one that
+// exhausts maxEventSendAttempts is dropped with a warning and counted.
+func (a *Agent) flushEvents() {
+	if a.backlog == nil {
+		return
+	}
+	for _, env := range a.backlog.flush(a.sendOrDrop) {
+		a.logf().Warnf("ws: dropping event %s after %d failed sends",
+			eventKind(env), a.backlog.maxTry)
+	}
+}
+
+// eventKind reads the kind out of an encoded event frame for a log line.
+func eventKind(env wsproto.Envelope) string {
+	var body struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(env.D, &body); err == nil && body.Kind != "" {
+		return body.Kind
+	}
+	return env.T
 }
 
 // hello builds the first frame of a connection.
@@ -445,8 +589,10 @@ func (a *Agent) intervals() (telemetry, comp time.Duration) {
 }
 
 // sender drives the telemetry and components cadence and flushes queued
-// events. It only runs while a session is up: before hello.ok there is no
-// cadence, and after a disconnect there is nobody to send to.
+// events. Telemetry and components only go out while a session is up; events
+// are different: a frame that cannot be delivered (no session, or a send that
+// failed) waits in the bounded backlog and is replayed, in order, once a
+// session starts.
 func (a *Agent) sender(ctx context.Context) {
 	var (
 		session   string
@@ -462,12 +608,10 @@ func (a *Agent) sender(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-a.wake:
-			// A session started: the check below adopts the cadence and sends
-			// the first frames right away.
+			// A session started: the check below adopts the cadence, sends
+			// the first frames right away and replays the event backlog.
 		case env := <-a.events:
-			if a.client.Connected() {
-				a.sendOrDrop(env)
-			}
+			a.enqueueEvent(env)
 		case <-telemetry.C:
 			if !a.client.Connected() {
 				continue
@@ -499,6 +643,13 @@ func (a *Agent) sender(ctx context.Context) {
 			lastComp = a.sendComponents(ctx)
 		} else if cur == "" {
 			session = ""
+		}
+
+		// Events that could not be delivered are replayed here, in order, on
+		// the first iteration of a session. While offline this is skipped, so
+		// the backlog keeps growing (bounded) instead of losing frames.
+		if a.client.Connected() {
+			a.flushEvents()
 		}
 
 		// The capability set is not static: a signed kernel manifest arriving

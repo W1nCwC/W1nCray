@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/selinux"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 	"github.com/W1nCwC/W1nCray/kernel/manifest"
@@ -47,6 +48,9 @@ type Options struct {
 	// lets RunningVersion tell which version is really executing. Empty
 	// disables the check: "in use" then falls back to the current pointer.
 	PIDDir string
+	// Labeler applies the bin_t label to the kernel tree on an SELinux
+	// machine. Nil disables labelling.
+	Labeler *selinux.Labeler
 	// Log receives installer events.
 	Log driver.Logger
 }
@@ -57,6 +61,8 @@ type Ensurer struct {
 	// pidDir and kernelsRoot resolve "which version is running" (inuse.go).
 	pidDir      string
 	kernelsRoot string
+	labeler     *selinux.Labeler
+	log         driver.Logger
 }
 
 var _ interface {
@@ -93,6 +99,8 @@ func New(o Options) (*Ensurer, error) {
 		pidDir: o.PIDDir,
 		// install.New keeps its kernels under <Dir>/kernels (install.go:131).
 		kernelsRoot: filepath.Join(root, "kernels"),
+		labeler:     o.Labeler,
+		log:         o.Log,
 	}
 	if o.ManifestPath != "" {
 		raw, err := os.ReadFile(o.ManifestPath)
@@ -158,7 +166,35 @@ func (e *Ensurer) ManifestSequence() (int64, bool) {
 
 // Ensure makes the pinned kernel installed and current. An empty pin.Version
 // selects the highest version the manifest lists as available on this machine.
+//
+// After a successful install it also applies the SELinux bin_t label to the
+// kernel tree. That step is best effort here (a machine with SELinux off, or
+// without the labelling tools, is a no-op) because the service manager labels
+// again — and fails loudly — right before it starts a kernel.
 func (e *Ensurer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	inst, err := e.ensure(ctx, pin, false)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(ctx)
+	return inst, nil
+}
+
+// EnsureForce is Ensure for an operator-initiated install (the panel's
+// kernel_install): it bypasses and clears the automatic retry back-off, so a
+// version an operator explicitly asks for after a rollback is really attempted
+// (D-M3). The reconcile loop keeps using Ensure and its back-off.
+func (e *Ensurer) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	inst, err := e.ensure(ctx, pin, true)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(ctx)
+	return inst, nil
+}
+
+// ensure is Ensure/EnsureForce without the labelling step.
+func (e *Ensurer) ensure(ctx context.Context, pin spec.KernelPin, force bool) (driver.Installed, error) {
 	if pin.Version == "" {
 		v, err := e.defaultVersion(pin.Name)
 		if err != nil {
@@ -166,7 +202,30 @@ func (e *Ensurer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Instal
 		}
 		pin.Version = v
 	}
+	if force {
+		return e.in.EnsureForce(ctx, pin)
+	}
 	return e.in.Ensure(ctx, pin)
+}
+
+// LabelKernels makes every installed kernel binary of this machine bin_t, so
+// an init system with SELinux enforcing starts them in unconfined_service_t
+// instead of init_t (agent/selinux). It is what xraysvc calls before it starts
+// the Xray service, and it is idempotent.
+func (e *Ensurer) LabelKernels(ctx context.Context) error {
+	if e == nil || e.labeler == nil {
+		return nil
+	}
+	return e.labeler.EnsureBinT(ctx, e.kernelsRoot)
+}
+
+// labelBestEffort labels the kernel tree and only logs a failure: the install
+// itself succeeded, and the caller that starts a kernel reports the real
+// problem with a much better message.
+func (e *Ensurer) labelBestEffort(ctx context.Context) {
+	if err := e.LabelKernels(ctx); err != nil && e.log != nil {
+		e.log.Warnf("kernel: SELinux 标签设置失败: %v", err)
+	}
 }
 
 // defaultVersion is the newest available version of a kernel in the manifest.

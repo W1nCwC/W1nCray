@@ -154,6 +154,7 @@ func New(cfg Config) (*Installer, error) {
 			in.logf("kernel: stored manifest rejected: %v", err)
 		} else {
 			in.man = m
+			in.logIgnoredTargets(m)
 		}
 	}
 	return in, nil
@@ -164,6 +165,20 @@ func (in *Installer) now() time.Time { return in.cfg.Now() }
 func (in *Installer) logf(format string, args ...any) {
 	if in.cfg.Log != nil {
 		in.cfg.Log.Infof(format, args...)
+	}
+}
+
+// logIgnoredTargets surfaces the forward-compatible target keys Validate
+// accepted but never selects (a "os/arch+<unknown suffix>" key from a newer
+// manifest). They are not an error, but an operator should see them: a kernel
+// whose only build is such a key is unavailable here.
+func (in *Installer) logIgnoredTargets(m *manifest.Manifest) {
+	rep, err := m.ValidateReport()
+	if err != nil {
+		return
+	}
+	for _, n := range rep.IgnoredTargets {
+		in.logf("kernel: manifest sequence %d: ignoring target %s %s: %s", m.Sequence, n.Kernel, n.Key, n.Reason)
 	}
 }
 
@@ -208,6 +223,7 @@ func (in *Installer) LoadManifest(raw []byte) error {
 		}
 	}
 	in.man = m
+	in.logIgnoredTargets(m)
 	return nil
 }
 
@@ -231,22 +247,35 @@ func manifestNameRe(n string) bool {
 }
 
 // selectTarget picks the first usable build among the platform's candidate
-// keys. The error distinguishes explicit null, absent and incompatible.
+// (field, key) pairs. On OpenWrt that is openwrt_targets[os/arch], then the
+// legacy targets[os/arch+openwrt], then targets[os/arch]; elsewhere only
+// targets[os/arch] is ever read. The returned key is the plain platform key.
+// The error distinguishes explicit null, absent and incompatible.
 func (in *Installer) selectTarget(k *manifest.Kernel) (string, *manifest.Target, error) {
 	var notes []string
-	for _, key := range in.plat.Keys() {
-		t, st := k.Lookup(key)
+	for _, c := range in.plat.Candidates() {
+		var (
+			t     *manifest.Target
+			st    manifest.TargetState
+			where = c.Key
+		)
+		if c.Source == platform.OpenWrtTargetsField {
+			t, st = k.LookupOpenWrt(c.Key)
+			where = "openwrt_targets[" + c.Key + "]"
+		} else {
+			t, st = k.Lookup(c.Key)
+		}
 		switch st {
 		case manifest.TargetPresent:
 			if err := in.plat.Compatible(t.Variant); err != nil {
-				notes = append(notes, key+": "+err.Error())
+				notes = append(notes, where+": "+err.Error())
 				continue
 			}
-			return key, t, nil
+			return c.Base, t, nil
 		case manifest.TargetNull:
-			notes = append(notes, key+": no build exists (null)")
+			notes = append(notes, where+": no build exists (null)")
 		default:
-			notes = append(notes, key+": not listed")
+			notes = append(notes, where+": not listed")
 		}
 	}
 	e := kernel.Newf(kernel.ErrUnavailable, k.Name, k.Version, "%v", notes)
@@ -298,8 +327,24 @@ func (in *Installer) resolve(name, version string) (*manifest.Kernel, string, *m
 // self-checks the binary and switches atomically; the previous version is
 // kept. Any failure leaves the previously current version untouched and is
 // remembered with exponential back-off. Errors wrap the kinds in package
-// kernel (ErrUnavailable, ErrNoSpace, ErrVerify, ErrRevoked, ...).
+// kernel (ErrUnavailable, ErrNoSpace, ErrVerify, ErrRevoked, ...). An
+// operator-initiated install uses EnsureForce instead: the back-off constrains
+// the automatic retries only (D-M3).
 func (in *Installer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return in.ensure(ctx, pin, false)
+}
+
+// EnsureForce is Ensure for an operator-initiated install: it bypasses the
+// retry back-off and clears the failure record first, so an administrator who
+// explicitly asks for a version after a rollback (or a failed automatic
+// attempt) is never refused by a timer meant for automatic retries (D-M3). A
+// failure of the forced attempt starts a fresh back-off, so the automatic path
+// still backs off.
+func (in *Installer) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.Installed, error) {
+	return in.ensure(ctx, pin, true)
+}
+
+func (in *Installer) ensure(ctx context.Context, pin spec.KernelPin, force bool) (driver.Installed, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 
@@ -307,6 +352,12 @@ func (in *Installer) Ensure(ctx context.Context, pin spec.KernelPin) (driver.Ins
 	k, key, t, err := in.resolve(name, version)
 	if err != nil {
 		return driver.Installed{}, err
+	}
+	if force {
+		// The operator's explicit request wins over the automatic back-off:
+		// the record is dropped so the attempt runs, and a fresh failure
+		// records a fresh count (recordFailure below).
+		in.clearFailure(name, version)
 	}
 	if mk := in.readMarker(name, version); mk != nil && mk.ArchiveSHA256 == t.ArchiveSHA256 && in.filesIntact(name, version, t) {
 		if err := in.activate(name, version); err != nil {
@@ -411,12 +462,8 @@ func sumExtract(t *manifest.Target) int64 {
 // has already been matched against t.ArchiveSHA256.
 func (in *Installer) installArchive(ctx context.Context, k *manifest.Kernel, key string, t *manifest.Target, archivePath string) (err error) {
 	name, version := k.Name, k.Version
-	if err := os.MkdirAll(in.partialDir(name), privDir); err != nil {
-		return err
-	}
-	stage := filepath.Join(in.partialDir(name), "stage-"+version)
-	_ = os.RemoveAll(stage)
-	if err := os.MkdirAll(stage, dirMode); err != nil {
+	stage, err := in.newStage(name, version)
+	if err != nil {
 		return err
 	}
 	defer func() {
@@ -437,6 +484,30 @@ func (in *Installer) installArchive(ctx context.Context, k *manifest.Kernel, key
 	if err := in.selfCheck(check, filepath.Join(stage, k.Run.Binary), k); err != nil {
 		return err
 	}
+	return in.commit(stage, k, key, t)
+}
+
+// newStage creates an empty staging directory for name@version under the
+// kernel's .partial area. The caller removes it on failure.
+func (in *Installer) newStage(name, version string) (string, error) {
+	if err := os.MkdirAll(in.partialDir(name), privDir); err != nil {
+		return "", err
+	}
+	stage := filepath.Join(in.partialDir(name), "stage-"+version)
+	_ = os.RemoveAll(stage)
+	if err := os.MkdirAll(stage, dirMode); err != nil {
+		return "", err
+	}
+	return stage, nil
+}
+
+// commit writes the installation marker into stage and atomically switches
+// <name>/<version> to it, keeping the version that was current as previous.
+// It is the shared tail of a manifest install and a local install: the two
+// produce byte-for-byte the same on-disk layout, so list/upgrade/rollback/
+// remove treat them identically.
+func (in *Installer) commit(stage string, k *manifest.Kernel, key string, t *manifest.Target) (err error) {
+	name, version := k.Name, k.Version
 	mk := marker{
 		Name: name, Version: version, Target: key, Variant: t.Variant, Binary: k.Run.Binary,
 		ArchiveSHA256: t.ArchiveSHA256, InstalledAt: in.now().UTC(),
@@ -497,6 +568,10 @@ func (in *Installer) installArchive(ctx context.Context, k *manifest.Kernel, key
 	}
 	// Re-check from the final location: catches noexec mounts and anything
 	// that differs between staging and the real path.
+	check := in.cfg.Check
+	if check == nil {
+		check = DefaultCheck(k.Run)
+	}
 	if err := in.selfCheck(check, filepath.Join(final, k.Run.Binary), k); err != nil {
 		revert()
 		return err

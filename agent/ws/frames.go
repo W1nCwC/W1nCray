@@ -13,9 +13,12 @@
 //     reason (docs/WS-PROTOCOL.md section 1);
 //   - one goroutine reads and one goroutine writes a connection (gorilla
 //     forbids concurrent writers), so a slow panel can never interleave frames;
-//   - the outbound queue belongs to a connection: nothing is buffered while
-//     offline and nothing is resent after a reconnect (docs/WS-PROTOCOL.md
-//     section 7 ruling 3).
+//   - the outbound queue belongs to a connection: telemetry and components are
+//     not buffered while offline and are not resent after a reconnect
+//     (docs/WS-PROTOCOL.md section 7 ruling 3). Events are the documented
+//     exception (ruling 14): the Agent keeps a bounded backlog and replays it,
+//     in order, once a session starts, so a frame produced before the
+//     handshake (the watchdog's self_update.rolled_back) reaches the panel.
 package ws
 
 import (

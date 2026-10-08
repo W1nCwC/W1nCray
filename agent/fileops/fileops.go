@@ -1,23 +1,30 @@
-// Package fileops is the agent's confined file manager (PLAN v9 D9 / WP-G6).
+// Package fileops is the agent's confined file manager (PLAN v9 D9 / WP-G6,
+// extended by PLAN v10).
 //
 // Every file_* command goes through Ops.Resolve first: it is the only place
 // that turns a (root, path) pair from the panel into a real path. The rules are
 // deliberately strict, because the panel is a remote caller:
 //
 //   - a path must be relative, must not contain a ".." or "\" segment, and must
-//     not be absolute;
+//     not be absolute — unless the machine is Unrestricted, where the path must
+//     be absolute and the root argument is ignored (PLAN v10: a machine whose
+//     terminal is on has a root shell anyway);
 //   - every path segment is checked with Lstat and opened with O_NOFOLLOW, so a
 //     symlink anywhere along the way is refused instead of being followed;
-//   - the target must be a regular file (or a directory, for file_list): FIFOs,
-//     devices, sockets and symlinks are refused;
+//   - the target must be a regular file (or a directory, for file_list and
+//     file_mkdir): FIFOs, devices, sockets and symlinks are refused;
 //   - the resolved path must sit inside the named root and must not be one of
 //     the agent's own files (agent.yml, desired.json, last_good.json), which
 //     are never reachable even when a root contains them;
 //   - file_write never writes an executable bit unless the local policy sets
-//     Files.AllowExec, and never a setuid/setgid/sticky bit;
+//     Files.AllowExec, and never a setuid/setgid/sticky bit; file_mkdir allows
+//     only 0700/0750/0755, because the directory's executable bit is what makes
+//     it searchable;
 //   - file_read and file_write are bounded by MaxRead/MaxWrite (128 KiB by
 //     default: the contract's frame limit, docs/WS-PROTOCOL.md section 7
-//     ruling 8).
+//     ruling 8). file_write append=true adds one bounded chunk to an existing
+//     file, which is how a file larger than one frame is uploaded;
+//   - file_rename never overwrites an existing target.
 //
 // Known limitation (design section 3.9): the os package has no openat, so
 // between the Lstat check and the open there is a small TOCTOU window. The
@@ -68,6 +75,8 @@ var (
 	ErrHashMismatch = errors.New("sha256 mismatch")
 	ErrUnknownRoot  = errors.New("unknown file root")
 	ErrNoRoots      = errors.New("no file root is configured")
+	ErrExists       = errors.New("the target already exists")
+	ErrNotExist     = errors.New("the file does not exist")
 )
 
 // Root is one managed directory. Name is the short label the panel sends
@@ -79,13 +88,17 @@ type Root struct {
 
 // Options configures the file operations.
 type Options struct {
-	// Roots are the only directories the panel may reach. At least one is
-	// required for the file_* commands to exist at all.
+	// Roots are the directories the panel may reach in confined mode. A
+	// machine with no root at all still gets the file_* commands when it is
+	// unrestricted (see Unrestricted); otherwise at least one is required.
 	Roots []Root
 	// Unrestricted skips the root lookup: the panel may name an absolute path
-	// or one with "..". It is a local-only switch (Files.Unrestricted) and the
-	// symlink, regular-file and size rules still apply.
-	Unrestricted bool
+	// (the root argument is ignored) and any ".." in it is resolved lexically.
+	// It is the materialised Files.Unrestricted tri-state (agentcfg resolves
+	// "not written" against the terminal gate before the options are built):
+	// nil means restricted, so a caller that forgets to set it gets the safe
+	// behaviour. The symlink, regular-file and size rules still apply.
+	Unrestricted *bool
 	// AllowExec permits writing the executable bit. Default false: a panel that
 	// can drop an executable into a directory root runs is a remote code
 	// execution path (design section 6.9).
@@ -105,6 +118,10 @@ type Options struct {
 	// temp directory sits under /tmp or /var; production code never sets it.
 	testAllowSystemRoot bool
 }
+
+// IsUnrestricted reports whether the roots lookup is skipped. A nil pointer
+// (the option was never set) is restricted, never unrestricted.
+func (o Options) IsUnrestricted() bool { return o.Unrestricted != nil && *o.Unrestricted }
 
 // Ops performs the confined file operations.
 type Ops struct {
@@ -131,12 +148,31 @@ type ReadResult struct {
 	EOF  bool   `json:"eof"`
 }
 
-// WriteResult is a file_write answer.
+// WriteResult is a file_write answer. Size and SHA256 always describe the WHOLE
+// file after the operation (for a full write that is the payload; for an append
+// it is everything the file holds), so the panel can verify a chunked upload
+// without reading the file back. SHA256 is hex.
 type WriteResult struct {
 	Path    string `json:"path"`
 	SHA256  string `json:"sha256"`
 	Size    int64  `json:"size"`
 	Created bool   `json:"created"`
+	Append  bool   `json:"append,omitempty"`
+}
+
+// MkdirResult is a file_mkdir answer. Created is false when the directory
+// already existed (mkdir -p semantics).
+type MkdirResult struct {
+	Path    string `json:"path"`
+	Created bool   `json:"created"`
+}
+
+// RenameResult is a file_rename answer. To is the resolved target; the target
+// never existed before (file_rename refuses to overwrite).
+type RenameResult struct {
+	Path    string `json:"path"`
+	To      string `json:"to"`
+	Renamed bool   `json:"renamed"`
 }
 
 // New validates the roots and builds the operations. A root that is a system
@@ -201,8 +237,8 @@ func (o *Ops) RootNames() []string {
 	return out
 }
 
-// Unrestricted reports the local Files.Unrestricted switch.
-func (o *Ops) Unrestricted() bool { return o.opts.Unrestricted }
+// Unrestricted reports the effective Files.Unrestricted switch.
+func (o *Ops) Unrestricted() bool { return o.opts.IsUnrestricted() }
 
 // AllowExec reports the local Files.AllowExec switch.
 func (o *Ops) AllowExec() bool { return o.opts.AllowExec }
@@ -341,6 +377,223 @@ func (o *Ops) Write(ctx context.Context, root, rel string, data []byte, mode os.
 	return WriteResult{Path: full, SHA256: got, Size: int64(len(data)), Created: created}, nil
 }
 
+// Append answers file_write with append=true: data is added to the end of an
+// EXISTING regular file. The file must already exist — a lost or out-of-order
+// chunk has to fail loudly instead of producing a short file; the panel creates
+// it with a normal (non-append) write first.
+//
+// wantSHA, when set, is checked against the payload (the chunk), exactly like a
+// full write. The returned Size and SHA256 describe the WHOLE file after the
+// append, so the panel can verify the assembled upload; the file is read back
+// for that, which costs one full read per chunk (the alternative — trusting a
+// cached digest — would report a hash the file may no longer have).
+//
+// The payload is written with a single O_APPEND write, so concurrent appends
+// cannot overwrite each other. The file is visible while it grows (a chunked
+// upload is not atomic by nature); a full write still goes through the
+// temporary-file-and-rename path.
+func (o *Ops) Append(ctx context.Context, root, rel string, data []byte, wantSHA string) (WriteResult, error) {
+	if int64(len(data)) > o.opts.MaxWrite {
+		return WriteResult{}, fmt.Errorf("%w: %d bytes exceeds %d", ErrTooLarge, len(data), o.opts.MaxWrite)
+	}
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	if wantSHA != "" {
+		if !strings.EqualFold(strings.TrimSpace(wantSHA), got) {
+			return WriteResult{}, fmt.Errorf("%w: want %s, got %s", ErrHashMismatch, strings.TrimSpace(wantSHA), got)
+		}
+	}
+	full, err := o.Resolve(root, rel)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	if err := o.checkTargetForWrite(full); err != nil {
+		return WriteResult{}, err
+	}
+	fi, err := os.Lstat(full)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return WriteResult{}, fmt.Errorf("%w: %s (append needs an existing file; write it first)", ErrNotExist, full)
+		}
+		return WriteResult{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return WriteResult{}, fmt.Errorf("%w: %s", ErrNotRegular, full)
+	}
+	if err := o.appendFile(full, data); err != nil {
+		return WriteResult{}, err
+	}
+	size, hash, err := fileDigest(full)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	o.logf().Infof("fileops: appended %d bytes to %s (%d bytes total)", len(data), full, size)
+	return WriteResult{Path: full, SHA256: hash, Size: size, Append: true}, nil
+}
+
+// appendFile appends data to an existing file in one O_APPEND write. The path
+// was resolved (no symlink on the way) and Lstat'ed as a regular file just
+// before; the open re-checks both so a swap cannot redirect the write.
+func (o *Ops) appendFile(full string, data []byte) error {
+	f, err := openAppend(full)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// fileDigest returns the size and the hex sha256 of a whole regular file.
+func fileDigest(path string) (int64, string, error) {
+	f, err := openRegular(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// Mkdir answers file_mkdir: it creates the path (and every missing parent) like
+// mkdir -p. mode applies to the LAST component only; intermediate directories
+// are created 0755, which is what mkdir -p does. The default is 0755.
+//
+// The mode policy differs from file_write on purpose: the executable bit on a
+// directory means "searchable" and is required for the directory to be usable,
+// so it never needs Files.AllowExec. The whitelist (0700, 0750, 0755) keeps a
+// world-writable directory out of a root, because such a directory is a
+// symlink-swap hole for the TOCTOU window described in the package comment.
+func (o *Ops) Mkdir(ctx context.Context, root, rel string, mode os.FileMode) (MkdirResult, error) {
+	if mode == 0 {
+		mode = 0o755
+	}
+	if err := o.checkDirMode(mode); err != nil {
+		return MkdirResult{}, err
+	}
+	base, segs, err := o.resolveBase(root, rel)
+	if err != nil {
+		return MkdirResult{}, err
+	}
+	if len(segs) == 0 {
+		// The root itself (or, unrestricted, the filesystem root): it exists by
+		// definition.
+		if err := o.checkExcluded(base); err != nil {
+			return MkdirResult{}, err
+		}
+		return MkdirResult{Path: base}, nil
+	}
+	dir := base
+	created := false
+	for i, seg := range segs {
+		dir = filepath.Join(dir, seg)
+		// The agent's own files are refused before anything is looked at: a
+		// root may contain agent.yml, and mkdir must never touch it.
+		if err := o.checkExcluded(dir); err != nil {
+			return MkdirResult{}, err
+		}
+		perm := os.FileMode(0o755)
+		if i == len(segs)-1 {
+			perm = mode.Perm()
+		}
+		fi, err := os.Lstat(dir)
+		switch {
+		case err == nil:
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return MkdirResult{}, fmt.Errorf("%w: %s", ErrSymlink, dir)
+			}
+			if !fi.IsDir() {
+				return MkdirResult{}, fmt.Errorf("%w: %s", ErrNotDir, dir)
+			}
+		case errors.Is(err, os.ErrNotExist):
+			if err := os.Mkdir(dir, perm); err != nil {
+				return MkdirResult{}, err
+			}
+			created = true
+			if i == len(segs)-1 {
+				// os.Mkdir applies the umask; the requested mode is a policy
+				// decision, not a hint, so it is set explicitly.
+				if err := os.Chmod(dir, perm); err != nil {
+					return MkdirResult{}, err
+				}
+			}
+		default:
+			return MkdirResult{}, err
+		}
+	}
+	if !o.opts.IsUnrestricted() && !within(base, dir) {
+		return MkdirResult{}, fmt.Errorf("%w: %s is not inside %s", ErrOutsideRoots, dir, base)
+	}
+	if err := o.checkExcluded(dir); err != nil {
+		return MkdirResult{}, err
+	}
+	if created {
+		o.logf().Infof("fileops: created directory %s (mode %04o)", dir, mode.Perm())
+	}
+	return MkdirResult{Path: dir, Created: created}, nil
+}
+
+// Rename answers file_rename: it moves path to to inside the SAME root (an
+// absolute path in unrestricted mode). The target must not exist: a rename
+// never overwrites, so a panel mistake cannot destroy a file. Both ends are
+// resolved with the usual rules (no symlink anywhere on the way, both inside
+// the root, neither of them an excluded agent file).
+func (o *Ops) Rename(ctx context.Context, root, from, to string) (RenameResult, error) {
+	if to == "" {
+		return RenameResult{}, fmt.Errorf("%w: empty target", ErrBadPath)
+	}
+	src, err := o.Resolve(root, from)
+	if err != nil {
+		return RenameResult{}, err
+	}
+	dst, err := o.Resolve(root, to)
+	if err != nil {
+		return RenameResult{}, err
+	}
+	if samePath(src, dst) {
+		return RenameResult{}, fmt.Errorf("%w: %s and %s are the same path", ErrBadPath, src, dst)
+	}
+	fi, err := os.Lstat(src)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return RenameResult{}, fmt.Errorf("%w: %s", ErrNotExist, src)
+		}
+		return RenameResult{}, err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return RenameResult{}, fmt.Errorf("%w: %s", ErrSymlink, src)
+	}
+	if !fi.IsDir() && !fi.Mode().IsRegular() {
+		return RenameResult{}, fmt.Errorf("%w: %s", ErrNotRegular, src)
+	}
+	// The target must not exist. The check and the rename are not one atomic
+	// step (os has no renameat2 with RENAME_NOREPLACE); the window is the same
+	// TOCTOU window the rest of this package documents, and a local user who
+	// could win it can already write into the root.
+	if _, err := os.Lstat(dst); err == nil {
+		return RenameResult{}, fmt.Errorf("%w: %s", ErrExists, dst)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return RenameResult{}, err
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return RenameResult{}, err
+	}
+	syncDir(filepath.Dir(src))
+	syncDir(filepath.Dir(dst))
+	o.logf().Infof("fileops: renamed %s to %s", src, dst)
+	return RenameResult{Path: src, To: dst, Renamed: true}, nil
+}
+
 // Delete answers file_delete. It removes one regular file and never recurses: a
 // directory, a symlink or a special file is refused, so one command can never
 // empty a configuration directory.
@@ -388,6 +641,24 @@ func (o *Ops) checkMode(mode os.FileMode) error {
 		return nil
 	default:
 		return fmt.Errorf("%w: mode %04o is not one of 0600, 0644, 0755", ErrBadPath, mode.Perm())
+	}
+}
+
+// checkDirMode applies the directory mode policy: only 0700, 0750 and 0755, no
+// setuid/setgid/sticky. It is deliberately not checkMode: the executable bit on
+// a directory means "searchable" and a directory without it is unusable, so it
+// does not need Files.AllowExec. World-writable modes are refused: a directory
+// anyone may write to inside a root is exactly the symlink-swap hole the
+// package's TOCTOU note warns about.
+func (o *Ops) checkDirMode(mode os.FileMode) error {
+	if mode&0o7000 != 0 {
+		return fmt.Errorf("%w: %04o", ErrSpecialMode, mode)
+	}
+	switch mode.Perm() {
+	case 0o700, 0o750, 0o755:
+		return nil
+	default:
+		return fmt.Errorf("%w: directory mode %04o is not one of 0700, 0750, 0755", ErrBadPath, mode.Perm())
 	}
 }
 

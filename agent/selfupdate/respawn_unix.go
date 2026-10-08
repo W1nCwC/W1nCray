@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -114,4 +115,89 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return syscall.Kill(pid, 0) == nil
+}
+
+// stopGrace is how long a process may take to leave after SIGTERM before it is
+// killed.
+const stopGrace = 5 * time.Second
+
+// stopAgentProcess stops one agent process gracefully and, if it does not exit
+// within stopGrace, forcefully. A rollback must never replace the executable
+// file of a process that is still running: that is what leaves the running
+// image and the install path pointing at different files (D-M7).
+//
+// The pid's identity is verified again before each signal. The watchdog runs as
+// root, and the pid comes from an on-disk lock or ready marker, so by the time
+// the signal is sent the process may have exited and the kernel may have handed
+// its pid to an unrelated program (F3b). A pid that is not a verified agent is
+// left alone and the refusal is logged.
+func stopAgentProcess(pid int, isAgent AgentIdentity, log driver.Logger) {
+	if pid <= 0 {
+		return
+	}
+	if !agentIdentityVerified(isAgent, pid, log, "SIGTERM") {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	if waitForProcessExit(pid, stopGrace) {
+		return
+	}
+	if log != nil {
+		log.Warnf("selfupdate: agent pid %d did not exit within %s; killing it", pid, stopGrace)
+	}
+	// The wait gave the process time to exit; verify once more so a pid that
+	// has just been reused is not killed with SIGKILL.
+	if !agentIdentityVerified(isAgent, pid, log, "SIGKILL") {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	_ = waitForProcessExit(pid, 2*time.Second)
+}
+
+// agentIdentityVerified reports whether pid may be signalled with sig. A
+// process that is already gone needs no signal and produces no warning; a live
+// pid that is not a verified agent has the signal withheld and the refusal is
+// logged.
+func agentIdentityVerified(isAgent AgentIdentity, pid int, log driver.Logger, sig string) bool {
+	if !processAlive(pid) {
+		return false
+	}
+	if isAgent != nil && isAgent(pid) {
+		return true
+	}
+	if log != nil {
+		log.Warnf("selfupdate: not sending %s to pid %d: it is not a verified W1nCray agent", sig, pid)
+	}
+	return false
+}
+
+// waitForProcessExit reports whether pid left before the timeout. A zombie
+// still answers signal 0, so the process table is consulted first.
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !processAlive(pid) || processZombie(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// processZombie reports whether pid is a reaped-awaiting zombie: it no longer
+// runs, but kill(pid, 0) still succeeds until its parent collects it.
+func processZombie(pid int) bool {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	// The second field is the state; the comm field is parenthesised and may
+	// contain spaces, so parse from the last ')'.
+	i := bytes.LastIndexByte(b, ')')
+	if i < 0 || i+2 >= len(b) {
+		return false
+	}
+	return b[i+2] == 'Z'
 }

@@ -6,7 +6,7 @@
       "id": "map-all",
       "name": "port_map逐端口指定目标，不写targets",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": {
         "addr": "0.0.0.0",
@@ -24,7 +24,7 @@
       "id": "map-override",
       "name": "port_map覆盖：20301改去别处，其余按targets一一映射",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": {
         "addr": "0.0.0.0",

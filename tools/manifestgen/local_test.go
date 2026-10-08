@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -205,6 +206,99 @@ func TestAgentExampleConfigLoads(t *testing.T) {
 	}
 }
 
+// TestLocalOpenWrtEntryGoesToOpenWrtTargets covers the release-blocker rule in
+// the generator: a local build marked openwrt: true lands in openwrt_targets
+// under a plain os/arch key, never under a "+openwrt" key in targets.
+func TestLocalOpenWrtEntryGoesToOpenWrtTargets(t *testing.T) {
+	dist := t.TempDir()
+	full := filepath.Join(dist, "W1nCray-xray-linux-amd64.gz")
+	lite := filepath.Join(dist, "W1nCray-xray-linux-amd64-lite.gz")
+	gzipFile(t, full, []byte("full"))
+	gzipFile(t, lite, []byte("lite"))
+	cfg := fmt.Sprintf(`
+sequence: 21
+mirrors: ["https://mirror.example/xray/{version}/{asset}"]
+kernels:
+  - name: xray
+    version: "0.6.0"
+    license: {spdx: MIT}
+    run: {binary: W1nCray-xray, version_cmd: ["version"]}
+    local:
+      - {file: '%s', target: linux/amd64, to: W1nCray-xray}
+      - {file: '%s', target: linux/amd64, to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+`, full, lite)
+	m, err := buildLocal(t, cfg)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	k := m.Kernels[0]
+	tg, st := k.Lookup("linux/amd64")
+	if st != manifest.TargetPresent || strings.Contains(tg.URLs[0], "-lite.gz") {
+		t.Fatalf("targets[linux/amd64] = %+v (%v)", tg, st)
+	}
+	ow, st := k.LookupOpenWrt("linux/amd64")
+	if st != manifest.TargetPresent || !strings.Contains(ow.URLs[0], "-lite.gz") {
+		t.Fatalf("openwrt_targets[linux/amd64] = %+v (%v)", ow, st)
+	}
+	if ow.Variant != "fallbackroots" {
+		t.Errorf("openwrt variant = %q", ow.Variant)
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("generated manifest is invalid: %v", err)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "+openwrt") {
+		t.Error("the generated manifest carries a +openwrt key")
+	}
+}
+
+// TestSuffixedTargetKeysAreRefused keeps the build description from
+// reintroducing the legacy "+openwrt" key, which is exactly what made a
+// v0.5.2 agent reject the whole manifest.
+func TestSuffixedTargetKeysAreRefused(t *testing.T) {
+	for _, field := range []string{"targets", "openwrt_targets"} {
+		cfg := fmt.Sprintf(`
+sequence: 22
+kernels:
+  - name: gost
+    version: "1.0.0"
+    repo: o/r
+    license: {spdx: MIT}
+    run: {binary: gost, version_cmd: ["-V"]}
+    extract: [{from: gost, to: gost}]
+    %s:
+      linux/amd64+openwrt: {asset: gost_1.0.0_linux_amd64.tar.gz}
+`, field)
+		p := filepath.Join(t.TempDir(), "cfg.yaml")
+		if err := os.WriteFile(p, []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(p); err == nil || !strings.Contains(err.Error(), "must not carry a suffix") {
+			t.Errorf("%s: err = %v, want a suffix refusal", field, err)
+		}
+	}
+	cfg := `
+sequence: 23
+kernels:
+  - name: agent
+    version: "0.5.0"
+    license: {spdx: MIT}
+    run: {binary: W1nCray, version_cmd: ["version"]}
+    local:
+      - {file: /nonexistent.gz, target: linux/amd64+openwrt, to: W1nCray}
+`
+	p := filepath.Join(t.TempDir(), "cfg.yaml")
+	if err := os.WriteFile(p, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(p); err == nil || !strings.Contains(err.Error(), "must not carry a suffix") {
+		t.Errorf("local: err = %v, want a suffix refusal", err)
+	}
+}
+
 // TestLocalAndRemoteTargetsCanCoexist guards the kernel-level wiring: a kernel
 // may list GitHub targets and local ones side by side, and a duplicate platform
 // key is refused at config load.
@@ -251,5 +345,17 @@ kernels:
 	}
 	if _, err := loadConfig(p); err == nil || !strings.Contains(err.Error(), "both in targets and local") {
 		t.Fatalf("err = %v, want a duplicate-key refusal", err)
+	}
+}
+
+func TestKernelMirrorsOverrideTheTopLevelOnes(t *testing.T) {
+	cfg := &Config{Mirrors: []string{"https://top/{name}/{asset}"}}
+	own := &KernelCfg{Name: "agent", Mirrors: []string{"https://own/v{version}/{asset}"}}
+	other := &KernelCfg{Name: "gost"}
+	if got := mirrorsFor(cfg, own); len(got) != 1 || got[0] != "https://own/v{version}/{asset}" {
+		t.Errorf("own mirrors = %v", got)
+	}
+	if got := mirrorsFor(cfg, other); len(got) != 1 || got[0] != "https://top/{name}/{asset}" {
+		t.Errorf("fallback mirrors = %v", got)
 	}
 }

@@ -49,6 +49,13 @@ const (
 	// seenCommands is how many command ids are remembered for deduplication.
 	seenCommands = 256
 
+	// acceptedWait bounds how long a long command's final result waits for its
+	// "accepted" answer to reach the panel. The answer is sent immediately
+	// after the handler returns, so the wait is normally microseconds; the
+	// bound only exists so a channel that never reports cannot wedge the
+	// command (D-M3).
+	acceptedWait = 10 * time.Second
+
 	// minScrubSecret mirrors the reconciler: shorter strings match too much.
 	minScrubSecret = 8
 )
@@ -212,6 +219,10 @@ type Runner struct {
 	seenOrder    []string
 	inflight     map[string]bool
 	manifestETag string
+	// acceptedGates holds the long commands whose final result must wait for
+	// the "accepted" answer to be on the wire (D-M3). The channel closes the
+	// entry with AcceptedSent.
+	acceptedGates map[string]chan struct{}
 }
 
 type nopLog struct{}
@@ -251,6 +262,7 @@ func NewRunner(api API, app Applier, o RunnerOptions) (*Runner, error) {
 		refresh:       make(chan struct{}, 1),
 		seen:          map[string]struct{}{},
 		inflight:      map[string]bool{},
+		acceptedGates: map[string]chan struct{}{},
 	}
 	if r.log == nil {
 		r.log = nopLog{}
@@ -717,7 +729,7 @@ func mergeInstances(last reconcile.Report, hasLast bool, counters []driver.Count
 	used := map[string]bool{}
 	if hasLast {
 		for _, in := range last.Instances {
-			st := InstanceStat{ID: in.ID, State: in.State, Engine: in.Engine}
+			st := InstanceStat{ID: in.ID, State: in.State, Engine: in.Engine, FirewallOpen: in.FirewallOpen}
 			if c, ok := byID[in.ID]; ok {
 				st.setCounter(c)
 				used[in.ID] = true
@@ -797,6 +809,10 @@ func (r *Runner) ExecuteCommand(ctx context.Context, id, typ string, args json.R
 		r.mu.Unlock()
 	}()
 
+	// The gate is armed before the handler runs: a long command may complete
+	// (and reach the sink) before Execute returns, and its final result must
+	// still wait for the accepted answer (D-M3).
+	r.beginAccepted(id)
 	status, result := r.execute(ctx, Command{ID: id, Type: typ, Args: args, ExpiresAt: expiresAt})
 	if status == ResultAccepted {
 		// A long command owns the id until its final result is delivered: the
@@ -804,6 +820,10 @@ func (r *Runner) ExecuteCommand(ctx context.Context, id, typ string, args json.R
 		// between must not run the command twice (design section 3.1 point 5).
 		// MarkAnswered (or ReleaseCommand) clears the slot.
 		keepInflight = true
+	} else {
+		// An inline command never sends an "accepted" answer, so the ordering
+		// gate must not hold its (sink-delivered) result back (D-M3).
+		r.AcceptedSent(id)
 	}
 	return status, result, nil
 }
@@ -830,11 +850,64 @@ func (r *Runner) ReleaseCommand(id string) {
 	r.mu.Unlock()
 }
 
+// --- accepted/final ordering (D-M3) ----------------------------------------
+
+// beginAccepted arms the ordering gate of one command id: a final result
+// delivered before AcceptedSent is held back.
+func (r *Runner) beginAccepted(id string) {
+	g := make(chan struct{})
+	r.mu.Lock()
+	r.acceptedGates[id] = g
+	r.mu.Unlock()
+}
+
+// AcceptedSent reports that the "accepted" answer of a long command is on the
+// wire (or that it will never be sent), releasing the final result. The
+// channels call it right after the accepted answer was delivered, and also when
+// that delivery failed: the final result is then the only answer the panel will
+// ever see. It is idempotent and safe for an unknown id.
+//
+// The order matters because the panel stores the accepted payload on top of
+// whatever result a command row already has: a final result delivered first is
+// erased and the row ends up "failed" with a null result (D-M3).
+func (r *Runner) AcceptedSent(id string) {
+	r.mu.Lock()
+	g := r.acceptedGates[id]
+	delete(r.acceptedGates, id)
+	r.mu.Unlock()
+	if g != nil {
+		close(g)
+	}
+}
+
+// WaitAccepted blocks until the accepted answer of a long command has been
+// sent, or until the bounded wait expires. DeliverResult calls it, so a final
+// result can never overtake the accepted one (D-M3). An id with no gate (an
+// inline command, or one already released) returns at once.
+func (r *Runner) WaitAccepted(ctx context.Context, id string) {
+	r.mu.Lock()
+	g := r.acceptedGates[id]
+	r.mu.Unlock()
+	if g == nil {
+		return
+	}
+	t := time.NewTimer(acceptedWait)
+	defer t.Stop()
+	select {
+	case <-g:
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
 // DeliverResult sends the final result of a long command (one that already
 // answered "accepted" over the same or the other channel) and remembers the
-// id. A delivery that fails releases the id so the panel's redelivery runs the
+// id. It first waits for the accepted answer to be on the wire (D-M3): the
+// panel would otherwise overwrite the final result with the accepted payload.
+// A delivery that fails releases the id so the panel's redelivery runs the
 // command again.
 func (r *Runner) DeliverResult(ctx context.Context, id, status string, result json.RawMessage) error {
+	r.WaitAccepted(ctx, id)
 	err := r.api.CommandResult(ctx, CommandResultRequest{
 		Schema:     Schema,
 		InstanceID: r.id(),
@@ -895,11 +968,17 @@ func (r *Runner) runCommand(ctx context.Context, c Command) {
 	})
 	if err != nil {
 		r.log.Warnf("panel: result of command %q not delivered: %v", c.ID, err)
+		// The accepted answer never reached the panel: release the ordering
+		// gate so the long command's final result (the only answer the panel
+		// will see) is not held back (D-M3).
+		r.AcceptedSent(c.ID)
 		return
 	}
 	if status == ResultAccepted {
 		// Only the accepted half is on the wire: the id stays in flight until
-		// the final result of the long command is delivered.
+		// the final result of the long command is delivered, and the final
+		// result may now follow (D-M3).
+		r.AcceptedSent(c.ID)
 		return
 	}
 	r.MarkAnswered(c.ID)

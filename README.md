@@ -53,6 +53,8 @@ sh install.sh install --binary ./W1nCray-linux-amd64
 
 **校验失败即拒绝（fail-closed）**：从发行页下载的程序必须通过 `SHA256SUMS` 校验。缺少 `sha256sum`、取不到 `SHA256SUMS`、校验值缺失/格式错误或与文件不符，一律中止安装并保持现有程序不变。只有明知风险时才用 `--insecure-skip-verify`（或环境变量 `W1NCRAY_INSECURE_SKIP_VERIFY=1`）整体跳过校验，脚本会打印醒目警告。`--binary` 指定的本地文件不经校验。
 
+**安装只装 agent**：`install` 安装 `W1nCray`（agent 程序 + `W1nCray` 服务），**不安装 Xray 内核**。Xray 内核（`W1nCray-xray`，见 [docs/AGENT.md](docs/AGENT.md) §13）由面板在给这台机器绑定节点时自动安装并启动，或手动执行 `W1nCray xray install`。面板一键接入参数 `--panel URL --machine ID --token TOKEN` 保持不变。
+
 安装脚本会：
 
 1. 按 CPU 自动选择资产（amd64 / 386 / arm64 / armv5-7 / mips / mipsle / mips64(le) / riscv64 / loong64；MIPS 通过 ELF 头判断字节序，ARM 通过 `/proc/cpuinfo` 判断 VFP，运行自检失败时自动换更低要求的版本），下载后校验 `SHA256SUMS`；
@@ -60,14 +62,14 @@ sh install.sh install --binary ./W1nCray-linux-amd64
 3. **检测到 `/etc/XrayR/config.yml` 时自动迁移**（`config.yml` 以及 dns/route/出入站/规则列表、geo 文件、XrayR 已签发的证书），XrayR 的文件只读、不会被修改；没有 XrayR 时生成默认配置；
 4. 缺少 `geoip.dat` / `geosite.dat` 时自动下载（OpenWRT 默认不下载，约 27 MB，需要时加 `--with-geo`）；
 5. 运行 `W1nCray check --online`：向面板拉取每个节点并实际构建入站，不监听端口；
-6. **XrayR 仍在运行时不会启动 W1nCray**（端口冲突），确认后再切换。
+6. **XrayR 仍在运行时不会启动 W1nCray**（端口冲突），确认后再切换；
+7. 升级时：已是 v11 agent 的机器只更新 agent；**0.5.x 及以前的单一程序**若配置里有 Xray 节点（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真），会先下载 agent 与对应的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序：停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...`（启动 Xray 内核服务）→ 启动 agent。下载在停止服务之前完成，中断只有两次进程重启。
 
 ### 管理命令（装好后直接输入 `W1nCray`）
 
 ```bash
 W1nCray                      # 管理菜单
 W1nCray status               # 版本、运行状态、开机自启、节点数、最近错误
-W1nCray log [-n 100]         # 实时日志（-n 只看最近若干行）
 W1nCray check                # 检查配置并向面板验证每个节点
 W1nCray start|stop|restart   # 服务控制
 W1nCray enable|disable       # 开机自启
@@ -76,17 +78,29 @@ W1nCray update [vX.Y.Z] [--lite|--full]
 W1nCray switch               # 停用 XrayR、启用 W1nCray；5 秒内未正常运行会自动回滚
 W1nCray rollback             # 随时回到 XrayR
 W1nCray migrate              # 重新迁移（先把现有 /etc/W1nCray 备份为 /etc/W1nCray.bak.<时间>）
-W1nCray uninstall [--purge]  # 卸载（--purge 同时删除配置）
+W1nCray xray status|start|stop|restart|install|remove
+                             # Xray 内核服务（与面板同一套实现；install 默认按已签名清单装最新版）
+W1nCray xray install --file <W1nCray-xray 文件或 .gz> --sha256 <hex>
+                             # 离线安装 Xray 内核（sha256 必填）
+W1nCray uninstall [--purge]  # 卸载（同时停止并删除 Xray 内核服务；--purge 再删除配置）
 ```
 
-其余子命令（`version`、`x25519`、`init`、带参数的 `migrate` / `check` 等）原样交给程序本体。
+查看日志（agent 程序本体**没有** `log` 子命令，按服务后端来）：
+
+```bash
+journalctl -u W1nCray -f         # systemd
+tail -f /var/log/W1nCray.log     # OpenRC（supervise-daemon 写的文件）
+logread -f -e W1nCray            # procd（OpenWRT）
+```
+
+其余 agent 子命令（`version`、`init`、`agent-apply`、带参数的 `migrate` / `check` 等）原样交给程序本体；`x25519` 属于 Xray 内核程序（`W1nCray-xray x25519`），agent 里没有。
 
 ### Alpine / OpenWRT 说明
 
 - **Alpine**：用 OpenRC 的 `supervise-daemon` 托管，崩溃后每 10 秒无限重启，日志在 `/var/log/W1nCray.log`。
-- **OpenWRT**：用 procd 托管（`respawn 3600 10 0`），日志用 `logread -e W1nCray`；默认安装精简版（`-lite`，约 39 MB，ACME DNS 验证仅含 alidns / cloudflare / dnspod / godaddy / namesilo / tencentcloud），内存小于 1 GiB 时自动设置 `GOMEMLIMIT`。路由器内置闪存通常装不下，请把外部存储挂载（extroot 或 USB/SD）后用 `--prefix /mnt/xxx/W1nCray` 安装。配置与服务脚本会写入 `/etc/sysupgrade.conf`，固件升级后保留配置，但程序文件需要重新执行安装命令。
-- 精简版缺少的 DNS 提供商可用 `W1nCray update --full` 换回完整版。
-- 同一份配置同一时间只允许一个 W1nCray 实例（`<配置文件>.lock`），避免多进程互相踢掉面板 WebSocket。
+- **OpenWRT**：用 procd 托管（`respawn 3600 10 0`），日志用 `logread -e W1nCray`；内存小于 1 GiB 时自动设置 `GOMEMLIMIT`。路由器内置闪存通常装不下，请把外部存储挂载（extroot 或 USB/SD）后用 `--prefix /mnt/xxx/W1nCray` 安装。配置与服务脚本会写入 `/etc/sysupgrade.conf`，固件升级后保留配置，但程序文件需要重新执行安装命令。
+- agent 现在是**单一构建**（不再链接 DNS/ACME，约 12 MB，内置备用根证书 `fallbackroots`，无系统 CA 的设备也能用 HTTPS）；`W1nCray-linux-<arch>-lite.gz` 只是同内容副本，供 v11 之前的安装脚本继续使用。Xray 内核有 full 与 `-lite`（`dnslite,fallbackroots`）两种构建，OpenWrt 上 agent 会选择 `-lite`（清单字段 `openwrt_targets`，键为纯 `linux/<arch>`；旧清单的 `linux/<arch>+openwrt` 键仍兼容读取）。
+- 同一份配置同一时间只允许一个 W1nCray 实例（`<配置文件>.lock`）；Xray 内核用自己的锁（`<配置文件>.xray.lock`），两者可以同时运行。
 - 从 XrayR 迁移时，路由里的旧入站 tag（形如 `V2ray_0.0.0.0_65534`）会自动映射到对应节点的入站，无需修改 `route.json`。
 
 ### 命令（程序本体）
@@ -97,8 +111,8 @@ W1nCray migrate --from /etc/XrayR --to /etc/W1nCray    # 迁移 XrayR（--dry-ru
 W1nCray check -c /etc/W1nCray/config.yml [--online]    # 检查配置（--online 同时向面板验证节点）
 W1nCray link --panel https://panel.example.com --machine 12 --token <T>  # 把静态节点转成机器模式（--dry-run 只预览）
 W1nCray init --dir /etc/W1nCray                        # 写入默认配置
-W1nCray version                                        # 版本、内核版本与构建类型（full / lite）
-W1nCray x25519                                         # 生成 REALITY 密钥对
+W1nCray version                                        # agent 版本与构建类型（不含 Xray-core；内核版本用 W1nCray-xray version）
+W1nCray-xray x25519                                    # 生成 REALITY 密钥对（Xray 内核程序；agent 本体没有该命令）
 ```
 
 面板路由中使用 `geosite:` / `geoip:` 时需要 `geosite.dat`、`geoip.dat`（默认从配置文件所在目录查找，也可用环境变量 `XRAY_LOCATION_ASSET` 指定）。
@@ -106,10 +120,22 @@ W1nCray x25519                                         # 生成 REALITY 密钥�
 ### 编译与发布
 
 ```bash
-bash release/build.sh v0.3.0 [arch ...]   # 默认 12 个架构 × full/lite；产出 .gz 与 SHA256SUMS
+bash release/build.sh v0.6.0 [arch ...]   # 默认 12 个架构；产出 agent 与 Xray 内核的 .gz 以及 SHA256SUMS
 ```
 
-产物：`W1nCray-linux-<arch>.gz`、`W1nCray-linux-<arch>-lite.gz`，另保留 `W1nCray-linux-amd64|arm64` 裸文件供 v0.3.0 之前的安装脚本升级。把 `dist/` 里的文件全部上传到 GitHub Release 即可。lite 构建标签：`dnslite,fallbackroots`。
+v11 起每个架构产出两个程序：
+
+| 产物 | 程序 | 说明 |
+|---|---|---|
+| `W1nCray-linux-<arch>.gz` | agent | 单一构建，`-tags fallbackroots`（内置备用根证书） |
+| `W1nCray-linux-<arch>-lite.gz` | agent | 与上一个**同内容**的副本，仅为兼容 v11 之前的安装脚本而保留 |
+| `W1nCray-linux-amd64\|arm64` | agent | 裸文件，供 v0.3.0 之前的安装脚本升级 |
+| `W1nCray-xray-linux-<arch>.gz` | Xray 内核 | full 构建 |
+| `W1nCray-xray-linux-<arch>-lite.gz` | Xray 内核 | `-tags dnslite,fallbackroots`，OpenWrt 使用 |
+
+同一个版本号注入两个程序（agent 的 `cmd.version`、内核的 `xraynode.Version`）。脚本对每个产物断言架构、在本机架构上执行 `version` 自检（交叉架构跳过并注明），并检查 agent 产物不含 `github.com/xtls/xray-core`、内核产物必须含它。把 `dist/` 里的文件全部上传到 GitHub Release 即可。
+
+内核清单条目见 [tools/manifestgen/examples/v11.yaml](tools/manifestgen/examples/v11.yaml)：agent 与 Xray 内核从本地 `dist/` 取哈希（需要 mirror 提供下载地址），gost/realm/frp 用上游 GitHub 资产。
 
 ## 配置
 

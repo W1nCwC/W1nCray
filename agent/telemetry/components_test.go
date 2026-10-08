@@ -13,8 +13,10 @@ import (
 type fakeProbe struct {
 	procs      []SupervisedProcess
 	kernels    []wsproto.KernelEntry
+	services   []wsproto.Component
 	panicProcs bool
 	panicKern  bool
+	panicSvc   bool
 }
 
 func (p *fakeProbe) SupervisedProcesses() []SupervisedProcess {
@@ -29,6 +31,13 @@ func (p *fakeProbe) InstalledKernels() []wsproto.KernelEntry {
 		panic("kernel list exploded")
 	}
 	return p.kernels
+}
+
+func (p *fakeProbe) ServiceComponents() []wsproto.Component {
+	if p.panicSvc {
+		panic("service components exploded")
+	}
+	return p.services
 }
 
 func TestComponentsWithNilProbeReportsTheAgent(t *testing.T) {
@@ -193,6 +202,54 @@ func TestComponentsAreSortedAndIncludeInstalledKernels(t *testing.T) {
 		if item.Name == "realm" && item.State != wsproto.StateStopped {
 			t.Fatalf("realm state = %q, want stopped (installed, not selected)", item.State)
 		}
+	}
+}
+
+// TestServiceComponentComesFromTheServiceManager covers the Xray kernel, which
+// runs as its own service: its component is the one the service manager and the
+// kernel's status endpoint describe, not the supervised-process view.
+func TestServiceComponentComesFromTheServiceManager(t *testing.T) {
+	p := &fakeProbe{
+		kernels: []wsproto.KernelEntry{{Name: "xray", Version: "0.6.0", Current: true}},
+		services: []wsproto.Component{{
+			Name: "xray", Kind: "kernel", Version: "0.6.0", State: wsproto.StateRunning, UptimeS: 12,
+			Instances: []wsproto.ComponentInstance{{ID: "node1@m1", State: wsproto.StateRunning, Conns: 3}},
+		}},
+	}
+	got := New(Options{AgentVersion: "v", Components: p}).Components(context.Background())
+	byName := map[string]wsproto.Component{}
+	for _, it := range got.Items {
+		byName[it.Name] = it
+	}
+	x, ok := byName["xray"]
+	if !ok {
+		t.Fatalf("no xray component: %+v", got.Items)
+	}
+	if x.State != wsproto.StateRunning || x.Version != "0.6.0" || x.UptimeS != 12 {
+		t.Fatalf("xray component = %+v", x)
+	}
+	if len(x.Instances) != 1 || x.Instances[0].ID != "node1@m1" || x.Instances[0].Conns != 3 {
+		t.Fatalf("xray instances = %+v", x.Instances)
+	}
+
+	// A kernel that is not installed at all is still reported (state
+	// not_installed) because the service manager knows about it.
+	p2 := &fakeProbe{services: []wsproto.Component{{
+		Name: "xray", Kind: "kernel", State: wsproto.StateNotInstalled,
+		Instances: []wsproto.ComponentInstance{},
+	}}}
+	got = New(Options{AgentVersion: "v", Components: p2}).Components(context.Background())
+	found := false
+	for _, it := range got.Items {
+		if it.Name == "xray" {
+			found = true
+			if it.State != wsproto.StateNotInstalled {
+				t.Fatalf("xray state = %q", it.State)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("an uninstalled service kernel must still be listed: %+v", got.Items)
 	}
 }
 

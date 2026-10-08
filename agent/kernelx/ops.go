@@ -35,8 +35,16 @@ func (e *Ensurer) Remove(name, version string) error { return e.in.Remove(name, 
 
 // Rollback makes the previous version current again and marks the version that
 // was current as bad (with back-off), so a later Ensure of the same pin does
-// not immediately switch back. It returns the now-current kernel.
-func (e *Ensurer) Rollback(name string) (driver.Installed, error) { return e.in.Rollback(name) }
+// not immediately switch back. It returns the now-current kernel, after
+// labelling it for SELinux (best effort, like Ensure).
+func (e *Ensurer) Rollback(name string) (driver.Installed, error) {
+	inst, err := e.in.Rollback(name)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(context.Background())
+	return inst, nil
+}
 
 // Current returns the version the installer last made current, from the
 // pointer alone (no process check).
@@ -55,4 +63,23 @@ func (e *Ensurer) DownloadFor(ctx context.Context, name, version, dir string) (m
 // install.Installer.VerifyArchiveFor.
 func (e *Ensurer) VerifyArchiveFor(ctx context.Context, name, version, archivePath, dest string) (manifest.Target, string, error) {
 	return e.in.VerifyArchiveFor(ctx, name, version, archivePath, dest)
+}
+
+// InstallLocal installs a kernel from a file already on this machine, without
+// a signed manifest, pinning the bytes with the operator-supplied sha256 (see
+// install.Installer.InstallLocal). The result is indistinguishable from a
+// manifest install, so list/upgrade/rollback/remove all work on it.
+//
+// Like Ensure and Rollback it labels the kernel tree for SELinux afterwards
+// (best effort), so the local-file path — install.sh's pre-v11 migration and
+// `W1nCray xray install --file` — gets the same bin_t label a manifest install
+// does. The labeler is idempotent, and xraysvc labels again (fatal) before it
+// starts the service.
+func (e *Ensurer) InstallLocal(ctx context.Context, li install.LocalInstall) (driver.Installed, error) {
+	inst, err := e.in.InstallLocal(ctx, li)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(ctx)
+	return inst, nil
 }

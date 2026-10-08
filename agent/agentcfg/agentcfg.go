@@ -19,8 +19,9 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/agent/spec"
-	"github.com/W1nCwC/W1nCray/node"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 // FileName is the conventional name looked for next to config.yml.
@@ -72,6 +73,19 @@ type Config struct {
 	Files *FilesConfig `mapstructure:"Files"`
 	// Modules is the local module switch (D3).
 	Modules *ModuleConfig `mapstructure:"Modules"`
+	// Firewall is the local firewall-automation switch (PLAN v11 D2). On
+	// OpenWrt the agent opens the WAN ports of the instances it runs; anywhere
+	// else it never touches the firewall.
+	Firewall *FirewallConfig `mapstructure:"Firewall"`
+	// Kernels is the local kernel-source switch (D-M1): it permits plain
+	// http:// mirrors for the signed manifest's assets. It is off by default
+	// and only a local file can turn it on.
+	Kernels *KernelsConfig `mapstructure:"Kernels"`
+	// Drivers holds the local driver timing overrides (D4).
+	Drivers *DriversConfig `mapstructure:"Drivers"`
+	// SelfUpdate holds the local self-update watchdog timing (D-M7). It is a
+	// local-only override: the panel never pushes agent configuration.
+	SelfUpdate *SelfUpdateConfig `mapstructure:"SelfUpdate"`
 
 	// dir is the directory the relative paths were resolved against and
 	// excludedFiles are the paths that are never reachable through
@@ -136,7 +150,7 @@ type PanelConfig struct {
 	// NodeController is the ControllerConfig template shared by every machine
 	// node (ListenIP, CertConfig, ...). Missing fields fall back to the node
 	// defaults.
-	NodeController *node.Config `mapstructure:"NodeController"`
+	NodeController *nodecfg.Config `mapstructure:"NodeController"`
 	// NodeControllers overrides NodeController for individual machine nodes,
 	// keyed by the panel's node id (the same field layout as
 	// Nodes[].ControllerConfig). An entry that exists is used as a whole: it is
@@ -145,7 +159,7 @@ type PanelConfig struct {
 	// Typical use: a node that needs PROXY protocol, its own certificate or a
 	// local DNS/REALITY setup, including credentials that must stay on this
 	// machine and are never sent to the panel.
-	NodeControllers map[int]*node.Config `mapstructure:"NodeControllers"`
+	NodeControllers map[int]*nodecfg.Config `mapstructure:"NodeControllers"`
 }
 
 // Policy maps agent/spec.Policy fields onto the config file. A zero value
@@ -240,13 +254,27 @@ func (t *TerminalConfig) Validate() error {
 
 // FilesConfig is the local file-operation policy (D9, ruling 13). Roots are
 // resolved and defaulted by ResolveLocalPolicy (xray config directory + state
-// directory); Unrestricted and AllowExec default to false, so the zero value is
-// the safe one. Only the types and their validation live here; the behaviour is
-// implemented by the later file-management package.
+// directory) unless the machine is unrestricted; AllowExec defaults to false,
+// so the zero value is the safe one. Only the types and their validation live
+// here; the behaviour is implemented by agent/fileops.
 type FilesConfig struct {
-	Roots        []string `mapstructure:"Roots"`
-	Unrestricted bool     `mapstructure:"Unrestricted"`
-	AllowExec    bool     `mapstructure:"AllowExec"`
+	Roots []string `mapstructure:"Roots"`
+	// Unrestricted is a THREE-STATE switch (PLAN v10):
+	//
+	//   - not written (nil): follow the terminal gate. A machine whose root
+	//     shell is already reachable gains nothing from confining the file
+	//     manager — the terminal can do anything the file manager can, only
+	//     less conveniently — so an effective terminal means "unrestricted".
+	//   - explicit true: unrestricted, whatever the terminal says.
+	//   - explicit false: the roots check always applies, even with the
+	//     terminal on.
+	//
+	// ResolveLocalPolicy materialises the value (so the field is non-nil after
+	// the load and every consumer sees the effective one); Config.
+	// UnrestrictedEnabled reads it defensively. In unrestricted mode the panel
+	// names an absolute path and sends an empty root.
+	Unrestricted *bool `mapstructure:"Unrestricted"`
+	AllowExec    bool  `mapstructure:"AllowExec"`
 	// MaxBytes bounds one managed-file blob (managed files are downloaded by
 	// sha256, see agent/filesync). 0 means the built-in default (64 MiB). A
 	// negative value turns geo downloads off locally: a machine that keeps no
@@ -262,6 +290,161 @@ type FilesConfig struct {
 // on; the panel can only ask for nodes, never relax this gate.
 type ModuleConfig struct {
 	XrayNodes *bool `mapstructure:"XrayNodes"`
+}
+
+// FirewallConfig is the local firewall-automation switch (PLAN v11 D2).
+// AutoOpen is a pointer on purpose: nil (not written) follows the platform
+// default, which is ON on OpenWrt and OFF everywhere else. Only OpenWrt is
+// implemented in this release: on another system the agent never touches the
+// firewall, whatever the field says.
+type FirewallConfig struct {
+	AutoOpen *bool `mapstructure:"AutoOpen"`
+}
+
+// KernelsConfig is the local kernel-source policy (D-M1). AllowHTTP permits
+// plain http:// sources for the assets of the signed kernel manifest.
+//
+// It is a LOCAL switch on purpose: the panel pushes a desired state and never
+// agent configuration, so it cannot turn this on remotely. Integrity does not
+// depend on it — the manifest is signed and every asset is checked against the
+// sha256 the manifest carries — which is exactly why an operator with a
+// self-hosted, internal-only mirror (no TLS) may want it. The default is off:
+// https only.
+type KernelsConfig struct {
+	AllowHTTP bool `mapstructure:"AllowHTTP"`
+}
+
+// KernelsAllowHTTP returns the effective Kernels.AllowHTTP value. The zero
+// value is false (https only), so a missing section, a nil Config and a Config
+// that was never resolved all keep the fail-closed default.
+func (c *Config) KernelsAllowHTTP() bool {
+	if c == nil || c.Kernels == nil {
+		return false
+	}
+	return c.Kernels.AllowHTTP
+}
+
+// DriversConfig holds the local driver timing overrides (D4, F6). Every field
+// is optional; a zero value means "use the driver's own default", which is
+// per-architecture and per-OpenWrt where that matters
+// (driver.DefaultReadyTimeout).
+type DriversConfig struct {
+	Frp  *FrpConfig  `mapstructure:"Frp"`
+	Gost *GostConfig `mapstructure:"Gost"`
+}
+
+// FrpConfig overrides the frp driver's readiness limit (D4).
+type FrpConfig struct {
+	// ReadyTimeoutSec bounds how long the driver waits for a started frps/frpc
+	// instance to answer before it reports that instance as failed. 0 means
+	// the shared default (driver.DefaultReadyTimeout): 15s on amd64/arm64 off
+	// OpenWrt, 60s on the slower targets and on every architecture running
+	// OpenWrt. Raise it on a device that is slower than its architecture
+	// suggests; the value is a local one, never pushed by the panel.
+	ReadyTimeoutSec int `mapstructure:"ReadyTimeoutSec"`
+}
+
+// GostConfig overrides the gost driver's readiness limit (F6). It is
+// symmetrical with FrpConfig: the same shared default and the same local-only
+// override, because the T2 run measured gost's old hard-coded 10s limit timing
+// out on MIPS just like frp's 15s one.
+type GostConfig struct {
+	// ReadyTimeoutSec bounds how long the driver waits for the gost process
+	// and each of its services to answer before it reports the instance as
+	// failed. 0 means the shared default (driver.DefaultReadyTimeout): 15s on
+	// amd64/arm64 off OpenWrt, 60s on the slower targets and on every
+	// architecture running OpenWrt. The value is a local one, never pushed by
+	// the panel.
+	ReadyTimeoutSec int `mapstructure:"ReadyTimeoutSec"`
+}
+
+// FrpReadyTimeout returns the configured frp readiness limit and whether it was
+// set at all. A nil Config, a missing section and a non-positive value all mean
+// "use the shared default" (driver.DefaultReadyTimeout).
+func (c *Config) FrpReadyTimeout() (time.Duration, bool) {
+	if c == nil || c.Drivers == nil || c.Drivers.Frp == nil || c.Drivers.Frp.ReadyTimeoutSec <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.Drivers.Frp.ReadyTimeoutSec) * time.Second, true
+}
+
+// GostReadyTimeout returns the configured gost readiness limit and whether it
+// was set at all. A nil Config, a missing section and a non-positive value all
+// mean "use the shared default" (driver.DefaultReadyTimeout). It is the gost
+// mirror of FrpReadyTimeout (F6).
+func (c *Config) GostReadyTimeout() (time.Duration, bool) {
+	if c == nil || c.Drivers == nil || c.Drivers.Gost == nil || c.Drivers.Gost.ReadyTimeoutSec <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.Drivers.Gost.ReadyTimeoutSec) * time.Second, true
+}
+
+// SelfUpdateConfig overrides the self-update watchdog timing (D-M7). Every
+// field is optional; 0 means "use the architecture default". The watchdog runs
+// as a copy of the previous agent binary, so it always runs on this machine's
+// architecture.
+type SelfUpdateConfig struct {
+	// AliveWindowSec is how long the watchdog tolerates "no agent alive" after
+	// the update before it rolls back. The default is 60 s on amd64/arm64 and
+	// 180 s on the slower targets. It has to cover the service manager's
+	// respawn delay plus the new process's start-up: raise it on a device that
+	// is slower than its architecture suggests.
+	AliveWindowSec int `mapstructure:"AliveWindowSec"`
+	// DeadlineSec is the watchdog's total observation budget. The default is
+	// 3 min on amd64/arm64 and 8 min on the slower targets. It is kept above
+	// AliveWindowSec.
+	DeadlineSec int `mapstructure:"DeadlineSec"`
+}
+
+// SelfUpdateAliveWindow returns the configured no-live-agent window and whether
+// it was set at all.
+func (c *Config) SelfUpdateAliveWindow() (time.Duration, bool) {
+	if c == nil || c.SelfUpdate == nil || c.SelfUpdate.AliveWindowSec <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.SelfUpdate.AliveWindowSec) * time.Second, true
+}
+
+// SelfUpdateDeadline returns the configured watchdog budget and whether it was
+// set at all.
+func (c *Config) SelfUpdateDeadline() (time.Duration, bool) {
+	if c == nil || c.SelfUpdate == nil || c.SelfUpdate.DeadlineSec <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.SelfUpdate.DeadlineSec) * time.Second, true
+}
+
+// SelfUpdateWindows returns the effective (alive, deadline) pair for goarch:
+// the local override when it was written, else the architecture default. A
+// deadline that is not above the window is raised, so a misconfigured file
+// cannot make the watchdog stop watching before its own rollback rule can fire.
+func (c *Config) SelfUpdateWindows(goarch string) (alive, deadline time.Duration) {
+	alive, deadline = selfupdate.DefaultWatchdogWindows(goarch)
+	if v, ok := c.SelfUpdateAliveWindow(); ok {
+		alive = v
+	}
+	if v, ok := c.SelfUpdateDeadline(); ok {
+		deadline = v
+	}
+	if deadline <= alive {
+		deadline = alive + 30*time.Second
+	}
+	return alive, deadline
+}
+
+// FirewallAutoOpen returns the effective value of Firewall.AutoOpen for a
+// machine whose OpenWrt detection is openWrt. An explicit true/false written in
+// the configuration is honoured on OpenWrt; "not written" is the platform
+// default. A non-OpenWrt machine always answers false because the agent has no
+// firewall automation there (the panel sees it in hello.policy.firewall).
+func (c *Config) FirewallAutoOpen(openWrt bool) bool {
+	if !openWrt {
+		return false
+	}
+	if c == nil || c.Firewall == nil || c.Firewall.AutoOpen == nil {
+		return true
+	}
+	return *c.Firewall.AutoOpen
 }
 
 // Load reads an agent.yml. A missing file returns (nil, nil): the caller then
@@ -298,6 +481,20 @@ func (c *Config) Validate() error {
 	if c == nil {
 		return nil
 	}
+	// A local timing override is validated even when the agent is disabled: a
+	// value that silently does nothing is worse than a clear refusal. Both
+	// drivers share one rule (frp D4, gost F6).
+	if c.Drivers != nil {
+		if c.Drivers.Frp != nil && c.Drivers.Frp.ReadyTimeoutSec < 0 {
+			return fmt.Errorf("config: Agent.Drivers.Frp.ReadyTimeoutSec must not be negative")
+		}
+		if c.Drivers.Gost != nil && c.Drivers.Gost.ReadyTimeoutSec < 0 {
+			return fmt.Errorf("config: Agent.Drivers.Gost.ReadyTimeoutSec must not be negative")
+		}
+	}
+	if c.SelfUpdate != nil && (c.SelfUpdate.AliveWindowSec < 0 || c.SelfUpdate.DeadlineSec < 0) {
+		return fmt.Errorf("config: Agent.SelfUpdate.AliveWindowSec and DeadlineSec must not be negative")
+	}
 	if !c.Enabled {
 		if c.Panel != nil && (c.Panel.Enabled || c.Panel.MachineNodes) {
 			return fmt.Errorf("config: Agent.Panel.Enabled requires Agent.Enabled")
@@ -325,12 +522,27 @@ func (c *Config) Validate() error {
 }
 
 // TerminalEnabled reports whether the interactive terminal is switched on
-// locally. The default is off (D8) and the panel can never relax it.
+// locally. The default is on (D8) and the panel can never relax it.
 func (c *Config) TerminalEnabled() bool {
 	if c == nil {
 		return false
 	}
 	return c.Terminal == nil || c.Terminal.Enabled == nil || *c.Terminal.Enabled
+}
+
+// UnrestrictedEnabled reports the effective Files.Unrestricted value: an
+// explicit true/false is honoured as written, an absent value follows the
+// terminal gate (see FilesConfig.Unrestricted). ResolveLocalPolicy materialises
+// the field, so this accessor only has to cover a Config that was never
+// resolved (a zero value, a test) — there the safe answer is "restricted".
+func (c *Config) UnrestrictedEnabled() bool {
+	if c == nil || c.Files == nil {
+		return false
+	}
+	if c.Files.Unrestricted != nil {
+		return *c.Files.Unrestricted
+	}
+	return c.TerminalEnabled()
 }
 
 // XrayNodesEnabled reports whether the local module gate allows node
@@ -406,10 +618,37 @@ func (c *Config) ResolveLocalPolicy(base, xrayDir string, excluded []string) err
 	if c.Files == nil {
 		c.Files = &FilesConfig{}
 	}
+	// The three-state switch is resolved first: materialising it here is what
+	// lets every consumer — the panel's fileops.Options, hello.policy.files —
+	// read the effective value instead of the raw one. An absent value follows
+	// the terminal gate (see FilesConfig.Unrestricted).
+	if c.Files.Unrestricted == nil {
+		v := c.TerminalEnabled()
+		c.Files.Unrestricted = &v
+	}
 	if len(c.Files.Roots) == 0 {
 		// Default: the xray configuration directory and the agent state
-		// directory, nothing else (D9).
+		// directory, nothing else (D9). The default is kept in unrestricted
+		// mode too: it is what the panel shows as the convenient shortcuts,
+		// while an unrestricted machine also accepts any absolute path with an
+		// empty root.
 		c.Files.Roots = []string{xrayDir, c.StateDir}
+	} else if xrayDir != "" && len(strings.Split(strings.Trim(filepath.ToSlash(filepath.Clean(xrayDir)), "/"), "/")) >= 2 {
+		// The xray configuration directory is always a root (named "xray"),
+		// even when Roots lists other directories: the panel's Xray config
+		// view reads the managed files there (PLAN v10 WP-C), and files_apply
+		// already writes them. A shallow directory ("/etc") is not added: the
+		// file-ops sanity check would refuse it and disable every root.
+		found := false
+		for _, r := range c.Files.Roots {
+			if abs, err := absPath(base, r); err == nil && samePath(abs, xrayDir) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			c.Files.Roots = append(c.Files.Roots, xrayDir)
+		}
 	}
 	roots := make([]string, 0, len(c.Files.Roots))
 	for i, r := range c.Files.Roots {
@@ -418,6 +657,10 @@ func (c *Config) ResolveLocalPolicy(base, xrayDir string, excluded []string) err
 			return fmt.Errorf("config: Agent.Files.Roots[%d]: %v", i, err)
 		}
 		roots = append(roots, abs)
+	}
+	// The machine token file is a credential: never reachable through a root.
+	if c.Panel != nil && c.Panel.TokenFile != "" {
+		excluded = append(append([]string(nil), excluded...), c.Panel.TokenFile)
 	}
 	excl := make([]string, 0, len(excluded))
 	for _, e := range excluded {
@@ -599,27 +842,8 @@ func (p *PanelConfig) Validate() error {
 // fields over the node defaults. It is the one place that completes a
 // ControllerConfig, so Nodes, the machine template and the per-node overrides
 // all get the same treatment.
-func ControllerConfigWithDefaults(src *node.Config) *node.Config {
-	cc := node.DefaultConfig()
-	if src != nil {
-		merge(cc, src)
-	}
-	return cc
-}
-
-// merge copies the set fields of src over the defaults in dst.
-func merge(dst, src *node.Config) {
-	defaults := *dst
-	*dst = *src
-	if dst.ListenIP == "" {
-		dst.ListenIP = defaults.ListenIP
-	}
-	if dst.SendIP == "" {
-		dst.SendIP = defaults.SendIP
-	}
-	if dst.DNSType == "" {
-		dst.DNSType = defaults.DNSType
-	}
+func ControllerConfigWithDefaults(src *nodecfg.Config) *nodecfg.Config {
+	return nodecfg.ControllerConfigWithDefaults(src)
 }
 
 // ResolveToken returns the machine token: Token as is, or the contents of

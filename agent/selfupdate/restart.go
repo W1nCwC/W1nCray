@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -83,7 +83,10 @@ const HelperCommand = "__watchdog"
 // ParseHelperArgs parses the watchdog's argv (everything after HelperCommand):
 //
 //	-parent PID -state DIR -exe EXE [-lock FILE] [-unit UNIT]
-//	[-attempts N] [-window 10s] [-deadline 90s] [-poll 2s] -- <agent argv...>
+//	[-attempts N] [-window D] [-deadline D] [-poll 2s] -- <agent argv...>
+//
+// A missing -window or -deadline falls back to DefaultWatchdogWindows(GOARCH):
+// 60 s / 3 min on amd64 and arm64, 180 s / 8 min on the slower targets.
 func ParseHelperArgs(args []string) (HelperOptions, error) {
 	var (
 		h   HelperOptions
@@ -213,12 +216,48 @@ func useSystemdRun(invocationID string, systemdDir bool, lookPath func(string) (
 type AgentProbe func() (pid int, alive bool)
 
 // RunHelper is the watchdog's main loop: wait for the agent that committed the
-// update to exit, then watch the single-instance lock until the new process
-// confirms the update, until the service manager is clearly not making
-// progress (roll back), or until the deadline (report stalled, keep the
-// update). It is what makes a version that cannot start recoverable.
+// update to exit, then watch the new version until it confirms the update,
+// until the service manager is clearly not making progress (roll back), or
+// until the deadline (report stalled, keep the update). It is what makes a
+// version that cannot start recoverable.
 func RunHelper(ctx context.Context, h HelperOptions, log driver.Logger) error {
-	return runWatchdog(ctx, h, pidProbe(h.LockPath), time.Now, time.Sleep, log)
+	up, err := New(Options{ExePath: h.ExePath, StateDir: h.StateDir, LockPath: h.LockPath, Log: log})
+	if err != nil {
+		return err
+	}
+	return runWatchdog(ctx, h, up.agentProbe(), time.Now, time.Sleep, log)
+}
+
+// agentProbe is the production liveness probe. The authoritative signal is the
+// ready marker the new process writes at start-up (D-M7): it carries the
+// version and the pid, so the watchdog can tell "the new version is really
+// running" from "the service manager has not started it yet" and from a stale
+// single-instance lock holding the pid of the process that just exited. The
+// lock stays as the fallback for a process that started before the marker
+// existed or could not write it.
+//
+// A live pid is not enough: the pid has to be running an agent executable.
+// The lock file and the ready marker are both on-disk records that outlive the
+// process they name, and the kernel hands a freed pid to whatever is started
+// next, so a stale record can point at an unrelated program (F3b). A pid that
+// fails the identity check is reported as "no agent", never as a live one.
+func (u *Updater) agentProbe() AgentProbe {
+	isAgent := u.agentIdentity(u.log)
+	return func() (int, bool) {
+		if m, ok := u.ReadyMarker(); ok {
+			if p, pending := u.Pending(); pending && m.Version == p.Version && processAlive(m.PID) && isAgent(m.PID) {
+				return m.PID, true
+			}
+			// A marker whose version does not match the pending update is
+			// stale (an older process left it behind) or carries no version
+			// at all: never treat it as the new version.
+		}
+		pid := lockPID(u.lockPath)
+		if pid <= 0 || !processAlive(pid) || !isAgent(pid) {
+			return 0, false
+		}
+		return pid, true
+	}
 }
 
 // runWatchdog is the decision loop with the clock, the sleep and the liveness
@@ -227,14 +266,21 @@ func runWatchdog(ctx context.Context, h HelperOptions, probe AgentProbe, now fun
 	if h.ExePath == "" || h.StateDir == "" {
 		return errors.New("selfupdate: the watchdog needs -exe and -state")
 	}
+	aliveDefault, deadlineDefault := DefaultWatchdogWindows(runtime.GOARCH)
 	if h.Attempts <= 0 {
 		h.Attempts = DefaultAttempts
 	}
 	if h.AliveWindow <= 0 {
-		h.AliveWindow = DefaultAliveWindow
+		h.AliveWindow = aliveDefault
 	}
 	if h.Deadline <= 0 {
-		h.Deadline = DefaultDeadline
+		h.Deadline = deadlineDefault
+	}
+	// The deadline must leave room for the no-live-agent window: a deadline
+	// that expires first would turn every slow start into a "stalled, kept"
+	// update and the machine would never be rolled back to a working binary.
+	if h.Deadline <= h.AliveWindow {
+		h.Deadline = h.AliveWindow + DefaultPollInterval*15
 	}
 	if h.PollInterval <= 0 {
 		h.PollInterval = DefaultPollInterval
@@ -284,9 +330,11 @@ func runWatchdog(ctx context.Context, h HelperOptions, probe AgentProbe, now fun
 			return err
 		}
 		// The new process reached the panel and confirmed: the update is good.
-		if _, ok := up.Pending(); !ok {
+		if p, ok := up.Pending(); !ok {
 			log.Infof("selfupdate: the new version confirmed the update; the watchdog stops")
 			return up.CleanupWatchdog()
+		} else {
+			pending = p
 		}
 		if haveProbe {
 			pid, alive := probe()
@@ -308,8 +356,21 @@ func runWatchdog(ctx context.Context, h HelperOptions, probe AgentProbe, now fun
 				return rollbackAndRestart(up, h, reason, log)
 			}
 			if !deadSince.IsZero() && now().Sub(deadSince) >= h.AliveWindow {
-				reason := fmt.Sprintf("no agent was alive for %s after the update", h.AliveWindow)
-				return rollbackAndRestart(up, h, reason, log)
+				// Probe once more before acting. A start that is merely slow
+				// is exactly what this window exists for, and the previous
+				// probe may have run microseconds before the new process took
+				// the lock or wrote its ready marker. Rolling back under a
+				// live process is what leaves "the running executable is not
+				// the installed file" behind (D-M7).
+				if pid, alive := probe(); alive {
+					deadSince = time.Time{}
+					lastPID = pid
+					log.Infof("selfupdate: agent pid %d appeared while the watchdog was deciding; keeping version %s",
+						pid, pending.Version)
+				} else {
+					reason := fmt.Sprintf("no agent was alive for %s after the update", h.AliveWindow)
+					return rollbackAndRestart(up, h, reason, log)
+				}
 			}
 		}
 		if !now().Before(deadline) {
@@ -326,55 +387,60 @@ func runWatchdog(ctx context.Context, h HelperOptions, probe AgentProbe, now fun
 }
 
 // rollbackAndRestart restores the previous binary, records why, and asks the
-// service manager to bring it back. The restart is best effort: on systemd the
-// unit is reset and restarted; every other manager brings the restored binary
-// back with its own respawn.
+// service manager to bring it back.
+//
+// It never restores the file under a process that is still running: the new
+// version is stopped by pid first, because renaming the executable away under a
+// live process is exactly what leaves "the running executable is not the
+// installed file" behind (D-M7). Before restarting the agent it stops the
+// W1nCray-xray service, so a rollback to the in-process-Xray 0.5.x agent never
+// finds the 0.6 service holding the node ports (R1-16).
+//
+// The pid is verified to be an agent before any signal is sent: the watchdog
+// runs as root and a stale lock or ready marker can name a pid the kernel has
+// since reused for an unrelated process (F3b).
 func rollbackAndRestart(up *Updater, h HelperOptions, reason string, log driver.Logger) error {
+	isAgent := up.agentIdentity(log)
+	newPID := liveAgentPID(up, h, log)
+	if newPID > 0 {
+		log.Warnf("selfupdate: %s; stopping agent pid %d before the rollback", reason, newPID)
+		stopAgentProcess(newPID, isAgent, log)
+	}
+	stopXrayService(log)
 	if err := up.Rollback(reason); err != nil {
 		return fmt.Errorf("selfupdate: %s; the rollback failed too: %w", reason, err)
 	}
+	// The service manager may have brought the new binary back while the
+	// rollback ran (its respawn does not know about the swap). Stop it once
+	// more so the next start picks the restored file. stopAgentProcess verifies
+	// the pid again, so a process that already exited is not signalled.
+	if newPID > 0 && processAlive(newPID) {
+		log.Warnf("selfupdate: agent pid %d came back during the rollback; stopping it again", newPID)
+		stopAgentProcess(newPID, isAgent, log)
+	}
 	log.Warnf("selfupdate: %s; restored %s", reason, up.ExePath())
-	restartService(h.Unit, log)
+	restartService(h, log)
 	return nil
 }
 
-// systemctlTimeout bounds one systemctl call. The restart runs on a detached
-// context: the watchdog may be shutting down, but the restored binary still has
-// to come back.
-const systemctlTimeout = 20 * time.Second
-
-// restartService restarts a systemd unit after a rollback. A failure is only
-// logged: the service manager may already be bringing the restored binary
-// back, and a rollback that succeeded must not be reported as failed because
-// systemctl was unavailable.
-func restartService(unit string, log driver.Logger) {
-	if unit == "" {
-		return
-	}
-	for _, args := range [][]string{{"reset-failed", unit}, {"restart", unit}} {
-		ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
-		//nolint:noshell -- systemctl with an argv array, never a shell.
-		cmd := exec.CommandContext(ctx, "systemctl", args...)
-		cmd.Env = os.Environ()
-		out, err := cmd.CombinedOutput()
-		cancel()
-		if err != nil {
-			log.Warnf("selfupdate: systemctl %s %s failed: %v: %s", args[0], unit, err, strings.TrimSpace(string(out)))
-			continue
+// liveAgentPID is the pid of the process running the new version right now: the
+// ready marker when its version matches the pending update, else the
+// single-instance lock. It is the process a rollback has to stop first.
+//
+// It only returns a pid that is both alive and verified to be running an agent
+// executable (F3b). A pid the kernel has reused for an unrelated process is
+// reported as 0 ("no agent"), so the rollback never signals it.
+func liveAgentPID(up *Updater, h HelperOptions, log driver.Logger) int {
+	isAgent := up.agentIdentity(log)
+	if m, ok := up.ReadyMarker(); ok {
+		if p, pending := up.Pending(); pending && m.Version == p.Version && processAlive(m.PID) && isAgent(m.PID) {
+			return m.PID
 		}
-		log.Infof("selfupdate: systemctl %s %s", args[0], unit)
 	}
-}
-
-// pidProbe reads the agent pid from the single-instance lock and checks it.
-func pidProbe(lockPath string) AgentProbe {
-	return func() (int, bool) {
-		pid := lockPID(lockPath)
-		if pid <= 0 {
-			return 0, false
-		}
-		return pid, processAlive(pid)
+	if pid := lockPID(h.LockPath); pid > 0 && processAlive(pid) && isAgent(pid) {
+		return pid
 	}
+	return 0
 }
 
 // lockPID reads the pid the single-instance lock records. cmd/lock_flock.go

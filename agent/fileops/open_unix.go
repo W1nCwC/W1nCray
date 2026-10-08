@@ -47,6 +47,31 @@ func openRegular(p string) (*os.File, error) {
 	return f, nil
 }
 
+// openAppend opens p for appending without following a final symlink and
+// without creating it: an append to a missing file must fail, not produce a
+// file that starts with the middle of an upload. O_NONBLOCK keeps a FIFO (which
+// a racing rename could substitute) from blocking the open forever, exactly as
+// in openNoFollow.
+func openAppend(p string) (*os.File, error) {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if isSymlinkErr(err) {
+			return nil, wrapSymlink(p)
+		}
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, notRegular(p)
+	}
+	return f, nil
+}
+
 // isSymlinkErr reports whether an open failed because the path is a symlink
 // (ELOOP on Unix).
 func isSymlinkErr(err error) bool {

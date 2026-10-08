@@ -126,3 +126,69 @@ func TestReadyNeedsAServiceUnit(t *testing.T) {
 		t.Error("an empty path must be refused")
 	}
 }
+
+// TestReadyAcceptsADeletedRunningImage is the D-M7 capability regression test.
+// A rollback that races the new process's start unlinks the running image, so
+// os.Executable() reports "<path> (deleted)". Ready must still accept the
+// installed file (and the diagnostic must be readable) instead of withdrawing
+// the upgrade capability for the life of the process. It failed before the fix.
+func TestReadyAcceptsADeletedRunningImage(t *testing.T) {
+	dir := t.TempDir()
+	install := filepath.Join(dir, "W1nCray")
+	if err := os.WriteFile(install, []byte("OLD-BINARY"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unit := filepath.Join(dir, "W1nCray.service")
+	body := "[Service]\nExecStart=" + install + " -c /etc/W1nCray/config.yml\nRestart=always\n"
+	if err := os.WriteFile(unit, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := serviceUnits
+	serviceUnits = []string{unit}
+	t.Cleanup(func() { serviceUnits = old })
+
+	if err := Ready(install + deletedSuffix); err != nil {
+		t.Fatalf("Ready(%q) = %v, want the installed path accepted", install+deletedSuffix, err)
+	}
+	if got := ServiceExecutable(); got != install {
+		t.Errorf("ServiceExecutable = %q, want %q", got, install)
+	}
+}
+
+// TestServiceExecutableReadsTheInstallerUnits covers the D-M7 fallback target
+// across the three backends install.sh writes: the executable token (not the
+// config file next to it) is the install path the swap has to target.
+func TestServiceExecutableReadsTheInstallerUnits(t *testing.T) {
+	dir := t.TempDir()
+	install := filepath.Join(dir, "W1nCray")
+	if err := os.WriteFile(install, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(config, []byte("Log: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		text string
+	}{
+		{"systemd", "[Service]\nExecStart=" + install + " -c " + config + "\n"},
+		{"openrc", "#!/sbin/openrc-run\ncommand=\"" + install + "\"\ncommand_args=\"-c " + config + "\"\n"},
+		{"procd", "USE_PROCD=1\nstart_service() {\n\tprocd_set_param command \"" + install + "\" run -c \"" + config + "\"\n}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandExecutable(tc.text); got != install {
+				t.Errorf("commandExecutable = %q, want %q (the executable, never the config file)", got, install)
+			}
+		})
+	}
+	// A unit that starts another program yields nothing, and neither does one
+	// whose command is commented out.
+	if got := commandExecutable("ExecStart=/usr/bin/other\n"); got != "" {
+		t.Errorf("commandExecutable(other) = %q, want empty", got)
+	}
+	if got := commandExecutable("# ExecStart=" + install + "\n"); got != "" {
+		t.Errorf("commandExecutable(commented) = %q, want empty", got)
+	}
+}

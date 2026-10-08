@@ -82,10 +82,17 @@ func TestFileCapabilityRequiresTheSeparatedLayoutAndRoots(t *testing.T) {
 		t.Error("a runtime without a confined file manager claims the file_* commands")
 	}
 
-	// No local root: the panel may not manage anything.
-	rt.cfg = &agentcfg.Config{Files: &agentcfg.FilesConfig{}}
+	// No local root and an explicit Files.Unrestricted: false: the panel may
+	// not manage anything.
+	rt.cfg = &agentcfg.Config{Files: &agentcfg.FilesConfig{Unrestricted: boolPtr(false)}}
 	if rt.fileCapable() {
 		t.Error("the capability was promised without a Files.Roots entry")
+	}
+	// No root but unrestricted (PLAN v10): the file layer reaches the xray
+	// directory by absolute path, so both file features are promised.
+	rt.cfg = &agentcfg.Config{Files: &agentcfg.FilesConfig{Unrestricted: boolPtr(true)}}
+	if !rt.fileCapable() {
+		t.Error("the capability was not promised on an unrestricted machine without roots")
 	}
 }
 

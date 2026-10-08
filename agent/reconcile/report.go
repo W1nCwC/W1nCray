@@ -70,7 +70,14 @@ type InstanceReport struct {
 	ConfigHash string            `json:"config_hash,omitempty"`
 	// Ports lists the listeners, compacted ("tcp 127.0.0.1:20000-20009").
 	Ports []string `json:"ports,omitempty"`
-	Error string   `json:"error,omitempty"`
+	// FirewallOpen is true when the agent has opened this instance's public
+	// ports in the machine's firewall (OpenWrt with Firewall.AutoOpen on, see
+	// agent/fwopen). It stays false for an instance without a public listener
+	// and on every machine where the agent does not manage the firewall;
+	// hello.policy.firewall.auto_open tells the panel which case it is looking
+	// at.
+	FirewallOpen bool   `json:"firewall_open"`
+	Error        string `json:"error,omitempty"`
 }
 
 // KernelEntry is one installed kernel version, mirroring the wire type

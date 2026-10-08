@@ -196,7 +196,7 @@ func TestReadRefusesDevices(t *testing.T) {
 	if _, err := os.Lstat(dev); err != nil {
 		t.Skipf("%s is not available: %v", dev, err)
 	}
-	ops, err := New(Options{Unrestricted: true, testAllowSystemRoot: true})
+	ops, err := New(Options{Unrestricted: boolPtr(true), testAllowSystemRoot: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +483,8 @@ func TestNewRefusesUnsafeRoots(t *testing.T) {
 	}{
 		{"filesystem-root", string(filepath.Separator)},
 		{"etc", "/etc"},
-		{"etc-below", "/etc/xray"},
+		// "/etc/xray" (a directory below /etc) is a valid root since 6b377f9:
+		// /etc/W1nCray is the standard install; path_regress_test.go covers it.
 		{"usr", "/usr"},
 		{"var", "/var"},
 		{"dev", "/dev"},
@@ -534,7 +535,7 @@ func TestUnrestrictedStillRefusesSymlinksAndSpecialFiles(t *testing.T) {
 	if !linkOK {
 		t.Log("no symlink can be created here: the Unrestricted symlink row runs on Linux")
 	}
-	ops, err := New(Options{Unrestricted: true, testAllowSystemRoot: true})
+	ops, err := New(Options{Unrestricted: boolPtr(true), testAllowSystemRoot: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,4 +584,354 @@ func TestRootsWithoutRoots(t *testing.T) {
 	}
 }
 
+// TestUnrestrictedWithoutRoots is PLAN v10 requirement 2: an unrestricted
+// machine needs no root at all. The panel names absolute paths with an empty
+// root, and the filesystem root itself is listable.
+func TestUnrestrictedWithoutRoots(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(file, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ops, err := New(Options{Unrestricted: boolPtr(true), testAllowSystemRoot: true})
+	if err != nil {
+		t.Fatalf("New without roots must succeed when unrestricted: %v", err)
+	}
+	if !ops.Unrestricted() {
+		t.Error("Unrestricted() = false")
+	}
+	if got := ops.RootNames(); len(got) != 0 {
+		t.Errorf("RootNames = %v, want none", got)
+	}
+	ctx := context.Background()
+	entries, err := ops.List(ctx, "", dir)
+	if err != nil {
+		t.Fatalf("List of an absolute directory without roots: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "note.txt" {
+		t.Errorf("List = %+v", entries)
+	}
+	if got, err := ops.Resolve("", file); err != nil || got != file {
+		t.Errorf("Resolve(%q) = %q, %v", file, got, err)
+	}
+	// The filesystem root is a directory listing like any other: the panel may
+	// start browsing from the volume root ("/" on Unix, "C:\" on Windows).
+	if _, err := ops.List(ctx, "", filepath.VolumeName(dir)+string(filepath.Separator)); err != nil {
+		t.Errorf("List of the filesystem root: %v", err)
+	}
+	// The root argument is ignored, but the path still has to be absolute.
+	if _, err := ops.Resolve("xray", "relative.txt"); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Resolve of a relative path = %v, want ErrBadPath", err)
+	}
+}
+
+// TestAppendWholeFileDigest covers the chunked upload: append adds one chunk to
+// an existing file, and every answer reports the size and the sha256 of the
+// WHOLE file, so the panel can verify the assembled result.
+func TestAppendWholeFileDigest(t *testing.T) {
+	root, ops := testRoots(t)
+	ctx := context.Background()
+	chunks := [][]byte{[]byte("first chunk;"), []byte("second chunk;"), []byte("third chunk")}
+	want := bytes.Join(chunks, nil)
+
+	res, err := ops.Write(ctx, "xray", "big.bin", chunks[0], 0o644, "")
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if !res.Created || res.Size != int64(len(chunks[0])) || res.Append {
+		t.Errorf("first write = %+v", res)
+	}
+	for i, chunk := range chunks[1:] {
+		sum := sha256.Sum256(chunk)
+		var err error
+		res, err = ops.Append(ctx, "xray", "big.bin", chunk, hex.EncodeToString(sum[:]))
+		if err != nil {
+			t.Fatalf("Append #%d: %v", i+1, err)
+		}
+		if !res.Append {
+			t.Errorf("Append #%d result does not report the append: %+v", i+1, res)
+		}
+		if res.Size != int64(len(bytes.Join(chunks[:i+2], nil))) {
+			t.Errorf("Append #%d size = %d", i+1, res.Size)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(root, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("file = %q, want %q", got, want)
+	}
+	wantSum := sha256.Sum256(want)
+	if res.SHA256 != hex.EncodeToString(wantSum[:]) {
+		t.Errorf("whole-file sha256 = %s, want %s", res.SHA256, hex.EncodeToString(wantSum[:]))
+	}
+	if res.Size != int64(len(want)) {
+		t.Errorf("whole-file size = %d, want %d", res.Size, len(want))
+	}
+	// The payload is still checked against the caller's sha256.
+	if _, err := ops.Append(ctx, "xray", "big.bin", []byte("x"), strings.Repeat("0", 64)); !errors.Is(err, ErrHashMismatch) {
+		t.Errorf("Append with a bad sha256 = %v, want ErrHashMismatch", err)
+	}
+	// The size limit applies to one chunk, not to the file.
+	if _, err := ops.Append(ctx, "xray", "big.bin", make([]byte, DefaultMaxWrite+1), ""); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("Append over MaxWrite = %v, want ErrTooLarge", err)
+	}
+}
+
+// TestAppendRefusesMissingAndSpecialFiles: an append never creates the file (a
+// lost chunk must fail loudly) and never follows a symlink.
+func TestAppendRefusesMissingAndSpecialFiles(t *testing.T) {
+	root, ops := testRoots(t)
+	ctx := context.Background()
+	if _, err := ops.Append(ctx, "xray", "not-there.bin", []byte("x"), ""); !errors.Is(err, ErrNotExist) {
+		t.Errorf("Append to a missing file = %v, want ErrNotExist", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "not-there.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("Append created the missing file")
+	}
+	if _, err := ops.Append(ctx, "xray", "sub", []byte("x"), ""); !errors.Is(err, ErrIsDir) {
+		t.Errorf("Append to a directory = %v, want ErrIsDir", err)
+	}
+	if _, err := ops.Append(ctx, "xray", "../outside/evil.txt", []byte("x"), ""); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Append outside the root = %v, want ErrBadPath", err)
+	}
+	if link, err := os.Lstat(filepath.Join(root, "link-to-outside")); err == nil && link != nil {
+		if _, err := ops.Append(ctx, "xray", "link-to-outside", []byte("x"), ""); !errors.Is(err, ErrSymlink) {
+			t.Errorf("Append through a symlink = %v, want ErrSymlink", err)
+		}
+	}
+}
+
+// TestMkdirCreatesParents covers file_mkdir: mkdir -p semantics, the default
+// mode 0755 and the directory mode whitelist.
+func TestMkdirCreatesParents(t *testing.T) {
+	root, ops := testRoots(t)
+	ctx := context.Background()
+
+	res, err := ops.Mkdir(ctx, "xray", "a/b/c", 0)
+	if err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if !res.Created {
+		t.Error("Mkdir of a new path reports Created = false")
+	}
+	if res.Path != filepath.Join(root, "a", "b", "c") {
+		t.Errorf("Mkdir path = %q", res.Path)
+	}
+	for _, rel := range []string{"a", "a/b", "a/b/c"} {
+		fi, err := os.Lstat(filepath.Join(root, rel))
+		if err != nil || !fi.IsDir() {
+			t.Fatalf("%s: %v", rel, err)
+		}
+	}
+	if fi, _ := os.Lstat(filepath.Join(root, "a", "b", "c")); !runtimeIsWindows && fi.Mode().Perm() != 0o755 {
+		t.Errorf("default directory mode = %04o, want 0755", fi.Mode().Perm())
+	}
+	// A second call is a no-op, not an error (mkdir -p).
+	again, err := ops.Mkdir(ctx, "xray", "a/b/c", 0)
+	if err != nil || again.Created {
+		t.Errorf("second Mkdir = %+v, %v", again, err)
+	}
+	// An explicit mode is honoured (the executable bit needs no AllowExec on a
+	// directory: it is what makes it searchable).
+	res, err = ops.Mkdir(ctx, "xray", "private", 0o700)
+	if err != nil {
+		t.Fatalf("Mkdir 0700: %v", err)
+	}
+	if fi, _ := os.Lstat(res.Path); !runtimeIsWindows && fi.Mode().Perm() != 0o700 {
+		t.Errorf("mode = %04o, want 0700", fi.Mode().Perm())
+	}
+	// A world-writable directory is refused, and so is a special bit.
+	if _, err := ops.Mkdir(ctx, "xray", "open", 0o777); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Mkdir 0777 = %v, want ErrBadPath", err)
+	}
+	if _, err := ops.Mkdir(ctx, "xray", "sticky", 0o1777); !errors.Is(err, ErrSpecialMode) {
+		t.Errorf("Mkdir 1777 = %v, want ErrSpecialMode", err)
+	}
+	// An existing regular file is not a directory.
+	if _, err := ops.Mkdir(ctx, "xray", "secret.txt", 0); !errors.Is(err, ErrNotDir) {
+		t.Errorf("Mkdir over a file = %v, want ErrNotDir", err)
+	}
+}
+
+// TestMkdirRefusesEscapes: the new command obeys exactly the same path rules.
+func TestMkdirRefusesEscapes(t *testing.T) {
+	_, ops := testRoots(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		root, path string
+		want       error
+	}{
+		{"xray", "../outside/evil", ErrBadPath},
+		{"xray", "/etc/w1n", ErrBadPath},
+		{"nope", "a", ErrUnknownRoot},
+		{"state", "desired.json", ErrOutsideRoots},
+	} {
+		if _, err := ops.Mkdir(ctx, tc.root, tc.path, 0); !errors.Is(err, tc.want) {
+			t.Errorf("Mkdir(%s, %s) = %v, want %v", tc.root, tc.path, err, tc.want)
+		}
+	}
+}
+
+// TestRenameMovesAndNeverOverwrites covers file_rename: a move inside the root
+// works, an existing target is refused, and a missing source is reported.
+func TestRenameMovesAndNeverOverwrites(t *testing.T) {
+	root, ops := testRoots(t)
+	ctx := context.Background()
+
+	res, err := ops.Rename(ctx, "xray", "secret.txt", "sub/moved.txt")
+	if err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if !res.Renamed || res.To != filepath.Join(root, "sub", "moved.txt") {
+		t.Errorf("Rename = %+v", res)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "secret.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the source still exists after Rename")
+	}
+	if b, err := os.ReadFile(res.To); err != nil || string(b) != "top secret" {
+		t.Errorf("moved content = %q, %v", b, err)
+	}
+	// The target must not exist: an existing file (or directory) is refused
+	// and left untouched.
+	if _, err := ops.Rename(ctx, "xray", "sub/moved.txt", "sub/inside.txt"); !errors.Is(err, ErrExists) {
+		t.Errorf("Rename over an existing file = %v, want ErrExists", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, "sub", "inside.txt")); err != nil || string(b) != "inside" {
+		t.Errorf("the target was modified: %q, %v", b, err)
+	}
+	if _, err := ops.Rename(ctx, "xray", "sub/moved.txt", "sub"); !errors.Is(err, ErrExists) {
+		t.Errorf("Rename over a directory = %v, want ErrExists", err)
+	}
+	if _, err := ops.Rename(ctx, "xray", "gone.txt", "other.txt"); !errors.Is(err, ErrNotExist) {
+		t.Errorf("Rename of a missing source = %v, want ErrNotExist", err)
+	}
+	if _, err := ops.Rename(ctx, "xray", "sub/moved.txt", "sub/moved.txt"); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Rename onto itself = %v, want ErrBadPath", err)
+	}
+	// A missing target directory is refused instead of being created.
+	if _, err := ops.Rename(ctx, "xray", "sub/moved.txt", "nodir/x.txt"); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Rename into a missing directory = %v, want ErrBadPath", err)
+	}
+}
+
+// TestRenameRefusesEscapes: both ends go through Resolve, so a rename can never
+// move a file out of its root.
+func TestRenameRefusesEscapes(t *testing.T) {
+	_, ops := testRoots(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, root, from, to string
+		want                 error
+	}{
+		{"source escapes", "xray", "../outside/evil.txt", "moved.txt", ErrBadPath},
+		{"target escapes", "xray", "secret.txt", "../outside/evil.txt", ErrBadPath},
+		{"target absolute", "xray", "secret.txt", "/etc/moved.txt", ErrBadPath},
+		{"excluded source", "state", "desired.json", "moved.json", ErrOutsideRoots},
+		{"excluded target", "state", "sub", "desired.json", ErrOutsideRoots},
+		{"unknown root", "nope", "a", "b", ErrUnknownRoot},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ops.Rename(ctx, tc.root, tc.from, tc.to); !errors.Is(err, tc.want) {
+				t.Errorf("Rename = %v, want %v", err, tc.want)
+			}
+		})
+	}
+	// A symlink is never moved (it would carry its target's meaning elsewhere).
+	if _, err := os.Lstat(filepath.Join(ops.Roots()[0].Path, "link-to-outside")); err == nil {
+		if _, err := ops.Rename(ctx, "xray", "link-to-outside", "sub/link"); !errors.Is(err, ErrSymlink) {
+			t.Errorf("Rename of a symlink = %v, want ErrSymlink", err)
+		}
+	}
+}
+
+// TestUnrestrictedMkdirAndRename: the new commands use absolute paths when the
+// machine is unrestricted, exactly like the old ones.
+func TestUnrestrictedMkdirAndRename(t *testing.T) {
+	base := t.TempDir()
+	ops, err := New(Options{Unrestricted: boolPtr(true), testAllowSystemRoot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dir := filepath.Join(base, "deep", "er")
+	if _, err := ops.Mkdir(ctx, "", dir, 0o755); err != nil {
+		t.Fatalf("Mkdir %s: %v", dir, err)
+	}
+	file := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(base, "b.txt")
+	if res, err := ops.Rename(ctx, "", file, moved); err != nil || !res.Renamed {
+		t.Fatalf("Rename = %+v, %v", res, err)
+	}
+	if _, err := ops.Rename(ctx, "", moved, "relative.txt"); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Rename to a relative path = %v, want ErrBadPath", err)
+	}
+	if _, err := ops.Mkdir(ctx, "", "relative", 0); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Mkdir of a relative path = %v, want ErrBadPath", err)
+	}
+}
+
+// TestFileListReportsModeAndMTime pins the file_list row shape: the panel needs
+// the permission bits and the modification time of every entry.
+func TestFileListReportsModeAndMTime(t *testing.T) {
+	root, ops := testRoots(t)
+	entries, err := ops.List(context.Background(), "xray", ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Name != "secret.txt" {
+			continue
+		}
+		found = true
+		if !runtimeIsWindows && e.Mode != "0644" {
+			t.Errorf("mode = %q, want 0644", e.Mode)
+		}
+		if e.Mode == "" {
+			t.Error("the entry has no mode")
+		}
+		fi, err := os.Lstat(filepath.Join(root, "secret.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e.MTime != fi.ModTime().Unix() {
+			t.Errorf("mtime = %d, want %d", e.MTime, fi.ModTime().Unix())
+		}
+	}
+	if !found {
+		t.Errorf("secret.txt is not in the listing: %+v", entries)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
 var _ driver.Logger = nopLog{}
+
+// TestUnrestrictedKeepsNamedRoots: an unrestricted machine still resolves a
+// named root plus a relative path (the panel's Xray config view reads
+// {root:"xray", path:"route.json"}); only the empty root takes an absolute path.
+func TestUnrestrictedKeepsNamedRoots(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "route.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ops, err := New(Options{Unrestricted: boolPtr(true), Roots: []Root{{Name: "xray", Path: dir}}, testAllowSystemRoot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ops.Resolve("xray", "route.json"); err != nil || got != filepath.Join(dir, "route.json") {
+		t.Fatalf("Resolve(xray, route.json) = %q, %v", got, err)
+	}
+	if _, err := ops.Resolve("xray", "../escape"); !errors.Is(err, ErrBadPath) {
+		t.Errorf("a named root must still refuse ..: %v", err)
+	}
+	abs := filepath.Join(dir, "route.json")
+	if got, err := ops.Resolve("", abs); err != nil || got != abs {
+		t.Errorf("Resolve(\"\", abs) = %q, %v", got, err)
+	}
+}

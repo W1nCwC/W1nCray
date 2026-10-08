@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/W1nCwC/W1nCray/node"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 // writeFile writes a file and fails the test on error.
@@ -78,11 +79,144 @@ Modules:
 	if !cfg.TerminalEnabled() || cfg.Terminal.Sessions() != 1 {
 		t.Errorf("terminal = %+v", cfg.Terminal)
 	}
-	if cfg.Files == nil || !cfg.Files.Unrestricted || !cfg.Files.AllowExec {
+	if cfg.Files == nil || cfg.Files.Unrestricted == nil || !*cfg.Files.Unrestricted || !cfg.Files.AllowExec {
 		t.Errorf("files = %+v", cfg.Files)
 	}
 	if cfg.XrayNodesEnabled() {
 		t.Error("Modules.XrayNodes: false must switch the node controllers off")
+	}
+}
+
+// TestKernelsAllowHTTPIsALocalSwitch covers D-M1: the agent.yml
+// Kernels.AllowHTTP switch exists, defaults to false (https only) and is read
+// from the machine's own configuration file. Nothing the panel pushes can set
+// it — the panel sends a desired state, never agent configuration.
+func TestKernelsAllowHTTPIsALocalSwitch(t *testing.T) {
+	var nilCfg *Config
+	if nilCfg.KernelsAllowHTTP() {
+		t.Error("a nil Config must not permit http kernel sources")
+	}
+	if (&Config{}).KernelsAllowHTTP() {
+		t.Error("a Config without a Kernels section must not permit http")
+	}
+	if (&Config{Kernels: &KernelsConfig{}}).KernelsAllowHTTP() {
+		t.Error("Kernels.AllowHTTP must default to false")
+	}
+	if !(&Config{Kernels: &KernelsConfig{AllowHTTP: true}}).KernelsAllowHTTP() {
+		t.Error("Kernels.AllowHTTP: true was ignored")
+	}
+
+	dir := t.TempDir()
+	path := writeFile(t, filepath.Join(dir, FileName), "Enabled: true\nKernels:\n  AllowHTTP: true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.KernelsAllowHTTP() {
+		t.Errorf("agent.yml Kernels.AllowHTTP was not read: %+v", cfg.Kernels)
+	}
+	// The switch is a local gate, not a policy: validation accepts it and the
+	// file that carries it stays loadable.
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	// The config.yml "Agent:" block uses the same field names, so a machine on
+	// the old layout gets the switch too.
+	block, err := Load(writeFile(t, filepath.Join(dir, "other.yml"), "Enabled: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if block.KernelsAllowHTTP() {
+		t.Error("a config without the section must stay https-only")
+	}
+}
+
+// TestFrpReadyTimeoutIsAnOptionalLocalOverride covers D4's configuration half:
+// Drivers.Frp.ReadyTimeoutSec overrides the frp driver's readiness limit, is
+// absent by default (the architecture default applies) and refuses a negative
+// value.
+func TestFrpReadyTimeoutIsAnOptionalLocalOverride(t *testing.T) {
+	var nilCfg *Config
+	if d, ok := nilCfg.FrpReadyTimeout(); ok || d != 0 {
+		t.Errorf("nil Config = (%s, %v), want (0, false)", d, ok)
+	}
+	if _, ok := (&Config{}).FrpReadyTimeout(); ok {
+		t.Error("a Config without a Drivers section must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{}}).FrpReadyTimeout(); ok {
+		t.Error("a Drivers section without Frp must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{Frp: &FrpConfig{}}}).FrpReadyTimeout(); ok {
+		t.Error("ReadyTimeoutSec 0 must mean the driver default")
+	}
+	if d, ok := (&Config{Drivers: &DriversConfig{Frp: &FrpConfig{ReadyTimeoutSec: 90}}}).FrpReadyTimeout(); !ok || d != 90*time.Second {
+		t.Errorf("explicit override = (%s, %v), want (1m30s, true)", d, ok)
+	}
+
+	// The field is read from agent.yml.
+	dir := t.TempDir()
+	path := writeFile(t, filepath.Join(dir, FileName), "Enabled: true\nDrivers:\n  Frp:\n    ReadyTimeoutSec: 45\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := cfg.FrpReadyTimeout(); !ok || d != 45*time.Second {
+		t.Errorf("agent.yml override = (%s, %v), want (45s, true)", d, ok)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	// A negative value is refused instead of silently ignored.
+	bad := &Config{Enabled: true, Drivers: &DriversConfig{Frp: &FrpConfig{ReadyTimeoutSec: -1}}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "ReadyTimeoutSec") {
+		t.Errorf("Validate(negative) = %v, want a ReadyTimeoutSec error", err)
+	}
+}
+
+// TestGostReadyTimeoutIsAnOptionalLocalOverride covers F6's configuration half:
+// Drivers.Gost.ReadyTimeoutSec mirrors the frp override, is absent by default
+// (the shared driver default applies) and refuses a negative value.
+func TestGostReadyTimeoutIsAnOptionalLocalOverride(t *testing.T) {
+	var nilCfg *Config
+	if d, ok := nilCfg.GostReadyTimeout(); ok || d != 0 {
+		t.Errorf("nil Config = (%s, %v), want (0, false)", d, ok)
+	}
+	if _, ok := (&Config{}).GostReadyTimeout(); ok {
+		t.Error("a Config without a Drivers section must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{}}).GostReadyTimeout(); ok {
+		t.Error("a Drivers section without Gost must use the driver default")
+	}
+	if _, ok := (&Config{Drivers: &DriversConfig{Gost: &GostConfig{}}}).GostReadyTimeout(); ok {
+		t.Error("ReadyTimeoutSec 0 must mean the driver default")
+	}
+	if d, ok := (&Config{Drivers: &DriversConfig{Gost: &GostConfig{ReadyTimeoutSec: 45}}}).GostReadyTimeout(); !ok || d != 45*time.Second {
+		t.Errorf("explicit override = (%s, %v), want (45s, true)", d, ok)
+	}
+
+	// Both drivers are read from the same agent.yml section, independently.
+	dir := t.TempDir()
+	path := writeFile(t, filepath.Join(dir, FileName), "Enabled: true\nDrivers:\n  Frp:\n    ReadyTimeoutSec: 45\n  Gost:\n    ReadyTimeoutSec: 90\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := cfg.GostReadyTimeout(); !ok || d != 90*time.Second {
+		t.Errorf("agent.yml gost override = (%s, %v), want (1m30s, true)", d, ok)
+	}
+	if d, ok := cfg.FrpReadyTimeout(); !ok || d != 45*time.Second {
+		t.Errorf("agent.yml frp override = (%s, %v), want (45s, true)", d, ok)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	// A negative value is refused instead of silently ignored.
+	bad := &Config{Enabled: true, Drivers: &DriversConfig{Gost: &GostConfig{ReadyTimeoutSec: -1}}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "Gost.ReadyTimeoutSec") {
+		t.Errorf("Validate(negative) = %v, want a Gost.ReadyTimeoutSec error", err)
 	}
 }
 
@@ -182,8 +316,14 @@ func TestLocalPolicyDefaults(t *testing.T) {
 	if len(cfg.Files.Roots) != len(want) || cfg.Files.Roots[0] != want[0] || cfg.Files.Roots[1] != want[1] {
 		t.Errorf("Roots = %v, want %v", cfg.Files.Roots, want)
 	}
-	if cfg.Files.Unrestricted || cfg.Files.AllowExec {
-		t.Errorf("the file gates must default to closed: %+v", cfg.Files)
+	if cfg.Files.AllowExec {
+		t.Errorf("AllowExec must default to false: %+v", cfg.Files)
+	}
+	// The terminal defaults to ON, so the file manager follows it: PLAN v10's
+	// three-state rule means "not written" is unrestricted on a machine whose
+	// root shell is already reachable. An explicit false is what confines it.
+	if !cfg.UnrestrictedEnabled() || cfg.Files.Unrestricted == nil || !*cfg.Files.Unrestricted {
+		t.Errorf("Files.Unrestricted must follow the terminal default (on): %+v", cfg.Files)
 	}
 	if !cfg.XrayNodesEnabled() {
 		t.Error("Modules.XrayNodes must default to on")
@@ -208,6 +348,42 @@ func TestLocalPolicyDefaults(t *testing.T) {
 				t.Errorf("root %q is an excluded file", root)
 			}
 		}
+	}
+}
+
+// TestUnrestrictedTriState pins PLAN v10's three-state rule for
+// Files.Unrestricted: an absent value follows the terminal gate, an explicit
+// value wins, and ResolveLocalPolicy materialises the effective value so every
+// consumer (the panel's fileops options, hello.policy.files) reads it.
+func TestUnrestrictedTriState(t *testing.T) {
+	cases := []struct {
+		name          string
+		terminal      *TerminalConfig
+		unrestricted  *bool
+		wantEffective bool
+	}{
+		{"unset + terminal on", nil, nil, true},
+		{"unset + terminal off", &TerminalConfig{Enabled: boolPtr(false)}, nil, false},
+		{"explicit true + terminal off", &TerminalConfig{Enabled: boolPtr(false)}, boolPtr(true), true},
+		{"explicit false + terminal on", nil, boolPtr(false), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, path := configPath(t)
+			cfg := resolveLocal(t, &Config{Enabled: true, Terminal: tc.terminal, Files: &FilesConfig{Unrestricted: tc.unrestricted}}, path)
+			if got := cfg.UnrestrictedEnabled(); got != tc.wantEffective {
+				t.Errorf("UnrestrictedEnabled() = %v, want %v", got, tc.wantEffective)
+			}
+			if cfg.Files.Unrestricted == nil || *cfg.Files.Unrestricted != tc.wantEffective {
+				t.Errorf("materialised Unrestricted = %v, want %v", cfg.Files.Unrestricted, tc.wantEffective)
+			}
+		})
+	}
+	// An unresolved Config has no Files section at all: the accessor must stay
+	// on the safe side (restricted) instead of inventing a policy.
+	raw := &Config{Enabled: true}
+	if raw.UnrestrictedEnabled() {
+		t.Error("a Config without a Files section must not report unrestricted")
 	}
 }
 
@@ -428,7 +604,7 @@ func TestControllerConfigWithDefaults(t *testing.T) {
 	if cc == nil || cc.ListenIP == "" {
 		t.Fatalf("defaults = %+v", cc)
 	}
-	src := &node.Config{ListenIP: "127.0.0.1", UpdatePeriodic: 30}
+	src := &nodecfg.Config{ListenIP: "127.0.0.1", UpdatePeriodic: 30}
 	cc = ControllerConfigWithDefaults(src)
 	if cc == src || cc.ListenIP != "127.0.0.1" || cc.UpdatePeriodic != 30 {
 		t.Fatalf("override = %+v", cc)
@@ -491,5 +667,107 @@ func TestSeparatedLayout(t *testing.T) {
 	}
 	if !Separated(path) {
 		t.Error("Separated = false although agent.yml exists")
+	}
+}
+
+// TestLocalPolicyAlwaysHasTheXrayRootAndHidesTheToken (PLAN v10 WP-C): explicit
+// Roots elsewhere still get the xray configuration directory added, a shallow
+// one is not added, and the machine token file is excluded.
+func TestLocalPolicyAlwaysHasTheXrayRootAndHidesTheToken(t *testing.T) {
+	base := t.TempDir()
+	xrayDir := filepath.Join(base, "etc", "W1nCray")
+	other := filepath.Join(base, "files")
+	cfg := &Config{Enabled: true, StateDir: filepath.Join(base, "state"),
+		Files: &FilesConfig{Roots: []string{other}},
+		Panel: &PanelConfig{TokenFile: filepath.Join(xrayDir, "agent.token")}}
+	if err := cfg.ResolveLocalPolicy(xrayDir, xrayDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Files.Roots) != 2 || cfg.Files.Roots[1] != xrayDir {
+		t.Errorf("Roots = %v, want [%s %s]", cfg.Files.Roots, other, xrayDir)
+	}
+	found := false
+	for _, e := range cfg.ExcludedFiles() {
+		if e == filepath.Join(xrayDir, "agent.token") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the token file is not excluded: %v", cfg.ExcludedFiles())
+	}
+
+	shallow := &Config{Enabled: true, Files: &FilesConfig{Roots: []string{other}}}
+	if err := shallow.ResolveLocalPolicy(base, string(filepath.Separator)+"etc", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(shallow.Files.Roots) != 1 {
+		t.Errorf("a shallow xray directory must not be added: %v", shallow.Files.Roots)
+	}
+}
+
+// TestFirewallAutoOpenDefaults pins the three-state switch of PLAN v11 D2:
+// "not written" follows the platform (on for OpenWrt, off elsewhere), an
+// explicit value is honoured on OpenWrt, and a non-OpenWrt machine never turns
+// it on because the agent has no firewall automation there.
+func TestFirewallAutoOpenDefaults(t *testing.T) {
+	on, off := true, false
+	cases := []struct {
+		name    string
+		cfg     *Config
+		openWrt bool
+		want    bool
+	}{
+		{"nil config on openwrt", nil, true, true},
+		{"nil config elsewhere", nil, false, false},
+		{"not written on openwrt", &Config{}, true, true},
+		{"not written elsewhere", &Config{}, false, false},
+		{"explicit on", &Config{Firewall: &FirewallConfig{AutoOpen: &on}}, true, true},
+		{"explicit off", &Config{Firewall: &FirewallConfig{AutoOpen: &off}}, true, false},
+		{"explicit on elsewhere", &Config{Firewall: &FirewallConfig{AutoOpen: &on}}, false, false},
+	}
+	for _, c := range cases {
+		if got := c.cfg.FirewallAutoOpen(c.openWrt); got != c.want {
+			t.Errorf("%s: FirewallAutoOpen = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestSelfUpdateWindowsAreALocalArchitectureAwareOverride pins the D-M7 timing
+// rule: the watchdog windows come from the architecture by default, a local
+// agent.yml value overrides them, and a deadline that is not above the window is
+// raised so the rollback rule can still fire.
+func TestSelfUpdateWindowsAreALocalArchitectureAwareOverride(t *testing.T) {
+	// Defaults: architecture-driven, never the old fixed 10 s.
+	alive, deadline := (*Config)(nil).SelfUpdateWindows("amd64")
+	if alive != selfupdate.DefaultAliveWindow || deadline != selfupdate.DefaultDeadline {
+		t.Errorf("nil config on amd64 = %s/%s, want %s/%s", alive, deadline, selfupdate.DefaultAliveWindow, selfupdate.DefaultDeadline)
+	}
+	slowAlive, _ := (*Config)(nil).SelfUpdateWindows("mips")
+	if slowAlive != selfupdate.DefaultAliveWindowSlow || slowAlive <= alive {
+		t.Errorf("the slow-target window %s must be the slow default %s and exceed the amd64 one %s", slowAlive, selfupdate.DefaultAliveWindowSlow, alive)
+	}
+
+	cfg := &Config{SelfUpdate: &SelfUpdateConfig{AliveWindowSec: 90, DeadlineSec: 600}}
+	alive, deadline = cfg.SelfUpdateWindows("mips")
+	if alive != 90*time.Second || deadline != 600*time.Second {
+		t.Errorf("override = %s/%s, want 90s/10m0s", alive, deadline)
+	}
+
+	// A deadline below the window is raised, not honoured: a watchdog that
+	// stops watching before its rollback rule fires would leave a broken
+	// binary in place.
+	cfg = &Config{SelfUpdate: &SelfUpdateConfig{AliveWindowSec: 300, DeadlineSec: 60}}
+	alive, deadline = cfg.SelfUpdateWindows("amd64")
+	if alive != 300*time.Second || deadline <= alive {
+		t.Errorf("misconfigured budget = %s/%s, want the deadline raised above 300s", alive, deadline)
+	}
+
+	// Zero and negative values mean "use the default", and a negative value is
+	// refused by Validate.
+	if a, d := (&Config{SelfUpdate: &SelfUpdateConfig{}}).SelfUpdateWindows("amd64"); a != selfupdate.DefaultAliveWindow || d != selfupdate.DefaultDeadline {
+		t.Errorf("zero values = %s/%s, want the architecture defaults", a, d)
+	}
+	if err := (&Config{SelfUpdate: &SelfUpdateConfig{AliveWindowSec: -1}}).Validate(); err == nil {
+		t.Error("a negative window must be refused")
 	}
 }

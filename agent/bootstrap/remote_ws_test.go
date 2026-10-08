@@ -375,11 +375,15 @@ func TestStartRemoteStopEndsTheWebSocketBeforeTheRunner(t *testing.T) {
 	}
 }
 
-// TestStartRemoteNodesHintPullsTheDesiredState covers ruling 6 for the batch-1
-// behaviour: with the local module on, a "nodes" hint only pulls the desired
-// state again (the per-node controllers land in a later batch).
-func TestStartRemoteNodesHintPullsTheDesiredState(t *testing.T) {
+// TestStartRemoteNodesHintSyncsTheKernel covers the wiring of ruling 6: the
+// hook the WebSocket channel gets is the runtime's kernel client, so a "nodes"
+// hint makes the kernel re-fetch this machine's node list now. The hint is
+// about the kernel's node list, not the agent's desired state, so the HTTP pull
+// must not run again.
+func TestStartRemoteNodesHintSyncsTheKernel(t *testing.T) {
 	rt, _ := bootCycle(t, t.TempDir(), false, nil)
+	k := &fakeXray{syncChanged: true}
+	rt.Xray = k
 	p := newWSPanel(t)
 	log := &orderLog{}
 	remoteWS(t, rt, p, log, &agentcfg.Config{})
@@ -388,9 +392,37 @@ func TestStartRemoteNodesHintPullsTheDesiredState(t *testing.T) {
 	p.waitConfigs(t, 1)
 
 	wc.sendType(t, wsproto.TypeHint, "h1", wsproto.Hint{What: "nodes"})
-	p.waitConfigs(t, 2)
+	waitFor(t, "the kernel sync", func() bool { return k.syncCallCount() == 1 })
 	if !strings.Contains(log.text(), "xray nodes hint") {
 		t.Errorf("the nodes hint was not logged:\n%s", log.text())
+	}
+	// The nodes hint must not pull the desired state any more.
+	time.Sleep(150 * time.Millisecond)
+	if n := len(p.configsSeen()); n != 1 {
+		t.Errorf("the nodes hint pulled the desired state %d time(s)", n-1)
+	}
+}
+
+// TestStartRemoteNodesHintDegradesWithoutTheKernel: on a machine without the
+// Xray kernel (rt.Xray is nil) the hint is logged and degraded to the kernel's
+// 60 s poll; it never fails the command path and it does not pull the desired
+// state.
+func TestStartRemoteNodesHintDegradesWithoutTheKernel(t *testing.T) {
+	rt, _ := bootCycle(t, t.TempDir(), false, nil) // no XrayConfigPath: rt.Xray is nil
+	p := newWSPanel(t)
+	log := &orderLog{}
+	remoteWS(t, rt, p, log, &agentcfg.Config{})
+	wc := p.waitConn(t)
+	wc.recvType(t, wsproto.TypeHello)
+	p.waitConfigs(t, 1)
+
+	wc.sendType(t, wsproto.TypeHint, "h1", wsproto.Hint{What: "nodes"})
+	waitFor(t, "the degradation to be logged", func() bool {
+		return strings.Contains(log.text(), "xray nodes hint")
+	})
+	time.Sleep(150 * time.Millisecond)
+	if n := len(p.configsSeen()); n != 1 {
+		t.Errorf("the nodes hint pulled the desired state %d time(s)", n-1)
 	}
 }
 

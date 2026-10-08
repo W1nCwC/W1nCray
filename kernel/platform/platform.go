@@ -32,16 +32,84 @@ type Info struct {
 	Float string
 	// Libc is "musl", "glibc" or "" (unknown or not Linux).
 	Libc string
+	// OpenWrt is true on an OpenWrt/ImmortalWrt system (/etc/openwrt_release).
+	// It makes Kernel.OpenWrtTargets the first candidates (the lite build),
+	// then the legacy "linux/<arch>+openwrt" key, then "linux/<arch>".
+	OpenWrt bool
+}
+
+// OpenWrtSuffix marks the legacy OpenWrt-specific manifest target keys. It is
+// the same constant as manifest.OpenWrtSuffix; a manifest test asserts they
+// agree. New manifests put the lite build in Kernel.OpenWrtTargets under a
+// plain "os/arch" key instead, so the suffixed form is only read for manifests
+// signed before that change.
+const OpenWrtSuffix = "+openwrt"
+
+// Source says which manifest field a Candidate key is looked up in.
+type Source uint8
+
+const (
+	// TargetsField is Kernel.Targets ("linux/amd64", legacy
+	// "linux/amd64+openwrt").
+	TargetsField Source = iota
+	// OpenWrtTargetsField is Kernel.OpenWrtTargets (plain "linux/amd64").
+	OpenWrtTargetsField
+)
+
+// Candidate is one place a build may be found, in preference order.
+type Candidate struct {
+	Source Source
+	// Key is the key to look up in the field named by Source.
+	Key string
+	// Base is the plain "os/arch" key this candidate belongs to; it is what a
+	// caller records as the selected platform key.
+	Base string
 }
 
 // Key is the primary manifest target key, e.g. "linux/amd64",
 // "linux/armv7", "linux/mipsle".
 func (i Info) Key() string { return i.Keys()[0] }
 
-// Keys lists acceptable manifest target keys in order of preference. For ARM
-// the lower levels follow: a GOARM=5 binary also runs on a v7 CPU, so a
-// kernel without an armv7 build can fall back to armv6/armv5.
+// Keys lists the plain (unsuffixed) manifest target keys for this machine in
+// order of preference. For ARM the lower levels follow: a GOARM=5 binary also
+// runs on a v7 CPU, so a kernel without an armv7 build can fall back to
+// armv6/armv5. Candidates is the full lookup order; Keys is only the
+// Kernel.Targets half of it.
 func (i Info) Keys() []string {
+	return i.baseKeys()
+}
+
+// Candidates lists every (field, key) a build may be found at, in order of
+// preference.
+//
+//   - A machine that is not OpenWrt only ever looks at
+//     targets["os/arch"]; Kernel.OpenWrtTargets is never read.
+//   - On OpenWrt each base key is tried in this order:
+//     openwrt_targets["os/arch"] (the current lite format),
+//     targets["os/arch+openwrt"] (the legacy format, kept so already-signed
+//     manifests keep selecting the lite build) and finally targets["os/arch"].
+func (i Info) Candidates() []Candidate {
+	base := i.baseKeys()
+	if !i.OpenWrt {
+		out := make([]Candidate, 0, len(base))
+		for _, k := range base {
+			out = append(out, Candidate{Source: TargetsField, Key: k, Base: k})
+		}
+		return out
+	}
+	out := make([]Candidate, 0, len(base)*3)
+	for _, k := range base {
+		out = append(out,
+			Candidate{Source: OpenWrtTargetsField, Key: k, Base: k},
+			Candidate{Source: TargetsField, Key: k + OpenWrtSuffix, Base: k},
+			Candidate{Source: TargetsField, Key: k, Base: k},
+		)
+	}
+	return out
+}
+
+// baseKeys lists the platform keys without the OpenWrt preference.
+func (i Info) baseKeys() []string {
 	if i.GOARCH == "arm" {
 		lv := i.ARM
 		if lv < 5 || lv > 7 {
@@ -158,6 +226,7 @@ func DetectEnv(e Env) Info {
 	}
 	if e.GOOS == "linux" {
 		info.Libc = detectLibc(e)
+		info.OpenWrt = e.Exists("/etc/openwrt_release")
 	}
 	return info
 }

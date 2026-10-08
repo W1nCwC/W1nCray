@@ -79,3 +79,41 @@ Files:
 # ---- 模块开关（D3）-----------------------------------------------------------
 Modules:
   XrayNodes: true # false = 本机永不启动节点控制器（面板 hint 也无法打开）
+
+# ---- 路由器防火墙自动放行（D2；仅 OpenWrt）-----------------------------------
+# OpenWrt 系默认拒绝 WAN 入站，转发实例监听的端口从外网连不上。在 OpenWrt 上
+# agent 为每个对外监听的实例维护一条 UCI 规则（section 名固定为
+# w1ncray_<实例id>，只碰自己前缀的规则），有改动时 uci commit firewall 并重载
+# （fw4 reload / 21.02 的 /etc/init.d/firewall reload）。
+# 缺省（不写这一段）在 OpenWrt 上是开启；其它系统上恒为关闭（本期只实现 OpenWrt）。
+# 本机关闭：
+#   Firewall: {AutoOpen: false}
+Firewall:
+  AutoOpen: true
+
+# ---- 内网 http 镜像（D-M1）----------------------------------------------------
+# 内核只从已签名清单安装：签名与每个资产的 sha256 都由 agent 在本机校验，下载走
+# 什么协议不影响完整性。缺省只允许 https；自建/内网只有明文 http 镜像时在本机打开
+# 这个开关（面板无法远程打开或关闭它，只通过 hello.policy.kernels 上报）。
+#   Kernels: {AllowHTTP: true}
+Kernels:
+  AllowHTTP: false
+
+# ---- 驱动计时（D4 / F6）--------------------------------------------------------
+# frp 每启动一个实例（frps/frpc）都要等它就绪（管理 API 能应答，portal 还要控制
+# 链路建立）；gost 同样要等进程起来、REST API 能应答。两个驱动共用一张缺省表：
+#   amd64/arm64 且非 OpenWrt -> 15 秒；
+#   其它（mips/arm/386/riscv64…，以及 OpenWrt 上的任何架构）-> 60 秒，
+#   因为路由器 CPU 比它的 GOARCH 看起来弱得多（arm64 的 MT7981 不是 arm64 服务器）。
+# 比缺省还慢的机器可以在本机调大（单位秒，两个驱动各自独立）：
+#   Drivers:
+#     Frp:
+#       ReadyTimeoutSec: 90
+#     Gost:
+#       ReadyTimeoutSec: 120
+# 0（或不写这一段）= 用缺省；负值会被配置校验拒绝。
+Drivers:
+  Frp:
+    ReadyTimeoutSec: 0
+  Gost:
+    ReadyTimeoutSec: 0

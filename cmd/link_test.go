@@ -3,19 +3,65 @@ package cmd
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
-	"github.com/W1nCwC/W1nCray/node"
-	"github.com/W1nCwC/W1nCray/panel"
+	"github.com/W1nCwC/W1nCray/config"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
+
+// The offline Xray check moved to the separate W1nCray-xray program (the agent
+// no longer links Xray-core). Tests that need it build the sibling program once
+// and point linkXrayBin at it, so they keep exercising the real check instead
+// of asserting a weaker agent-only one.
+var (
+	xrayBinOnce sync.Once
+	xrayBinPath string
+	xrayBinErr  error
+)
+
+// buildXrayBin builds ./w1ncray-xray once and returns the executable path.
+func buildXrayBin(t *testing.T) string {
+	t.Helper()
+	xrayBinOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "w1ncray-xray-bin-")
+		if err != nil {
+			xrayBinErr = err
+			return
+		}
+		name := "W1nCray-xray"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		out := filepath.Join(dir, name)
+		cmd := exec.Command("go", "build", "-o", out, "./w1ncray-xray")
+		if b, err := cmd.CombinedOutput(); err != nil {
+			xrayBinErr = fmt.Errorf("go build ./w1ncray-xray: %v\n%s", err, b)
+			return
+		}
+		xrayBinPath = out
+	})
+	if xrayBinErr != nil {
+		t.Fatal(xrayBinErr)
+	}
+	return xrayBinPath
+}
+
+// withXrayBin points the offline check at the real kernel binary for one test.
+func withXrayBin(t *testing.T) {
+	t.Helper()
+	old := linkXrayBin
+	linkXrayBin = buildXrayBin(t)
+	t.Cleanup(func() { linkXrayBin = old })
+}
 
 // The fixture is a sanitized but real-shaped v0.3 config: three nodes of the
 // same panel (vmess with PROXY protocol + a DNS certificate, shadowsocks
@@ -146,11 +192,11 @@ func commentEntry(t *testing.T, entry string) string {
 func TestLinkConvertsMatchingNodesAndPreservesControllerConfig(t *testing.T) {
 	dir, cfgPath := writeLinkFixture(t, linkFixture)
 
-	before, err := panel.LoadConfig(cfgPath)
+	before, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the fixture must be valid: %v", err)
 	}
-	want := map[int]*node.Config{}
+	want := map[int]*nodecfg.Config{}
 	for _, n := range before.NodesConfig {
 		switch n.ApiConfig.NodeID {
 		case 173, 119, 138:
@@ -166,7 +212,7 @@ func TestLinkConvertsMatchingNodesAndPreservesControllerConfig(t *testing.T) {
 		t.Fatalf("link failed: %v\n%s", err, out.String())
 	}
 
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the converted config must load: %v\n%s", err, out.String())
 	}
@@ -278,14 +324,14 @@ func TestLinkCommentsConvertedEntriesAndKeepsTheRest(t *testing.T) {
 
 func TestLinkLeavesUnrelatedTopLevelKeysUnchanged(t *testing.T) {
 	_, cfgPath := writeLinkFixture(t, linkFixture)
-	before, err := panel.LoadConfig(cfgPath)
+	before, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := runLink(cfgPath, linkTestOpts(), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +354,7 @@ func TestLinkSkipsNodesOfAnotherPanel(t *testing.T) {
 	if err := runLink(cfgPath, linkTestOpts(), &out); err != nil {
 		t.Fatal(err)
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +378,7 @@ func TestLinkSkipsNodesWithAPIConfigOverrides(t *testing.T) {
 	if err := runLink(cfgPath, linkTestOpts(), &out); err != nil {
 		t.Fatal(err)
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +403,7 @@ func TestLinkIgnoreAPIConfigOverrides(t *testing.T) {
 	if err := runLink(cfgPath, opts, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +478,7 @@ func TestLinkWritesAgentYMLForANewMachine(t *testing.T) {
 		t.Errorf("config.yml still has an Agent: block:\n%s", cfgText)
 	}
 
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the converted configuration must load: %v\n%s", err, out.String())
 	}
@@ -452,7 +498,7 @@ func TestLinkWritesAgentYMLForANewMachine(t *testing.T) {
 		t.Errorf("the report does not name agent.yml:\n%s", out.String())
 	}
 	// The pair link wrote passes the offline check.
-	if _, err := panel.CheckReport(cfgPath, false, io.Discard); err != nil {
+	if _, err := config.Load(cfgPath); err != nil {
 		t.Fatalf("the converted configuration does not pass check: %v", err)
 	}
 }
@@ -519,7 +565,7 @@ Agent:
 		t.Errorf("config.yml does not say the block moved:\n%s", cfgText)
 	}
 
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the migrated configuration must load: %v\n%s", err, out.String())
 	}
@@ -546,7 +592,7 @@ Agent:
 		t.Errorf("NodeControllers has %d entries, want 3", len(pc.NodeControllers))
 	}
 	// The migrated pair passes the offline check.
-	if _, err := panel.CheckReport(cfgPath, false, io.Discard); err != nil {
+	if _, err := config.Load(cfgPath); err != nil {
 		t.Fatalf("the migrated configuration does not pass check: %v", err)
 	}
 }
@@ -570,7 +616,7 @@ Agent:
 	if !strings.Contains(string(agentText), "DesiredPath: /etc/W1nCray/desired.json") {
 		t.Errorf("the migrated block lost DesiredPath:\n%s", agentText)
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -654,7 +700,7 @@ func TestLinkForceOverwritesAnExistingAgentYML(t *testing.T) {
 	if !strings.Contains(out.String(), agentPath) {
 		t.Errorf("the report does not name agent.yml:\n%s", out.String())
 	}
-	if _, err := panel.CheckReport(cfgPath, false, io.Discard); err != nil {
+	if _, err := config.Load(cfgPath); err != nil {
 		t.Fatalf("the rewritten configuration does not pass check: %v", err)
 	}
 }
@@ -678,7 +724,7 @@ func TestLinkNoTerminal(t *testing.T) {
 	if !strings.Contains(string(agentText), "Terminal: {Enabled: false}") {
 		t.Errorf("--noterminal did not disable the terminal:\n%s", agentText)
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,7 +758,7 @@ Agent:
 	if n := countTopLevelKey(string(agentText2), "Terminal"); n != 1 {
 		t.Errorf("agent.yml has %d Terminal keys, want 1:\n%s", n, agentText2)
 	}
-	after2, err := panel.LoadConfig(cfgPath2)
+	after2, err := config.Load(cfgPath2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1022,6 +1068,7 @@ func TestLinkKeepsEveryFileOnValidationFailure(t *testing.T) {
 // had (here a route.json that is not valid JSON) must not block the
 // conversion; it is reported as a warning and the conversion is written.
 func TestLinkProceedsOnAPreExistingProblem(t *testing.T) {
+	withXrayBin(t)
 	dir, cfgPath := writeLinkFixture(t, linkFixture)
 	routePath := filepath.Join(dir, "route.json")
 	if err := os.WriteFile(routePath, []byte("{ this is not valid json"), 0o600); err != nil {
@@ -1041,7 +1088,7 @@ func TestLinkProceedsOnAPreExistingProblem(t *testing.T) {
 	if !strings.Contains(out.String(), "转换前就有以下问题") {
 		t.Errorf("the report does not warn about the pre-existing problem:\n%s", out.String())
 	}
-	if _, err := panel.LoadConfig(cfgPath); err != nil {
+	if _, err := config.Load(cfgPath); err != nil {
 		t.Fatalf("the converted config must load: %v", err)
 	}
 	got, _ := os.ReadFile(cfgPath)
@@ -1068,7 +1115,7 @@ func TestLinkAllowHTTP(t *testing.T) {
 	if err := runLink(cfgPath, opts, &bytes.Buffer{}); err != nil {
 		t.Fatalf("link with --allow-http failed: %v", err)
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1188,11 +1235,11 @@ func prepareRealLinkFixture(t *testing.T) (dir, cfgPath string, orig []byte) {
 func TestLinkRealV03Config(t *testing.T) {
 	dir, cfgPath, orig := prepareRealLinkFixture(t)
 
-	before, err := panel.LoadConfig(cfgPath)
+	before, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the prepared fixture must load: %v", err)
 	}
-	want := map[int]*node.Config{}
+	want := map[int]*nodecfg.Config{}
 	for _, n := range before.NodesConfig {
 		want[n.ApiConfig.NodeID] = n.ControllerConfig
 	}
@@ -1226,7 +1273,7 @@ func TestLinkRealV03Config(t *testing.T) {
 		t.Errorf("the report does not list all three nodes:\n%s", out.String())
 	}
 
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the converted config must load: %v\n%s", err, out.String())
 	}
@@ -1320,6 +1367,7 @@ func TestLinkRealV03Config(t *testing.T) {
 // them: it converts, warns about the pre-existing failures and leaves a
 // loadable config, a backup and a 0600 token file behind.
 func TestLinkRealV03ConfigWithoutCompanionFiles(t *testing.T) {
+	withXrayBin(t)
 	src, err := os.ReadFile(filepath.Join("testdata", "link_v03_real.yml"))
 	if err != nil {
 		t.Fatalf("read the real fixture: %v", err)
@@ -1363,7 +1411,7 @@ func TestLinkRealV03ConfigWithoutCompanionFiles(t *testing.T) {
 		t.Errorf("the warning does not name the missing file:\n%s", out.String())
 	}
 
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the converted config must load: %v\n%s", err, out.String())
 	}
@@ -1421,7 +1469,7 @@ func TestLinkSkipCheck(t *testing.T) {
 	if !strings.Contains(out.String(), "--skip-check") {
 		t.Errorf("the report does not mention --skip-check:\n%s", out.String())
 	}
-	after, err := panel.LoadConfig(cfgPath)
+	after, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("the converted config must load: %v", err)
 	}
