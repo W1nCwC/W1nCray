@@ -69,8 +69,39 @@ agent 不再链接 Xray-core，转发规则/实例只用 gost、realm（frp 用�
 
 本期要求：
 - X2：Xray 内核服务除 systemd 外，同样提供 OpenRC（`/etc/init.d/W1nCray-xray`，supervise-daemon 守护）与 procd（`/etc/init.d/W1nCray-xray`，procd respawn）两种后端，写法与 install.sh 现有后端一致；三者都没有时才退回 agent 子进程。
-- X3：Xray 内核在清单中为 OpenWrt 提供 lite 变体（与现在 W1nCray lite 相同的构建标签），agent 在 OpenWrt 上选择 lite；OpenWrt 上把内核目录与服务脚本追加进 `/etc/sysupgrade.conf`（固件升级后保留）。
+- X3：Xray 内核在清单中为 OpenWrt 提供 lite 变体（与现在 W1nCray lite 相同的构建标签），agent 在 OpenWrt 上选择 lite；OpenWrt 上把内核目录与服务脚本追加进 `/etc/sysupgrade.conf`（固件升级后保留）。lite 构建写在内核的 `openwrt_targets` 字段（纯 `os/arch` 键），**不写** `linux/<arch>+openwrt` 键，理由见 §2.8。
 - 验收增加：在测试机上用 Alpine 3.20 与 OpenWrt 23.05 真实 rootfs（chroot + unshare，与 v0.3 同法）跑通「安装 agent → 面板连上 → 安装 Xray 内核 → 服务运行 → agent 重启不影响 Xray → 卸载」，以及 gost 转发与终端。
+
+### 2.8 清单目标键：`openwrt_targets` 与 0.5.x 兼容（F10，上线阻断项）
+
+v11 最初把 OpenWrt lite 构建放在 `targets` 的 `linux/<arch>+openwrt` 键上。生产落地机跑的是
+**v0.5.2**，它的 `kernel/manifest/manifest.go` 只认 `^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`，并且对
+**任一**不合规目标键**整份清单拒绝**（`git show v0.5.2:kernel/manifest/manifest.go`）。于是
+面板清单（sequence 8/9/10）里的 `+openwrt` 键让老机器一份清单都拿不到：`kernel_install` 与
+`self_update` 全部 `no_manifest`，gost/realm/frp 转发规则也因没有签名清单被拒 —— PLAN §2.6 的
+两步迁移第 1 步就走不通（REG3-1）。
+
+定稿：
+
+| 清单字段 | 键 | 选择者 |
+|---|---|---|
+| `targets` | 纯 `os/arch`；历史清单的 `os/arch+openwrt` 继续被识别 | 所有系统；`+openwrt` 只在 OpenWrt |
+| `openwrt_targets` | 纯 `os/arch`（无后缀） | 只在 OpenWrt；其它系统永不读取 |
+
+- 选择顺序（`kernel/platform.Info.Candidates` → `kernel/install.selectTarget`）：OpenWrt 上
+  `openwrt_targets["os/arch"]` → `targets["os/arch+openwrt"]`（旧格式）→ `targets["os/arch"]`；
+  非 OpenWrt 只有 `targets["os/arch"]`。ARM 仍逐级回退。
+- 0.5.x 用 Go 默认 `json.Decoder`（`sign.go`，无 `DisallowUnknownFields`）解码进结构体，未知字段
+  `openwrt_targets` 被忽略；签名覆盖整棵 JSON 树（`canonical.go`），新增字段同样被签名。所以新清单
+  在 v0.5.2 上通过校验、内核目录可用。
+- v11 的 `Validate` 同时向前兼容：`os/arch+<未知后缀>`（后缀 `[a-z0-9]{1,16}`）不再整份拒绝，而是
+  忽略该目标（不可被选中）并由 `Manifest.ValidateReport` 报告；其它不合规键仍按原规则拒绝。
+- `tools/manifestgen` 不再生成任何 `+后缀` 键（配置里出现即拒绝），OpenWrt 构建走
+  `openwrt_targets:` 或 `local` 条目的 `openwrt: true`；`examples/v11.yaml`、`tools/manifestgen/README.md`
+  与 `docs/AGENT.md` §13.8.2 同步。
+- 验收（F10）：单元测试内置 v0.5.2 规则复刻，断言新格式通过、旧格式被拒；真实 v0.5.2 在 debian13
+  上接受新清单（无 `manifest invalid`、`kernel_list` catalog 非空）；v11 在 openwrt2410 上从
+  `openwrt_targets` 选中 lite 构建（核对下载资产名与 sha256）。
 
 ## 3. 工作包
 
