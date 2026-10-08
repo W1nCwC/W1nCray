@@ -258,23 +258,41 @@ func localPolicy(cfg *agentcfg.Config, openWrt bool) wsproto.Policy {
 	return pol
 }
 
-// xrayNodeHint is the batch-1 xray-nodes hook: the per-node controllers land in
-// a later batch, so a "nodes" hint only pulls the desired state again and says
-// so in the log. The local module gate is enforced here: a hint can never turn
-// the module on (protocol ruling 13).
+// xrayNodeHint is the xray-nodes hook. A "nodes" hint makes the running kernel
+// re-fetch this machine's node list from the panel now instead of at its next
+// 60 s poll, and the kernel asks for a reload only when the list changed. The
+// local module gate is enforced here: a hint can never turn the module on
+// (protocol ruling 13).
+//
+// Every other outcome degrades to the poll instead of failing: a machine
+// without the kernel (nil Service), a kernel that predates the route (HTTP 404)
+// and an unreachable panel are all logged as a warning and return nil, so the
+// hint never turns into a command failure or an agent crash.
 type xrayNodeHint struct {
 	enabled bool
-	refresh func()
+	xray    xrayapi.Service
 	log     driver.Logger
 }
 
-func (h xrayNodeHint) SyncXrayNodes(context.Context) error {
+func (h xrayNodeHint) SyncXrayNodes(ctx context.Context) error {
 	if !h.enabled {
 		h.log.Warnf("bootstrap: xray nodes hint refused: Modules.XrayNodes is false on this machine")
 		return errXrayNodesDisabled
 	}
-	h.log.Infof("bootstrap: xray nodes hint: per-node controllers are not implemented yet, pulling the desired state")
-	h.refresh()
+	if h.xray == nil {
+		h.log.Warnf("bootstrap: xray nodes hint: the Xray kernel is not installed; falling back to its 60s machine-node poll")
+		return nil
+	}
+	changed, err := h.xray.SyncMachineNodes(ctx)
+	if err != nil {
+		h.log.Warnf("bootstrap: xray nodes hint: %v; falling back to the kernel's 60s machine-node poll", err)
+		return nil
+	}
+	if changed {
+		h.log.Infof("bootstrap: xray nodes hint: the kernel's machine node list changed, reloading it now")
+	} else {
+		h.log.Infof("bootstrap: xray nodes hint: the kernel's machine node list is unchanged")
+	}
 	return nil
 }
 
