@@ -47,8 +47,13 @@ func usage(w io.Writer) {
   keygen  -out FILE                 generate an ed25519 key pair (FILE 0600, FILE.pub)
   build   -config FILE -out FILE    resolve upstream releases into an unsigned manifest
                                      [-kernels a,b] builds only those kernel names
-  sign    -key FILE -in FILE -out FILE
+                                     [-no-legacy-gate] skip the 0.5.x compatibility gate
+  sign    -key FILE -in FILE -out FILE [-no-legacy-gate]
   verify  -in FILE -pub HEX|FILE [-pub ...]
+
+build and sign refuse a manifest that a v0.5.2 agent would reject outright
+(any kernel without a "targets" key, any "targets" key that is not a plain
+"os/arch"); -no-legacy-gate turns that gate off. See README.md.
 `)
 }
 
@@ -148,6 +153,7 @@ func cmdBuild(args []string, stdout, stderr io.Writer) error {
 	kernels := fs.String("kernels", "", "comma-separated kernel names to build (default: every kernel in the config)")
 	api := fs.String("api-base", "https://api.github.com", "GitHub API base URL (tests)")
 	nowFlag := fs.String("now", "", "issue time, RFC 3339 (default: now)")
+	noLegacyGate := fs.Bool("no-legacy-gate", false, "skip the 0.5.x compatibility gate: emit a manifest a v0.5.2 agent rejects outright (see README.md)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -179,7 +185,7 @@ func cmdBuild(args []string, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 	m, err := Build(ctx, buildOptions{
-		Cfg: cfg, GH: gh, Cache: *cache, Now: now,
+		Cfg: cfg, GH: gh, Cache: *cache, Now: now, SkipLegacyGate: *noLegacyGate,
 		Log: func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) },
 	})
 	if err != nil {
@@ -240,6 +246,7 @@ func cmdSign(args []string, stdout io.Writer) error {
 	keyPath := fs.String("key", "", "private key file")
 	in := fs.String("in", "", "unsigned manifest")
 	out := fs.String("out", "", "signed manifest to write")
+	noLegacyGate := fs.Bool("no-legacy-gate", false, "sign even if the manifest would be rejected by a v0.5.2 agent (see README.md)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -260,6 +267,14 @@ func cmdSign(args []string, stdout io.Writer) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&m); err != nil {
 		return fmt.Errorf("%s: %w", *in, err)
+	}
+	// Signing is the last moment before a manifest reaches an agent: run the
+	// 0.5.x gate here too, so a hand-edited or older unsigned manifest cannot
+	// be signed into one a v0.5.2 agent rejects outright.
+	if !*noLegacyGate {
+		if err := checkLegacyV052(&m); err != nil {
+			return fmt.Errorf("%s: %w", *in, err)
+		}
 	}
 	signed, err := manifest.Sign(&m, priv)
 	if err != nil {
@@ -331,9 +346,10 @@ func cmdVerify(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "OK  signature valid (key %s), sequence %d, issued %s, expires %s\n",
 		m.Signature.KeyID, m.Sequence, m.IssuedAt.UTC().Format(time.RFC3339), m.ExpiresAt.UTC().Format(time.RFC3339))
+	rep, _ := m.ValidateReport()
 	for i := range m.Kernels {
 		k := &m.Kernels[i]
-		var have, none []string
+		var have, none, ow []string
 		for key, t := range k.Targets {
 			if t == nil {
 				none = append(none, key)
@@ -341,13 +357,27 @@ func cmdVerify(args []string, stdout io.Writer) error {
 				have = append(have, key)
 			}
 		}
+		for key, t := range k.OpenWrtTargets {
+			if t == nil {
+				none = append(none, "openwrt_targets["+key+"]")
+			} else {
+				ow = append(ow, key)
+			}
+		}
 		sort.Strings(have)
 		sort.Strings(none)
+		sort.Strings(ow)
 		note := ""
 		if err := k.CheckAgent(*agent); err != nil {
 			note = "  [" + err.Error() + "]"
 		}
 		fmt.Fprintf(stdout, "    %-6s %-10s %d builds, %d unavailable (%s)%s\n", k.Name, k.Version, len(have), len(none), strings.Join(none, " "), note)
+		if len(ow) > 0 {
+			fmt.Fprintf(stdout, "           openwrt_targets: %s\n", strings.Join(ow, " "))
+		}
+	}
+	for _, n := range rep.IgnoredTargets {
+		fmt.Fprintf(stdout, "    note: ignoring target %s %s: %s\n", n.Kernel, n.Key, n.Reason)
 	}
 	return nil
 }

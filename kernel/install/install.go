@@ -154,6 +154,7 @@ func New(cfg Config) (*Installer, error) {
 			in.logf("kernel: stored manifest rejected: %v", err)
 		} else {
 			in.man = m
+			in.logIgnoredTargets(m)
 		}
 	}
 	return in, nil
@@ -164,6 +165,20 @@ func (in *Installer) now() time.Time { return in.cfg.Now() }
 func (in *Installer) logf(format string, args ...any) {
 	if in.cfg.Log != nil {
 		in.cfg.Log.Infof(format, args...)
+	}
+}
+
+// logIgnoredTargets surfaces the forward-compatible target keys Validate
+// accepted but never selects (a "os/arch+<unknown suffix>" key from a newer
+// manifest). They are not an error, but an operator should see them: a kernel
+// whose only build is such a key is unavailable here.
+func (in *Installer) logIgnoredTargets(m *manifest.Manifest) {
+	rep, err := m.ValidateReport()
+	if err != nil {
+		return
+	}
+	for _, n := range rep.IgnoredTargets {
+		in.logf("kernel: manifest sequence %d: ignoring target %s %s: %s", m.Sequence, n.Kernel, n.Key, n.Reason)
 	}
 }
 
@@ -208,6 +223,7 @@ func (in *Installer) LoadManifest(raw []byte) error {
 		}
 	}
 	in.man = m
+	in.logIgnoredTargets(m)
 	return nil
 }
 
@@ -231,22 +247,35 @@ func manifestNameRe(n string) bool {
 }
 
 // selectTarget picks the first usable build among the platform's candidate
-// keys. The error distinguishes explicit null, absent and incompatible.
+// (field, key) pairs. On OpenWrt that is openwrt_targets[os/arch], then the
+// legacy targets[os/arch+openwrt], then targets[os/arch]; elsewhere only
+// targets[os/arch] is ever read. The returned key is the plain platform key.
+// The error distinguishes explicit null, absent and incompatible.
 func (in *Installer) selectTarget(k *manifest.Kernel) (string, *manifest.Target, error) {
 	var notes []string
-	for _, key := range in.plat.Keys() {
-		t, st := k.Lookup(key)
+	for _, c := range in.plat.Candidates() {
+		var (
+			t     *manifest.Target
+			st    manifest.TargetState
+			where = c.Key
+		)
+		if c.Source == platform.OpenWrtTargetsField {
+			t, st = k.LookupOpenWrt(c.Key)
+			where = "openwrt_targets[" + c.Key + "]"
+		} else {
+			t, st = k.Lookup(c.Key)
+		}
 		switch st {
 		case manifest.TargetPresent:
 			if err := in.plat.Compatible(t.Variant); err != nil {
-				notes = append(notes, key+": "+err.Error())
+				notes = append(notes, where+": "+err.Error())
 				continue
 			}
-			return key, t, nil
+			return c.Base, t, nil
 		case manifest.TargetNull:
-			notes = append(notes, key+": no build exists (null)")
+			notes = append(notes, where+": no build exists (null)")
 		default:
-			notes = append(notes, key+": not listed")
+			notes = append(notes, where+": not listed")
 		}
 	}
 	e := kernel.Newf(kernel.ErrUnavailable, k.Name, k.Version, "%v", notes)

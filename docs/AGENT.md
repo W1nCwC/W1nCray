@@ -772,7 +772,13 @@ Agent:
 | `W1nCray-xray check-staged -c <config.yml> --dir <暂存目录> --files a,b` | 校验暂存文件集，输出 `{"ok":bool,"errors":[{"file":..,"message":..}]}`；退出码 0/1（语义同原 `CoreValidator.ValidateStaged`） |
 | `W1nCray-xray x25519` | 生成 REALITY 密钥对 |
 
-在 OpenWrt（`/etc/openwrt_release` 存在）上，agent 查找清单目标时**先找 `linux/<arch>+openwrt`**（lite 变体），找不到再找 `linux/<arch>`；`+openwrt` 是清单目标键唯一允许的后缀。非 OpenWrt 只看 `linux/<arch>`。
+在 OpenWrt（`/etc/openwrt_release` 存在）上，agent 查找清单目标时依次尝试
+`openwrt_targets["os/arch"]`（lite 变体，v11 起的格式）→ `targets["os/arch+openwrt"]`（旧格式，
+继续兼容已签发的清单）→ `targets["os/arch"]`；非 OpenWrt 只看 `targets["os/arch"]`，**永不**读取
+`openwrt_targets`。`targets` 的每个键都必须是纯 `os/arch`：0.5.x 的清单解析器只认
+`^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`，且遇到任一不合规键就拒绝整份清单（见
+`tools/manifestgen/README.md`）。v11 的 `Validate` 对 `os/arch+<未知后缀>` 只忽略该目标并在
+`ValidateReport` 里报告，不再整份拒绝。
 
 ### 13.3 单实例锁
 
@@ -937,12 +943,17 @@ agent 与 Xray 内核都是本地构建（`local:` 条目从 `dist/` 计算哈�
       version_regex: "W1nCray-xray v?([0-9][0-9.]*)"   # 从 "W1nCray-xray v0.6.0 (Xray-core 26.3.27)" 取 0.6.0
     mirrors: ["https://<mirror>/W1nCray-xray/{version}/{asset}"]
     local:
-      - {file: dist/W1nCray-xray-linux-amd64.gz,      target: linux/amd64,         to: W1nCray-xray}
-      - {file: dist/W1nCray-xray-linux-amd64-lite.gz, target: linux/amd64+openwrt, to: W1nCray-xray, variant: fallbackroots}
-      # ... 其余架构相同：full -> linux/<arch>，lite -> linux/<arch>+openwrt
+      - {file: dist/W1nCray-xray-linux-amd64.gz,      target: linux/amd64, to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-amd64-lite.gz, target: linux/amd64, to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+      # ... 其余架构相同：full -> targets[linux/<arch>]，lite -> openwrt_targets[linux/<arch>]（openwrt: true）
 ```
 
 - 资产是**单文件 raw gz**（与 agent 条目相同的解包方式：`archive: gz`，`extract.from` 默认取归档基名）。
+- **OpenWrt lite 构建放 `openwrt_targets`，键是不带后缀的 `os/arch`**（`openwrt: true` 的 local 条目，
+  或配置里的 `openwrt_targets:`）。`targets` 的每个键都必须满足 0.5.x 的旧正则
+  `^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`：0.5.x 遇到任一不合规键会拒绝**整份**清单，`kernel_install` /
+  `self_update` 全部 `no_manifest`（REG3-1）。`openwrt_targets` 是 0.5.x 不认识的字段，被它的
+  `json.Decoder` 忽略，所以新清单在旧 agent 上可用。选择顺序与兼容理由见 `tools/manifestgen/README.md`。
 - `min_agent` 故意留空：0.5.x agent 必须能先安装 Xray 内核（§2.6 的迁移顺序），所以内核条目不能要求 0.6。
 - `manifestgen build -kernels xray` 只重建选定的内核条目，便于 agent/内核重新构建后单独发布，而不必重新下载全部上游资产。
 - 第二个 Xray 版本（升级/回滚测试用）在示例里是**注释掉的占位条目**：本仓库没有旧构建，`release/build.sh` 只产出当前版本；用旧 tag 构建到 `dist/old/` 后取消注释即可。不要把它指向当前 `dist/` 文件——内核自检会发现版本不符。
