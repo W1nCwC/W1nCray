@@ -35,7 +35,7 @@ Unknown `t` → the receiver replies `{"t":"error","id":<same>,"d":{"code":"unkn
 | `term.data` | `{session, data:"<base64>"}` | PTY output |
 | `term.exit` | `{session, code, reason?}` | shell exited / closed / limit hit |
 | `term.error` | `{session, code, message}` | e.g. `terminal_disabled` |
-| `event` | `{kind, level, message, data?}` | e.g. `kernel.installed`, `apply.rejected`, `self_update.started` |
+| `event` | `{kind, level, message, data?}` | e.g. `kernel.installed`, `apply.rejected`, `self_update.started`; buffered up to 64 frames while offline and replayed in order after the next `hello.ok` (ruling 14) |
 | `ping`/`pong` | `{}` | |
 
 ### HostInfo (static-ish, sent in `hello`, refreshed on change)
@@ -117,7 +117,8 @@ A browser may hold at most one terminal session per machine; the panel enforces 
    Phase 1 adds no desired key.
 2. **`telemetry.conns` may be `null`** (not readable on this platform); `components` of the embedded engine (`xray`) carry
    no `pid/cpu_pct/rss` (it shares the agent process).
-3. **No replay.** `telemetry`/`components` are live data: nothing is queued while disconnected, nothing is resent on reconnect.
+3. **No replay for live data.** `telemetry`/`components` are live data: nothing is queued while disconnected, nothing is resent on reconnect.
+   `event` frames are the documented exception (ruling 14).
 4. **`cpu_cores`** = physical cores, **`cpu_threads`** = logical CPUs.
 5. **`hint` for something the agent does not support** is answered with `error{code:"not_supported"}`, never silently ignored.
 6. **`policy.modules.xray_nodes` is a LOCAL gate** (agent.yml, default on). The panel asks for nodes with `hint{what:"nodes"}`;
@@ -150,3 +151,11 @@ A browser may hold at most one terminal session per machine; the panel enforces 
 13. **Local gates the panel can never relax:** `Terminal.Enabled` (**default true** by the owner's decision; a machine opts out locally with `Terminal.Enabled: false`, installer/`link` flag `--noterminal`), `Files.Roots`, `Files.Unrestricted` (**three-state**: not written follows `Terminal.Enabled`, `true`/`false` are explicit),
     `Files.AllowExec` (refuse writes with an exec bit), `Modules.XrayNodes`. `agent.yml` and the agent state files
     (`desired.json`, `last_good.json`) are never inside any root.
+14. **Events survive a disconnect.** Ruling 3 covers `telemetry`/`components` only. `event` frames are buffered by the agent:
+    a frame produced before `hello.ok` — the watchdog's `self_update.rolled_back` is emitted by a process that has not
+    handshaken yet — or while the socket is down waits in a **bounded backlog of 64 frames** and is replayed **in order**
+    once the session starts. When the backlog is full the **oldest** frame is dropped, logged and counted; a frame whose
+    send fails keeps its place and is retried on the next flush, and is dropped (logged and counted) after **3** failed
+    attempts, so one dead frame can never stall the queue. The wire format is unchanged: a replayed frame is
+    byte-identical to the one that was queued (`event` has no timestamp field and none is invented), so the panel needs
+    no change to receive it.

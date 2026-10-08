@@ -602,7 +602,7 @@ Agent:
 - **能力集合是动态的，靠重连发布**：`hello.capabilities` 只在建连时发送一次，同一连接上第二个 `hello` 是协议错误（面板回 `unexpected_type`），而能力可能在握手之后才就绪（签名清单到达、`self_update` 注册完成）。agent 在每个 telemetry/components 周期把运行时的能力集合与上次 `hello` 实际发出的集合按**集合**比较（排序、去重）：不同就干净地断开当前连接并重连一次，让新的 `hello` 携带新集合。两次这样的重连至少间隔 30 s（集合来回抖动不会变成重连风暴），且本机有活动终端会话时推迟到会话结束（重连会打断用户的 shell）。这条路径**不发送任何新帧类型**（契约 §1/§3）。
 - **`file_*` 的根与错误码**：受限模式下 `root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；不受限模式下 `root` 传空、`path` 传绝对路径（PLAN v10，见 §3 的 `Files`）。`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内（`mkdir`/`rename` 同样拒绝）。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`already_exists`、`not_found`、`invalid_args`。
 - **结构化清单**：`hello.kernels` 与 HTTP `/report`、`/ack` 的 `kernel_entries` 是同一份 `KernelEntry[]`；旧的 `kernels` map（"本次应用选的版本"）保持不变，仍一起发送。
-- **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道），断线时不补发。
+- **事件**：内核安装成功发 `event{kind:"kernel.installed"}`，卸载成功发 `event{kind:"kernel.removed"}`（契约 §7-10）。事件只走 WebSocket（HTTP 契约没有事件通道）。**断线期间的 event 会缓存补发**（契约 §7-14）：sender 保留一个有上限的待发队列（最多 **64** 条，超出丢**最旧**并计数、记一条 warning），会话建立（`hello.ok`）后**按原序**补发；发送失败也回到队列，同一帧最多重试 **3** 次后丢弃并计数。补发不改线格式：`event` 载荷没有时间戳字段，补发的帧与入队时逐字节相同，面板端无需改动。
 - **参数是严格解码的**：多一个字段、少一个必填字段、类型不对都会回 `failed` + `result.code="invalid_args"`，命令不执行。
 
 ### 7.1 `self_update`（agent 自升级）
@@ -621,8 +621,8 @@ Agent:
   - **窗口与架构**：`AliveWindow` 默认 **60 s**（amd64/arm64）、**180 s**（更慢的目标：mips/arm/386 等），`Deadline` 默认 3 min / 8 min；它必须覆盖「服务管理器的重启间隔（systemd `RestartSec`、procd respawn、OpenRC supervise-daemon）+ 新进程自身启动」。本机可用 `agent.yml` 的 `Agent.SelfUpdate.AliveWindowSec` / `DeadlineSec` 覆盖（本地配置，面板不可改；`DeadlineSec` 若不大于窗口会被抬到窗口之上）。旧的固定 10 s 在 2 vCPU OpenWrt 25.12 上会误判健康的新进程（D-M7）。
 - **助手如何在 systemd 下活下来**：systemd 默认 `KillMode=control-group`，服务停止/重启时同一 cgroup 的所有进程都会被杀死，`Setsid` 也逃不掉——而"主进程退出 → 服务管理器重启"正是自升级的关键时刻，看门狗必须活过它。因此在 systemd 下助手用 `systemd-run --quiet --collect --no-block --unit=w1ncray-selfupdate-<unix时间> -- <旧二进制副本> __watchdog <args>` 启动，落在**独立的 transient unit/cgroup**，服务重启不会连坐。检测条件：环境变量 `INVOCATION_ID` 非空或 `/run/systemd/system` 存在，且 `systemd-run` 可执行；不满足（OpenRC/procd/无服务管理器）或 `systemd-run` 启动失败 → 记日志并回退到 `Setsid` 方式，**升级不会因为看门狗启动方式而失败**。命令一律是 argv 数组、不经 shell。
 - **确认**：新进程在第一次成功得到面板 `/config` 应答后调用 `Confirm()`，删除 `.old`、`pending.json` 与 `ready.json`。
-- **连不上面板不回滚**：新进程起来了但 10 分钟内没连上面板，只发 `event{kind:"self_update.stalled"}`（事件是实时数据，断线不补发），**绝不自动回滚**——面板故障不是二进制坏。同时（R1-7）该进程会**自行执行 Xray 启动迁移**并发 `event{kind:"self_update.xray_started"}`：此时看门狗已退出（Deadline 到点不回滚），不会再发生回滚，而 0.5.x 在面板不可达时照常服务 Xray，0.6 不能因为面板故障就停服。
-- **事件**：`self_update.started`（开始）、`self_update.rolled_back`（看门狗回滚后由下一次启动上报一次）、`self_update.stalled`、`self_update.xray_started`（未确认但已启动 Xray 内核服务）。
+- **连不上面板不回滚**：新进程起来了但 10 分钟内没连上面板，只发 `event{kind:"self_update.stalled"}`（与其他 event 一样进入有上限的待发队列，重连后按原序补发，见 §7 的「事件」与契约 §7-14），**绝不自动回滚**——面板故障不是二进制坏。同时（R1-7）该进程会**自行执行 Xray 启动迁移**并发 `event{kind:"self_update.xray_started"}`：此时看门狗已退出（Deadline 到点不回滚），不会再发生回滚，而 0.5.x 在面板不可达时照常服务 Xray，0.6 不能因为面板故障就停服。
+- **事件**：`self_update.started`（开始）、`self_update.rolled_back`（看门狗回滚后由下一次启动上报一次）、`self_update.stalled`、`self_update.xray_started`（未确认但已启动 Xray 内核服务）。`self_update.rolled_back` 是在 WS 会话建立**之前**产生的（新进程刚 `Boot`，尚未 `hello.ok`），它正是靠 §7 的待发队列在会话建立后补发才到得了面板（契约 §7-14；修复前它在 `hello.ok` 前被 sender 静默丢弃，见 REG3-2）。
 - **能力声明**：`hello.capabilities`（及 HTTP `/config` 的 `features`）出现 `upgrade` 的条件是 `self_update` 命令真的注册了：平台能替换自身 exe（Windows 一律不行）、可执行文件是常规文件且所在目录可写、有服务管理器（systemd/OpenRC/procd 的 init 文件里 `ExecStart`/`command` 指向该 exe），并且进程提供了重启钩子。不满足时命令回 `failed` + `result.code="not_supported"`，能力也不声明（契约 §7-1/§7-11）。**自救**：若运行镜像已被替换/删除（`/proc/self/exe` 报 `"<path> (deleted)"`，例如回滚与本次启动竞态），`Ready()` 会剥掉该后缀重试，`bootstrap` 也会改用服务单元里指向的**安装路径**作为替换目标，因此面板仍可再发一次 `self_update` 把机器恢复到一致状态，而不是永久失去 `upgrade`（D-M7）。
 ### 受管文件（`files_apply` / `files_validate` / `files_rollback`）
 
@@ -639,7 +639,7 @@ Agent:
 - **健康判定在面板侧**：agent **不在进程内等健康**。`files_apply` 在重载发起后回 `done{applied_pending:true}`，随后由面板按 `hello`/`telemetry`（60 s 内）与 `components.xray.state=running` 判定，必要时下发 `files_rollback`（契约 §7-9）。
 - **`hint{what:"files"}`** 触发同一套同步（等价于 `files_apply`）；本机没有受管文件层时回 `error{code:"not_supported"}`，不静默忽略（契约 §7-5）。
 - **`hint{what:"nodes"}`** 让本机 Xray 内核**立刻**重跑一次机器节点发现（内核本地 `GET /nodes/sync`，见 §13.4），不再等 60 s 轮询；内核未装/太旧/调用失败只记 warn 并退回轮询。`Modules.XrayNodes` 为假时拒绝（本机闸门，契约 §7-6/§7-13）。
-- **事件**：应用成功发 `event{kind:"files.applied"}`，回滚发 `event{kind:"files.rolled_back"}`（契约 §7-10，只走 WebSocket）。
+- **事件**：应用成功发 `event{kind:"files.applied"}`，回滚发 `event{kind:"files.rolled_back"}`（契约 §7-10，只走 WebSocket；断线期间按 §7-14 缓存补发）。
 
 ## 8 常见拒绝原因与排错
 
