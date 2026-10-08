@@ -147,6 +147,14 @@ func (c *Client) Status(ctx context.Context) (xrayapi.Status, error) {
 // file set and returns its JSON verdict. A non-zero exit code with a valid
 // JSON body is a "not ok" result, not a transport error; a kernel that is not
 // installed is reported as ErrNotInstalled.
+//
+// The verdict is located in the command's combined output instead of decoding
+// the whole stream: the kernel prints the document on stdout, but the
+// Xray-core loader it runs may log there too, and one warning line used to turn
+// a valid verdict into a parse failure (R1-3). The extraction is on the agent
+// side on purpose: the agent must cope with every kernel build the signed
+// manifest can install (including ones older than a protocol change), and a
+// separate output channel would only work with a matching kernel.
 func (c *Client) CheckStaged(ctx context.Context, dir string, files []string) (xrayapi.StagedResult, error) {
 	var res xrayapi.StagedResult
 	if dir == "" || len(files) == 0 {
@@ -163,13 +171,19 @@ func (c *Client) CheckStaged(ctx context.Context, dir string, files []string) (x
 		"--files", strings.Join(files, ","),
 	}
 	out, runErr := c.opts.Runner.Run(ctx, bin, args...)
-	if err := json.Unmarshal(trimOutput(out), &res); err != nil {
-		if runErr != nil {
+	if body := lastJSONObject(out); body != nil {
+		if err := json.Unmarshal(body, &res); err == nil {
+			return res, nil
+		} else if runErr != nil {
 			return res, fmt.Errorf("执行 %s check-staged: %w: %s", bin, runErr, oneLine(out))
+		} else {
+			return res, fmt.Errorf("解析 %s check-staged 的输出: %w: %s", bin, err, oneLine(out))
 		}
-		return res, fmt.Errorf("解析 %s check-staged 的输出: %w: %s", bin, err, oneLine(out))
 	}
-	return res, nil
+	if runErr != nil {
+		return res, fmt.Errorf("执行 %s check-staged: %w: %s", bin, runErr, oneLine(out))
+	}
+	return res, fmt.Errorf("解析 %s check-staged 的输出: %w: %s", bin, errNoVerdict, oneLine(out))
 }
 
 // WaitReloaded waits until the kernel reports fingerprint as its loaded
@@ -213,9 +227,54 @@ func (c *Client) kernelBinary() (string, error) {
 	return inst.Path, nil
 }
 
-// trimOutput strips the whitespace around a command's output so a trailing
-// newline cannot break JSON decoding.
-func trimOutput(b []byte) []byte { return []byte(strings.TrimSpace(string(b))) }
+// errNoVerdict is reported when the command's output holds no JSON object at
+// all.
+var errNoVerdict = errors.New("输出中没有 JSON 对象")
+
+// lastJSONObject returns the last complete JSON object in b, ignoring whatever
+// surrounds it (log lines, warnings, a banner).
+//
+// It counts braces while respecting JSON strings and escapes, and keeps the
+// last object that closes at top level: a nested object closes before its
+// parent, so the parent wins, and a stray brace in a log line does not hide the
+// verdict. Quotes outside an object are ignored, so an unbalanced quote in a
+// log line cannot swallow the document.
+func lastJSONObject(b []byte) []byte {
+	var (
+		stack []int
+		inStr bool
+		esc   bool
+		last  []byte
+	)
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			if len(stack) > 0 {
+				inStr = true
+			}
+		case '{':
+			stack = append(stack, i)
+		case '}':
+			if n := len(stack); n > 0 {
+				last = b[stack[n-1] : i+1]
+				stack = stack[:n-1]
+			}
+		}
+	}
+	return last
+}
 
 // oneLine collapses a command's output to one short line for an error message.
 func oneLine(b []byte) string {

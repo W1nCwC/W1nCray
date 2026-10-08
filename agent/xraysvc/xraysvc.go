@@ -138,6 +138,9 @@ type Options struct {
 	// HealthInterval is how often the status endpoint is polled while waiting
 	// for health (default 500ms).
 	HealthInterval time.Duration
+	// RemoveTimeout is how long Remove waits for the fallback backend's child
+	// process to exit before refusing with in_use (default 10s).
+	RemoveTimeout time.Duration
 	// StatusTimeout bounds one health-check status read (default 2s).
 	StatusTimeout time.Duration
 	// Backend overrides backend detection (tests).
@@ -172,6 +175,9 @@ func New(o Options) (*Manager, error) {
 	}
 	if o.HealthInterval <= 0 {
 		o.HealthInterval = 500 * time.Millisecond
+	}
+	if o.RemoveTimeout <= 0 {
+		o.RemoveTimeout = 10 * time.Second
 	}
 	if o.StatusTimeout <= 0 {
 		o.StatusTimeout = 2 * time.Second
@@ -277,10 +283,21 @@ func (m *Manager) EnsureRunning(ctx context.Context) error {
 // Install makes the requested version current and the service running. An
 // empty version selects the newest one the signed manifest offers for this
 // machine. It is idempotent: the same version with the same unit file is not
-// restarted. A health-check failure leaves no half-installed service behind.
+// restarted. A health-check failure leaves no half-installed service behind: a
+// machine that was already serving traffic keeps the version it was serving,
+// and only a machine that had no running service is cleaned up. A failed
+// same-version reinstall is retried on that version and is never demoted to the
+// previous one.
 func (m *Manager) Install(ctx context.Context, version string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// What has to survive a failed install is read before the installing flag
+	// hides it: Status reports "installing" while the flag is set, so the
+	// version and the service state must be captured first.
+	prev, perr := m.opts.Kernels.Current(xrayapi.KernelName)
+	wasRunning := m.serviceRunning(ctx)
+
 	m.installing.Store(true)
 	defer m.installing.Store(false)
 
@@ -289,15 +306,65 @@ func (m *Manager) Install(ctx context.Context, version string) error {
 		return err
 	}
 	if err := m.activate(ctx, inst, false); err != nil {
+		return m.restoreAfterFailedInstall(ctx, err, inst, prev, perr, wasRunning)
+	}
+	return nil
+}
+
+// serviceRunning reports whether the service is up right now, using the same
+// rules as Status. A state that cannot be read is "not running": nothing is
+// preserved that cannot be named.
+func (m *Manager) serviceRunning(ctx context.Context) bool {
+	st, err := m.Status(ctx)
+	return err == nil && st.State == StateRunning
+}
+
+// restoreAfterFailedInstall undoes a failed Install. A machine that was already
+// serving traffic is rolled back to the version it was serving, exactly like a
+// failed Upgrade; the half-written service is only deleted when there was
+// nothing running to preserve (R1-1/R1-5).
+//
+// A same-version reinstall is the exception (F4b). EnsureForce installs the
+// version that is already current, so kernel/install.commit leaves the previous
+// pointer alone and current still names the running version; Rollback would
+// therefore move the machine to an older version nobody asked for and mark the
+// version it was already running as failed. The same version is restarted once
+// more instead, and the service and the current version are kept either way.
+func (m *Manager) restoreAfterFailedInstall(ctx context.Context, cause error, inst, prev driver.Installed, perr error, wasRunning bool) error {
+	if !wasRunning {
 		// The kernel is installed but the service never came up healthy:
 		// remove what this call wrote so the machine is not left with a
 		// service that cannot start.
 		if derr := m.deactivate(ctx); derr != nil {
 			m.log.Warnf("xraysvc: 清理未通过健康检查的服务: %v", derr)
 		}
-		return err
+		return cause
 	}
-	return nil
+	if perr != nil || prev.Path == "" {
+		// The service was up but the version it ran cannot be named: deleting
+		// the service would take a working Xray down, so leave it in place and
+		// report the failure instead.
+		return fmt.Errorf("%w（安装前有正在运行的 Xray 服务，但无法确定其版本，未自动恢复）", cause)
+	}
+	if prev.Version == inst.Version && prev.Path == inst.Path {
+		// The install did not switch versions: there is nothing to roll back
+		// to, and the previous pointer names an older version the operator
+		// never asked for. Retry the same version with a restart instead.
+		m.log.Warnf("xraysvc: 同版本重装 %s 健康检查失败，重启重试（不回滚、不降级）", inst.Version)
+		if werr := m.activate(ctx, inst, true); werr != nil {
+			return fmt.Errorf("%w（同版本重装 %s 健康检查失败，重启重试仍未通过: %v；保留当前版本与服务，未降级）", cause, inst.Version, werr)
+		}
+		m.log.Infof("xraysvc: 同版本重装 %s 已通过重启恢复", inst.Version)
+		return nil
+	}
+	rb, rerr := m.opts.Kernels.Rollback(xrayapi.KernelName)
+	if rerr != nil {
+		return fmt.Errorf("%w（恢复安装前运行的 %s 失败: %v）", cause, prev.Version, rerr)
+	}
+	if werr := m.activate(ctx, rb, true); werr != nil {
+		return fmt.Errorf("%w（已回滚到 %s，但服务仍未通过健康检查: %v）", cause, rb.Version, werr)
+	}
+	return fmt.Errorf("安装 %s 失败，已恢复到安装前运行的 %s: %w", inst.Version, rb.Version, cause)
 }
 
 // Upgrade installs version, repoints the service at it, restarts and checks
@@ -415,6 +482,17 @@ func (m *Manager) Remove(ctx context.Context) (removed bool, err error) {
 	}
 
 	derr := m.deactivate(ctx)
+	// The fallback backend runs the kernel as a child of the agent's
+	// supervisor. Deleting the kernel directory while that process is still
+	// alive removes the binary of a running program (and the rollback pointer
+	// with it), so the removal waits for the exit and refuses otherwise
+	// (R1-8).
+	if werr := m.waitChildGone(ctx); werr != nil {
+		if derr != nil {
+			return removed, fmt.Errorf("%v；%w", derr, werr)
+		}
+		return removed, werr
+	}
 	rerr := m.opts.Kernels.Remove(xrayapi.KernelName, "")
 	if rerr != nil && !errors.Is(rerr, kernel.ErrNotInstalled) {
 		if derr != nil {
@@ -425,9 +503,45 @@ func (m *Manager) Remove(ctx context.Context) (removed bool, err error) {
 	return removed, derr
 }
 
+// waitChildGone waits for the fallback backend's child process to really exit
+// after it was stopped, and reports kernel.ErrInUse (in_use) when it is still
+// alive at the deadline. Backends whose process belongs to an init system
+// return immediately: their process is the init system's to stop, and the
+// manager never waits on a service it does not own.
+func (m *Manager) waitChildGone(ctx context.Context) error {
+	b, ok := m.backend.(*agentBackend)
+	if !ok {
+		return nil
+	}
+	deadline := time.Now().Add(m.opts.RemoveTimeout)
+	for {
+		if !b.running() {
+			return nil
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			break
+		}
+		t := time.NewTimer(m.opts.HealthInterval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+		case <-t.C:
+		}
+	}
+	return kernel.Newf(kernel.ErrInUse, xrayapi.KernelName, "",
+		"内核进程在 %s 内没有退出；内核文件保留，稍后重试 remove", m.opts.RemoveTimeout)
+}
+
 // activate writes the service definition, enables the service, starts it (or
 // restarts it when a version switch requires it) and waits for the kernel's
 // status endpoint to report running.
+//
+// restart=false means "bring the requested version up". A fresh machine is
+// started, but a service that is already running is *restarted* when the
+// service definition changed or the running kernel reports another version: the
+// init systems' start is a no-op for a unit that is already active, so a plain
+// start would leave the old process serving traffic while the unit file and the
+// current pointer already name the new version (R1-1/R1-5).
 func (m *Manager) activate(ctx context.Context, inst driver.Installed, restart bool) error {
 	if inst.Path == "" {
 		return errors.New("xraysvc: 内核版本没有可执行文件路径")
@@ -437,11 +551,18 @@ func (m *Manager) activate(ctx context.Context, inst driver.Installed, restart b
 	if err := m.labelKernels(ctx); err != nil {
 		return err
 	}
-	if _, err := m.backend.writeUnit(inst.Path, m.opts.ConfigPath, m.ConfigDir()); err != nil {
+	// Whether a service definition existed *before* this write separates a
+	// fresh install (nothing can be running) from a re-point of a live service.
+	existed := m.backend.exists()
+	changed, err := m.backend.writeUnit(inst.Path, m.opts.ConfigPath, m.ConfigDir())
+	if err != nil {
 		return err
 	}
 	if err := m.backend.enable(ctx); err != nil {
 		return fmt.Errorf("启用 %s 服务: %w", ServiceName, err)
+	}
+	if !restart {
+		restart = m.mustRestart(ctx, existed, changed, inst)
 	}
 	if restart {
 		if err := m.backend.restart(ctx); err != nil {
@@ -451,6 +572,54 @@ func (m *Manager) activate(ctx context.Context, inst driver.Installed, restart b
 		return fmt.Errorf("启动 %s 服务: %w", ServiceName, err)
 	}
 	return m.waitHealthy(ctx)
+}
+
+// mustRestart decides whether an activation that was not asked to restart has
+// to replace the running kernel process instead of issuing a plain start. A
+// service manager's start is a no-op for a unit that is already active, so
+// starting is only correct when nothing is running.
+func (m *Manager) mustRestart(ctx context.Context, existed, changed bool, inst driver.Installed) bool {
+	if !existed {
+		// The service was never defined on this machine: there is no process
+		// of this service to replace.
+		return false
+	}
+	// A running kernel that reports another version than the one being
+	// activated is the clearest reason to restart, whatever the unit file
+	// says: an earlier attempt may already have written it.
+	if v, ok := m.runningKernelVersion(ctx); ok && v != "" && v != inst.Version {
+		return true
+	}
+	if !changed {
+		// The unit file already names this binary, so what runs is the
+		// intended version (or nothing runs): a plain start is enough. This is
+		// what keeps a same-version reinstall from restarting the service.
+		return false
+	}
+	state, err := m.backend.active(ctx)
+	if err != nil {
+		// The service manager cannot tell: replacing the process is the safe
+		// choice, because a plain start would silently do nothing if it is up.
+		return true
+	}
+	return state == StateRunning
+}
+
+// runningKernelVersion asks the kernel's own status endpoint which version is
+// executing. ok is false when there is no endpoint, when an init system does
+// not own the process, or when the endpoint does not answer: an unanswered
+// endpoint says nothing about the running version.
+func (m *Manager) runningKernelVersion(ctx context.Context) (string, bool) {
+	if m.opts.Status == nil || m.backend.managedBy() != "service" {
+		return "", false
+	}
+	sctx, cancel := context.WithTimeout(ctx, m.opts.StatusTimeout)
+	defer cancel()
+	st, err := m.opts.Status.Status(sctx)
+	if err != nil || !st.Running {
+		return "", false
+	}
+	return st.Version, true
 }
 
 // deactivate stops and disables the service and removes its service file. The

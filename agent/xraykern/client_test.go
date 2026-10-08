@@ -146,6 +146,66 @@ func TestCheckStagedUnparsableOutput(t *testing.T) {
 	}
 }
 
+// TestCheckStagedToleratesLogLinesAroundTheVerdict is R1-3: the verdict is the
+// kernel's JSON on stdout, but the Xray-core loader it runs may log there too.
+// The agent must pick the JSON object out of the mixed output instead of
+// reporting a parse failure for a perfectly good answer.
+func TestCheckStagedToleratesLogLinesAroundTheVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		out   string
+		ok    bool
+		files []string
+	}{
+		{
+			name: "log line with braces before the verdict",
+			out:  "2026/10/08 [Warning] route {odd} skipped\n{\"ok\":true}\n",
+			ok:   true,
+		},
+		{
+			name: "unbalanced brace in a log line before the verdict",
+			out:  "warning: unexpected token {\n{\"ok\":true}\n",
+			ok:   true,
+		},
+		{
+			name: "log line after the verdict",
+			out:  "{\"ok\":true}\n2026/10/08 done\n",
+			ok:   true,
+		},
+		{
+			name: "pretty-printed verdict between log lines",
+			out: "2026/10/08 [Debug] loading\n{\n  \"ok\": false,\n" +
+				"  \"errors\": [{\"file\": \"route.json\", \"message\": \"bad rule\"}]\n}\n",
+			ok: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &fakeRunner{out: []byte(tc.out), err: errors.New("exit status 1")}
+			c, _ := newClient(t, fakeKernels{inst: driver.Installed{Path: "/x", Version: "1"}}, run)
+			res, err := c.CheckStaged(context.Background(), "/staged", []string{"route.json"})
+			if err != nil {
+				t.Fatalf("CheckStaged: %v", err)
+			}
+			if res.OK != tc.ok {
+				t.Fatalf("ok = %v, want %v (result %+v)", res.OK, tc.ok, res)
+			}
+			if !tc.ok && (len(res.Errors) != 1 || res.Errors[0].File != "route.json") {
+				t.Fatalf("errors = %+v", res.Errors)
+			}
+		})
+	}
+}
+
+// TestCheckStagedWithoutAnyJSON keeps the failure honest: output with no JSON
+// object at all is still a parse error carrying the raw output.
+func TestCheckStagedWithoutAnyJSON(t *testing.T) {
+	c, _ := newClient(t, fakeKernels{inst: driver.Installed{Path: "/x", Version: "1"}}, &fakeRunner{out: []byte("no json here\n")})
+	_, err := c.CheckStaged(context.Background(), "/staged", []string{"route.json"})
+	if err == nil || !strings.Contains(err.Error(), "no json here") {
+		t.Fatalf("err = %v, want a parse failure carrying the output", err)
+	}
+}
+
 func TestWaitReloaded(t *testing.T) {
 	c, dir := newClient(t, fakeKernels{err: ErrNotInstalled}, nil)
 	c.opts.ReloadTimeout = time.Second

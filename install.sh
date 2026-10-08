@@ -956,6 +956,78 @@ xray_hint() {
 	yellow "  W1nCray xray install --file <W1nCray-xray .gz> --sha256 <hex>   # 离线安装"
 }
 
+# ---- v11 migration: backup and restore --------------------------------------
+# The 0.5.x -> 0.6 migration replaces the running single program in place and
+# rewrites its service file. Both are saved first, so a failed
+# `xray install --file` can put the working 0.5.x node back instead of leaving
+# the machine with no Xray at all (R1-11). The backups are removed again once
+# the migration succeeded, or once the restore proved the machine is whole.
+
+MIG_BIN_BAK=""
+MIG_UNIT_BAK=""
+
+# svc_unit_file NAME prints the service file the current backend owns for NAME
+# ("" when the backend keeps none).
+svc_unit_file() {
+	case "$BACKEND" in
+	systemd) printf '%s' "$ROOT/etc/systemd/system/$1.service" ;;
+	openrc | procd) printf '%s' "$ROOT/etc/init.d/$1" ;;
+	*) printf '' ;;
+	esac
+}
+
+# migration_backup saves the pre-v11 binary and its service file next to them.
+# It runs before the first destructive step (stopping the old service, replacing
+# the binary, rewriting the service file).
+migration_backup() {
+	MIG_BIN_BAK=""
+	MIG_UNIT_BAK=""
+	if [ -f "$BIN" ]; then
+		MIG_BIN_BAK="$BIN.pre-v11"
+		cp -p "$BIN" "$MIG_BIN_BAK" || die "备份旧程序 $BIN 失败，未做任何改动"
+	fi
+	_mig_unit="$(svc_unit_file W1nCray)"
+	if [ -n "$_mig_unit" ] && [ -f "$_mig_unit" ]; then
+		MIG_UNIT_BAK="$_mig_unit.pre-v11"
+		cp -p "$_mig_unit" "$MIG_UNIT_BAK" || die "备份旧服务文件 $_mig_unit 失败，未做任何改动"
+	fi
+}
+
+# migration_restore puts the saved binary and service file back and starts the
+# service. It returns non-zero when the machine could not be restored; the
+# backups are then kept for the operator.
+migration_restore() {
+	[ -n "$MIG_BIN_BAK" ] && [ -f "$MIG_BIN_BAK" ] || return 1
+	# Replace by rename: cp over a binary that is still executing fails with
+	# ETXTBSY.
+	cp -p "$MIG_BIN_BAK" "$BIN.restore" || return 1
+	mv -f "$BIN.restore" "$BIN" || return 1
+	if [ -n "$MIG_UNIT_BAK" ] && [ -f "$MIG_UNIT_BAK" ]; then
+		_mig_unit="$(svc_unit_file W1nCray)"
+		if [ -n "$_mig_unit" ]; then
+			cp -p "$MIG_UNIT_BAK" "$_mig_unit" || return 1
+		fi
+	fi
+	case "$BACKEND" in
+	systemd) systemctl daemon-reload >/dev/null 2>&1 || true ;;
+	esac
+	svc start W1nCray || return 1
+	return 0
+}
+
+# migration_forget removes the backups of a migration that succeeded or was
+# fully undone.
+migration_forget() {
+	if [ -n "$MIG_BIN_BAK" ]; then
+		rm -f "$MIG_BIN_BAK"
+	fi
+	if [ -n "$MIG_UNIT_BAK" ]; then
+		rm -f "$MIG_UNIT_BAK"
+	fi
+	MIG_BIN_BAK=""
+	MIG_UNIT_BAK=""
+}
+
 # panel_config DEST writes the xray side of the machine-mode config. The agent's
 # own configuration lives in agent.yml (agent_config below); config.yml never
 # carries an Agent: block any more (D1, ruling 1).
@@ -1239,6 +1311,10 @@ cmd_install() {
 		fetch_xray_kernel "${RELEASE_TAG:-}" "${CHOSEN_ARCH:-$(detect_arch)}"
 		yellow "迁移到 v11：停止旧的单一程序 -> 替换 agent -> 安装并启动 Xray 内核服务 -> 启动 agent。"
 		yellow "下载已完成；中断只包含这两次重启（通常几秒到几十秒），期间经 Xray 节点的连接会断开。"
+		# Save the old program and its service file before the first
+		# destructive step: a failed kernel install must be able to put the
+		# working 0.5.x node back (R1-11).
+		migration_backup
 		if [ "$BACKEND" != none ]; then
 			svc stop W1nCray >/dev/null 2>&1 || true
 		fi
@@ -1336,6 +1412,9 @@ cmd_install() {
 		yellow "可手动前台运行: $BIN -c $CONF   （或 W1nCray run）"
 		if [ "$_migrate_xray" -eq 1 ]; then
 			yellow "Xray 内核尚未安装：请执行 W1nCray xray install --file <文件> --sha256 $XRAYSHA"
+			if [ -n "$MIG_BIN_BAK" ]; then
+				yellow "（旧 0.5.x 程序已备份到 $MIG_BIN_BAK，需要回退时手工替换回 $BIN）"
+			fi
 		else
 			xray_hint
 		fi
@@ -1351,8 +1430,19 @@ cmd_install() {
 	if [ "$_migrate_xray" -eq 1 ]; then
 		# Replace the in-process Xray with the kernel service before the agent
 		# comes back: the kernel serves the nodes while the agent restarts.
-		"$BIN" -c "$CONF" xray install --file "$XRAYGZ" --sha256 "$XRAYSHA" ||
-			die "Xray 内核安装失败。agent 已替换；请重新下载 $XRAYASSET 后执行: W1nCray xray install --file <文件> --sha256 $XRAYSHA"
+		if ! "$BIN" -c "$CONF" xray install --file "$XRAYGZ" --sha256 "$XRAYSHA"; then
+			# The v11 agent is already in place and the 0.5.x service is
+			# stopped: put the old binary and its service file back and start
+			# the service again, so the node keeps serving instead of staying
+			# down (R1-11).
+			if migration_restore; then
+				migration_forget
+				red "Xray 内核安装失败；已恢复到原版本并重新启动服务：$("$BIN" version | head -n1)"
+				die "请重新下载 $XRAYASSET 后重试: W1nCray xray install --file <文件> --sha256 $XRAYSHA"
+			fi
+			die "Xray 内核安装失败，且自动恢复原版本失败。旧程序备份: $MIG_BIN_BAK，旧服务文件备份: $MIG_UNIT_BAK；请手工恢复后重试。"
+		fi
+		migration_forget
 		rm -rf "$TMPD"
 		trap - EXIT INT TERM
 		green "Xray 内核服务已安装并启动（迁移完成）"
@@ -1576,7 +1666,7 @@ cmd_uninstall() {
 			fi
 		fi
 	fi
-	rm -f "$BIN" "$BIN_DIR/install.sh" "$MGR"
+	rm -f "$BIN" "$BIN.pre-v11" "$BIN_DIR/install.sh" "$MGR"
 	rmdir "$BIN_DIR" 2>/dev/null || true
 	drop_sysupgrade_entries "$_purge"
 	selinux_forget

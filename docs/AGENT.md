@@ -818,7 +818,7 @@ type Service interface {
 `agentd.Options.Xray` 与 `bootstrap.Options.Xray` 都接受它。X1 里 agent 传 `nil`，此时受管 Xray 文件的 `files_apply` 会以明确原因 **`Xray 内核未安装`** 拒绝，而不是写下一份没有实例会读取的文件。X2 起由 `agent/xraykern` 实现它：
 
 - `Status` 读 `/run/W1nCray/xray.sock`（旧内核的 `<config 目录>/xray.sock` 仍然接受；Windows 读 `xray.addr`）的 `GET /status`，2 s 超时；连不上就是「内核没在跑」。
-- `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。
+- `CheckStaged` 执行**已安装当前版本**的 `W1nCray-xray check-staged -c <config> --dir <dir> --files a,b` 并解析它的 JSON；未安装时返回 **`Xray 内核未安装`**。校验用的是运行实例将来会用的同一个 loader。解析不整段 `json.Unmarshal`：stdout 里混入的日志行（Xray-core loader 自己打的）会被跳过，取**最后一个完整 JSON 对象**（`lastJSONObject`，尊重字符串与转义）；这是 agent 侧的防御，因为 agent 必须兼容清单里任意新旧的内核构建，而独立输出通道要求两边同步升级（R1-3）。
 - `WaitReloaded` 在 `files_apply` 写入受管文件后，等待状态接口的 `config_fingerprint` 变成**写入后文件的指纹**，超时 30 s。指纹用 `config.Fingerprint` 对 `config.WatchedFiles` 计算——与内核（`xraynode`）**同一份代码**，所以两边不可能不一致；超时即 `files_apply` 失败，走既有的 `last_good` 回滚路径（§13.6 的 `files_apply` 行）。
 
 ### 13.5.1 服务管理（`agent/xraysvc`）
@@ -834,9 +834,9 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 服务名固定为 `W1nCray-xray`。`Install`/`Upgrade`/`Rollback`/`Restart`/`Remove` 都幂等、带超时、失败可读：
 
-- `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动 → 健康检查（状态接口 30 s 内 `running=true`）。健康检查失败会停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
+- `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动/重启 → 健康检查（状态接口 30 s 内 `running=true`）。**换版本一定重启**：服务文件内容变化、或运行中的内核报告的版本与要装的版本不同时，`activate` 用 `restart` 而不是 `start`（三个 init 系统的 `start` 对已 active 的单元是 no-op，否则旧进程会继续跑而单元与 current 指针已指向新版本）；同版本、服务文件不变的幂等重装不重启。健康检查失败时：**安装前服务在运行** → 回滚到安装前运行的版本并重启（与 `Upgrade` 一致），不会把可用的 Xray 停掉；安装前本来没有服务 → 停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
 - `Upgrade`：装新版本 → 改服务指向 → 重启 → 健康检查；失败自动 `kernelx` 回滚到上一版本并重启，报告里带上失败原因与回滚结果。
-- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
+- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。agent 子进程后端（没有 init 系统）下，删除内核文件前会等待 supervisor 的子进程真正退出（`RemoveTimeout`，默认 10 s）；超时仍在运行则返回 **`in_use`** 且**不删任何文件**（R1-8），避免删掉正在执行的二进制与回滚指针。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
 
 面板命令接入：`kernel_install`（已装过则走 `Upgrade`，带自动回滚）、`kernel_remove`（不需要版本号，整服务删除）、`kernel_rollback`、`component_restart` 在 `name=xray` 时都走这一套。`kernel_list` / `hello.kernel_entries` 里 xray 与其它内核格式一致，并附 `service`（`backend`、`state`、`managed_by`）；`state ∈ running/stopped/failed/installing/not_installed`。遥测的 `components` 里 xray 项来自状态接口：state、version、每个节点一项（在线数）、`last_error`。
 
@@ -945,7 +945,7 @@ agent 与 Xray 内核都是本地构建（`local:` 条目从 `dist/` 计算哈�
 | 路径 | 行为 |
 |---|---|
 | `install`（全新） | 只安装 agent（`W1nCray` 程序 + `W1nCray` 服务），**不安装 Xray 内核**；结束时提示「Xray 内核将在面板绑定节点时自动安装，或执行 `W1nCray xray install`」。`--panel URL --machine ID --token TOKEN` 一键接入保持不变。 |
-| `update`（升级） | 已是 v11 agent：只更新 agent。0.5.x 及以前的**单一程序**且配置需要 Xray（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真）：先下载 agent 与对应架构的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序 **停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...` → 启动 agent**，并打印中断时长提示。下载在停止服务之前完成。 |
+| `update`（升级） | 已是 v11 agent：只更新 agent。0.5.x 及以前的**单一程序**且配置需要 Xray（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真）：先下载 agent 与对应架构的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序 **停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...` → 启动 agent**，并打印中断时长提示。下载在停止服务之前完成。停止服务前先把旧程序与旧服务文件备份到 `<BIN>.pre-v11` 与 `<unit>.pre-v11`（R1-11）：`xray install --file` 失败时自动把两者恢复回去并重新启动旧服务，再报错退出（提示机器已恢复到原版本）；迁移成功或恢复成功后删除这两个备份。没有服务管理器（`BACKEND=none`）时不尝试安装内核，备份保留并在提示里给出路径。 |
 | `uninstall` | 停止并删除 `W1nCray` 服务后，调用 `W1nCray xray remove` 停止并删除 `W1nCray-xray` 服务与内核文件（失败时脚本按当前后端自己删除 unit/init 脚本）；是否保留配置目录与原来一致（`--purge` 才删除）。 |
 
 管理菜单新增 14–19（Xray 内核 状态/启动/停止/重启/安装/卸载），快捷命令 `W1nCray xray ...` 直接透传给程序本体（带 `-c <配置>`）。

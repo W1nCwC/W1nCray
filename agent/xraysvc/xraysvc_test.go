@@ -13,6 +13,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
+	"github.com/W1nCwC/W1nCray/kernel"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 )
 
@@ -27,7 +28,10 @@ type fakeKernels struct {
 	rollback driver.Installed
 	rbErr    error
 	onRback  func()
-	ensured  []spec.KernelPin
+	// rbCalls counts Rollback calls: a same-version reinstall must never make
+	// the manager demote the machine to the previous pointer (F4b).
+	rbCalls int
+	ensured []spec.KernelPin
 	// forced records the explicit (operator-initiated) installs, which must
 	// bypass the automatic back-off (D-M3).
 	forced  []spec.KernelPin
@@ -81,6 +85,7 @@ func (f *fakeKernels) Current(string) (driver.Installed, error) {
 
 func (f *fakeKernels) Rollback(string) (driver.Installed, error) {
 	f.mu.Lock()
+	f.rbCalls++
 	fn := f.onRback
 	if f.rbErr != nil {
 		err := f.rbErr
@@ -94,6 +99,13 @@ func (f *fakeKernels) Rollback(string) (driver.Installed, error) {
 		fn()
 	}
 	return inst, nil
+}
+
+// rollbackCount reports how often Rollback was called.
+func (f *fakeKernels) rollbackCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rbCalls
 }
 
 func (f *fakeKernels) Remove(name, version string) error {
@@ -145,12 +157,49 @@ func (f *fakeStatus) setRunning(v bool) {
 }
 
 // fakeRunner records service-manager commands and simulates systemd's state.
+//
+// start and restart are deliberately NOT interchangeable here: `systemctl
+// start` on a unit that is already active is a no-op and does not replace the
+// running process, while `systemctl restart` always does. An earlier version of
+// this fake treated both as "start the service", which hid exactly the defect
+// R1-1/R1-5 report.
 type fakeRunner struct {
 	mu      sync.Mutex
 	calls   []string
 	active  bool
 	order   *[]string
 	respond func(name string, args []string) ([]byte, error)
+	// onCall, when set, observes every command after the simulated state was
+	// updated; it scripts state changes the default fake cannot express (for
+	// example "the second restart brings the service up").
+	onCall func(name string, args []string)
+	// unitPath, when set, is the systemd unit the simulated service runs:
+	// start/restart record its ExecStart binary in runningExec.
+	unitPath string
+	// runningExec is the binary the simulated process was last started with
+	// ("" when nothing runs).
+	runningExec string
+}
+
+// execStart reads the binary the unit currently names.
+func (f *fakeRunner) execStart() string {
+	if f.unitPath == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(f.unitPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		rest, ok := strings.CutPrefix(line, "ExecStart=")
+		if !ok {
+			continue
+		}
+		if fields := strings.Fields(rest); len(fields) > 0 {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -160,6 +209,7 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 		*f.order = append(*f.order, name+" "+strings.Join(args, " "))
 	}
 	respond := f.respond
+	onCall := f.onCall
 	if respond == nil && name == "systemctl" && len(args) > 0 {
 		switch args[0] {
 		case "is-active":
@@ -169,17 +219,36 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 			}
 			f.mu.Unlock()
 			return []byte("inactive\n"), errors.New("exit status 3")
-		case "start", "restart":
+		case "start":
+			// systemd's start is a no-op for an active unit: the process that
+			// is running keeps running, whatever the unit file now says.
+			if !f.active {
+				f.active = true
+				f.runningExec = f.execStart()
+			}
+		case "restart":
 			f.active = true
+			f.runningExec = f.execStart()
 		case "stop":
 			f.active = false
+			f.runningExec = ""
 		}
 	}
 	f.mu.Unlock()
+	if onCall != nil {
+		onCall(name, args)
+	}
 	if respond != nil {
 		return respond(name, args)
 	}
 	return nil, nil
+}
+
+// running returns the binary the simulated service is executing.
+func (f *fakeRunner) running() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runningExec
 }
 
 func (f *fakeRunner) seq() []string {
@@ -218,6 +287,9 @@ type fakeSup struct {
 	specs    []driver.ProcSpec
 	running  bool
 	lastExit string
+	// stuck makes Stop leave the process reported as running, modelling a
+	// child that has not exited yet (R1-8).
+	stuck bool
 }
 
 func (f *fakeSup) Start(_ context.Context, p driver.ProcSpec) error {
@@ -231,7 +303,9 @@ func (f *fakeSup) Start(_ context.Context, p driver.ProcSpec) error {
 func (f *fakeSup) Stop(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.running = false
+	if !f.stuck {
+		f.running = false
+	}
 	return nil
 }
 
@@ -319,6 +393,7 @@ func newFixture(t *testing.T, markers ...string) *fixture {
 		HealthTimeout:  100 * time.Millisecond,
 		HealthInterval: time.Millisecond,
 		StatusTimeout:  50 * time.Millisecond,
+		RemoveTimeout:  20 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -428,6 +503,217 @@ func TestSystemdInstall(t *testing.T) {
 	}
 	if got := f.run.seq(); contains(got, "systemctl restart "+ServiceName) {
 		t.Fatalf("a repeated install restarted the service: %v", got)
+	}
+}
+
+// TestInstallRestartsWhenTheVersionChanges is R1-1: installing another version
+// must replace the running process. systemd's `start` is a no-op for a unit
+// that is already active, so before the fix the old version kept serving while
+// the unit file and the current pointer already named the new one.
+func TestInstallRestartsWhenTheVersionChanges(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	f.run.unitPath = filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	oldBin := installedKernel(t, f.root, "1.0.0")
+	newBin := installedKernel(t, f.root, "2.0.0")
+	f.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		return driver.Installed{Path: oldBin, Version: "1.0.0"}, nil
+	}
+	if err := f.manager.Install(context.Background(), "1.0.0"); err != nil {
+		t.Fatalf("Install 1.0.0: %v", err)
+	}
+	if got := f.run.running(); got != oldBin {
+		t.Fatalf("running binary = %q, want %q", got, oldBin)
+	}
+
+	f.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		return driver.Installed{Path: newBin, Version: "2.0.0"}, nil
+	}
+	if err := f.manager.Install(context.Background(), "2.0.0"); err != nil {
+		t.Fatalf("Install 2.0.0: %v", err)
+	}
+	if got := f.run.running(); got != newBin {
+		t.Fatalf("running binary = %q, want the newly installed %q (start on an active unit is a no-op)", got, newBin)
+	}
+	if got := f.run.seq(); !contains(got, "systemctl restart "+ServiceName) {
+		t.Fatalf("the version switch did not restart the service: %v", got)
+	}
+}
+
+// TestStartRestartsWhenTheUnitPointsAtAnotherVersion is R1-5: the `--file`
+// path installs the local build first and then calls Start. Start has to
+// replace a process that is running another version, not silently reuse it.
+func TestStartRestartsWhenTheUnitPointsAtAnotherVersion(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	f.run.unitPath = filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	oldBin := installedKernel(t, f.root, "0.6.0")
+	newBin := installedKernel(t, f.root, "0.6.1")
+	f.kern.current = driver.Installed{Path: oldBin, Version: "0.6.0"}
+	f.kern.curErr = nil
+	if err := f.manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start 0.6.0: %v", err)
+	}
+	if got := f.run.running(); got != oldBin {
+		t.Fatalf("running binary = %q, want %q", got, oldBin)
+	}
+	// InstallLocal committed the new version; Start has to switch the service.
+	f.kern.current = driver.Installed{Path: newBin, Version: "0.6.1"}
+	if err := f.manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start 0.6.1: %v", err)
+	}
+	if got := f.run.running(); got != newBin {
+		t.Fatalf("running binary = %q, want the newly installed %q", got, newBin)
+	}
+}
+
+// TestInstallHealthFailureRestoresTheRunningVersion is the second half of
+// R1-1/R1-5: when the machine was already serving traffic, a failed install
+// must put that version back instead of deleting the service. Before the fix
+// Install called deactivate and left the machine with no Xray at all.
+func TestInstallHealthFailureRestoresTheRunningVersion(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	f.run.unitPath = filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	oldBin := installedKernel(t, f.root, "1.0.0")
+	newBin := installedKernel(t, f.root, "2.0.0")
+	f.kern.current = driver.Installed{Path: oldBin, Version: "1.0.0"}
+	f.kern.curErr = nil
+	f.status.setRunning(true)
+	if err := f.manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	f.kern.rollback = driver.Installed{Path: oldBin, Version: "1.0.0"}
+	f.kern.onRback = func() { f.status.setRunning(true) }
+	f.kern.ensureFn = func(pin spec.KernelPin) (driver.Installed, error) {
+		if pin.Version == "2.0.0" {
+			f.status.setRunning(false)
+			return driver.Installed{Path: newBin, Version: "2.0.0"}, nil
+		}
+		f.status.setRunning(true)
+		return driver.Installed{Path: oldBin, Version: "1.0.0"}, nil
+	}
+
+	err := f.manager.Install(context.Background(), "2.0.0")
+	if err == nil || !strings.Contains(err.Error(), "已恢复") {
+		t.Fatalf("Install error = %v, want a restore report", err)
+	}
+	unitPath := filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	if _, serr := os.Stat(unitPath); serr != nil {
+		t.Fatalf("the service file of the previously working version was deleted: %v", serr)
+	}
+	raw, rerr := os.ReadFile(unitPath)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !strings.Contains(string(raw), oldBin) {
+		t.Fatalf("the unit was not repointed at the previous version:\n%s", string(raw))
+	}
+	if got := f.run.running(); got != oldBin {
+		t.Fatalf("running binary = %q, want the restored %q", got, oldBin)
+	}
+	if st, _ := f.manager.Status(context.Background()); st.Version != "1.0.0" {
+		t.Fatalf("current version = %q, want the restored 1.0.0", st.Version)
+	}
+}
+
+// TestSameVersionReinstallFailureKeepsTheVersion is F4b: a same-version
+// reinstall (the unit content changed, or an operator asked for a reinstall)
+// restarts the service, and EnsureForce does not switch current when the
+// version is already current (kernel/install.commit leaves the previous
+// pointer alone). Calling Rollback then would make the machine current on an
+// older version nobody asked for and mark the version it was already running
+// as failed. The manager must retry the same version instead, keep the service
+// and report the failure without downgrading.
+func TestSameVersionReinstallFailureKeepsTheVersion(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	f.run.unitPath = filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	bin := installedKernel(t, f.root, "1.0.0")
+	older := installedKernel(t, f.root, "0.9.0")
+	f.kern.current = driver.Installed{Path: bin, Version: "1.0.0"}
+	f.kern.curErr = nil
+	// The previous pointer names an older version: that is exactly the version
+	// a Rollback would make current.
+	f.kern.rollback = driver.Installed{Path: older, Version: "0.9.0"}
+	f.status.setRunning(true)
+	if err := f.manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The reinstall itself fails its health check for good.
+	f.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		f.status.setRunning(false)
+		return driver.Installed{Path: bin, Version: "1.0.0"}, nil
+	}
+
+	err := f.manager.Install(context.Background(), "1.0.0")
+	if err == nil || !strings.Contains(err.Error(), "未降级") {
+		t.Fatalf("Install error = %v, want a same-version failure that says it did not downgrade", err)
+	}
+	if n := f.kern.rollbackCount(); n != 0 {
+		t.Fatalf("Rollback was called %d time(s) for a same-version reinstall", n)
+	}
+	if cur, cerr := f.kern.Current(""); cerr != nil || cur.Version != "1.0.0" {
+		t.Fatalf("current = %+v (%v), want the same 1.0.0", cur, cerr)
+	}
+	unitPath := filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	if _, serr := os.Stat(unitPath); serr != nil {
+		t.Fatalf("the service file was deleted: %v", serr)
+	}
+	raw, rerr := os.ReadFile(unitPath)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !strings.Contains(string(raw), bin) {
+		t.Fatalf("the unit no longer names the running version:\n%s", string(raw))
+	}
+	if got := f.run.running(); got != bin {
+		t.Fatalf("running binary = %q, want the preserved %q", got, bin)
+	}
+	// The retry replaced the process: the first activation only issued a
+	// plain start (systemd's start is a no-op on an active unit), so the
+	// restart can only come from the same-version retry.
+	if n := countOf(f.run.seq(), "systemctl restart "+ServiceName); n < 1 {
+		t.Fatalf("the same version was not retried with a restart: %v", f.run.seq())
+	}
+}
+
+// TestSameVersionReinstallRecoversWithARestart is the other half of F4b: when
+// the retry restart brings the same version up healthy, the requested state
+// holds, so the install is not reported as a failure and nothing is rolled
+// back.
+func TestSameVersionReinstallRecoversWithARestart(t *testing.T) {
+	f := newFixture(t, "run/systemd/system/")
+	f.run.unitPath = filepath.Join(f.root, "etc", "systemd", "system", ServiceName+".service")
+	bin := installedKernel(t, f.root, "1.0.0")
+	older := installedKernel(t, f.root, "0.9.0")
+	f.kern.current = driver.Installed{Path: bin, Version: "1.0.0"}
+	f.kern.curErr = nil
+	f.kern.rollback = driver.Installed{Path: older, Version: "0.9.0"}
+	f.status.setRunning(true)
+	if err := f.manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	f.kern.ensureFn = func(spec.KernelPin) (driver.Installed, error) {
+		f.status.setRunning(false)
+		return driver.Installed{Path: bin, Version: "1.0.0"}, nil
+	}
+	// The first activation only issues a plain start (a no-op on an active
+	// unit); the first restart is the same-version retry, and it brings the
+	// same version up.
+	f.run.onCall = func(name string, args []string) {
+		if name == "systemctl" && len(args) > 0 && args[0] == "restart" {
+			f.status.setRunning(true)
+		}
+	}
+
+	if err := f.manager.Install(context.Background(), "1.0.0"); err != nil {
+		t.Fatalf("Install recovered with the retry restart, got: %v", err)
+	}
+	if n := f.kern.rollbackCount(); n != 0 {
+		t.Fatalf("Rollback was called %d time(s) for a same-version reinstall", n)
+	}
+	if cur, _ := f.kern.Current(""); cur.Version != "1.0.0" {
+		t.Fatalf("current = %+v, want the same 1.0.0", cur)
+	}
+	if got := f.run.running(); got != bin {
+		t.Fatalf("running binary = %q, want %q", got, bin)
 	}
 }
 
@@ -905,6 +1191,46 @@ func TestAgentBackendRunsUnderTheSupervisor(t *testing.T) {
 	}
 }
 
+// TestRemoveRefusesWhileTheAgentChildIsStillRunning is R1-8: on a machine with
+// no init system the kernel is a child of the agent's supervisor, and Remove
+// must not delete its directory while the process is still alive. Before the
+// fix Remove went straight to Kernels.Remove after the stop.
+func TestRemoveRefusesWhileTheAgentChildIsStillRunning(t *testing.T) {
+	f := newFixture(t)
+	bin := installedKernel(t, f.root, "1.0.0")
+	f.kern.current = driver.Installed{Path: bin, Version: "1.0.0"}
+	f.kern.curErr = nil
+	f.sup.mu.Lock()
+	f.sup.running = true
+	f.sup.stuck = true
+	f.sup.mu.Unlock()
+
+	removed, err := f.manager.Remove(context.Background())
+	if !errors.Is(err, kernel.ErrInUse) {
+		t.Fatalf("Remove error = %v, want in_use", err)
+	}
+	if !removed {
+		t.Error("Remove did not report the installed service it refused to delete")
+	}
+	if code := kernel.Code(err); code != "in_use" {
+		t.Fatalf("kernel.Code = %q, want in_use", code)
+	}
+	if len(f.kern.removed) != 0 {
+		t.Fatalf("the kernel files were removed while the process was alive: %v", f.kern.removed)
+	}
+
+	// Once the process is really gone the same call removes everything.
+	f.sup.mu.Lock()
+	f.sup.stuck = false
+	f.sup.mu.Unlock()
+	if _, err := f.manager.Remove(context.Background()); err != nil {
+		t.Fatalf("Remove after the exit: %v", err)
+	}
+	if len(f.kern.removed) != 1 {
+		t.Fatalf("kernel removal = %v, want one", f.kern.removed)
+	}
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 func equalStrings(a, b []string) bool {
@@ -926,4 +1252,14 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func countOf(list []string, want string) int {
+	n := 0
+	for _, s := range list {
+		if s == want {
+			n++
+		}
+	}
+	return n
 }
