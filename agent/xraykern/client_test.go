@@ -229,3 +229,108 @@ func TestWaitReloadedEmptyFingerprint(t *testing.T) {
 		t.Fatal("an empty fingerprint must be refused")
 	}
 }
+
+// TestSyncMachineNodesReadsTheEndpoint: the nodes hint is one GET on the
+// kernel's local endpoint, on the route the kernel serves next to /status.
+func TestSyncMachineNodesReadsTheEndpoint(t *testing.T) {
+	c, dir := newClient(t, fakeKernels{err: ErrNotInstalled}, nil)
+	serveStatus(t, dir, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != xrayapi.NodesSyncPath {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.RawQuery != "" || r.ContentLength > 0 {
+			t.Errorf("the request carries a parameter: query %q, content-length %d", r.URL.RawQuery, r.ContentLength)
+		}
+		_ = json.NewEncoder(w).Encode(xrayapi.NodesSyncResult{Changed: true, Version: "v2"})
+	}))
+	changed, err := c.SyncMachineNodes(context.Background())
+	if err != nil {
+		t.Fatalf("SyncMachineNodes: %v", err)
+	}
+	if !changed {
+		t.Error("changed = false, want true")
+	}
+}
+
+// TestSyncMachineNodesIdleList: an unchanged list is a successful (false, nil),
+// not an error.
+func TestSyncMachineNodesIdleList(t *testing.T) {
+	c, dir := newClient(t, fakeKernels{err: ErrNotInstalled}, nil)
+	serveStatus(t, dir, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != xrayapi.NodesSyncPath {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(xrayapi.NodesSyncResult{Changed: false, Version: "v1"})
+	}))
+	changed, err := c.SyncMachineNodes(context.Background())
+	if err != nil {
+		t.Fatalf("SyncMachineNodes: %v", err)
+	}
+	if changed {
+		t.Error("changed = true for an idle list")
+	}
+}
+
+// TestSyncMachineNodesOldKernelFallsBack: a kernel that predates the route
+// answers 404 to everything but /status. The agent must report an error (so the
+// caller degrades to the poll), not treat it as "unchanged".
+func TestSyncMachineNodesOldKernelFallsBack(t *testing.T) {
+	c, dir := newClient(t, fakeKernels{err: ErrNotInstalled}, nil)
+	serveStatus(t, dir, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != xrayapi.StatusPath {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(xrayapi.Status{Version: "0.6.0", Running: true})
+	}))
+	// The old kernel is reachable: its status endpoint still answers.
+	if _, err := c.Status(context.Background()); err != nil {
+		t.Fatalf("Status on the old kernel: %v", err)
+	}
+	_, err := c.SyncMachineNodes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("err = %v, want an HTTP 404 error", err)
+	}
+}
+
+// TestSyncMachineNodesFailures: no endpoint, a failing kernel and a timeout are
+// all errors the caller degrades on.
+func TestSyncMachineNodesFailures(t *testing.T) {
+	t.Run("no kernel", func(t *testing.T) {
+		c, _ := newClient(t, fakeKernels{err: ErrNotInstalled}, nil)
+		if _, err := c.SyncMachineNodes(context.Background()); err == nil {
+			t.Fatal("SyncMachineNodes without an endpoint must fail")
+		}
+	})
+	t.Run("kernel failure", func(t *testing.T) {
+		c, dir := newClient(t, fakeKernels{err: ErrNotInstalled}, nil)
+		serveStatus(t, dir, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "panel unreachable", http.StatusBadGateway)
+		}))
+		_, err := c.SyncMachineNodes(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "502") {
+			t.Fatalf("err = %v, want an HTTP 502 error", err)
+		}
+	})
+	t.Run("timeout", func(t *testing.T) {
+		c, dir := newClient(t, fakeKernels{err: ErrNotInstalled}, nil)
+		c.opts.SyncTimeout = 50 * time.Millisecond
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		serveStatus(t, dir, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}))
+		_, err := c.SyncMachineNodes(context.Background())
+		if err == nil {
+			t.Fatal("SyncMachineNodes must time out")
+		}
+	})
+}

@@ -59,7 +59,7 @@ pid?, uptime_s?, restarts?, cpu_pct?, rss?, instances:[{id, state, conns?, up_by
 | `t` | `d` | notes |
 |---|---|---|
 | `hello.ok` | `{server_time, intervals:{telemetry_s, components_s}, session:"<id>"}` | answer to `hello` |
-| `hint` | `{what:"desired"|"files"|"nodes"|"manifest"}` | agent pulls the named resource over HTTP now (no payload) |
+| `hint` | `{what:"desired"|"files"|"nodes"|"manifest"}` | agent pulls the named resource over HTTP now (no payload). `nodes`: the agent makes the local Xray kernel re-fetch this machine's node list from the panel now instead of at its next 60 s poll (the kernel reloads only when the list version changed). Wire format unchanged |
 | `cmd` | `{type, args, ttl_s}` with `id` | agent answers `cmd.result` with the same `id`; unanswered after `ttl_s` = expired |
 | `term.open` | `{session, cols, rows}` | requires local policy `terminal=true`, else `term.error terminal_disabled` |
 | `term.input` | `{session, data:"<base64>"}` | ≤ 64 KiB |
@@ -122,6 +122,10 @@ A browser may hold at most one terminal session per machine; the panel enforces 
 5. **`hint` for something the agent does not support** is answered with `error{code:"not_supported"}`, never silently ignored.
 6. **`policy.modules.xray_nodes` is a LOCAL gate** (agent.yml, default on). The panel asks for nodes with `hint{what:"nodes"}`;
    the agent then pulls the machine's node list: empty = stop all node controllers, otherwise start those (per node, no full reload).
+   The agent does not fetch the list itself: it asks the local Xray kernel to re-run its machine-node discovery now (a local
+   endpoint request that carries no parameter), and the kernel reloads only when the list version changed. A kernel that is not
+   installed, predates that route, or cannot reach the panel is logged and the agent degrades to the kernel's own 60 s poll;
+   the hint is never answered with an error for those cases.
 7. **Long commands** answer immediately with `cmd.result{status:"accepted"}` (within `ttl_s`), then a final `done|failed`.
    The panel keeps the command `pending` until the final result; the WS push never marks it `sent` (HTTP fallback may deliver
    the same command again: the agent de-duplicates by command id).

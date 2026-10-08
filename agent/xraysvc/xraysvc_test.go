@@ -150,6 +150,11 @@ func (f *fakeStatus) CheckStaged(context.Context, string, []string) (xrayapi.Sta
 
 func (f *fakeStatus) WaitReloaded(context.Context, string) error { return nil }
 
+// SyncMachineNodes is the machine-node hint route (F9). The service manager
+// never calls it; the method exists because Options.Status is an
+// xrayapi.Service.
+func (f *fakeStatus) SyncMachineNodes(context.Context) (bool, error) { return false, nil }
+
 func (f *fakeStatus) setRunning(v bool) {
 	f.mu.Lock()
 	f.running = v

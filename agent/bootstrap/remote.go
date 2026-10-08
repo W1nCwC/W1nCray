@@ -61,8 +61,10 @@ type RemoteOptions struct {
 	// WSCommands overrides the shared command entry point (tests). nil uses the
 	// Runner, so the HTTP and WS channels share one whitelist and one id space.
 	WSCommands ws.Commands
-	// WSNodes overrides the xray-nodes hint hook (tests). nil uses the local
-	// module gate; batch 1 only pulls the desired state again.
+	// WSNodes overrides the xray-nodes hint hook (tests). nil uses the runtime's
+	// kernel client and the local module gate: the hint makes the kernel
+	// re-fetch the machine's node list now, and degrades to its 60 s poll when
+	// the kernel is absent, too old, or the call fails.
 	WSNodes ws.NodeToggle
 
 	// ManifestSync enables the signed kernel manifest sync loop: the link
@@ -344,10 +346,12 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 			agentOpts.Files = r.Files
 		}
 		// The nodes hint is always wired, so it is never silently ignored; the
-		// local module gate lives inside the hook (ruling 6).
+		// local module gate lives inside the hook (ruling 6). The hook makes
+		// the kernel re-fetch the machine's node list now (r.Xray is nil on a
+		// machine without the kernel, which degrades to the kernel's poll).
 		agentOpts.Nodes = o.WSNodes
 		if agentOpts.Nodes == nil {
-			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), refresh: runner.RequestRefresh, log: log}
+			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), xray: r.Xray, log: log}
 		}
 		// The interactive terminal is wired only when this machine really has
 		// one; a nil sink is what answers term.error{terminal_disabled}

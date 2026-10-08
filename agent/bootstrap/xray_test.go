@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/W1nCwC/W1nCray/agent/filesync"
@@ -16,6 +17,12 @@ type fakeXray struct {
 	err      error
 	gotDir   string
 	gotFiles []string
+	// syncChanged/syncErr script the SyncMachineNodes answer; syncMu guards the
+	// counter, because the "nodes" hint runs on the WebSocket serve goroutine.
+	syncChanged bool
+	syncErr     error
+	syncMu      sync.Mutex
+	syncCalls   int
 }
 
 func (f *fakeXray) Status(context.Context) (xrayapi.Status, error) { return xrayapi.Status{}, nil }
@@ -26,6 +33,20 @@ func (f *fakeXray) CheckStaged(_ context.Context, dir string, files []string) (x
 }
 
 func (f *fakeXray) WaitReloaded(context.Context, string) error { return nil }
+
+func (f *fakeXray) SyncMachineNodes(context.Context) (bool, error) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
+	f.syncCalls++
+	return f.syncChanged, f.syncErr
+}
+
+// syncCallCount is the number of SyncMachineNodes calls so far.
+func (f *fakeXray) syncCallCount() int {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
+	return f.syncCalls
+}
 
 // TestFilesValidatorWithoutXrayKernel is the nil-safe degradation PLAN v11 §D
 // asks for: a machine without the kernel must refuse managed Xray files with an

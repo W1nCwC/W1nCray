@@ -21,6 +21,10 @@ const (
 	StatusAddrName   = xrayapi.StatusAddrName
 	// StatusPath is the HTTP path the status document is served on.
 	StatusPath = xrayapi.StatusPath
+	// NodesSyncPath is the HTTP path that asks the kernel to re-fetch the
+	// machine's node list now (the agent's hint{what:"nodes"}). It shares the
+	// status endpoint and takes no parameter.
+	NodesSyncPath = xrayapi.NodesSyncPath
 )
 
 // StatusServer serves GET /status on the kernel's local endpoint.
@@ -46,6 +50,7 @@ func NewStatusServer(svc *Service, configDir string) (*StatusServer, error) {
 	s := &StatusServer{svc: svc, ln: ln, addr: addr, endpointPath: path}
 	mux := http.NewServeMux()
 	mux.HandleFunc(StatusPath, s.handleStatus)
+	mux.HandleFunc(NodesSyncPath, s.handleNodesSync)
 	s.srv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -84,6 +89,29 @@ func (s *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(s.svc.Status())
+}
+
+// handleNodesSync answers GET /nodes/sync: the kernel re-fetches this machine's
+// node list from the panel now instead of waiting for its 60 s poll, and asks
+// for a reload only when the version changed. The request carries no parameter
+// (no path, no command, no node data) and the route exists only on the local
+// status endpoint, so it adds no listener and no remote surface.
+//
+// A panel that could not be reached is answered with 502 and the running node
+// list is left untouched: the caller (the agent) then falls back to the poll.
+func (s *StatusServer) handleNodesSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	changed, version, err := s.svc.SyncMachineNodes(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(xrayapi.NodesSyncResult{Changed: changed, Version: version})
 }
 
 // StatusSocketPath returns the path of the Unix socket (the runtime directory,

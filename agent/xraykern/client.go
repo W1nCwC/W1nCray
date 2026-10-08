@@ -4,6 +4,8 @@
 //
 //   - Status reads the kernel's local status endpoint (a Unix socket, or the
 //     loopback address file on Windows);
+//   - SyncMachineNodes asks the kernel over the same endpoint to re-fetch the
+//     machine's node list from the panel now instead of at its next poll;
 //   - CheckStaged runs the installed kernel binary's own check-staged command,
 //     so the agent validates a staged managed-file set with exactly the loader
 //     the running instance uses;
@@ -61,6 +63,12 @@ const (
 	DefaultStatusTimeout = 2 * time.Second
 	DefaultReloadTimeout = 30 * time.Second
 	DefaultPollInterval  = 500 * time.Millisecond
+	// DefaultSyncTimeout bounds one SyncMachineNodes request. It is a few
+	// seconds rather than the status read's two, because the kernel answers it
+	// only after its own round trip to the panel: the request must survive a
+	// slow panel, and it must still be short enough that a hint never blocks
+	// the WebSocket frame reader for long.
+	DefaultSyncTimeout = 10 * time.Second
 	// maxStatusBytes bounds what is read from the status endpoint.
 	maxStatusBytes = 1 << 20
 )
@@ -76,6 +84,8 @@ type Options struct {
 	Runner Runner
 	// StatusTimeout bounds one status request (default 2s).
 	StatusTimeout time.Duration
+	// SyncTimeout bounds one SyncMachineNodes request (default 10s).
+	SyncTimeout time.Duration
 	// ReloadTimeout bounds WaitReloaded (default 30s).
 	ReloadTimeout time.Duration
 	// PollInterval is how often WaitReloaded re-reads the status (default
@@ -104,6 +114,9 @@ func New(o Options) (*Client, error) {
 	if o.StatusTimeout <= 0 {
 		o.StatusTimeout = DefaultStatusTimeout
 	}
+	if o.SyncTimeout <= 0 {
+		o.SyncTimeout = DefaultSyncTimeout
+	}
 	if o.ReloadTimeout <= 0 {
 		o.ReloadTimeout = DefaultReloadTimeout
 	}
@@ -118,14 +131,14 @@ func New(o Options) (*Client, error) {
 // "stopped" or "not installed").
 func (c *Client) Status(ctx context.Context) (xrayapi.Status, error) {
 	var st xrayapi.Status
-	client, url, err := statusEndpoint(c.opts.ConfigPath)
+	client, base, err := statusEndpoint(c.opts.ConfigPath)
 	if err != nil {
 		return st, err
 	}
 	defer client.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(ctx, c.opts.StatusTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+xrayapi.StatusPath, nil)
 	if err != nil {
 		return st, err
 	}
@@ -141,6 +154,41 @@ func (c *Client) Status(ctx context.Context) (xrayapi.Status, error) {
 		return st, fmt.Errorf("解析 Xray 内核状态接口响应: %w", err)
 	}
 	return st, nil
+}
+
+// SyncMachineNodes asks the kernel to re-fetch this machine's node list from the
+// panel now instead of waiting for its 60 s poll, and reports whether the list
+// changed (the kernel then requests a reload). It is the agent side of
+// hint{what:"nodes"}: the request carries no parameter at all.
+//
+// Every failure — no endpoint, a kernel that predates the route (HTTP 404), a
+// timeout, an unreachable panel — is returned as an error and the caller
+// degrades to the poll. It never changes the running node list on its own.
+func (c *Client) SyncMachineNodes(ctx context.Context) (bool, error) {
+	client, base, err := statusEndpoint(c.opts.ConfigPath)
+	if err != nil {
+		return false, err
+	}
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(ctx, c.opts.SyncTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+xrayapi.NodesSyncPath, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("请求 Xray 内核同步机器节点: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("Xray 内核节点同步接口返回 HTTP %d", resp.StatusCode)
+	}
+	var res xrayapi.NodesSyncResult
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxStatusBytes)).Decode(&res); err != nil {
+		return false, fmt.Errorf("解析 Xray 内核节点同步接口响应: %w", err)
+	}
+	return res.Changed, nil
 }
 
 // CheckStaged runs the installed kernel's check-staged command on a staged

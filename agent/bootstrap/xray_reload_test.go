@@ -28,6 +28,9 @@ func (r *recordingXray) WaitReloaded(_ context.Context, fingerprint string) erro
 	r.fp = fingerprint
 	return r.err
 }
+func (r *recordingXray) SyncMachineNodes(context.Context) (bool, error) {
+	return false, errors.New("not used")
+}
 
 // TestXrayReloaderWaitsForTheWrittenFingerprint is PLAN v11 §C: after a
 // managed-file apply the agent waits for the kernel to report the fingerprint

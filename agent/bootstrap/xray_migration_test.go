@@ -47,6 +47,9 @@ func (s migrationStatus) CheckStaged(context.Context, string, []string) (xrayapi
 	return xrayapi.StagedResult{OK: true}, nil
 }
 func (s migrationStatus) WaitReloaded(context.Context, string) error { return nil }
+func (s migrationStatus) SyncMachineNodes(context.Context) (bool, error) {
+	return false, nil
+}
 
 // migrationSup is the supervisor of the fallback backend.
 type migrationSup struct {
