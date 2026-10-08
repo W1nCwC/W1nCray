@@ -27,6 +27,10 @@ type buildOptions struct {
 	Cache string // download cache directory
 	Now   time.Time
 	Log   func(format string, args ...any)
+	// SkipLegacyGate turns off the 0.5.x compatibility gate. It is set only by
+	// the explicit --no-legacy-gate command-line flag: by default every
+	// generated manifest must be one a v0.5.2 agent accepts.
+	SkipLegacyGate bool
 }
 
 // Build resolves every configured kernel against its upstream release and
@@ -61,6 +65,15 @@ func Build(ctx context.Context, o buildOptions) (*manifest.Manifest, error) {
 	}
 	if err := m.Validate(); err != nil {
 		return nil, fmt.Errorf("generated manifest is invalid: %w", err)
+	}
+	// The 0.5.x gate runs on the final document, before anything is written or
+	// signed: a manifest that v0.5.2 rejects outright must never leave the
+	// generator. v11 is deliberately more permissive (a kernel with only
+	// openwrt_targets is valid), so v11's own Validate cannot catch this.
+	if !o.SkipLegacyGate {
+		if err := checkLegacyV052(m); err != nil {
+			return nil, err
+		}
 	}
 	return m, nil
 }

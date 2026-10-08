@@ -10,6 +10,8 @@ manifestgen sign   -key keys/manifest-1.key -in unsigned.json -out manifest.json
 manifestgen verify -in manifest.json -default-keys [-min-sequence N] [-agent X.Y.Z]
 ```
 
+`build` 与 `sign` 都带 `[-no-legacy-gate]`，见下文「0.5.x 兼容闸门」。
+
 完整的 v11 构建描述是 `examples/v11.yaml`（agent 与 Xray 内核来自本机 `dist/`，gost / realm /
 frp 来自各自 GitHub Release）。`-kernels xray` 只重建选定的条目，不必重新下载全部上游资产。
 
@@ -64,6 +66,31 @@ frp 来自各自 GitHub Release）。`-kernels xray` 只重建选定的条目，
 不再导致整份清单被拒，而是被忽略、永不可选，并由 `Manifest.ValidateReport` 报告
 （`manifestgen verify` 会打印一行 `note: ignoring target ...`）。其它不合规的键仍按原规则拒绝。
 这样将来新增平台后缀时，不会重演「新后缀把旧 agent 全部挡在门外」。
+
+## 0.5.x 兼容闸门（默认开启）
+
+`build` 在写 `unsigned.json` 之前、`sign` 在读入 `unsigned.json` 之后，都会对**最终清单**
+跑一次 `checkLegacyV052`（`legacy.go`）。它复刻 v0.5.2 的 `Kernel.validate()`
+（`git show v0.5.2:kernel/manifest/manifest.go`；`kernel/manifest` 测试里的
+`legacyV052Validate` 是同一份逻辑）：
+
+- 清单至少有一个内核；
+- **每个**内核的 `targets` 至少有一个键——空 `targets` 被 v0.5.2 判为 `no targets`；
+- **每个** `targets` 键匹配 `^[a-z0-9]{2,16}/[a-z0-9]{2,16}$`，因此不允许任何 `+后缀` 键。
+
+v0.5.2 遇到上述任一情况返回 `ErrManifestInvalid` 并**拒绝整份清单**（不是跳过该条目）。
+所以只要配置里有一个只写 `openwrt_targets` 的内核，生成的清单就会让 0.5.x agent 的
+`kernel_install`、`self_update` 全部 `no_manifest`——这正是 REG3-1 的另一种形式。
+闸门不通过时 `build`/`sign` 直接报错退出，错误信息写明内核名与版本、违规的键，以及
+「v0.5.2 会因此拒绝整份清单、旧 agent 将拿不到任何内核」。
+
+闸门**默认开启，不是可关的开关**。只有明确不再需要支持 0.5.x（例如 0.5.x 已下线）时，
+才可以用显式命令行参数 `--no-legacy-gate` 跳过它；`build` 与 `sign` 各自都要显式传入：
+
+- 后果：生成的清单会被所有仍在运行的 0.5.x agent **整份拒绝**，它们的 `kernel_install`、
+  `self_update` 以及一切依赖签名清单的命令都返回 `no_manifest`，内核目录为空；
+  v11 agent 不受影响。
+- `verify` 不跑闸门：它校验签名、序列号与时效，不决定发布内容。
 
 ## 选择顺序（agent 侧）
 
