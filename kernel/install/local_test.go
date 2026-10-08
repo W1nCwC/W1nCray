@@ -198,9 +198,11 @@ func TestInstallLocalRefusesBadInput(t *testing.T) {
 	}
 }
 
-// TestInstallLocalKeepsTheRequestedTargetAndVariant covers the OpenWrt case:
-// the caller (install.sh on a router) pins the +openwrt target key and the
-// lite variant token.
+// TestInstallLocalKeepsTheRequestedTargetAndVariant: an explicit Target and
+// Variant are written to the marker verbatim instead of being replaced by the
+// detected platform key. The legacy "+openwrt" spelling is used here as the
+// value to preserve; the current OpenWrt lite build is selected from the
+// manifest's openwrt_targets field under a plain os/arch key (F10).
 func TestInstallLocalKeepsTheRequestedTargetAndVariant(t *testing.T) {
 	f := newFixture(t)
 	in := f.installer(t.TempDir())

@@ -89,7 +89,13 @@ type SinkFunc func(id, status string, data json.RawMessage)
 func (f SinkFunc) Deliver(id, status string, data json.RawMessage) { f(id, status, data) }
 
 // EventSink reports a local event to the panel (event frames, audit). It is
-// best effort: events are live data and are never replayed.
+// best effort: Event never blocks the caller. Events are not live-only data,
+// though: the WebSocket agent keeps a bounded backlog of up to 64 undelivered
+// frames and replays them, in order, after the next hello.ok
+// (docs/WS-PROTOCOL.md section 7 ruling 14; the eventBacklog in
+// agent/ws/agentclient.go), so an event produced before the handshake or while
+// the socket is down still reaches the panel. Only a full backlog (the oldest
+// frame is evicted) or three failed sends drop one.
 type EventSink interface {
 	Event(kind, level, message string)
 }
