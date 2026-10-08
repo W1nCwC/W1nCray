@@ -76,6 +76,14 @@ func buildKernel(ctx context.Context, o buildOptions, kc *KernelCfg) (*manifest.
 			break
 		}
 	}
+	if !needsRelease {
+		for _, tc := range kc.OpenWrtTargets {
+			if tc != nil {
+				needsRelease = true
+				break
+			}
+		}
+	}
 	var rel *ghRelease
 	if needsRelease {
 		if o.GH == nil {
@@ -119,41 +127,80 @@ func buildKernel(ctx context.Context, o buildOptions, kc *KernelCfg) (*manifest.
 		License:      manifest.License{SPDX: kc.License.SPDX, File: kc.License.File, SourceURL: kc.License.SourceURL},
 		Capabilities: kc.Capabilities,
 		Run:          manifest.Run{Binary: kc.Run.Binary, VersionCmd: kc.Run.VersionCmd, VersionRegex: kc.Run.VersionRegex},
-		Targets:      map[string]*manifest.Target{},
 	}
 	for _, r := range kc.Revoked {
 		k.Revoked = append(k.Revoked, manifest.Revocation{Version: r.Version, SHA256: r.SHA256, Reason: r.Reason})
 	}
 
-	keys := make([]string, 0, len(kc.Targets))
-	for key := range kc.Targets {
-		keys = append(keys, key)
+	targets, err := buildRemoteTargets(ctx, o, kc, rel, sums, "targets", kc.Targets)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		tc := kc.Targets[key]
-		if tc == nil {
-			k.Targets[key] = nil
-			o.Log("%s %s: %s -> unavailable (null)", kc.Name, kc.Version, key)
-			continue
-		}
-		t, err := buildTarget(ctx, o, kc, rel, sums, tc)
-		if err != nil {
-			return nil, fmt.Errorf("target %s: %w", key, err)
-		}
-		k.Targets[key] = t
-		o.Log("%s %s: %s -> %s sha256=%s size=%d", kc.Name, kc.Version, key, tc.Asset, t.ArchiveSHA256[:16], t.ArchiveSize)
+	k.Targets = targets
+	if k.Targets == nil {
+		k.Targets = map[string]*manifest.Target{}
 	}
+	openwrtTargets, err := buildRemoteTargets(ctx, o, kc, rel, sums, "openwrt_targets", kc.OpenWrtTargets)
+	if err != nil {
+		return nil, err
+	}
+	if len(openwrtTargets) > 0 {
+		k.OpenWrtTargets = openwrtTargets
+	}
+
 	for i := range kc.Local {
 		la := kc.Local[i]
 		t, err := buildLocalTarget(o, kc, la)
 		if err != nil {
 			return nil, fmt.Errorf("local target %s: %w", la.Target, err)
 		}
-		k.Targets[la.Target] = t
-		o.Log("%s %s: %s -> %s (local) sha256=%s size=%d", kc.Name, kc.Version, la.Target, la.File, t.ArchiveSHA256[:16], t.ArchiveSize)
+		where := la.Target
+		if la.OpenWrt {
+			where = "openwrt_targets[" + la.Target + "]"
+			if k.OpenWrtTargets == nil {
+				k.OpenWrtTargets = map[string]*manifest.Target{}
+			}
+			k.OpenWrtTargets[la.Target] = t
+		} else {
+			k.Targets[la.Target] = t
+		}
+		o.Log("%s %s: %s -> %s (local) sha256=%s size=%d", kc.Name, kc.Version, where, la.File, t.ArchiveSHA256[:16], t.ArchiveSize)
 	}
 	return k, nil
+}
+
+// buildRemoteTargets resolves one map of target keys (KernelCfg.Targets or
+// KernelCfg.OpenWrtTargets) against the release. A nil config value becomes a
+// manifest null. The returned map is nil when the config map is empty.
+func buildRemoteTargets(ctx context.Context, o buildOptions, kc *KernelCfg, rel *ghRelease, sums map[string]string, field string, cfg map[string]*TargetCfg) (map[string]*manifest.Target, error) {
+	if len(cfg) == 0 {
+		return nil, nil
+	}
+	prefix := "target"
+	if field == "openwrt_targets" {
+		prefix = "openwrt target"
+	}
+	keys := make([]string, 0, len(cfg))
+	for key := range cfg {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make(map[string]*manifest.Target, len(cfg))
+	for _, key := range keys {
+		tc := cfg[key]
+		if tc == nil {
+			out[key] = nil
+			o.Log("%s %s: %s -> unavailable (null)", kc.Name, kc.Version, field+"["+key+"]")
+			continue
+		}
+		t, err := buildTarget(ctx, o, kc, rel, sums, tc)
+		if err != nil {
+			return nil, fmt.Errorf("%s %s: %w", prefix, key, err)
+		}
+		out[key] = t
+		o.Log("%s %s: %s -> %s sha256=%s size=%d", kc.Name, kc.Version, field+"["+key+"]", tc.Asset, t.ArchiveSHA256[:16], t.ArchiveSize)
+	}
+	return out, nil
 }
 
 func sha256Hex(b []byte) string {

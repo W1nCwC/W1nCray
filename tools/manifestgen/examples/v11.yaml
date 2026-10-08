@@ -11,8 +11,10 @@
 # The agent and the Xray kernel are local builds: their hashes come from the
 # files release/build.sh wrote into dist/, and a mirror must serve them because
 # a local file has no upstream URL. The Xray kernel also has an OpenWrt lite
-# build (-tags dnslite,fallbackroots): it is published under the
-# linux/<arch>+openwrt target key, which the agent prefers on OpenWrt.
+# build (-tags dnslite,fallbackroots): it is published in openwrt_targets under
+# a plain linux/<arch> key (never a "+openwrt" key in targets, which a v0.5.x
+# agent rejects as invalid and then has no manifest at all), and the agent
+# prefers it on OpenWrt. See tools/manifestgen/README.md.
 #
 #   bash release/build.sh v0.6.0                       # all 12 architectures
 #   manifestgen build -config tools/manifestgen/examples/v11.yaml -out unsigned.json -sequence 110
@@ -59,10 +61,14 @@ kernels:
       - {file: dist/W1nCray-linux-loong64.gz,  target: linux/loong64,  to: W1nCray}
 
   # ----------------------------------------------------------------- xray
-  # Our Xray kernel. One manifest version per release; the +openwrt key gets
-  # the lite build (dist/...-lite.gz, -tags dnslite,fallbackroots) and the
-  # plain key the full build. Both extract the same single member, the raw gz
-  # stream of the binary, exactly like the agent entry.
+  # Our Xray kernel. One manifest version per release; the OpenWrt lite build
+  # (dist/...-lite.gz, -tags dnslite,fallbackroots) goes in openwrt_targets
+  # under the same plain linux/<arch> key as the full build, which stays in
+  # targets. Every "targets" key is therefore a plain "os/arch" key that a
+  # v0.5.x agent's parser accepts (a "+openwrt" key there would make it reject
+  # the whole manifest); openwrt_targets is an unknown field to it and is
+  # ignored. Both entries extract the same single member, the raw gz stream of
+  # the binary, exactly like the agent entry.
   - name: xray
     version: "0.6.0"
     license: {spdx: MIT}
@@ -76,30 +82,30 @@ kernels:
       version_regex: "W1nCray-xray v?([0-9][0-9.]*)"
     mirrors: ["https://<mirror>/W1nCray-xray/{version}/{asset}"]
     local:
-      - {file: dist/W1nCray-xray-linux-amd64.gz,       target: linux/amd64,            to: W1nCray-xray}
-      - {file: dist/W1nCray-xray-linux-amd64-lite.gz,  target: linux/amd64+openwrt,    to: W1nCray-xray, variant: fallbackroots}
-      - {file: dist/W1nCray-xray-linux-386.gz,         target: linux/386,              to: W1nCray-xray, variant: softfloat}
-      - {file: dist/W1nCray-xray-linux-386-lite.gz,    target: linux/386+openwrt,      to: W1nCray-xray, variant: "softfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-arm64.gz,       target: linux/arm64,            to: W1nCray-xray}
-      - {file: dist/W1nCray-xray-linux-arm64-lite.gz,  target: linux/arm64+openwrt,    to: W1nCray-xray, variant: fallbackroots}
-      - {file: dist/W1nCray-xray-linux-armv7.gz,       target: linux/armv7,            to: W1nCray-xray, variant: hardfloat}
-      - {file: dist/W1nCray-xray-linux-armv7-lite.gz,  target: linux/armv7+openwrt,    to: W1nCray-xray, variant: "hardfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-armv6.gz,       target: linux/armv6,            to: W1nCray-xray, variant: softfloat}
-      - {file: dist/W1nCray-xray-linux-armv6-lite.gz,  target: linux/armv6+openwrt,    to: W1nCray-xray, variant: "softfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-armv5.gz,       target: linux/armv5,            to: W1nCray-xray, variant: softfloat}
-      - {file: dist/W1nCray-xray-linux-armv5-lite.gz,  target: linux/armv5+openwrt,    to: W1nCray-xray, variant: "softfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-mips.gz,        target: linux/mips,             to: W1nCray-xray, variant: softfloat}
-      - {file: dist/W1nCray-xray-linux-mips-lite.gz,   target: linux/mips+openwrt,     to: W1nCray-xray, variant: "softfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-mipsle.gz,      target: linux/mipsle,           to: W1nCray-xray, variant: softfloat}
-      - {file: dist/W1nCray-xray-linux-mipsle-lite.gz, target: linux/mipsle+openwrt,   to: W1nCray-xray, variant: "softfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-mips64.gz,      target: linux/mips64,           to: W1nCray-xray, variant: softfloat}
-      - {file: dist/W1nCray-xray-linux-mips64-lite.gz, target: linux/mips64+openwrt,   to: W1nCray-xray, variant: "softfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-mips64le.gz,    target: linux/mips64le,         to: W1nCray-xray, variant: softfloat}
-      - {file: dist/W1nCray-xray-linux-mips64le-lite.gz, target: linux/mips64le+openwrt, to: W1nCray-xray, variant: "softfloat fallbackroots"}
-      - {file: dist/W1nCray-xray-linux-riscv64.gz,     target: linux/riscv64,          to: W1nCray-xray}
-      - {file: dist/W1nCray-xray-linux-riscv64-lite.gz, target: linux/riscv64+openwrt, to: W1nCray-xray, variant: fallbackroots}
-      - {file: dist/W1nCray-xray-linux-loong64.gz,     target: linux/loong64,          to: W1nCray-xray}
-      - {file: dist/W1nCray-xray-linux-loong64-lite.gz, target: linux/loong64+openwrt, to: W1nCray-xray, variant: fallbackroots}
+      - {file: dist/W1nCray-xray-linux-amd64.gz,         target: linux/amd64,    to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-amd64-lite.gz,    target: linux/amd64,    to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+      - {file: dist/W1nCray-xray-linux-386.gz,           target: linux/386,      to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-386-lite.gz,      target: linux/386,      to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-arm64.gz,         target: linux/arm64,    to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-arm64-lite.gz,    target: linux/arm64,    to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+      - {file: dist/W1nCray-xray-linux-armv7.gz,         target: linux/armv7,    to: W1nCray-xray, variant: hardfloat}
+      - {file: dist/W1nCray-xray-linux-armv7-lite.gz,    target: linux/armv7,    to: W1nCray-xray, variant: "hardfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-armv6.gz,         target: linux/armv6,    to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-armv6-lite.gz,    target: linux/armv6,    to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-armv5.gz,         target: linux/armv5,    to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-armv5-lite.gz,    target: linux/armv5,    to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mips.gz,          target: linux/mips,     to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mips-lite.gz,     target: linux/mips,     to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mipsle.gz,        target: linux/mipsle,   to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mipsle-lite.gz,   target: linux/mipsle,   to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mips64.gz,        target: linux/mips64,   to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mips64-lite.gz,   target: linux/mips64,   to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-mips64le.gz,      target: linux/mips64le, to: W1nCray-xray, variant: softfloat}
+      - {file: dist/W1nCray-xray-linux-mips64le-lite.gz, target: linux/mips64le, to: W1nCray-xray, variant: "softfloat fallbackroots", openwrt: true}
+      - {file: dist/W1nCray-xray-linux-riscv64.gz,       target: linux/riscv64,  to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-riscv64-lite.gz,  target: linux/riscv64,  to: W1nCray-xray, variant: fallbackroots, openwrt: true}
+      - {file: dist/W1nCray-xray-linux-loong64.gz,       target: linux/loong64,  to: W1nCray-xray}
+      - {file: dist/W1nCray-xray-linux-loong64-lite.gz,  target: linux/loong64,  to: W1nCray-xray, variant: fallbackroots, openwrt: true}
 
   # A second Xray kernel version is what exercises upgrade/rollback against a
   # real older build. There is no such build in this tree (release/build.sh
@@ -120,8 +126,8 @@ kernels:
   #     version_regex: "W1nCray-xray v?([0-9][0-9.]*)"
   #   mirrors: ["https://<mirror>/W1nCray-xray/{version}/{asset}"]
   #   local:
-  #     - {file: dist/old/W1nCray-xray-linux-amd64.gz,      target: linux/amd64,         to: W1nCray-xray}
-  #     - {file: dist/old/W1nCray-xray-linux-amd64-lite.gz, target: linux/amd64+openwrt, to: W1nCray-xray, variant: fallbackroots}
+  #     - {file: dist/old/W1nCray-xray-linux-amd64.gz,      target: linux/amd64, to: W1nCray-xray}
+  #     - {file: dist/old/W1nCray-xray-linux-amd64-lite.gz, target: linux/amd64, to: W1nCray-xray, variant: fallbackroots, openwrt: true}
   #     # ... the other architectures ...
 
   # ---------------------------------------------------------------- gost

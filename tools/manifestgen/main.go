@@ -331,9 +331,10 @@ func cmdVerify(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "OK  signature valid (key %s), sequence %d, issued %s, expires %s\n",
 		m.Signature.KeyID, m.Sequence, m.IssuedAt.UTC().Format(time.RFC3339), m.ExpiresAt.UTC().Format(time.RFC3339))
+	rep, _ := m.ValidateReport()
 	for i := range m.Kernels {
 		k := &m.Kernels[i]
-		var have, none []string
+		var have, none, ow []string
 		for key, t := range k.Targets {
 			if t == nil {
 				none = append(none, key)
@@ -341,13 +342,27 @@ func cmdVerify(args []string, stdout io.Writer) error {
 				have = append(have, key)
 			}
 		}
+		for key, t := range k.OpenWrtTargets {
+			if t == nil {
+				none = append(none, "openwrt_targets["+key+"]")
+			} else {
+				ow = append(ow, key)
+			}
+		}
 		sort.Strings(have)
 		sort.Strings(none)
+		sort.Strings(ow)
 		note := ""
 		if err := k.CheckAgent(*agent); err != nil {
 			note = "  [" + err.Error() + "]"
 		}
 		fmt.Fprintf(stdout, "    %-6s %-10s %d builds, %d unavailable (%s)%s\n", k.Name, k.Version, len(have), len(none), strings.Join(none, " "), note)
+		if len(ow) > 0 {
+			fmt.Fprintf(stdout, "           openwrt_targets: %s\n", strings.Join(ow, " "))
+		}
+	}
+	for _, n := range rep.IgnoredTargets {
+		fmt.Fprintf(stdout, "    note: ignoring target %s %s: %s\n", n.Kernel, n.Key, n.Reason)
 	}
 	return nil
 }
