@@ -90,6 +90,12 @@ type Options struct {
 	// (<config>.lock). The self-update watchdog reads the agent pid from it to
 	// tell "the new version is up" from "a broken binary is restart-looping".
 	LockPath string
+	// SelfUpdateAliveWindow and SelfUpdateDeadline are the local watchdog
+	// timing overrides (Agent.SelfUpdate, D-M7). Zero means the architecture
+	// default (selfupdate.DefaultWatchdogWindows). They are local-only: the
+	// panel never pushes agent configuration.
+	SelfUpdateAliveWindow time.Duration
+	SelfUpdateDeadline    time.Duration
 	// AllowHTTP permits http:// kernel sources (development only).
 	AllowHTTP bool
 	// Terminal is the local terminal policy (D8). Enabled is the resolved
@@ -316,6 +322,16 @@ func Boot(opts Options) (*Runtime, error) {
 		log.Warnf("bootstrap: self-update is not available: %v", uerr)
 	} else {
 		rt.Updater = up
+		// The authoritative "the new version is really running" signal for the
+		// watchdog (D-M7): a marker carrying this process's pid and version.
+		// It is written before Ready is judged, so a watchdog still deciding
+		// sees the version-correct process even if the install path was
+		// already swapped under us.
+		if _, pending := up.Pending(); pending {
+			if merr := up.MarkReady(); merr != nil {
+				log.Warnf("bootstrap: writing the self-update ready marker: %v", merr)
+			}
+		}
 		if rerr := up.Ready(); rerr != nil {
 			log.Infof("bootstrap: self-update capability withheld: %v", rerr)
 		} else {
@@ -379,6 +395,58 @@ func (r *Runtime) EnsureXray(ctx context.Context) error {
 	return err
 }
 
+// selfUpdateStalledReporter is the callback WatchStalled runs when a committed
+// self-update was not confirmed within ConfirmWindow. It reports the stall and
+// then stops deferring the Xray start-up migration (R1-7).
+func (r *Runtime) selfUpdateStalledReporter(version string) func(kind, level, message string) {
+	return func(kind, level, message string) {
+		r.warnf("bootstrap: %s: %s", kind, message)
+		if r.Ops != nil {
+			r.Ops.EmitEvent(kind, level, message)
+		}
+		r.StartXrayAfterUnconfirmedUpdate(version)
+	}
+}
+
+// StartXrayAfterUnconfirmedUpdate runs the Xray start-up migration for a
+// process whose self-update the panel never confirmed (R1-7).
+//
+// The migration is deferred while an update is pending so that a rollback to
+// the in-process-Xray 0.5.x agent never finds the 0.6 service holding the node
+// ports. Once ConfirmWindow has passed, the watchdog has already exited: it
+// either rolled the update back (this process is gone) or gave up and kept it
+// (protocol ruling 11). Keeping Xray down for as long as the panel is
+// unreachable is a regression against 0.5.x, which served Xray without the
+// panel, so the migration runs now and the decision is reported. The
+// rollbackAndRestart path also stops the Xray service first (R1-16), so a
+// rollback racing this start still cannot leave two Xray instances on the
+// ports.
+func (r *Runtime) StartXrayAfterUnconfirmedUpdate(version string) {
+	if r == nil || !r.xrayNeeded || r.XrayManager == nil {
+		return
+	}
+	if err := r.EnsureXray(context.Background()); err != nil {
+		r.warnf("bootstrap: 未确认的自升级 %s 之后启动 Xray 内核服务: %v", version, err)
+		return
+	}
+	msg := fmt.Sprintf("version %s was not confirmed within %s; the Xray kernel service was started without the panel confirmation",
+		version, r.ConfirmWindow())
+	r.warnf("bootstrap: %s", msg)
+	if r.Ops != nil {
+		r.Ops.EmitEvent("self_update.xray_started", "warn", msg)
+	}
+}
+
+// ConfirmWindow is how long a process from a committed self-update waits for
+// the panel before it reports self_update.stalled (and, R1-7, starts Xray
+// anyway). A runtime without an updater reports the default.
+func (r *Runtime) ConfirmWindow() time.Duration {
+	if r == nil || r.Updater == nil {
+		return selfupdate.DefaultConfirmWindow
+	}
+	return r.Updater.ConfirmWindow()
+}
+
 // KernelInstaller builds the kernel installer (kernelx) and loads the
 // persisted manifest. Boot uses it; the local `W1nCray xray` command uses it
 // too, so both go through exactly the same trust root.
@@ -439,6 +507,13 @@ func XrayManager(o Options, kern *kernelx.Ensurer, sup *supervisor.Supervisor) (
 // newUpdater builds the self-update updater around the running executable and
 // the kernel installer. The executable is resolved (EvalSymlinks) so the swap
 // replaces the real file a service manager runs, not a symlink to it.
+//
+// When the running image no longer resolves, the installed path from the
+// service unit is used instead. That is the D-M7 self-heal: a rollback that
+// raced this process's start unlinks the running image, and /proc/self/exe then
+// reports "<path> (deleted)"; without the fallback, Ready would fail and the
+// upgrade capability would be gone for the life of the process, with no way for
+// the panel to put the machine back into a consistent state.
 func newUpdater(kern *kernelx.Ensurer, opts Options, log driver.Logger) (*selfupdate.Updater, error) {
 	if kern == nil {
 		return nil, errors.New("no kernel installer")
@@ -447,17 +522,40 @@ func newUpdater(kern *kernelx.Ensurer, opts Options, log driver.Logger) (*selfup
 	if err != nil {
 		return nil, fmt.Errorf("resolving the running executable: %w", err)
 	}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
+	target, healed := resolveUpdaterExe(exe, filepath.EvalSymlinks, selfupdate.ServiceExecutable)
+	if healed {
+		log.Warnf("bootstrap: the running executable %s no longer resolves; self-update targets the installed path %s", exe, target)
 	}
 	return selfupdate.New(selfupdate.Options{
-		ExePath:      exe,
+		ExePath:      target,
 		StateDir:     opts.StateDir,
 		LockPath:     opts.LockPath,
 		AgentVersion: opts.SelfVersion,
 		Installer:    kern,
 		Log:          log,
+		AliveWindow:  opts.SelfUpdateAliveWindow,
+		Deadline:     opts.SelfUpdateDeadline,
 	})
+}
+
+// resolveUpdaterExe picks the file a self-update replaces: the running
+// executable when it still resolves, else the installed path a service manager
+// runs. The second result reports whether the fallback was used.
+//
+// The fallback is the D-M7 self-heal: a rollback that raced this process's
+// start unlinks the running image, so os.Executable() returns
+// "<path> (deleted)" and EvalSymlinks fails. The install path is still the file
+// that has to be swapped, so targeting it keeps Ready() (and therefore the
+// "upgrade" capability) working instead of losing it for the life of the
+// process. It is pure so both branches are testable.
+func resolveUpdaterExe(running string, resolve func(string) (string, error), installed func() string) (string, bool) {
+	if resolved, err := resolve(running); err == nil {
+		return resolved, false
+	}
+	if p := installed(); p != "" {
+		return p, true
+	}
+	return running, false
 }
 
 // loadPersistedManifest restores the manifest the panel sync loop persisted in

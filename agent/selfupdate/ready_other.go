@@ -7,6 +7,10 @@ package selfupdate
 // itself into, so every other platform is refused.
 func Ready(string) error { return ErrNotSupported }
 
+// ServiceExecutable names the executable a service manager runs. No supported
+// service manager exists on this platform, so there is none.
+func ServiceExecutable() string { return "" }
+
 // serviceUnitFor names the service unit that runs exe. No supported service
 // manager exists on this platform, so there is none.
 func serviceUnitFor(string) string { return "" }

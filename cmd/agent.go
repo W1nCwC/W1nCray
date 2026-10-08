@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -67,6 +68,7 @@ func runAgentApply(configPath, desiredFile string, out io.Writer) error {
 	if cfg.Agent == nil || !cfg.Agent.Enabled {
 		return fmt.Errorf("config %s has no enabled Agent section", configPath)
 	}
+	selfAlive, selfDeadline := cfg.Agent.SelfUpdateWindows(runtime.GOARCH)
 	rt, err := bootstrap.Boot(bootstrap.Options{
 		StateDir:         cfg.Agent.StateDir,
 		KernelsDir:       cfg.Agent.KernelsDir,
@@ -83,6 +85,9 @@ func runAgentApply(configPath, desiredFile string, out io.Writer) error {
 		// is replacing.
 		SelfVersion: version,
 		LockPath:    configPath + ".lock",
+		// The local self-update watchdog timing (agent.yml, D-M7).
+		SelfUpdateAliveWindow: selfAlive,
+		SelfUpdateDeadline:    selfDeadline,
 		// The managed-file layer has no blob fetcher without a panel link, so
 		// agent-apply never applies files; it still reports the same local
 		// policy as the service (the capability list is only sent over the
