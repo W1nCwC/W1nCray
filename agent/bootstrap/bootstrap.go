@@ -187,7 +187,8 @@ func (nopLog) Errorf(string, ...any) {}
 
 // driverBuilder builds the engine registry. It is a package variable so tests
 // can substitute fakes without a running xray core; production code never
-// changes it. cfg carries the local driver overrides (agent.yml Drivers, D4).
+// changes it. cfg carries the local driver overrides (agent.yml Drivers, D4)
+// and openWrt the platform fact the readiness defaults follow (F6).
 var driverBuilder = buildDrivers
 
 // Boot builds and starts the agent. The Xray forwarding engine is gone
@@ -234,13 +235,14 @@ func Boot(opts Options) (*Runtime, error) {
 			}
 		}
 	}
-	drivers, err := driverBuilder(opts.Policy, opts.AgentConfig, log)
+	// The platform facts are read once: the driver readiness defaults (F6), the
+	// OpenWrt firewall automation and the hello.policy report all need them
+	// (PLAN v11 §4.3).
+	plat := platform.Detect()
+	drivers, err := driverBuilder(opts.Policy, opts.AgentConfig, plat.OpenWrt, log)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
-	// The platform facts are read once: the OpenWrt firewall automation and the
-	// hello.policy report both need them (PLAN v11 §4.3).
-	plat := platform.Detect()
 	rec := &reconcile.Reconciler{
 		Drivers:  drivers,
 		Kernels:  kern,
@@ -533,16 +535,23 @@ func newFirewall(opts Options, openWrt bool, log driver.Logger) reconcile.Firewa
 
 // buildDrivers is the production driver registry. The Xray forwarding engine
 // is gone (PLAN v11 §2.5): the Xray instance is the separate W1nCray-xray
-// program, so no engine here links Xray-core.
-func buildDrivers(pol spec.Policy, cfg *agentcfg.Config, log driver.Logger) (map[string]driver.Driver, error) {
-	// The frp readiness limit is per architecture unless agent.yml overrides it
-	// (Drivers.Frp.ReadyTimeoutSec, D4).
-	var frpOpts frp.Options
+// program, so no engine here links Xray-core. openWrt is the platform fact of
+// this machine: both readiness limits follow it (F6).
+func buildDrivers(pol spec.Policy, cfg *agentcfg.Config, openWrt bool, log driver.Logger) (map[string]driver.Driver, error) {
+	// The readiness limits are per architecture and per OpenWrt unless
+	// agent.yml overrides them (Drivers.Frp.ReadyTimeoutSec, D4;
+	// Drivers.Gost.ReadyTimeoutSec, F6). The drivers resolve their own default
+	// from the platform fact, so only a real override is passed on.
+	frpOpts := frp.Options{OpenWrt: openWrt}
 	if d, ok := cfg.FrpReadyTimeout(); ok {
 		frpOpts.ReadyTimeout = d
 	}
+	gostOpts := gost.Options{OpenWrt: openWrt}
+	if d, ok := cfg.GostReadyTimeout(); ok {
+		gostOpts.ReadyTimeout = d
+	}
 	m := map[string]driver.Driver{}
-	m[spec.EngineGost] = gost.New(gost.Options{})
+	m[spec.EngineGost] = gost.New(gostOpts)
 	m[spec.EngineFrp] = frp.New(frpOpts)
 	m[spec.EngineRealm] = realm.New(realm.Options{})
 	return m, nil
