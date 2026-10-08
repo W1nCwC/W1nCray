@@ -85,9 +85,17 @@ type KernelRemoveArgs struct {
 // KernelRemoveResult is the result of a successful kernel_remove. AlreadyAbsent
 // is true when there was nothing to remove: kernel_remove is idempotent, so an
 // already-absent target is a success, not a failure (D-M2).
+//
+// Uninstalled is set only for the Xray kernel when the requested version was
+// its current one: Xray is a service, so removing the current version means
+// uninstalling the kernel (the service is stopped and disabled, its unit file
+// and every installed version are deleted, config.yml is kept). The flag lets
+// the panel and an operator tell that answer apart from the removal of an
+// older version, which leaves the running service untouched.
 type KernelRemoveResult struct {
 	FreedBytes    int64 `json:"freed_bytes"`
 	AlreadyAbsent bool  `json:"already_absent,omitempty"`
+	Uninstalled   bool  `json:"uninstalled,omitempty"`
 }
 
 // KernelRollbackArgs is the args of kernel_rollback.

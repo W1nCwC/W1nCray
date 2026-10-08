@@ -74,7 +74,7 @@ pid?, uptime_s?, restarts?, cpu_pct?, rss?, instances:[{id, state, conns?, up_by
 | `dump_state` | `{}` | redacted state dump |
 | `kernel_list` | `{}` | `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}` |
 | `kernel_install` | `{name, version?}` | installs from the signed manifest (empty version = newest) |
-| `kernel_remove` | `{name, version}` | refuses the version in use; result lists freed bytes |
+| `kernel_remove` | `{name, version}` | deletes exactly the named installed version; refuses the version in use; result `{freed_bytes, already_absent?, uninstalled?}`. `xray` is the single exception, see below |
 | `kernel_rollback` | `{name}` | |
 | `component_restart` | `{name}` | restarts a kernel process (not the agent) |
 | `self_update` | `{version}` | version listed for `agent` in the signed manifest; verified; swap + restart; auto-rollback |
@@ -85,6 +85,17 @@ pid?, uptime_s?, restarts?, cpu_pct?, rss?, instances:[{id, state, conns?, up_by
 | `file_mkdir` | `{root, path, mode?}` | `mkdir -p`; `mode` (octal string, default `0755`) applies to the last component, allowed: `0700`/`0750`/`0755`; result `{path, created}` |
 | `file_rename` | `{root, path, to}` | move inside the same root; the target must not exist (`already_exists`); result `{path, to, renamed:true}` |
 | `files_apply` | `{}` | same as `hint files` but reports the apply outcome (validate → swap → reload → confirm/rollback) |
+
+`kernel_remove {name, version}` deletes exactly the named installed version and leaves the other versions alone.
+A version that is in use (the current pointer names it, or a live process executes it) is refused with `failed` +
+`result.code="in_use"`. **The single exception is `name="xray"`**: the Xray kernel runs as a service, so naming its
+**current** version means uninstalling the kernel — the service is stopped and disabled, its unit file and every
+installed version are removed (`config.yml` and the managed files stay) and the result carries `uninstalled: true`.
+Naming an older xray version deletes only that version and never touches the running service. The panel itself
+refuses `kernel_remove xray` with HTTP 409 `xray_in_use` while nodes are still bound to the machine, so the
+uninstall path is only reachable once nothing is bound. An empty `version` (not allowed by this protocol, kept
+only for backward compatibility) is handled as the uninstall and logged as a warning. An agent that does not
+manage the Xray service at all (no configured Xray config path) keeps the plain file-kernel behaviour for `xray`.
 
 All file commands are confined to the roots in the agent's local policy (`policy.files.roots`), unless
 `policy.files.unrestricted` is set locally. Path traversal, symlink escapes and non-regular files are refused.

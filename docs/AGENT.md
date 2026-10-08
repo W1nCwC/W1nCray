@@ -577,7 +577,7 @@ Agent:
 |---|---|---|
 | `kernel_list` | `{}` | 回 `{kernels:[KernelEntry], catalog:[{name,versions:[…]}]}`。`kernels` 是**已安装**的版本（事实，读内核目录）；`catalog` 只列已签名清单里**本机可用**的版本。没有加载清单时 `catalog: []`，`kernels` 照常返回。 |
 | `kernel_install` | `{name, version?}` | 长命令。`version` 省略/空 = 清单里该内核的最新版本。只从**已签名清单**安装（哈希、平台、revoked、`min_agent` 全部照旧校验）。结果 `{name, version, path}`。**管理员明确下发时绕过并清除自动重试退避**（D-M3）：回滚掉的版本可以立刻重装，退避只约束自动重试。 |
-| `kernel_remove` | `{name, version}` | 删除一个已安装版本。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`；**幂等**：目标本来就没装（或已经删掉）时同样 `done`，结果里带 `already_absent: true`（D-M2）。`name=xray` 不需要 `version`：整服务卸载（`freed_bytes` 是所有已装版本声明体积之和），服务本就不存在时也回 `already_absent`。 |
+| `kernel_remove` | `{name, version}` | 删除**指定**的已安装版本，其它版本保留。**正在使用的版本被拒**：`failed` + `result.code="in_use"`（当前指针指向它，或有存活进程正在执行它）。成功时回 `{freed_bytes}`；**幂等**：目标本来就没装（或已经删掉）时同样 `done`，结果里带 `already_absent: true`（D-M2）。**唯一例外是 `name=xray`**：Xray 是服务，`version` 指向**当前**版本时即卸载内核（停用并删除服务文件、删除全部 xray 版本，保留 `config.yml` 与受管文件），结果里带 `uninstalled: true`；`version` 是旧版本时只删该版本、不停也不改 Xray 服务。面板在机器仍绑定节点时以 HTTP 409 `xray_in_use` 直接拦下该命令，因此卸载路径只在没有节点绑定后可达；`version` 为空（协议不允许，仅为兼容旧面板保留）按卸载处理并记一条 warning（本机没有配置 Xray 配置路径、因而没有服务管理器时，xray 与其它内核一样按普通版本处理）。 |
 | `kernel_rollback` | `{name}` | 把 `previous` 变成 `current`，两者互换；结果 `{name, version, path}`。 |
 | `component_restart` | `{name}` | 只重启**受管内核进程**（gost/realm/frp 由 supervisor 拉起）。结果 `{name, restarted:<n>}`。`agent` 一律拒绝（见下）；`xray` 走 Xray 内核服务（§13.5.1），服务未托管时回 `not_supported`。 |
 | `file_list` | `{root, path}` | 列出一个 root 下相对路径的目录项：`{entries:[{name,type,size,mode,mtime}], roots:[…]}`；`path` 省略 = root 本身。`mode` 是八进制权限串，`mtime` 是 Unix 秒。 |
@@ -597,7 +597,7 @@ Agent:
 - **`component_restart` 不能重启 agent**：agent 不由 supervisor 管理（重启它会断掉面板连接），回 `failed` + `result.code="reserved_name"`。`name=xray` 由 Xray 内核服务处理（§13.5.1）：服务已托管则重启它，未托管回 `not_supported`。名字对应的内核进程没在跑时回 `failed`（`component "x" is not running`）。
 - **`in_use` 的判定**：优先用 supervisor 的 pid 记录（`<StateDir>/pid/*.pid`）+ 存活与 `/proc/<pid>/exe` 身份复核，把正在执行的二进制映射回 `<KernelsDir>/kernels/<name>/<version>/`；平台无法核实身份（Windows 等）或没配 pid 目录时，退化为"当前指针 = 在用"，不假装精确。回滚后进程仍执行旧版本的情况也能如实反映。
 - **`KernelEntry` 字段**：`{name, version, current, previous, path, size_bytes, installed_at, in_use}`（契约 §3）。`size_bytes` 是**清单声明**的安装体积（各文件声明大小之和），不是磁盘实测。`kernel_list` 不额外发明 `size_on_disk`/`in_use_exact` 等字段（契约里没有）。
-- **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。`kernel_remove xray` 一次删掉整棵内核目录，所以它是所有已装版本声明体积之和（REG2 观察 1 的修复）。
+- **`freed_bytes`** 同样是该版本清单声明的体积（删除前读取），不是 `du` 的实测值。`kernel_remove xray <旧版本>` 只算该版本；删除 xray 的**当前**版本（卸载内核）时一次删掉整棵内核目录，所以它是所有已装版本声明体积之和（REG2 观察 1 的修复）。
 - **能力声明**：`hello.capabilities`（以及 HTTP `/config` 的 `features`）里出现 `kernel` 的条件是**内核安装器可用且已加载一份已签名清单**——没有清单时 `kernel_install` 无法解析版本，所以不做这个承诺（契约 §7-1）。
 - **能力集合是动态的，靠重连发布**：`hello.capabilities` 只在建连时发送一次，同一连接上第二个 `hello` 是协议错误（面板回 `unexpected_type`），而能力可能在握手之后才就绪（签名清单到达、`self_update` 注册完成）。agent 在每个 telemetry/components 周期把运行时的能力集合与上次 `hello` 实际发出的集合按**集合**比较（排序、去重）：不同就干净地断开当前连接并重连一次，让新的 `hello` 携带新集合。两次这样的重连至少间隔 30 s（集合来回抖动不会变成重连风暴），且本机有活动终端会话时推迟到会话结束（重连会打断用户的 shell）。这条路径**不发送任何新帧类型**（契约 §1/§3）。
 - **`file_*` 的根与错误码**：受限模式下 `root` 是**本机命名的 root**（默认 `xray` = xray 配置目录、`state` = agent 状态目录，其余按目录名），`path` 是相对路径；不受限模式下 `root` 传空、`path` 传绝对路径（PLAN v10，见 §3 的 `Files`）。`agent.yml`、`desired.json`、`last_good.json` 永不在任何 root 内（`mkdir`/`rename` 同样拒绝）。越界、符号链接逃逸、非常规文件等拒绝都带稳定的 `result.code`：`outside_roots`、`symlink`、`not_regular`、`not_a_directory`、`is_a_directory`、`too_large`、`exec_bit`、`special_mode`、`sha256_mismatch`、`unknown_root`、`already_exists`、`not_found`、`invalid_args`。
@@ -858,9 +858,9 @@ Xray 内核**不**是 agent 的子进程，而是一个独立服务：agent 重�
 
 - `Install`：按清单 `Ensure`（内核名 `xray`）→ 写服务 → 启动/重启 → 健康检查（状态接口 30 s 内 `running=true`）。**换版本一定重启**：服务文件内容变化、或运行中的内核报告的版本与要装的版本不同时，`activate` 用 `restart` 而不是 `start`（三个 init 系统的 `start` 对已 active 的单元是 no-op，否则旧进程会继续跑而单元与 current 指针已指向新版本）；同版本、服务文件不变的幂等重装不重启。健康检查失败时：**安装前服务在运行** → 回滚到安装前运行的版本并重启（与 `Upgrade` 一致），不会把可用的 Xray 停掉；安装前本来没有服务 → 停掉并删除刚写的服务，不留半装状态；`Ensure` 失败则什么都不写。
 - `Upgrade`：装新版本 → 改服务指向 → 重启 → 健康检查；失败自动 `kernelx` 回滚到上一版本并重启，报告里带上失败原因与回滚结果。
-- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。agent 子进程后端（没有 init 系统）下，删除内核文件前会等待 supervisor 的子进程真正退出（`RemoveTimeout`，默认 10 s）；超时仍在运行则返回 **`in_use`** 且**不删任何文件**（R1-8），避免删掉正在执行的二进制与回滚指针。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。
+- `Remove`：停止并禁用服务、删除服务文件、删除该内核**所有**版本；**保留** `config.yml` 与受管文件，重装即恢复。agent 子进程后端（没有 init 系统）下，删除内核文件前会等待 supervisor 的子进程真正退出（`RemoveTimeout`，默认 10 s）；超时仍在运行则返回 **`in_use`** 且**不删任何文件**（R1-8），避免删掉正在执行的二进制与回滚指针。**幂等**（D-M2）：服务不存在（从未安装，或已经卸掉）时直接成功返回，不会把 `systemctl stop` 的 `Unit … not loaded`（以及 OpenRC / procd 的等价情况）当失败上报；`kernel_remove xray` 的结果里带 `already_absent: true`。`kernel_remove xray <当前版本>`（以及 `version` 为空的历史兼容路径）才走这条整服务卸载路径；`kernel_remove xray <旧版本>` 只删该版本目录、不碰服务（§7 的 `kernel_remove` 行）。
 
-面板命令接入：`kernel_install`（已装过则走 `Upgrade`，带自动回滚）、`kernel_remove`（不需要版本号，整服务删除）、`kernel_rollback`、`component_restart` 在 `name=xray` 时都走这一套。`kernel_list` / `hello.kernel_entries` 里 xray 与其它内核格式一致，并附 `service`（`backend`、`state`、`managed_by`）；`state ∈ running/stopped/failed/installing/not_installed`。遥测的 `components` 里 xray 项来自状态接口：state、version、每个节点一项（在线数）、`last_error`。
+面板命令接入：`kernel_install`（已装过则走 `Upgrade`，带自动回滚）、`kernel_remove`（`version` 为当前版本时整服务卸载并回 `uninstalled: true`；为旧版本时只删该版本、不停服务）、`kernel_rollback`、`component_restart` 在 `name=xray` 时都走这一套。`kernel_list` / `hello.kernel_entries` 里 xray 与其它内核格式一致，并附 `service`（`backend`、`state`、`managed_by`）；`state ∈ running/stopped/failed/installing/not_installed`。遥测的 `components` 里 xray 项来自状态接口：state、version、每个节点一项（在线数）、`last_error`。
 
 ### 13.5.2 启动迁移与自升级顺序
 
