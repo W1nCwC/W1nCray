@@ -71,6 +71,15 @@ type Service struct {
 	// shutdown never returns before they stopped.
 	machineCancel context.CancelFunc
 	machineWG     *sync.WaitGroup
+	// machineClient and machineVersion are the machine-node watcher state of
+	// the running instance: the client the agent's nodes hint reuses, and the
+	// node-list version the instance was built from. They are guarded by s.mu
+	// and nil/"" when machine mode is off or nothing runs.
+	machineClient  *xboard.Client
+	machineVersion string
+	// machineSyncMu serialises the hint-driven node fetches, so two hints
+	// arriving together cannot both report the same change as theirs.
+	machineSyncMu sync.Mutex
 
 	reloadCh chan struct{}
 	stop     chan struct{}
@@ -319,6 +328,7 @@ func (s *Service) startXrayLocked(cfg *Config) (err error) {
 	if machine != nil {
 		s.startMachineWatch(machineCtx, &machineWG, machine, machineVersion)
 	}
+	s.machineClient, s.machineVersion = machine, machineVersion
 	s.core, s.nodes = cr, nodes
 	s.publishCoreOptionsLocked()
 	s.machineCancel, s.machineWG = machineCancel, &machineWG
@@ -469,6 +479,51 @@ func (s *Service) machineWatch(ctx context.Context, c *xboard.Client, version st
 	}
 }
 
+// SyncMachineNodes asks the panel for this machine's node list right now and
+// requests a reload when the list changed since the running instance was built.
+// It is the kernel side of the agent's hint{what:"nodes"}: the same "fetch the
+// version, reload only when it differs" rule machineWatch applies every 60 s,
+// just on demand. An idle hint (same version) returns changed=false and does
+// not reload; a configuration without machine mode has no list to refresh and
+// also returns changed=false.
+//
+// version is the version the panel reported, for the caller's log. It is empty
+// when there is nothing to refresh.
+//
+// The version is recorded before the (asynchronous) reload so that a second
+// hint arriving while the rebuild runs is idle instead of queueing another one;
+// startXrayLocked republishes the authoritative version when it discovers the
+// list again. Calls are serialised, so concurrent hints never both report the
+// same change.
+func (s *Service) SyncMachineNodes(ctx context.Context) (changed bool, version string, err error) {
+	s.machineSyncMu.Lock()
+	defer s.machineSyncMu.Unlock()
+
+	s.mu.Lock()
+	c, current := s.machineClient, s.machineVersion
+	s.mu.Unlock()
+	if c == nil {
+		// Machine mode is off, or the instance is being rebuilt and has no
+		// client right now: there is nothing to refresh.
+		return false, "", nil
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, machineRequestTimeout)
+	defer cancel()
+	_, next, err := c.ListMachineNodes(reqCtx)
+	if err != nil {
+		return false, "", err
+	}
+	if next == current {
+		return false, next, nil
+	}
+	s.mu.Lock()
+	s.machineVersion = next
+	s.mu.Unlock()
+	log.Infof("machine node list changed (version %s)", next)
+	s.requestReload("machine nodes changed")
+	return true, next, nil
+}
+
 // scheduleMachineRetry asks for a reload after machineRetryDelay, so a failed
 // discovery is retried without blocking the running nodes. The goroutine ends
 // with the instance context or after it fired. wg is the wait group of the
@@ -490,6 +545,11 @@ func (s *Service) scheduleMachineRetry(ctx context.Context, wg *sync.WaitGroup, 
 // stopMachineLocked cancels and joins the machine-node tasks. The caller must
 // hold s.mu.
 func (s *Service) stopMachineLocked() {
+	// The hint route must not keep the client of an instance that is being torn
+	// down: drop it before the tasks are joined, so a hint that arrives during
+	// a rebuild reports "nothing to refresh" instead of fetching through a
+	// client of the previous instance.
+	s.machineClient, s.machineVersion = nil, ""
 	if s.machineCancel == nil {
 		return
 	}

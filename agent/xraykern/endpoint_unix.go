@@ -13,12 +13,12 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 )
 
-// statusEndpoint builds the HTTP client and URL of the kernel's status
-// endpoint. On Unix-like systems it is the Unix socket in the runtime directory
-// (/run/W1nCray/xray.sock, mode 0600, so only the agent — running as the same
-// user — can read it). A socket left by a kernel up to v0.6.0 next to
-// config.yml is still accepted, so an in-place upgrade keeps reporting status
-// until the running kernel is restarted.
+// statusEndpoint builds the HTTP client and base URL of the kernel's local
+// endpoint (the caller appends the route path). On Unix-like systems it is the
+// Unix socket in the runtime directory (/run/W1nCray/xray.sock, mode 0600, so
+// only the agent — running as the same user — can read it). A socket left by a
+// kernel up to v0.6.0 next to config.yml is still accepted, so an in-place
+// upgrade keeps reporting status until the running kernel is restarted.
 func statusEndpoint(configPath string) (*http.Client, string, error) {
 	dir := filepath.Dir(configPath)
 	candidates := []string{xrayapi.SocketPath(dir), xrayapi.LegacySocketPath(dir)}
@@ -37,5 +37,5 @@ func statusEndpoint(configPath string) (*http.Client, string, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		},
 	}
-	return &http.Client{Transport: tr}, "http://unix" + xrayapi.StatusPath, nil
+	return &http.Client{Transport: tr}, "http://unix", nil
 }

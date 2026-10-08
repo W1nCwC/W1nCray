@@ -22,6 +22,13 @@ const (
 	StatusAddrName = "xray.addr"
 	// StatusPath is the HTTP path the status document is served on.
 	StatusPath = "/status"
+	// NodesSyncPath is the HTTP path that asks the kernel to re-fetch this
+	// machine's node list from the panel right now instead of waiting for its
+	// 60 s poll. It is served on the same local endpoint as StatusPath (the
+	// Unix socket, or the loopback address on Windows) and takes no parameter:
+	// no path, no command, no node data. A kernel older than this route answers
+	// HTTP 404, which the caller degrades to the poll.
+	NodesSyncPath = "/nodes/sync"
 	// RuntimeDirName is the directory under /run that holds the kernel's
 	// runtime files. The systemd unit asks systemd to create it
 	// (RuntimeDirectory=W1nCray); the kernel creates it itself when it is not
@@ -65,6 +72,20 @@ type NodeStatus struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// NodesSyncResult is the JSON body of NodesSyncPath. A request that could not
+// reach the panel is answered with a non-2xx status instead, so the caller can
+// tell "the list is unchanged" (changed=false) from "the kernel could not ask".
+type NodesSyncResult struct {
+	// Changed reports whether the panel's node-list version differed from the
+	// one the running instance was built from. When it is true the kernel has
+	// requested a reload; when it is false the running list is current and
+	// nothing was reloaded.
+	Changed bool `json:"changed"`
+	// Version is the version the panel reported, for logs. It is empty when
+	// machine mode is off (there is no list to refresh).
+	Version string `json:"version,omitempty"`
+}
+
 // StagedError is one problem `check-staged` found in a staged file.
 type StagedError struct {
 	File    string `json:"file"`
@@ -93,4 +114,12 @@ type Service interface {
 	// WaitReloaded waits until the kernel reports fingerprint as its loaded
 	// configuration fingerprint (or ctx ends).
 	WaitReloaded(ctx context.Context, fingerprint string) error
+	// SyncMachineNodes asks the kernel to re-fetch this machine's node list
+	// from the panel now instead of waiting for its 60 s poll. changed reports
+	// whether the list differed from the running instance's one (the kernel
+	// then requested a reload); an idle list is (false, nil). An error means
+	// the kernel could not be reached or answered with a failure — including a
+	// kernel that predates the route (HTTP 404) — and the caller falls back to
+	// the poll instead of failing.
+	SyncMachineNodes(ctx context.Context) (changed bool, err error)
 }
