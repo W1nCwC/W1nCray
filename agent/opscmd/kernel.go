@@ -281,6 +281,11 @@ func (k *kernelCmds) anyInstalled(name string) bool {
 // kernelRemove answers kernel_remove. It is quick (no network), so it finishes
 // inline. A version that is executing right now is refused even when the
 // current pointer already moved on, which a rollback can leave behind.
+//
+// It is a version-level command: one installed version is deleted and the
+// others stay. The Xray kernel is the single exception to the "the current
+// version is refused" rule, because it is a service: naming its current version
+// means uninstalling the kernel. xrayRemove below spells that out.
 func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Completion) (Result, error) {
 	var a panelclient.KernelRemoveArgs
 	if err := decodeArgs(req.Args, &a); err != nil {
@@ -289,30 +294,30 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	if err := checkKernelName(a.Name); err != nil {
 		return Result{}, err
 	}
-	// The Xray kernel is a service: removing it stops and disables the
-	// service, deletes its service file and removes every installed version,
-	// while config.yml and the managed files stay. No version is required.
+	// The Xray kernel is a service, so kernel_remove has two meanings that the
+	// requested version decides (FIN1-1: the version used to be ignored and
+	// every installed version was deleted):
+	//
+	//   - the version is not the current one: delete just that version
+	//     directory through the plain kernel installer, exactly like
+	//     gost/realm/frp. The service is not stopped or rewritten; a version
+	//     that is really executing right now is still refused (in_use), and the
+	//     installer clears the rollback pointer when the version was the
+	//     previous one.
+	//   - the version is the current one: that is an uninstall. Stop and
+	//     disable the service, delete its unit file and remove every installed
+	//     version, while config.yml and the managed files stay.
+	//
+	// The panel always sends a version (W1nCBoard: kernel_remove's version is
+	// required) and refuses the command with 409 xray_in_use while nodes are
+	// still bound to the machine. An empty version is not part of the protocol:
+	// it keeps the historical whole-service uninstall for backward
+	// compatibility and is logged as a warning.
 	//
 	// It is idempotent (D-M2): a machine where the service was never installed
 	// answers done with already_absent, never a "Unit not loaded" failure.
 	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
-		// The service manager removes every installed version at once, so the
-		// freed bytes are the sum over them. Like the supervised kernels below
-		// the declared installed size is read *before* the removal, because
-		// afterwards the entries are gone (REG2 observation 1: this branch used
-		// to answer freed_bytes=0).
-		freed := k.installedSizeOf(xrayapi.KernelName, "")
-		removed, err := k.deps.Xray.Remove(ctx)
-		if err != nil {
-			return Result{}, err
-		}
-		if !removed {
-			k.reg.logf().Infof("opscmd: kernel_remove xray: nothing installed (already absent)")
-			return done(panelclient.KernelRemoveResult{AlreadyAbsent: true}), nil
-		}
-		k.reg.logf().Infof("opscmd: kernel_remove xray done (%d bytes freed; service and files removed; configuration kept)", freed)
-		k.reg.event("kernel.removed", "info", "kernel xray removed (service and files; configuration kept)")
-		return done(panelclient.KernelRemoveResult{FreedBytes: freed}), nil
+		return k.xrayRemove(ctx, a)
 	}
 	if a.Version == "" {
 		return Result{}, coded("invalid_args", errors.New("version is required"))
@@ -337,6 +342,87 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	k.reg.logf().Infof("opscmd: kernel_remove %s@%s done (%d bytes freed)", a.Name, version, freed)
 	k.reg.event("kernel.removed", "info", fmt.Sprintf("kernel %s@%s removed", a.Name, version))
 	return done(panelclient.KernelRemoveResult{FreedBytes: freed}), nil
+}
+
+// xrayRemove answers kernel_remove for the Xray kernel service. The requested
+// version decides what the command means; kernelRemove documents the two cases.
+func (k *kernelCmds) xrayRemove(ctx context.Context, a panelclient.KernelRemoveArgs) (Result, error) {
+	version := manifest.NormalizeVersion(a.Version)
+	if version == "" {
+		// The protocol requires a version (W1nCBoard always sends one). An
+		// older or hand-made panel that omits it still gets the historical
+		// whole-service uninstall, and the omission is visible in the log.
+		k.reg.logf().Warnf("opscmd: kernel_remove xray without a version: uninstalling the whole service (the protocol requires a version)")
+		return k.xrayUninstall(ctx)
+	}
+	list, err := k.deps.Kernels.List()
+	if err != nil {
+		return Result{}, fmt.Errorf("listing the installed kernels: %w", err)
+	}
+	installed, current := false, false
+	for _, e := range list {
+		if e.Name != xrayapi.KernelName || e.Version != version {
+			continue
+		}
+		installed, current = true, e.Current
+		break
+	}
+	if !installed {
+		k.reg.logf().Infof("opscmd: kernel_remove xray@%s: not installed (already absent)", version)
+		return done(panelclient.KernelRemoveResult{AlreadyAbsent: true}), nil
+	}
+	if current {
+		// Xray is the single kernel whose current version can be removed: it is
+		// a service, so this is the uninstall of the kernel.
+		return k.xrayUninstall(ctx)
+	}
+	// A non-current version is a plain version removal: the same in_use guard
+	// as gost/realm/frp (a rollback can leave an older version executing) and
+	// the same kernel/install per-version deletion, which also clears the
+	// rollback pointer when this was the previous version. The service manager
+	// is deliberately not involved, so a running Xray is never stopped.
+	if running, exact := k.deps.Kernels.RunningVersion(xrayapi.KernelName); exact && running == version {
+		return Result{}, coded("in_use", fmt.Errorf("kernel %s@%s is running; ensure or roll back to another version first", a.Name, version))
+	}
+	freed := k.installedSizeOf(xrayapi.KernelName, version)
+	if err := k.deps.Kernels.Remove(xrayapi.KernelName, version); err != nil {
+		if errors.Is(err, kernel.ErrNotInstalled) {
+			k.reg.logf().Infof("opscmd: kernel_remove xray@%s: not installed (already absent)", version)
+			return done(panelclient.KernelRemoveResult{AlreadyAbsent: true}), nil
+		}
+		return Result{}, err
+	}
+	k.reg.logf().Infof("opscmd: kernel_remove xray@%s done (%d bytes freed; the running service was not touched)", version, freed)
+	k.reg.event("kernel.removed", "info", fmt.Sprintf("kernel xray@%s removed", version))
+	return done(panelclient.KernelRemoveResult{FreedBytes: freed}), nil
+}
+
+// xrayUninstall stops and deletes the Xray kernel service and every installed
+// version, keeping config.yml and the managed files: reinstalling restores the
+// service. It is what kernel_remove means when the requested version is the
+// current one (and, defensively, when no version is sent), and it is idempotent
+// (D-M2): a machine where the service was never installed answers success with
+// already_absent.
+func (k *kernelCmds) xrayUninstall(ctx context.Context) (Result, error) {
+	// The service manager removes every installed version at once, so the freed
+	// bytes are the sum over them. Like the supervised kernels below the
+	// declared installed size is read *before* the removal, because afterwards
+	// the entries are gone (REG2 observation 1: this branch used to answer
+	// freed_bytes=0).
+	freed := k.installedSizeOf(xrayapi.KernelName, "")
+	removed, err := k.deps.Xray.Remove(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if !removed {
+		k.reg.logf().Infof("opscmd: kernel_remove xray: nothing installed (already absent)")
+		return done(panelclient.KernelRemoveResult{AlreadyAbsent: true}), nil
+	}
+	k.reg.logf().Infof("opscmd: kernel_remove xray done (%d bytes freed; service and files removed; configuration kept)", freed)
+	k.reg.event("kernel.removed", "info", "kernel xray removed (service and files; configuration kept)")
+	// uninstalled tells the panel/operator that the running service was removed
+	// with the kernel, as opposed to one stale version being deleted.
+	return done(panelclient.KernelRemoveResult{FreedBytes: freed, Uninstalled: true}), nil
 }
 
 // installedSizeOf returns the declared installed size of one kernel version, or

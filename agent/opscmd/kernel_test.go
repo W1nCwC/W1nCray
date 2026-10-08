@@ -102,14 +102,22 @@ func newKernelRig(t *testing.T) *kernelRig {
 // addVersion publishes one signed, downloadable version of the "gost" kernel.
 func (r *kernelRig) addVersion(version string) {
 	r.t.Helper()
+	r.addKernelVersion("gost", version)
+}
+
+// addKernelVersion publishes one signed, downloadable version of any kernel.
+// The Xray lifecycle test needs the same rig for name "xray", whose service
+// manager drives the very same installer.
+func (r *kernelRig) addKernelVersion(name, version string) {
+	r.t.Helper()
 	bin := []byte("#!/bin/sh\n# FAKEKERNEL version=" + version + "\n" + strings.Repeat("x", 512))
-	archive := tarGz(r.t, "gost", bin)
-	path := "/gost-" + version + ".tar.gz"
+	archive := tarGz(r.t, name, bin)
+	path := "/" + name + "-" + version + ".tar.gz"
 	r.blobs[path] = archive
 	r.kernels = append(r.kernels, manifest.Kernel{
-		Name: "gost", Version: version, Channel: "stable",
+		Name: name, Version: version, Channel: "stable",
 		License: manifest.License{SPDX: "MIT"},
-		Run:     manifest.Run{Binary: "gost", VersionCmd: []string{"-V"}},
+		Run:     manifest.Run{Binary: name, VersionCmd: []string{"-V"}},
 		Targets: map[string]*manifest.Target{
 			r.plat.Key(): {
 				URLs:          []string{r.srv.URL + path},
@@ -117,7 +125,7 @@ func (r *kernelRig) addVersion(version string) {
 				ArchiveSHA256: sha256Hex(archive),
 				ArchiveSize:   int64(len(archive)),
 				Extract: []manifest.Extract{{
-					From: "gost", To: "gost", SHA256: sha256Hex(bin), Size: int64(len(bin)), Mode: "0755",
+					From: name, To: name, SHA256: sha256Hex(bin), Size: int64(len(bin)), Mode: "0755",
 				}},
 			},
 		},
