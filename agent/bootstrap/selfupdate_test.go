@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
@@ -20,6 +21,37 @@ func (fakeSelfUpdate) Commit(selfupdate.Staged) error      { return nil }
 func (fakeSelfUpdate) RespawnHelper() error                { return nil }
 func (fakeSelfUpdate) Ready() error                        { return nil }
 func (fakeSelfUpdate) Pending() (selfupdate.Pending, bool) { return selfupdate.Pending{}, false }
+
+// TestResolveUpdaterExeFallsBackToTheInstalledPath is the D-M7 self-heal: when
+// the running image no longer resolves ("<path> (deleted)" after a rollback
+// raced this start), the self-update must target the installed path from the
+// service unit instead of giving up on the upgrade capability. It failed before
+// the fix (the deleted path was kept and Ready refused it).
+func TestResolveUpdaterExeFallsBackToTheInstalledPath(t *testing.T) {
+	ok := func(string) (string, error) { return "/usr/local/W1nCray/W1nCray", nil }
+	gone := func(string) (string, error) {
+		return "", errors.New("lstat /usr/local/W1nCray/W1nCray (deleted): no such file")
+	}
+
+	// The running executable resolves: it wins, no fallback.
+	got, healed := resolveUpdaterExe("/proc/self/exe", ok, func() string { return "/install/W1nCray" })
+	if got != "/usr/local/W1nCray/W1nCray" || healed {
+		t.Errorf("resolving path = (%q, %v), want the resolved path and no fallback", got, healed)
+	}
+
+	// It does not resolve and a service unit names the installed path.
+	got, healed = resolveUpdaterExe("/usr/local/W1nCray/W1nCray (deleted)", gone, func() string { return "/install/W1nCray" })
+	if got != "/install/W1nCray" || !healed {
+		t.Errorf("fallback = (%q, %v), want the installed path and healed=true", got, healed)
+	}
+
+	// It does not resolve and there is no installed path: keep the running one
+	// and let Ready report the readable diagnostic.
+	got, healed = resolveUpdaterExe("/x/W1nCray (deleted)", gone, func() string { return "" })
+	if got != "/x/W1nCray (deleted)" || healed {
+		t.Errorf("no-installed path = (%q, %v), want the running path and healed=false", got, healed)
+	}
+}
 
 // TestUpgradeCapabilityFollowsTheRegistration covers protocol ruling 11: the
 // "upgrade" capability is a promise that self_update is served here, so it is

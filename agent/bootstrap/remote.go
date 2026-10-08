@@ -412,12 +412,11 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	// A pending update that never reaches the panel is reported, never rolled
 	// back (protocol ruling 11).
 	if startup != nil {
-		go startup.WatchStalled(runCtx, func(kind, level, message string) {
-			log.Warnf("bootstrap: %s: %s", kind, message)
-			if r.Ops != nil {
-				r.Ops.EmitEvent(kind, level, message)
-			}
-		})
+		version := ""
+		if p, ok := startup.Pending(); ok {
+			version = p.Version
+		}
+		go startup.WatchStalled(runCtx, r.selfUpdateStalledReporter(version))
 	}
 
 	runnerDone := make(chan struct{})

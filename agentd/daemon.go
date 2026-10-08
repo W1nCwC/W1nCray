@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sync"
 	"time"
 
@@ -109,6 +110,10 @@ func (d *Daemon) startAgentLocked(cfg *Config) {
 	if src := cfg.AgentSourcePath(); src != "" {
 		log.Infof("agent: configuration from %s", src)
 	}
+	// The self-update watchdog timing is a local override (agent.yml, D-M7):
+	// the panel never pushes agent configuration. Zero keeps the architecture
+	// default.
+	selfAlive, selfDeadline := cfg.Agent.SelfUpdateWindows(runtime.GOARCH)
 	rt, err := bootstrap.Boot(bootstrap.Options{
 		StateDir:         cfg.Agent.StateDir,
 		KernelsDir:       cfg.Agent.KernelsDir,
@@ -125,8 +130,12 @@ func (d *Daemon) startAgentLocked(cfg *Config) {
 		// running agent.
 		SelfVersion: AgentVersion,
 		LockPath:    d.path + ".lock",
-		Files:       FilesOptionsFor(cfg, d.path),
-		Log:         log.StandardLogger(),
+		// The local self-update watchdog timing (D-M7): a slow device widens
+		// the "no agent alive" window instead of being rolled back mid-start.
+		SelfUpdateAliveWindow: selfAlive,
+		SelfUpdateDeadline:    selfDeadline,
+		Files:                 FilesOptionsFor(cfg, d.path),
+		Log:                   log.StandardLogger(),
 		// The local terminal policy (D8, WP-G6). Enabled is the resolved
 		// agentcfg value: on unless the machine opted out with
 		// Terminal.Enabled: false or --noterminal.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -114,4 +115,58 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return syscall.Kill(pid, 0) == nil
+}
+
+// stopGrace is how long a process may take to leave after SIGTERM before it is
+// killed.
+const stopGrace = 5 * time.Second
+
+// stopAgentProcess stops one agent process gracefully and, if it does not exit
+// within stopGrace, forcefully. A rollback must never replace the executable
+// file of a process that is still running: that is what leaves the running
+// image and the install path pointing at different files (D-M7).
+func stopAgentProcess(pid int, log driver.Logger) {
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	if waitForProcessExit(pid, stopGrace) {
+		return
+	}
+	if log != nil {
+		log.Warnf("selfupdate: agent pid %d did not exit within %s; killing it", pid, stopGrace)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	_ = waitForProcessExit(pid, 2*time.Second)
+}
+
+// waitForProcessExit reports whether pid left before the timeout. A zombie
+// still answers signal 0, so the process table is consulted first.
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !processAlive(pid) || processZombie(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// processZombie reports whether pid is a reaped-awaiting zombie: it no longer
+// runs, but kill(pid, 0) still succeeds until its parent collects it.
+func processZombie(pid int) bool {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	// The second field is the state; the comm field is parenthesised and may
+	// contain spaces, so parse from the last ')'.
+	i := bytes.LastIndexByte(b, ')')
+	if i < 0 || i+2 >= len(b) {
+		return false
+	}
+	return b[i+2] == 'Z'
 }

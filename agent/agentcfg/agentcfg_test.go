@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
@@ -683,5 +684,45 @@ func TestFirewallAutoOpenDefaults(t *testing.T) {
 		if got := c.cfg.FirewallAutoOpen(c.openWrt); got != c.want {
 			t.Errorf("%s: FirewallAutoOpen = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// TestSelfUpdateWindowsAreALocalArchitectureAwareOverride pins the D-M7 timing
+// rule: the watchdog windows come from the architecture by default, a local
+// agent.yml value overrides them, and a deadline that is not above the window is
+// raised so the rollback rule can still fire.
+func TestSelfUpdateWindowsAreALocalArchitectureAwareOverride(t *testing.T) {
+	// Defaults: architecture-driven, never the old fixed 10 s.
+	alive, deadline := (*Config)(nil).SelfUpdateWindows("amd64")
+	if alive != selfupdate.DefaultAliveWindow || deadline != selfupdate.DefaultDeadline {
+		t.Errorf("nil config on amd64 = %s/%s, want %s/%s", alive, deadline, selfupdate.DefaultAliveWindow, selfupdate.DefaultDeadline)
+	}
+	slowAlive, _ := (*Config)(nil).SelfUpdateWindows("mips")
+	if slowAlive != selfupdate.DefaultAliveWindowSlow || slowAlive <= alive {
+		t.Errorf("the slow-target window %s must be the slow default %s and exceed the amd64 one %s", slowAlive, selfupdate.DefaultAliveWindowSlow, alive)
+	}
+
+	cfg := &Config{SelfUpdate: &SelfUpdateConfig{AliveWindowSec: 90, DeadlineSec: 600}}
+	alive, deadline = cfg.SelfUpdateWindows("mips")
+	if alive != 90*time.Second || deadline != 600*time.Second {
+		t.Errorf("override = %s/%s, want 90s/10m0s", alive, deadline)
+	}
+
+	// A deadline below the window is raised, not honoured: a watchdog that
+	// stops watching before its rollback rule fires would leave a broken
+	// binary in place.
+	cfg = &Config{SelfUpdate: &SelfUpdateConfig{AliveWindowSec: 300, DeadlineSec: 60}}
+	alive, deadline = cfg.SelfUpdateWindows("amd64")
+	if alive != 300*time.Second || deadline <= alive {
+		t.Errorf("misconfigured budget = %s/%s, want the deadline raised above 300s", alive, deadline)
+	}
+
+	// Zero and negative values mean "use the default", and a negative value is
+	// refused by Validate.
+	if a, d := (&Config{SelfUpdate: &SelfUpdateConfig{}}).SelfUpdateWindows("amd64"); a != selfupdate.DefaultAliveWindow || d != selfupdate.DefaultDeadline {
+		t.Errorf("zero values = %s/%s, want the architecture defaults", a, d)
+	}
+	if err := (&Config{SelfUpdate: &SelfUpdateConfig{AliveWindowSec: -1}}).Validate(); err == nil {
+		t.Error("a negative window must be refused")
 	}
 }

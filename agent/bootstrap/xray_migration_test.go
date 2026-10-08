@@ -4,9 +4,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/opscmd"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 	"github.com/W1nCwC/W1nCray/agent/xraysvc"
@@ -174,5 +178,134 @@ func TestEnsureXrayRunsOnceAndOnlyWhenNeeded(t *testing.T) {
 	}
 	if len(sup.started) != 1 {
 		t.Fatalf("the migration ran %d time(s), want once", len(sup.started))
+	}
+}
+
+// migrationKernelOps is the opscmd.KernelOps surface with nothing behind it: the
+// R1-7 test only needs a registry that can carry an event sink.
+type migrationKernelOps struct{}
+
+func (migrationKernelOps) List() ([]install.Entry, error)           { return nil, nil }
+func (migrationKernelOps) Catalog() ([]install.CatalogEntry, error) { return nil, nil }
+func (migrationKernelOps) Ensure(context.Context, spec.KernelPin) (driver.Installed, error) {
+	return driver.Installed{}, nil
+}
+func (migrationKernelOps) EnsureForce(context.Context, spec.KernelPin) (driver.Installed, error) {
+	return driver.Installed{}, nil
+}
+func (migrationKernelOps) Remove(string, string) error { return nil }
+func (migrationKernelOps) Rollback(string) (driver.Installed, error) {
+	return driver.Installed{}, nil
+}
+func (migrationKernelOps) RunningVersion(string) (string, bool) { return "", false }
+
+// migrationRuntime builds a Runtime with a real xraysvc manager over the
+// stand-in supervisor, a committed self-update with a short confirm window and
+// an ops registry that records the events.
+func migrationRuntime(t *testing.T, root string, sup *migrationSup) (*Runtime, *selfupdate.Updater, *[]string) {
+	t.Helper()
+	bin := filepath.Join(root, "kernels", "xray", "0.6.0", "W1nCray-xray")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.yml")
+	if err := os.WriteFile(configPath, []byte("Log: {Level: warning}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := xraysvc.New(xraysvc.Options{
+		Root:       root,
+		Kernels:    migrationKernels{current: driver.Installed{Path: bin, Version: "0.6.0"}},
+		ConfigPath: configPath,
+		StateDir:   filepath.Join(root, "state"),
+		Status:     migrationStatus{running: true},
+		Sup:        sup,
+		Backend:    xraysvc.BackendAgent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(filepath.Join(stateDir, "update"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pending := `{"version":"0.6.0","at":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(stateDir, "update", "pending.json"), []byte(pending), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(root, "W1nCray")
+	if err := os.WriteFile(exe, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	up, err := selfupdate.New(selfupdate.Options{
+		ExePath: exe, StateDir: stateDir,
+		// Short enough to keep the test quick; the production default is 10
+		// minutes.
+		ConfirmWindow: 20 * time.Millisecond,
+		Ready:         func(string) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reg, err := opscmd.New(opscmd.Deps{Kernels: migrationKernelOps{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := &[]string{}
+	reg.SetEvents(opscmd.EventFunc(func(kind, _, _ string) {
+		*events = append(*events, kind)
+	}))
+	return &Runtime{Ops: reg, Updater: up, XrayManager: mgr, xrayNeeded: true}, up, events
+}
+
+// TestUnconfirmedUpdateStartsTheXrayMigration is the R1-7 regression test: a
+// process from a committed self_update whose panel never answers must not leave
+// the Xray start-up migration deferred forever. Once ConfirmWindow has passed
+// the watchdog can no longer roll back, so the migration runs, reports
+// self_update.stalled and says the Xray service was started without the
+// confirmation. It failed before the fix (the migration stayed deferred).
+func TestUnconfirmedUpdateStartsTheXrayMigration(t *testing.T) {
+	sup := &migrationSup{}
+	rt, up, events := migrationRuntime(t, t.TempDir(), sup)
+
+	startup := up.BeginStartup()
+	if _, ok := startup.Pending(); !ok {
+		t.Fatal("the process must see the committed update as pending")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		startup.WatchStalled(context.Background(), rt.selfUpdateStalledReporter("0.6.0"))
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("WatchStalled never fired: the unconfirmed update did not unlock the migration")
+	}
+	if len(sup.started) != 1 {
+		t.Fatalf("the Xray migration ran %d time(s) after the unconfirmed update, want once", len(sup.started))
+	}
+	got := strings.Join(*events, ",")
+	if !strings.Contains(got, "self_update.stalled") {
+		t.Errorf("events = %q, want self_update.stalled", got)
+	}
+	if !strings.Contains(got, "self_update.xray_started") {
+		t.Errorf("events = %q, want self_update.xray_started (the panel must learn Xray was started without it)", got)
+	}
+}
+
+// TestUnconfirmedUpdateDoesNotStartXrayWhenItIsNotNeeded keeps the R1-7 unlock
+// narrow: a machine whose configuration needs no Xray kernel starts nothing.
+func TestUnconfirmedUpdateDoesNotStartXrayWhenItIsNotNeeded(t *testing.T) {
+	sup := &migrationSup{}
+	rt, _, _ := migrationRuntime(t, t.TempDir(), sup)
+	rt.xrayNeeded = false
+	rt.StartXrayAfterUnconfirmedUpdate("0.6.0")
+	if len(sup.started) != 0 {
+		t.Fatalf("a machine that does not need Xray started it: %v", sup.started)
 	}
 }

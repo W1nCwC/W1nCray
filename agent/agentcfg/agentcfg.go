@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/nodecfg"
 )
@@ -82,6 +83,9 @@ type Config struct {
 	Kernels *KernelsConfig `mapstructure:"Kernels"`
 	// Drivers holds the local driver timing overrides (D4).
 	Drivers *DriversConfig `mapstructure:"Drivers"`
+	// SelfUpdate holds the local self-update watchdog timing (D-M7). It is a
+	// local-only override: the panel never pushes agent configuration.
+	SelfUpdate *SelfUpdateConfig `mapstructure:"SelfUpdate"`
 
 	// dir is the directory the relative paths were resolved against and
 	// excludedFiles are the paths that are never reachable through
@@ -348,6 +352,59 @@ func (c *Config) FrpReadyTimeout() (time.Duration, bool) {
 	return time.Duration(c.Drivers.Frp.ReadyTimeoutSec) * time.Second, true
 }
 
+// SelfUpdateConfig overrides the self-update watchdog timing (D-M7). Every
+// field is optional; 0 means "use the architecture default". The watchdog runs
+// as a copy of the previous agent binary, so it always runs on this machine's
+// architecture.
+type SelfUpdateConfig struct {
+	// AliveWindowSec is how long the watchdog tolerates "no agent alive" after
+	// the update before it rolls back. The default is 60 s on amd64/arm64 and
+	// 180 s on the slower targets. It has to cover the service manager's
+	// respawn delay plus the new process's start-up: raise it on a device that
+	// is slower than its architecture suggests.
+	AliveWindowSec int `mapstructure:"AliveWindowSec"`
+	// DeadlineSec is the watchdog's total observation budget. The default is
+	// 3 min on amd64/arm64 and 8 min on the slower targets. It is kept above
+	// AliveWindowSec.
+	DeadlineSec int `mapstructure:"DeadlineSec"`
+}
+
+// SelfUpdateAliveWindow returns the configured no-live-agent window and whether
+// it was set at all.
+func (c *Config) SelfUpdateAliveWindow() (time.Duration, bool) {
+	if c == nil || c.SelfUpdate == nil || c.SelfUpdate.AliveWindowSec <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.SelfUpdate.AliveWindowSec) * time.Second, true
+}
+
+// SelfUpdateDeadline returns the configured watchdog budget and whether it was
+// set at all.
+func (c *Config) SelfUpdateDeadline() (time.Duration, bool) {
+	if c == nil || c.SelfUpdate == nil || c.SelfUpdate.DeadlineSec <= 0 {
+		return 0, false
+	}
+	return time.Duration(c.SelfUpdate.DeadlineSec) * time.Second, true
+}
+
+// SelfUpdateWindows returns the effective (alive, deadline) pair for goarch:
+// the local override when it was written, else the architecture default. A
+// deadline that is not above the window is raised, so a misconfigured file
+// cannot make the watchdog stop watching before its own rollback rule can fire.
+func (c *Config) SelfUpdateWindows(goarch string) (alive, deadline time.Duration) {
+	alive, deadline = selfupdate.DefaultWatchdogWindows(goarch)
+	if v, ok := c.SelfUpdateAliveWindow(); ok {
+		alive = v
+	}
+	if v, ok := c.SelfUpdateDeadline(); ok {
+		deadline = v
+	}
+	if deadline <= alive {
+		deadline = alive + 30*time.Second
+	}
+	return alive, deadline
+}
+
 // FirewallAutoOpen returns the effective value of Firewall.AutoOpen for a
 // machine whose OpenWrt detection is openWrt. An explicit true/false written in
 // the configuration is honoured on OpenWrt; "not written" is the platform
@@ -401,6 +458,9 @@ func (c *Config) Validate() error {
 	// value that silently does nothing is worse than a clear refusal.
 	if c.Drivers != nil && c.Drivers.Frp != nil && c.Drivers.Frp.ReadyTimeoutSec < 0 {
 		return fmt.Errorf("config: Agent.Drivers.Frp.ReadyTimeoutSec must not be negative")
+	}
+	if c.SelfUpdate != nil && (c.SelfUpdate.AliveWindowSec < 0 || c.SelfUpdate.DeadlineSec < 0) {
+		return fmt.Errorf("config: Agent.SelfUpdate.AliveWindowSec and DeadlineSec must not be negative")
 	}
 	if !c.Enabled {
 		if c.Panel != nil && (c.Panel.Enabled || c.Panel.MachineNodes) {

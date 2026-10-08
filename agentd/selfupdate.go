@@ -29,15 +29,23 @@ func SelfUpdateStartup(cfg *Config) *selfupdate.Startup {
 		exe = resolved
 	}
 	up, err := selfupdate.New(selfupdate.Options{
-		ExePath:  exe,
-		StateDir: a.StateDir,
-		Log:      log.StandardLogger(),
+		ExePath:      exe,
+		StateDir:     a.StateDir,
+		AgentVersion: AgentVersion,
+		Log:          log.StandardLogger(),
 	})
 	if err != nil {
 		log.Warnf("agent: self-update start-up check skipped: %v", err)
 		return nil
 	}
 	st := up.BeginStartup()
+	if _, pending := st.Pending(); pending {
+		// The authoritative "the new version is running" signal the watchdog
+		// reads (D-M7): this process's version and pid.
+		if err := up.MarkReady(); err != nil {
+			log.Warnf("agent: writing the self-update ready marker: %v", err)
+		}
+	}
 	if rb, ok := st.TakeRollback(); ok {
 		log.Warnf("agent: self_update.rolled_back: version %s: %s", rb.Version, rb.Reason)
 	}
