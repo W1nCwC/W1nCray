@@ -6,7 +6,7 @@
 
 | # | 事实 | 来源 | 档位 |
 |---|---|---|---|
-| W1 | 发现：`POST /api/v2/server/handshake`（body `token`,`node_id`）→ `{"websocket":{"enabled":bool,"ws_url":...}}`；enabled 需后台开关 + ws-server 心跳 | `V2/Server/ServerController.php` | 已验证（用户面板返回 `enabled:true, ws_url: wss://subscribe.w1nc.xyz/ws`） |
+| W1 | 发现：`POST /api/v2/server/handshake`（body `token`,`node_id`）→ `{"websocket":{"enabled":bool,"ws_url":...}}`；enabled 需后台开关 + ws-server 心跳 | `V2/Server/ServerController.php` | 已验证（用户面板返回 `enabled:true, ws_url: wss://panel.example.com/ws`） |
 | W2 | 连接：`ws_url?token=..&node_id=..`；token 错误/节点不存在时在握手阶段直接 close（不回 101） | `NodeWorker::authenticateNode` | 已验证 |
 | W3 | 认证成功：`clearAllNodeDevices(nodeId)` → 发 `auth.success` → 推 `sync.config{config}` + `sync.users{users}` | `NodeWorker.php:186-201`、`NodeEventHandlers::pushFullSync` | 已验证 |
 | W4 | `sync.config.config` = `buildNodeConfig()`，**不含 base_config**（HTTP config 含） | `NodeSyncService::notifyConfigUpdated`、`UniProxyController::config` | 已验证 |
