@@ -185,8 +185,9 @@ config rule 'w1ncray_<实例id>'
 - **只动自己的规则**：agent 只读、建、改、删 section 名以 `w1ncray_` 开头的规则；用户自己的规则、zone、defaults 一律不碰。
 - **UCI section 名**只允许 `[A-Za-z0-9_]`（`-` 会被 uci 以 `Invalid argument` 拒绝），所以实例 id 里的 `-` 写成 `_d`、`_` 写成 `__`（可逆、不冲突）：id `d2-fwd2` 的 section 是 `w1ncray_d2_dfwd2`，id `d2fwd1` 是 `w1ncray_d2fwd1`。
 - **只放行对外监听的实例**：`forward` / `tunnel_entry` / `reverse_portal` 用 `listen.addr`，`tunnel_exit` 用 `tunnel.listen`；`listen.addr` 是回环（`127.0.0.1` / `::1`）的实例、`enabled: false` 的实例、以及 `reverse_bridge`（它只主动连出，公网端口属于 portal 实例）都不放行。
-- **同步**：每次应用成功后按当前实例集合对账——新增，端口或 proto 变化即更新，实例删除即删除；agent 启动时再对账一次，删除遗留的 `w1ncray_*` 规则。有改动时先 `uci commit firewall` 再重载：OpenWrt ≥ 22.03 用 `fw4 reload`，21.02（fw3/iptables）用 `/etc/init.d/firewall reload`。没有改动就不 commit、不重载。
-- **失败不拆实例**：防火墙命令失败只记一条 warn，实例继续运行（本机转发仍然可用），对应实例的 `firewall_open` 为 `false`；不会因为防火墙失败回滚正在运行的实例。
+- **同步**：每次应用成功后按当前实例集合对账——新增，端口或 proto 变化即更新，实例删除即删除；agent 启动时再对账一次，删除遗留的 `w1ncray_*` 规则。有改动时先 `uci commit firewall` 再重载：OpenWrt ≥ 22.03 用 `fw4 reload`，21.02（fw3/iptables）用 `/etc/init.d/firewall reload`。没有改动就不 commit、不重载。重载失败会重试（最多 3 次，退避 1s/2s，整个重载循环总时长上限 20s）。
+- **失败不拆实例**：防火墙命令失败只记一条 warn，实例继续运行（本机转发仍然可用），对应实例的 `firewall_open` 为 `false`；不会因为防火墙失败回滚正在运行的实例。若失败发生在 `uci commit` 之后（规则已保存、重载失败），重试都失败时报告消息写明「规则已保存、尚未生效」，下一次成功重载（下一次 apply 或重启）即生效。
+- **端口解析失败不静默跳过**：实例的端口声明解析失败时它拿不到规则，agent 记一条含实例 id 的 warn，并把「哪些实例没有规则、为什么」一并返回给 reconciler 写进报告消息；`firewall_open` 为 `false`。这不需要新的面板协议字段。
 - **状态上报**：实例状态里新增 `firewall_open`（`/ack` 的 `report.instances[]` 与 `/report` 的 `instances[]`）。它只在 agent 确实放行了该实例的公网端口时为 `true`；机器不由 agent 管理防火墙时恒为 `false`，面板要结合 `hello.policy.firewall.auto_open` 解读。
 
 ### 内网 http 镜像（`Kernels.AllowHTTP`，D-M1）

@@ -13,26 +13,30 @@ import (
 // fakeFirewall records the instance sets it is asked to sync and reports them
 // open (unless configured otherwise).
 type fakeFirewall struct {
-	mu    sync.Mutex
-	calls [][]spec.Instance
-	open  map[string]bool
-	err   error
+	mu      sync.Mutex
+	calls   [][]spec.Instance
+	open    map[string]bool
+	skipped map[string]string
+	err     error
 }
 
-func (f *fakeFirewall) Sync(_ context.Context, instances []spec.Instance) (map[string]bool, error) {
+func (f *fakeFirewall) Sync(_ context.Context, instances []spec.Instance) (map[string]bool, map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, append([]spec.Instance(nil), instances...))
 	if f.err != nil {
-		return nil, f.err
+		return nil, f.skipped, f.err
 	}
 	out := map[string]bool{}
 	for _, in := range instances {
+		if _, skip := f.skipped[in.ID]; skip {
+			continue // no rule, so not open (mirrors fwopen)
+		}
 		if f.open == nil || f.open[in.ID] {
 			out[in.ID] = true
 		}
 	}
-	return out, nil
+	return out, f.skipped, nil
 }
 
 func (f *fakeFirewall) synced() [][]spec.Instance {
@@ -102,6 +106,50 @@ func TestFirewallFailureDoesNotRollBack(t *testing.T) {
 	}
 	if len(e.xray.Running()) == 0 {
 		t.Fatal("the instance was torn down by a firewall failure")
+	}
+}
+
+// TestFirewallSkippedInstancesAreReported: an instance the firewall could not
+// derive a rule for is reported closed and named in the message, so a missing
+// rule is diagnosable from the report alone.
+func TestFirewallSkippedInstancesAreReported(t *testing.T) {
+	e := newEnv(t)
+	f := &fakeFirewall{skipped: map[string]string{"a": `listen ports "0": port 0 out of range 1-65535`}}
+	e.r.Firewall = f
+	rep := e.mustApply(desired(1, fwd(t, "a", "xray")))
+	if inst(rep, "a").FirewallOpen {
+		t.Fatalf("firewall_open = true for a skipped instance: %s", dumpReport(rep))
+	}
+	if !strings.Contains(rep.Message, "firewall rules missing for a (") {
+		t.Fatalf("message does not name the skipped instance: %q", rep.Message)
+	}
+}
+
+// persistedErr models the firewall error that committed the rules but could not
+// activate them (fwopen.ReloadError), matched structurally by the reconciler.
+type persistedErr struct{}
+
+func (persistedErr) Error() string        { return "reload failed after 3 attempt(s)" }
+func (persistedErr) RulesPersisted() bool { return true }
+
+// TestFirewallPersistedButInactive: a reload failure after the commit is
+// reported as saved-but-not-active, not as a lost configuration, while the
+// instances still report their ports closed.
+func TestFirewallPersistedButInactive(t *testing.T) {
+	e := newEnv(t)
+	e.r.Firewall = &fakeFirewall{err: persistedErr{}}
+	rep, err := e.apply(desired(1, fwd(t, "a", "xray")))
+	if err != nil || rep.Status != StatusApplied {
+		t.Fatalf("a firewall failure must not fail the apply: %v %s", err, dumpReport(rep))
+	}
+	if inst(rep, "a").FirewallOpen {
+		t.Fatalf("firewall_open = true while the reload failed")
+	}
+	if !strings.Contains(rep.Message, "saved but not active") {
+		t.Fatalf("message = %q, want the saved-but-not-active wording", rep.Message)
+	}
+	if !strings.Contains(rep.Message, "next successful reload") {
+		t.Fatalf("message = %q, want it to say when the rules take effect", rep.Message)
 	}
 }
 

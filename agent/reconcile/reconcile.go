@@ -47,10 +47,24 @@ type KernelEnsurer interface {
 // means "this machine does not manage its firewall": every instance is then
 // reported with firewall_open false.
 type Firewall interface {
-	// Sync makes the firewall match the given instances and returns, per
-	// instance id, whether that instance's public ports are open. It must only
+	// Sync makes the firewall match the given instances. It returns, per
+	// instance id, whether that instance's public ports are open, and the
+	// instances it could not derive a rule for (id -> reason). It must only
 	// touch the rules it owns.
-	Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, error)
+	//
+	// An error leaves the open map unusable. An error whose value reports
+	// RulesPersisted() true means the rules were saved but could not be
+	// activated (see firewallPersisted).
+	Sync(ctx context.Context, instances []spec.Instance) (open map[string]bool, skipped map[string]string, err error)
+}
+
+// firewallPersisted is implemented by a Sync error that committed the rules but
+// could not activate them. It is matched structurally so this package does not
+// import agent/fwopen.
+type firewallPersisted interface {
+	// RulesPersisted reports that the firewall rules are saved in the
+	// configuration and will take effect on the next successful reload.
+	RulesPersisted() bool
 }
 
 // Defaults for the optional Reconciler fields.
@@ -528,22 +542,61 @@ func (r *Reconciler) apply(ctx context.Context, d spec.Desired) (Report, error) 
 // failure is a warning, never a rollback: the instances are running and local
 // forwarding works, so tearing them down would make the machine worse. The
 // affected instances then report firewall_open false.
+//
+// The report carries the two states the panel cannot see in firewall_open
+// alone, without a new protocol field: rules that were saved but could not be
+// activated (the reload failed), and instances the firewall could not derive a
+// rule for (an unparseable port declaration).
 func (r *Reconciler) syncFirewall(ctx context.Context, instances []spec.Instance, rep *Report) {
 	if r.Firewall == nil {
 		return
 	}
-	open, err := r.Firewall.Sync(ctx, instances)
+	open, skipped, err := r.Firewall.Sync(ctx, instances)
+	if len(skipped) > 0 {
+		missing := describeSkipped(skipped)
+		r.logf("warn", "firewall: no rule for %s", missing)
+		appendMessage(rep, "firewall rules missing for "+missing)
+	}
 	if err != nil {
 		r.logf("warn", "firewall: %v", err)
-		if rep.Message != "" {
-			rep.Message += "; "
+		var persisted firewallPersisted
+		if errors.As(err, &persisted) && persisted.RulesPersisted() {
+			appendMessage(rep, "firewall rules are saved but not active yet (they take effect on the next successful reload): "+err.Error())
+		} else {
+			appendMessage(rep, "firewall rules could not be applied: "+err.Error())
 		}
-		rep.Message += "firewall rules could not be applied: " + err.Error()
+		// The open map is unusable on error: report every instance closed.
+		for i := range rep.Instances {
+			rep.Instances[i].FirewallOpen = false
+		}
 		return
 	}
 	for i := range rep.Instances {
 		rep.Instances[i].FirewallOpen = open[rep.Instances[i].ID]
 	}
+}
+
+// appendMessage adds one clause to the report message.
+func appendMessage(rep *Report, clause string) {
+	if rep.Message != "" {
+		rep.Message += "; "
+	}
+	rep.Message += clause
+}
+
+// describeSkipped renders the instances Sync could not derive a rule for, in a
+// stable order.
+func describeSkipped(skipped map[string]string) string {
+	ids := make([]string, 0, len(skipped))
+	for id := range skipped {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, id+" ("+skipped[id]+")")
+	}
+	return strings.Join(parts, ", ")
 }
 
 // ReconcileFirewall re-applies the firewall rules of the last applied state.
@@ -563,7 +616,7 @@ func (r *Reconciler) ReconcileFirewall(ctx context.Context) error {
 	if cur := r.currentApplied(); cur != nil {
 		instances = cur.desired.Instances
 	}
-	if _, err := r.Firewall.Sync(ctx, instances); err != nil {
+	if _, _, err := r.Firewall.Sync(ctx, instances); err != nil {
 		r.logf("warn", "firewall: %v", err)
 		return err
 	}

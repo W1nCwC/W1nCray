@@ -55,6 +55,23 @@ const fw3InitScript = "/etc/init.d/firewall"
 // reconciler (and therefore every apply) forever.
 const commandTimeout = 20 * time.Second
 
+// Reload retry policy. The rules are committed before the reload runs, so a
+// reload that fails transiently (fw4 reload is known to time out under load)
+// leaves a persisted but inactive configuration. Retrying turns that window
+// back into a normal apply; the wait doubles after every failure and the whole
+// loop is bounded by reloadBudget.
+const (
+	// reloadAttempts is the total number of reload invocations after a commit
+	// (the first try plus its retries).
+	reloadAttempts = 3
+	// reloadBackoff is the wait before the second attempt; it doubles after
+	// every further failure.
+	reloadBackoff = time.Second
+	// reloadBudget caps the total time the reload loop may take, including the
+	// time the reload commands themselves run.
+	reloadBudget = 20 * time.Second
+)
+
 // Executor runs the external commands fwopen needs. It is an interface so the
 // unit tests can pin the exact command sequence without a router.
 type Executor interface {
@@ -71,7 +88,13 @@ type Manager struct {
 	// reload is the argv of the firewall reload command (nil when neither fw4
 	// nor the fw3 init script was found).
 	reload []string
-	log    driver.Logger
+	// reloadTries, reloadWait and reloadCap are the retry policy of
+	// reloadFirewall. New fills them with the package defaults; the unit tests
+	// shrink them so a retry test does not sleep.
+	reloadTries int
+	reloadWait  time.Duration
+	reloadCap   time.Duration
+	log         driver.Logger
 
 	mu sync.Mutex
 }
@@ -98,11 +121,14 @@ type Options struct {
 // error when it is first used.
 func New(o Options) *Manager {
 	m := &Manager{
-		openWrt:  o.OpenWrt,
-		autoOpen: o.AutoOpen,
-		exec:     o.Exec,
-		reload:   append([]string(nil), o.Reload...),
-		log:      o.Log,
+		openWrt:     o.OpenWrt,
+		autoOpen:    o.AutoOpen,
+		exec:        o.Exec,
+		reload:      append([]string(nil), o.Reload...),
+		reloadTries: reloadAttempts,
+		reloadWait:  reloadBackoff,
+		reloadCap:   reloadBudget,
+		log:         o.Log,
 	}
 	if m.exec == nil {
 		m.exec = execExecutor{}
@@ -141,29 +167,55 @@ func (r rule) fields() [][2]string {
 	}
 }
 
-// Sync makes the firewall sections match the public listeners of instances and
-// returns, per instance id, whether its ports are open. It is a no-op on a
-// machine where Enabled is false (the result is then empty).
+// Sync makes the firewall sections match the public listeners of instances. It
+// is a no-op on a machine where Enabled is false (open is then empty and
+// skipped is nil).
 //
-// The section of an instance whose ports are open is reported true even when
-// nothing had to change. A failure leaves the reported map unusable: the caller
-// must treat every instance as not opened.
-func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, error) {
+// It returns:
+//
+//   - open: per instance id, whether that instance's public ports are open. The
+//     section of an instance whose ports are open is reported true even when
+//     nothing had to change. A failure leaves this map unusable (nil): the
+//     caller must treat every instance as not opened.
+//   - skipped: per instance id, why no rule could be derived for it, i.e. a
+//     port declaration the agent could not parse. A warning is logged for every
+//     entry; the caller can surface them in its own report. A skipped instance
+//     is absent from open.
+//   - err: a command failed. A *ReloadError means the configuration was
+//     committed but the firewall was not reloaded: the rules are persisted yet
+//     not active.
+func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[string]bool, map[string]string, error) {
 	open := map[string]bool{}
 	if !m.Enabled() {
-		return open, nil
+		return open, nil, nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	want := desiredRules(instances)
+	want, skips := desiredRules(instances)
+	skipped := make(map[string]string, len(skips))
+	for _, s := range skips {
+		skipped[s.instance] = s.reason
+	}
+	if len(skips) > 0 {
+		// Sorted so the warning order of two identical applies is the same.
+		ids := make([]string, 0, len(skips))
+		for _, s := range skips {
+			ids = append(ids, s.instance)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			m.log.Warnf("fwopen: instance %s has no firewall rule: %s", id, skipped[id])
+		}
+	}
+
 	wantBySection := make(map[string]rule, len(want))
 	for _, r := range want {
 		wantBySection[r.section] = r
 	}
 	have, err := m.show(ctx)
 	if err != nil {
-		return nil, err
+		return nil, skipped, err
 	}
 
 	changed := false
@@ -177,15 +229,15 @@ func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[stri
 				// A section of the wrong type cannot be turned into a rule;
 				// remove it first so the recreate cannot fail halfway.
 				if _, err := m.run(ctx, "uci", "delete", "firewall."+r.section); err != nil {
-					return nil, err
+					return nil, skipped, err
 				}
 			}
 			if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"=rule"); err != nil {
-				return nil, err
+				return nil, skipped, err
 			}
 			for _, kv := range r.fields() {
 				if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"."+kv[0]+"="+kv[1]); err != nil {
-					return nil, err
+					return nil, skipped, err
 				}
 			}
 			changed = true
@@ -195,7 +247,7 @@ func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[stri
 					continue
 				}
 				if _, err := m.run(ctx, "uci", "set", "firewall."+r.section+"."+kv[0]+"="+kv[1]); err != nil {
-					return nil, err
+					return nil, skipped, err
 				}
 				changed = true
 			}
@@ -212,22 +264,22 @@ func (m *Manager) Sync(ctx context.Context, instances []spec.Instance) (map[stri
 	sort.Strings(stale)
 	for _, section := range stale {
 		if _, err := m.run(ctx, "uci", "delete", "firewall."+section); err != nil {
-			return nil, err
+			return nil, skipped, err
 		}
 		changed = true
 	}
 
 	if !changed {
-		return open, nil
+		return open, skipped, nil
 	}
 	if _, err := m.run(ctx, "uci", "commit", "firewall"); err != nil {
-		return nil, err
+		return nil, skipped, err
 	}
 	if err := m.reloadFirewall(ctx); err != nil {
-		return nil, err
+		return nil, skipped, err
 	}
 	m.log.Infof("fwopen: firewall updated (%d rule(s) open, %d removed)", len(want), len(stale))
-	return open, nil
+	return open, skipped, nil
 }
 
 // show reads the firewall configuration and returns the agent-owned sections,
@@ -284,12 +336,23 @@ func unquote(s string) string {
 	return s
 }
 
+// skip is one instance that got no rule because its port declaration could not
+// be parsed. It is reported in the Sync result instead of being dropped
+// silently.
+type skip struct {
+	instance string // instance id, for the report
+	reason   string // why no rule was derived ("listen ports ...: ...")
+}
+
 // desiredRules extracts the firewall rule of every instance that accepts user
-// traffic on a non-loopback address. Instances without such a listener produce
-// no rule: a disabled instance, a loopback-only listener, and a reverse_bridge
-// (it dials out; the public port belongs to the portal instance).
-func desiredRules(instances []spec.Instance) []rule {
+// traffic on a non-loopback address, together with the instances it had to
+// skip because their port declaration does not parse. Instances without such a
+// listener produce no rule and no skip: a disabled instance, a loopback-only
+// listener, and a reverse_bridge (it dials out; the public port belongs to the
+// portal instance).
+func desiredRules(instances []spec.Instance) ([]rule, []skip) {
 	var out []rule
+	var skips []skip
 	seen := map[string]bool{}
 	for _, in := range instances {
 		if !in.Enabled {
@@ -301,7 +364,13 @@ func desiredRules(instances []spec.Instance) []rule {
 		}
 		lo, hi, err := portledger.ParsePorts(ports)
 		if err != nil {
-			continue // the validator rejects this long before we run
+			// The validator rejects this long before we run, so this branch is
+			// defence in depth: never drop a rule without saying so.
+			skips = append(skips, skip{
+				instance: in.ID,
+				reason:   fmt.Sprintf("listen ports %q: %v", ports, err),
+			})
+			continue
 		}
 		dest := strconv.Itoa(lo)
 		if hi != lo {
@@ -323,7 +392,7 @@ func desiredRules(instances []spec.Instance) []rule {
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].section < out[j].section })
-	return out
+	return out, skips
 }
 
 // publicListener returns the address and port spec an instance listens on for
@@ -423,13 +492,81 @@ func sectionID(id string) string {
 	return b.String()
 }
 
-// reloadFirewall reloads the firewall after a commit.
+// ReloadError reports that the firewall configuration was committed but the
+// firewall did not reload, so the new rules are persisted and not active. A
+// later reload (the next apply, or a reboot) makes them effective.
+type ReloadError struct {
+	// Attempts is the number of reload invocations that failed.
+	Attempts int
+	// Err is the last failure.
+	Err error
+}
+
+func (e *ReloadError) Error() string {
+	return fmt.Sprintf("fwopen: firewall rules committed but not active: reload failed after %d attempt(s): %v", e.Attempts, e.Err)
+}
+
+// Unwrap exposes the last failure to errors.Is and errors.As.
+func (e *ReloadError) Unwrap() error { return e.Err }
+
+// RulesPersisted reports that the rules are saved and will take effect on the
+// next successful reload. The reconciler matches this method structurally, so
+// it can tell this state from a failure that changed nothing without importing
+// this package.
+func (e *ReloadError) RulesPersisted() bool { return true }
+
+// reloadFirewall reloads the firewall after a commit. The rules are already
+// persisted, so a transient failure (fw4 reload is known to time out under
+// load) is retried with a doubling wait; the whole loop is bounded by
+// reloadCap. When every attempt fails the returned error is a *ReloadError:
+// the rules are saved but not active.
 func (m *Manager) reloadFirewall(ctx context.Context) error {
 	if len(m.reload) == 0 {
 		return fmt.Errorf("fwopen: no firewall reload command found (%s or fw4)", fw3InitScript)
 	}
-	_, err := m.run(ctx, m.reload[0], m.reload[1:]...)
-	return err
+	rctx, cancel := context.WithTimeout(ctx, m.reloadCap)
+	defer cancel()
+	var lastErr error
+	attempts := 0
+	for {
+		attempts++
+		_, err := m.run(rctx, m.reload[0], m.reload[1:]...)
+		if err == nil {
+			if attempts > 1 {
+				m.log.Infof("fwopen: firewall reload succeeded on attempt %d", attempts)
+			}
+			return nil
+		}
+		lastErr = err
+		if attempts >= m.reloadTries {
+			break
+		}
+		m.log.Warnf("fwopen: firewall reload attempt %d/%d failed: %v", attempts, m.reloadTries, lastErr)
+		wait := m.reloadWait << (attempts - 1)
+		if wait <= 0 || wait > m.reloadCap {
+			wait = m.reloadCap
+		}
+		if !sleepContext(rctx, wait) {
+			break
+		}
+	}
+	return &ReloadError{Attempts: attempts, Err: lastErr}
+}
+
+// sleepContext waits for d and reports false when ctx is done first. A
+// non-positive wait returns immediately.
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // defaultReload resolves the reload command of the running system.
