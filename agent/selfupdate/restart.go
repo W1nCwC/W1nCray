@@ -83,7 +83,10 @@ const HelperCommand = "__watchdog"
 // ParseHelperArgs parses the watchdog's argv (everything after HelperCommand):
 //
 //	-parent PID -state DIR -exe EXE [-lock FILE] [-unit UNIT]
-//	[-attempts N] [-window 10s] [-deadline 90s] [-poll 2s] -- <agent argv...>
+//	[-attempts N] [-window D] [-deadline D] [-poll 2s] -- <agent argv...>
+//
+// A missing -window or -deadline falls back to DefaultWatchdogWindows(GOARCH):
+// 60 s / 3 min on amd64 and arm64, 180 s / 8 min on the slower targets.
 func ParseHelperArgs(args []string) (HelperOptions, error) {
 	var (
 		h   HelperOptions

@@ -99,7 +99,7 @@ logread -f -e W1nCray            # procd（OpenWRT）
 
 - **Alpine**：用 OpenRC 的 `supervise-daemon` 托管，崩溃后每 10 秒无限重启，日志在 `/var/log/W1nCray.log`。
 - **OpenWRT**：用 procd 托管（`respawn 3600 10 0`），日志用 `logread -e W1nCray`；内存小于 1 GiB 时自动设置 `GOMEMLIMIT`。路由器内置闪存通常装不下，请把外部存储挂载（extroot 或 USB/SD）后用 `--prefix /mnt/xxx/W1nCray` 安装。配置与服务脚本会写入 `/etc/sysupgrade.conf`，固件升级后保留配置，但程序文件需要重新执行安装命令。
-- agent 现在是**单一构建**（不再链接 DNS/ACME，约 12 MB，内置备用根证书 `fallbackroots`，无系统 CA 的设备也能用 HTTPS）；`W1nCray-linux-<arch>-lite.gz` 只是同内容副本，供 v11 之前的安装脚本继续使用。Xray 内核有 full 与 `-lite`（`dnslite,fallbackroots`）两种构建，OpenWrt 上 agent 会选择 `-lite`（清单目标键 `linux/<arch>+openwrt`）。
+- agent 现在是**单一构建**（不再链接 DNS/ACME，约 12 MB，内置备用根证书 `fallbackroots`，无系统 CA 的设备也能用 HTTPS）；`W1nCray-linux-<arch>-lite.gz` 只是同内容副本，供 v11 之前的安装脚本继续使用。Xray 内核有 full 与 `-lite`（`dnslite,fallbackroots`）两种构建，OpenWrt 上 agent 会选择 `-lite`（清单字段 `openwrt_targets`，键为纯 `linux/<arch>`；旧清单的 `linux/<arch>+openwrt` 键仍兼容读取）。
 - 同一份配置同一时间只允许一个 W1nCray 实例（`<配置文件>.lock`）；Xray 内核用自己的锁（`<配置文件>.xray.lock`），两者可以同时运行。
 - 从 XrayR 迁移时，路由里的旧入站 tag（形如 `V2ray_0.0.0.0_65534`）会自动映射到对应节点的入站，无需修改 `route.json`。
 
