@@ -285,7 +285,9 @@ func (m *Manager) EnsureRunning(ctx context.Context) error {
 // machine. It is idempotent: the same version with the same unit file is not
 // restarted. A health-check failure leaves no half-installed service behind: a
 // machine that was already serving traffic keeps the version it was serving,
-// and only a machine that had no running service is cleaned up.
+// and only a machine that had no running service is cleaned up. A failed
+// same-version reinstall is retried on that version and is never demoted to the
+// previous one.
 func (m *Manager) Install(ctx context.Context, version string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -321,6 +323,13 @@ func (m *Manager) serviceRunning(ctx context.Context) bool {
 // serving traffic is rolled back to the version it was serving, exactly like a
 // failed Upgrade; the half-written service is only deleted when there was
 // nothing running to preserve (R1-1/R1-5).
+//
+// A same-version reinstall is the exception (F4b). EnsureForce installs the
+// version that is already current, so kernel/install.commit leaves the previous
+// pointer alone and current still names the running version; Rollback would
+// therefore move the machine to an older version nobody asked for and mark the
+// version it was already running as failed. The same version is restarted once
+// more instead, and the service and the current version are kept either way.
 func (m *Manager) restoreAfterFailedInstall(ctx context.Context, cause error, inst, prev driver.Installed, perr error, wasRunning bool) error {
 	if !wasRunning {
 		// The kernel is installed but the service never came up healthy:
@@ -336,6 +345,17 @@ func (m *Manager) restoreAfterFailedInstall(ctx context.Context, cause error, in
 		// the service would take a working Xray down, so leave it in place and
 		// report the failure instead.
 		return fmt.Errorf("%w（安装前有正在运行的 Xray 服务，但无法确定其版本，未自动恢复）", cause)
+	}
+	if prev.Version == inst.Version && prev.Path == inst.Path {
+		// The install did not switch versions: there is nothing to roll back
+		// to, and the previous pointer names an older version the operator
+		// never asked for. Retry the same version with a restart instead.
+		m.log.Warnf("xraysvc: 同版本重装 %s 健康检查失败，重启重试（不回滚、不降级）", inst.Version)
+		if werr := m.activate(ctx, inst, true); werr != nil {
+			return fmt.Errorf("%w（同版本重装 %s 健康检查失败，重启重试仍未通过: %v；保留当前版本与服务，未降级）", cause, inst.Version, werr)
+		}
+		m.log.Infof("xraysvc: 同版本重装 %s 已通过重启恢复", inst.Version)
+		return nil
 	}
 	rb, rerr := m.opts.Kernels.Rollback(xrayapi.KernelName)
 	if rerr != nil {
