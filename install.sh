@@ -14,8 +14,9 @@
 # receives its nodes and forwarding rules. The machine token is stored in
 # $CONF_DIR/agent.token (0600) and never written to config.yml or the logs.
 #
-# Release downloads are checked against SHA256SUMS and refused when the check
-# is impossible or fails; --insecure-skip-verify (or
+# Release downloads are checked against the release's checksum (the per-asset
+# <asset>.sha256 from v0.7.0 on, the combined SHA256SUMS before it) and refused
+# when the check is impossible or fails; --insecure-skip-verify (or
 # W1NCRAY_INSECURE_SKIP_VERIFY=1) is the only way to skip it.
 #
 # After installation the same script is the `W1nCray` command: run it without
@@ -52,9 +53,10 @@ WAIT_SWITCH="${W1NCRAY_WAIT:-5}"
 # Size needed to download, unpack and replace (KiB): gzip + binary + old binary.
 NEED_KB_LITE=90000
 NEED_KB_FULL=170000
-# Release downloads are verified against SHA256SUMS and refused otherwise.
-# Only an explicit opt-out (--insecure-skip-verify, or this variable set to 1)
-# skips the check. It never applies to --binary files, which are not checked.
+# Release downloads are verified against the release's checksum and refused
+# otherwise. Only an explicit opt-out (--insecure-skip-verify, or this variable
+# set to 1) skips the check. It never applies to --binary files, which are not
+# checked.
 INSECURE_SKIP_VERIFY=0
 if [ "${W1NCRAY_INSECURE_SKIP_VERIFY:-}" = 1 ]; then
 	INSECURE_SKIP_VERIFY=1
@@ -237,7 +239,26 @@ default_flavor() {
 	if is_openwrt; then echo lite; else echo full; fi
 }
 
-asset_name() { # arch flavor -> name of the .gz asset
+# asset_name TAG ARCH FLAVOR -> release asset name of the agent.
+#
+# v0.7.0 publishes versioned asset names (w1ncray-v0.7.0-linux-<arch>.gz), and
+# that is what the release's own manifest entry (tools/manifestgen, "archive":
+# "gz") and every later release use; install.sh has to match it or a
+# "download the release page" install simply 404s. The old unversioned name
+# (W1nCray-linux-<arch>.gz) is still what releases up to and including v0.6.0
+# ship, so legacy_asset_name below is the fallback and both stay supported.
+#
+# The agent is a single build per architecture (docs/AGENT.md 13.8.1): there is
+# no separate OpenWrt program, only the "-lite" compatibility name pre-v11
+# installers asked for on OpenWrt.
+asset_name() { # tag arch flavor -> name of the .gz asset
+	case "$3" in
+	lite) echo "w1ncray-$1-linux-$2-lite.gz" ;;
+	*) echo "w1ncray-$1-linux-$2.gz" ;;
+	esac
+}
+
+legacy_asset_name() { # arch flavor -> pre-v0.7.0 name of the .gz asset
 	if [ "$2" = lite ]; then
 		echo "W1nCray-linux-$1-lite.gz"
 	else
@@ -300,8 +321,34 @@ latest_tag() {
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 have_sha256sum() { command -v sha256sum >/dev/null 2>&1; }
 
-# verify_sha256 FILE ASSET TAG checks FILE against the release SHA256SUMS. It
-# fails closed: a missing sha256sum, a missing or unreadable SHA256SUMS, a
+# is_gzip FILE: true when FILE is a gzip stream. The release ships both a bare
+# ELF (w1ncray-v0.7.0-linux-<arch>, the primary asset) and its .gz, and the name
+# alone cannot be trusted, so the bytes decide. busybox gunzip is not required
+# to implement -t, so the check decompresses to /dev/null instead: a gzip stream
+# succeeds, anything else fails (the program is then copied verbatim). A missing
+# or unreadable file is not gzip.
+is_gzip() {
+	[ -f "$1" ] || return 1
+	gunzip -c "$1" >/dev/null 2>&1
+}
+
+# unpack_to ARCHIVE DEST writes the program from ARCHIVE to DEST, gunzipping a
+# gzip stream and copying anything else verbatim.
+unpack_to() {
+	if is_gzip "$1"; then
+		gunzip -c "$1" >"$2" || die "解压失败: $1"
+	else
+		cp "$1" "$2"
+	fi
+}
+
+# verify_sha256 FILE ASSET TAG checks FILE against the release's checksum for
+# ASSET. Two published forms are accepted:
+#
+#   <asset>.sha256   the per-asset checksum every v0.7.0+ asset carries
+#   SHA256SUMS       the combined file releases up to and including v0.6.0 ship
+#
+# It fails closed: a missing sha256sum, neither checksum source reachable, a
 # missing or malformed digest and a mismatch all abort the installation. The
 # only way past it is the explicit opt-out (--insecure-skip-verify or
 # W1NCRAY_INSECURE_SKIP_VERIFY=1), which skips the check altogether.
@@ -312,18 +359,27 @@ verify_sha256() {
 	fi
 	have_sha256sum ||
 		die "未找到 sha256sum，无法校验下载文件的完整性。请安装 sha256sum（coreutils 或 busybox），或改用 --binary 提供本地文件；明知风险仍要继续请加 --insecure-skip-verify"
+	_want=""
 	_sums="$(mktemp)"
-	if ! download "https://github.com/$REPO/releases/download/$3/SHA256SUMS" "$_sums" >/dev/null 2>&1 || [ ! -s "$_sums" ]; then
-		rm -f "$_sums"
-		die "无法获取 $3 的 SHA256SUMS，拒绝安装未经校验的程序。请检查网络或版本号；明知风险仍要继续请加 --insecure-skip-verify"
+	# The per-asset checksum first (the v0.7.0 convention).
+	if download "https://github.com/$REPO/releases/download/$3/$2.sha256" "$_sums" >/dev/null 2>&1 && [ -s "$_sums" ]; then
+		# "<hex>" or "<hex>  <name>", either way the first field is the digest.
+		_want="$(awk 'NR==1 {print $1; exit}' "$_sums")"
 	fi
-	_want="$(awk -v n="$2" '{f=$2; sub(/^\*/, "", f); if (f == n) {print $1; exit}}' "$_sums")"
+	if [ -z "$_want" ]; then
+		# Fall back to the combined SHA256SUMS of pre-v0.7.0 releases.
+		if ! download "https://github.com/$REPO/releases/download/$3/SHA256SUMS" "$_sums" >/dev/null 2>&1 || [ ! -s "$_sums" ]; then
+			rm -f "$_sums"
+			die "无法获取 $3 的 $2.sha256 或 SHA256SUMS，拒绝安装未经校验的程序。请检查网络或版本号；明知风险仍要继续请加 --insecure-skip-verify"
+		fi
+		_want="$(awk -v n="$2" '{f=$2; sub(/^\*/, "", f); if (f == n) {print $1; exit}}' "$_sums")"
+		[ -n "$_want" ] || die "SHA256SUMS 中没有 $2 的校验值"
+	fi
 	rm -f "$_sums"
-	[ -n "$_want" ] || die "SHA256SUMS 中没有 $2 的校验值"
 	case "$_want" in
-	*[!0-9A-Fa-f]*) die "SHA256SUMS 中 $2 的校验值不是十六进制: $_want" ;;
+	*[!0-9A-Fa-f]*) die "$2 的校验值不是十六进制: $_want" ;;
 	esac
-	[ "${#_want}" -eq 64 ] || die "SHA256SUMS 中 $2 的校验值长度不是 64: $_want"
+	[ "${#_want}" -eq 64 ] || die "$2 的校验值长度不是 64: $_want"
 	_want="$(printf '%s' "$_want" | tr 'A-F' 'a-f')"
 	_got="$(sha256_of "$1")"
 	[ "$_want" = "$_got" ] || die "SHA256 校验失败（期望 $_want，实际 $_got）"
@@ -376,17 +432,11 @@ fetch_binary() {
 	file:*)
 		_f="${_src#file:}"
 		[ -f "$_f" ] || die "找不到文件: $_f"
-		case "$_f" in
-		*.gz) gunzip -c "$_f" >"$NEWBIN" ;;
-		*) cp "$_f" "$NEWBIN" ;;
-		esac
+		unpack_to "$_f" "$NEWBIN"
 		;;
 	url:*)
 		download "${_src#url:}" "$TMPD/dl" || die "下载失败: ${_src#url:}"
-		case "${_src#url:}" in
-		*.gz) gunzip -c "$TMPD/dl" >"$NEWBIN" ;;
-		*) mv "$TMPD/dl" "$NEWBIN" ;;
-		esac
+		unpack_to "$TMPD/dl" "$NEWBIN"
 		;;
 	*)
 		if [ "$_src" = latest ]; then
@@ -400,11 +450,19 @@ fetch_binary() {
 		_arch="$(detect_arch)"
 		_ok=0
 		for _a in $(arch_fallbacks "$_arch"); do
-			_asset="$(asset_name "$_a" "$_fl")"
+			# The versioned name first (v0.7.0+), the pre-v0.7.0 unversioned
+			# name as the fallback, so --version works across releases.
+			_asset="$(asset_name "$_tag" "$_a" "$_fl")"
+			_url="https://github.com/$REPO/releases/download/$_tag/$_asset"
 			yellow "下载 W1nCray $_tag ($_a, $_fl) ..."
-			download "https://github.com/$REPO/releases/download/$_tag/$_asset" "$TMPD/dl.gz" || die "下载失败: $REPO $_tag $_asset"
+			if ! download "$_url" "$TMPD/dl.gz" >/dev/null 2>&1; then
+				_asset="$(legacy_asset_name "$_a" "$_fl")"
+				_url="https://github.com/$REPO/releases/download/$_tag/$_asset"
+				yellow "未找到 $_tag 的版本化资产，尝试旧命名 $_asset ..."
+				download "$_url" "$TMPD/dl.gz" || die "下载失败: $REPO $_tag $_asset"
+			fi
 			verify_sha256 "$TMPD/dl.gz" "$_asset" "$_tag"
-			gunzip -c "$TMPD/dl.gz" >"$NEWBIN" || die "解压失败: $_asset"
+			unpack_to "$TMPD/dl.gz" "$NEWBIN"
 			rm -f "$TMPD/dl.gz"
 			chmod 755 "$NEWBIN"
 			if "$NEWBIN" version >/dev/null 2>&1; then
@@ -1772,7 +1830,8 @@ W1nCray 管理命令
   安装只装 agent（W1nCray 程序 + 服务），不安装 Xray 内核：Xray 内核由面板在
   绑定节点时自动安装，或手动执行 W1nCray xray install。
 
-  下载的发行包必须通过 SHA256SUMS 校验，缺少 sha256sum / SHA256SUMS 或不匹配都会拒绝安装；
+  下载的发行包必须通过发行页的校验值校验（v0.7.0 起为每个资产的 <资产名>.sha256，
+  更早的版本为合并的 SHA256SUMS）；缺少 sha256sum、取不到校验值或不匹配都会拒绝安装；
   明知风险仍要跳过时才加 --insecure-skip-verify（或设置 W1NCRAY_INSECURE_SKIP_VERIFY=1）。
 
 升级（update）:

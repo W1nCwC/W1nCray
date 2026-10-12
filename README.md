@@ -42,28 +42,29 @@
 
 ```bash
 # 一键安装（curl 或 wget 任选其一；OpenWRT 没有 curl，用 wget）
-(curl -fsSL -o /tmp/W1nCray-install.sh https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.sh \
-  || wget -O /tmp/W1nCray-install.sh https://raw.githubusercontent.com/W1nCwC/W1nCray/main/install.sh) \
-  && sh /tmp/W1nCray-install.sh install
+# 固定版本时用 tag 下的脚本（安装器会从同一个 tag 的发行页取程序）：
+(curl -fsSL -o /tmp/W1nCray-install.sh https://raw.githubusercontent.com/W1nCwC/W1nCray/v0.7.0/install.sh \
+  || wget -O /tmp/W1nCray-install.sh https://raw.githubusercontent.com/W1nCwC/W1nCray/v0.7.0/install.sh) \
+  && sh /tmp/W1nCray-install.sh install --version v0.7.0
 # 或使用本地编译的二进制
-sh install.sh install --binary ./W1nCray-linux-amd64
+sh install.sh install --binary ./w1ncray-v0.7.0-linux-amd64
 ```
 
 安装参数：`--lite | --full`（版本类型）、`--prefix DIR`（安装目录，空间不足时指向外部存储）、`--with-geo`（强制下载 geo 文件）、`--version vX.Y.Z`、`--url 地址`、`--binary 文件`、`--insecure-skip-verify`。
 
-**校验失败即拒绝（fail-closed）**：从发行页下载的程序必须通过 `SHA256SUMS` 校验。缺少 `sha256sum`、取不到 `SHA256SUMS`、校验值缺失/格式错误或与文件不符，一律中止安装并保持现有程序不变。只有明知风险时才用 `--insecure-skip-verify`（或环境变量 `W1NCRAY_INSECURE_SKIP_VERIFY=1`）整体跳过校验，脚本会打印醒目警告。`--binary` 指定的本地文件不经校验。
+**校验失败即拒绝（fail-closed）**：从发行页下载的程序必须通过发行页的校验值校验——**v0.7.0 起是每个资产旁的 `<资产名>.sha256`**（发行页自带的校验文件），更早的版本是合并的 `SHA256SUMS`（两者脚本都认）。缺少 `sha256sum`、取不到任何一种校验值、校验值缺失/格式错误或与文件不符，一律中止安装并保持现有程序不变。只有明知风险时才用 `--insecure-skip-verify`（或环境变量 `W1NCRAY_INSECURE_SKIP_VERIFY=1`）整体跳过校验，脚本会打印醒目警告。`--binary` 指定的本地文件不经校验。
 
 **安装只装 agent**：`install` 安装 `W1nCray`（agent 程序 + `W1nCray` 服务），**不安装 Xray 内核**。Xray 内核（`W1nCray-xray`，见 [docs/AGENT.md](docs/AGENT.md) §13）由面板在给这台机器绑定节点时自动安装并启动，或手动执行 `W1nCray xray install`。面板一键接入参数 `--panel URL --machine ID --token TOKEN` 保持不变。
 
 安装脚本会：
 
-1. 按 CPU 自动选择资产（amd64 / 386 / arm64 / armv5-7 / mips / mipsle / mips64(le) / riscv64 / loong64；MIPS 通过 ELF 头判断字节序，ARM 通过 `/proc/cpuinfo` 判断 VFP，运行自检失败时自动换更低要求的版本），下载后校验 `SHA256SUMS`；
+1. 按 CPU 自动选择资产（amd64 / 386 / arm64 / armv5-7 / mips / mipsle / mips64(le) / riscv64 / loong64；MIPS 通过 ELF 头判断字节序，ARM 通过 `/proc/cpuinfo` 判断 VFP，运行自检失败时自动换更低要求的版本），下载后校验发行页的校验值（v0.7.0 起为每个资产的 `.sha256`，更早的版本为 `SHA256SUMS`）；
 2. 安装到 `/usr/local/W1nCray/W1nCray`，配置目录 `/etc/W1nCray`，注册服务 `W1nCray`；并把管理命令放到 `/usr/local/bin/W1nCray`（OpenWRT 为 `/usr/bin/W1nCray`）；
 3. **检测到 `/etc/XrayR/config.yml` 时自动迁移**（`config.yml` 以及 dns/route/出入站/规则列表、geo 文件、XrayR 已签发的证书），XrayR 的文件只读、不会被修改；没有 XrayR 时生成默认配置；
 4. 缺少 `geoip.dat` / `geosite.dat` 时自动下载（OpenWRT 默认不下载，约 27 MB，需要时加 `--with-geo`）；
 5. 运行 `W1nCray check --online`：向面板拉取每个节点并实际构建入站，不监听端口；
 6. **XrayR 仍在运行时不会启动 W1nCray**（端口冲突），确认后再切换；
-7. 升级时：已是 v11 agent 的机器只更新 agent；**0.5.x 及以前的单一程序**若配置里有 Xray 节点（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真），会先下载 agent 与对应的 Xray 内核资产（OpenWrt 用 `-lite`）并通过 `SHA256SUMS` 校验，再按顺序：停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...`（启动 Xray 内核服务）→ 启动 agent。下载在停止服务之前完成，中断只有两次进程重启。
+7. 升级时：已是 v11 agent 的机器只更新 agent；**0.5.x 及以前的单一程序**若配置里有 Xray 节点（`config.yml` 有 `Nodes`，或 `Agent.Panel.MachineNodes` 为真），会先下载 agent 与对应的 Xray 内核资产（OpenWrt 用 `-lite`）并通过发行页校验值校验，再按顺序：停止旧服务 → 替换 agent → `W1nCray xray install --file ... --sha256 ...`（启动 Xray 内核服务）→ 启动 agent。下载在停止服务之前完成，中断只有两次进程重启。
 
 ### 管理命令（装好后直接输入 `W1nCray`）
 
@@ -120,12 +121,12 @@ W1nCray-xray x25519                                    # 生成 REALITY 密钥�
 ### 编译与发布
 
 ```bash
-bash release/build.sh v0.6.0 [arch ...]   # 默认 12 个架构；产出 agent 与 Xray 内核的 .gz 以及 SHA256SUMS
+bash release/build.sh v0.7.0 [arch ...]   # 默认 12 个架构；产出 agent 与 Xray 内核的 .gz 以及 SHA256SUMS
 ```
 
 v11 起每个架构产出两个程序：
 
-| 产物 | 程序 | 说明 |
+| 产物（`release/build.sh` 的 `dist/` 名） | 程序 | 说明 |
 |---|---|---|
 | `W1nCray-linux-<arch>.gz` | agent | 单一构建，`-tags fallbackroots`（内置备用根证书） |
 | `W1nCray-linux-<arch>-lite.gz` | agent | 与上一个**同内容**的副本，仅为兼容 v11 之前的安装脚本而保留 |
@@ -133,7 +134,9 @@ v11 起每个架构产出两个程序：
 | `W1nCray-xray-linux-<arch>.gz` | Xray 内核 | full 构建 |
 | `W1nCray-xray-linux-<arch>-lite.gz` | Xray 内核 | `-tags dnslite,fallbackroots`，OpenWrt 使用 |
 
-同一个版本号注入两个程序（agent 的 `cmd.version`、内核的 `xraynode.Version`）。脚本对每个产物断言架构、在本机架构上执行 `version` 自检（交叉架构跳过并注明），并检查 agent 产物不含 `github.com/xtls/xray-core`、内核产物必须含它。把 `dist/` 里的文件全部上传到 GitHub Release 即可。
+同一个版本号注入两个程序（agent 的 `cmd.version`、内核的 `xraynode.Version`）。脚本对每个产物断言架构、在本机架构上执行 `version` 自检（交叉架构跳过并注明），并检查 agent 产物不含 `github.com/xtls/xray-core`、内核产物必须含它。
+
+**GitHub Release 的资产命名（v0.7.0 起）**：发行页上的资产名带版本号前缀，`w1ncray-<版本>-linux-<架构>`（agent 的裸 ELF）、`…-<架构>.gz`（同一程序的确定性 gzip，`gzip -9 -n`）、`…-<架构>-lite.gz`（OpenWrt 兼容名，内容与 `.gz` 相同），以及每个资产旁的 `…<资产名>.sha256`。安装器按 `<tag>` 拼出这些名字并校验对应的 `.sha256`；v0.7.0 之前的发行页用不带版本号的名字与合并的 `SHA256SUMS`，安装器同样兼容。上传时把 `dist/` 的内容按这套名字发布（`W1nCray-linux-<arch>.gz` → `w1ncray-<版本>-linux-<arch>.gz`，裸文件同理）。
 
 内核清单条目见 [tools/manifestgen/examples/v11.yaml](tools/manifestgen/examples/v11.yaml)：agent 与 Xray 内核从本地 `dist/` 取哈希（需要 mirror 提供下载地址），gost/realm/frp 用上游 GitHub 资产。
 

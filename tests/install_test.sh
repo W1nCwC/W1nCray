@@ -172,10 +172,12 @@ mock_downloads() {
 	}
 }
 
-# publish ASSETNAME BINFILE adds <asset>.gz and its SHA256SUMS line.
+# publish ASSETNAME BINFILE adds <asset>.gz, its per-asset .sha256 and its
+# SHA256SUMS line (both checksum conventions install.sh accepts).
 publish() {
 	mkdir -p "$W1NCRAY_ROOT/release"
 	gzip -c "$2" >"$W1NCRAY_ROOT/release/$1"
+	sha256sum "$W1NCRAY_ROOT/release/$1" | awk '{print $1}' >"$W1NCRAY_ROOT/release/$1.sha256"
 	printf '%s *%s\n' "$(sha256sum "$W1NCRAY_ROOT/release/$1" | awk '{print $1}')" "$1" >>"$W1NCRAY_ROOT/release/SHA256SUMS"
 }
 
@@ -223,8 +225,17 @@ t_arch() {
 	eq "arm fallbacks v7" "$(arch_fallbacks armv7)" "armv7 armv6 armv5"
 	eq "arm fallbacks v6" "$(arch_fallbacks armv6)" "armv6 armv5"
 	eq "no fallbacks for amd64" "$(arch_fallbacks amd64)" "amd64"
-	eq "asset full" "$(asset_name armv7 full)" "W1nCray-linux-armv7.gz"
-	eq "asset lite" "$(asset_name mipsle lite)" "W1nCray-linux-mipsle-lite.gz"
+	eq "asset full" "$(asset_name v0.7.0 armv7 full)" "w1ncray-v0.7.0-linux-armv7.gz"
+	eq "asset lite" "$(asset_name v0.7.0 mipsle lite)" "w1ncray-v0.7.0-linux-mipsle-lite.gz"
+	eq "legacy asset full" "$(legacy_asset_name armv7 full)" "W1nCray-linux-armv7.gz"
+	eq "legacy asset lite" "$(legacy_asset_name mipsle lite)" "W1nCray-linux-mipsle-lite.gz"
+	# gzip detection: a real gzip stream, a bare ELF, and a missing file.
+	printf 'payload' | gzip -c >"$W1NCRAY_ROOT/gz"
+	printf '\177ELF\002\001\001\000' >"$W1NCRAY_ROOT/elf"
+	check "is_gzip accepts a gzip stream" is_gzip "$W1NCRAY_ROOT/gz"
+	refute "is_gzip rejects a bare ELF" is_gzip "$W1NCRAY_ROOT/elf"
+	refute "is_gzip rejects a missing file" is_gzip "$W1NCRAY_ROOT/nope"
+	rm -f "$W1NCRAY_ROOT/gz" "$W1NCRAY_ROOT/elf"
 }
 
 t_endian_dd_and_hexdump() {
@@ -277,6 +288,15 @@ t_verify() {
 	echo "payload" >"$W1NCRAY_ROOT/f.gz"
 	h="$(sha256sum "$W1NCRAY_ROOT/f.gz" | awk '{print $1}')"
 	mkdir -p "$W1NCRAY_ROOT/release"
+	# v0.7.0+ form: a per-asset <asset>.sha256 next to the asset.
+	printf '%s\n' "$h" >"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	check "matching per-asset checksum passes" verify_sha256 "$W1NCRAY_ROOT/f.gz" w1ncray-v1.2.3-linux-amd64.gz v1.2.3
+	echo tampered >>"$W1NCRAY_ROOT/f.gz"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" w1ncray-v1.2.3-linux-amd64.gz v1.2.3 ) >/dev/null 2>&1 && fail "tampered per-asset file accepted" || pass "a tampered file is rejected against its .sha256"
+	rm -f "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	echo "payload" >"$W1NCRAY_ROOT/f.gz"
+	h="$(sha256sum "$W1NCRAY_ROOT/f.gz" | awk '{print $1}')"
+	# Pre-v0.7.0 form: the combined SHA256SUMS (still the fallback).
 	printf '%s *W1nCray-linux-amd64.gz\n0000 *other.gz\n' "$h" >"$W1NCRAY_ROOT/release/SHA256SUMS"
 	check "matching checksum passes" verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1
 	echo tampered >>"$W1NCRAY_ROOT/f.gz"
@@ -288,7 +308,7 @@ t_verify() {
 	( verify_sha256 "$W1NCRAY_ROOT/f.gz" bad.gz v1 ) >/dev/null 2>&1 && fail "non-hex checksum accepted" || pass "non-hex checksum value is rejected"
 	( verify_sha256 "$W1NCRAY_ROOT/f.gz" empty.gz v1 ) >/dev/null 2>&1 && fail "empty checksum accepted" || pass "empty checksum value is rejected"
 	rm -f "$W1NCRAY_ROOT/release/SHA256SUMS"
-	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "missing SHA256SUMS accepted" || pass "a release without SHA256SUMS is refused"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "missing SHA256SUMS accepted" || pass "a release without any checksum is refused"
 	has "the refusal names the opt-out" "$(cat "$W1NCRAY_ROOT/out")" "--insecure-skip-verify"
 	h="$(sha256sum "$W1NCRAY_ROOT/f.gz" | awk '{print $1}')"
 	printf '%s *W1nCray-linux-amd64.gz\n' "$h" >"$W1NCRAY_ROOT/release/SHA256SUMS"
@@ -297,6 +317,10 @@ t_verify() {
 	# Upper-case hex digests are accepted when they match.
 	printf '%s *W1nCray-linux-amd64.gz\n' "$(printf '%s' "$h" | tr 'a-f' 'A-F')" >"$W1NCRAY_ROOT/release/SHA256SUMS"
 	check "an upper-case digest that matches passes" verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1
+	# A malformed per-asset file must not silently fall through to nothing.
+	printf 'not-a-digest\n' >"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" w1ncray-v1.2.3-linux-amd64.gz v1.2.3 ) >/dev/null 2>&1 && fail "malformed per-asset digest accepted" || pass "a malformed per-asset digest is rejected"
+	rm -f "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
 }
 
 t_verify_opt_out() {
@@ -490,7 +514,7 @@ t_install_from_release() {
 	d="$(cat "$DL_LOG")"
 	has "newest release tag is used" "$d" "/releases/download/v9.9.9/W1nCray-linux-armv7.gz"
 	has "falls back to a lower GOARM when the binary cannot run" "$d" "/releases/download/v9.9.9/W1nCray-linux-armv6.gz"
-	has "checksums are fetched" "$d" "/releases/download/v9.9.9/SHA256SUMS"
+	has "checksums are fetched" "$d" "/releases/download/v9.9.9/W1nCray-linux-armv7.gz.sha256"
 	has "fallback is announced" "$out" "尝试更低要求"
 	check "armv6 binary installed" test -x "$BIN"
 	eq "installed binary runs" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
@@ -521,12 +545,13 @@ t_install_verify_policy() {
 	make_fake_bin "$W1NCRAY_ROOT/fakebin"
 	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
 	before="$(cat "$BIN")"
-	# The release has the asset but no SHA256SUMS.
+	# The release has the asset but neither checksum form.
 	mkdir -p "$W1NCRAY_ROOT/release"
 	printf '#!/bin/sh\necho "W1nCray vNEW"\n' >"$W1NCRAY_ROOT/newbin"
+	rm -f "$W1NCRAY_ROOT/release/W1nCray-linux-amd64.gz.sha256"
 	gzip -c "$W1NCRAY_ROOT/newbin" >"$W1NCRAY_ROOT/release/W1nCray-linux-amd64.gz"
 
-	( cmd_install --version v1.2.3 --no-geo ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "unverifiable release installed" || pass "a release without SHA256SUMS is refused"
+	( cmd_install --version v1.2.3 --no-geo ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "unverifiable release installed" || pass "a release without any checksum is refused"
 	has "the refusal names the opt-out" "$(cat "$W1NCRAY_ROOT/out")" "--insecure-skip-verify"
 	eq "binary unchanged after the refusal" "$(cat "$BIN")" "$before"
 	hasnt "no temp download dir left after the refusal" "$(ls -a "$BIN_DIR")" ".dl."
@@ -549,6 +574,57 @@ t_install_verify_policy() {
 	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
 	eq "--binary needs no checksum" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
 	has "help documents the flag" "$(usage)" "--insecure-skip-verify"
+}
+
+# The v0.7.0 asset convention: versioned names plus a per-asset <asset>.sha256,
+# and the bare (ungzipped) primary asset.
+t_install_versioned_asset() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	make_fake_bin "$W1NCRAY_ROOT/vbin"
+	mkdir -p "$W1NCRAY_ROOT/release"
+	# The .gz form, with its per-asset checksum.
+	gzip -c "$W1NCRAY_ROOT/vbin" >"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz"
+	printf '%s\n' "$(sha256sum "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz" | awk '{print $1}')" \
+		>"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	: >"$DL_LOG"
+	cmd_install --version v1.2.3 --no-geo >/dev/null 2>&1
+	d="$(cat "$DL_LOG")"
+	has "the versioned asset name is used" "$d" "/releases/download/v1.2.3/w1ncray-v1.2.3-linux-amd64.gz"
+	has "the per-asset checksum is fetched" "$d" "/releases/download/v1.2.3/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	hasnt "no legacy name is tried when the versioned one exists" "$d" "W1nCray-linux-amd64.gz"
+	eq "the versioned asset is installed" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
+
+	# The bare (ungzipped) primary asset installs too: gzip magic decides.
+	rm -f "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz"*
+	cp "$W1NCRAY_ROOT/vbin" "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64"
+	printf '%s\n' "$(sha256sum "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64" | awk '{print $1}')" \
+		>"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.sha256"
+	: >"$DL_LOG"
+	cmd_install --version v1.2.3 --no-geo >/dev/null 2>&1
+	has "the bare asset is tried first" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/w1ncray-v1.2.3-linux-amd64"
+	eq "the bare asset is installed" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
+	hasnt "no .gz name is needed for a bare asset" "$(cat "$DL_LOG")" "w1ncray-v1.2.3-linux-amd64.gz"
+}
+
+# A release that only has the pre-v0.7.0 names still installs (the fallback).
+t_install_legacy_name_fallback() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	make_fake_bin "$W1NCRAY_ROOT/lbin"
+	publish W1nCray-linux-amd64.gz "$W1NCRAY_ROOT/lbin"
+	: >"$DL_LOG"
+	cmd_install --version v0.6.0 --no-geo >/dev/null 2>&1
+	d="$(cat "$DL_LOG")"
+	has "the versioned name is tried first" "$d" "/releases/download/v0.6.0/w1ncray-v0.6.0-linux-amd64.gz"
+	has "the legacy name is the fallback" "$d" "/releases/download/v0.6.0/W1nCray-linux-amd64.gz"
+	eq "the legacy release still installs" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
 }
 
 t_update_version_shorthand() {
@@ -1210,7 +1286,8 @@ run() { # name
 
 for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_verify_opt_out t_generated_scripts \
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
-	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
+	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy \
+	t_install_versioned_asset t_install_legacy_name_fallback t_update_version_shorthand t_space_check t_switch_rollback \
 	t_update_migrates_single_program t_update_agent_only t_uninstall_removes_xray t_uninstall_xray_backend_fallback t_xray_dispatch \
 	t_manager_dispatch t_log_hint t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
 	t_install_panel t_install_panel_missing_args t_install_panel_bad_id t_install_panel_http \
