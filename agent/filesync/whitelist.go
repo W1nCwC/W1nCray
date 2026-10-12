@@ -13,6 +13,7 @@ package filesync
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -26,6 +27,32 @@ const (
 	NameGeoIP          = "geoip.dat"
 	NameGeoSite        = "geosite.dat"
 )
+
+// The managed certificate family (ACME-1). The panel issues and renews the
+// certificates and delivers each one as an ordinary managed file: the content
+// travels as a blob, the name is the only thing the desired state carries, and
+// the file lands in the same managed directory as the xray files (the panel
+// injects the resulting absolute path into the tunnel spec that references it,
+// and agent/certreload restarts the instances that reference it).
+//
+// The names are fixed by the panel's ManagedFileCatalog (its single source of
+// truth): `cert-<certificate id>.pem` and `key-<certificate id>.pem`. They are
+// matched by pattern rather than listed, because a machine may hold
+// certificates for several tunnels and the id is the panel's primary key. A
+// certificate is not an xray configuration file: the kernel validator only
+// knows the seven names above and ignores these.
+const (
+	// CertPrefix prefixes the managed-file name of a certificate.
+	CertPrefix = "cert-"
+	// KeyPrefix prefixes the managed-file name of a certificate's private key.
+	KeyPrefix = "key-"
+)
+
+// certNameRe is the certificate-family pattern: `cert-<id>.pem` or
+// `key-<id>.pem` with a positive decimal id. It mirrors the panel's
+// ManagedFileCatalog::CERT_NAME_PATTERN, so a name the panel refuses to store
+// can never be accepted here either.
+var certNameRe = regexp.MustCompile(`^(?:cert|key)-[1-9][0-9]{0,15}\.pem$`)
 
 // ManagedNames is the whitelist of names the panel may manage, in apply order.
 var ManagedNames = []string{
@@ -44,16 +71,23 @@ var neverManaged = map[string]bool{
 	"manifest.json":  true,
 }
 
-// IsManaged reports whether name is a managed file name: a plain file name
-// from the whitelist, with no directory part and no traversal.
+// IsManaged reports whether name is a managed file name: one of the seven xray
+// files or a certificate of the managed certificate family (ACME-1).
 func IsManaged(name string) bool {
 	for _, n := range ManagedNames {
 		if name == n {
 			return true
 		}
 	}
-	return false
+	return IsCert(name)
 }
+
+// IsCert reports whether name is a managed certificate file
+// (`cert-<id>.pem` or `key-<id>.pem`). Certificates are not xray configuration
+// files: the kernel validator ignores them and replacing one never reloads the
+// xray instance — the instances whose spec references the file are restarted
+// instead (agent/certreload).
+func IsCert(name string) bool { return certNameRe.MatchString(name) }
 
 // CheckName refuses every name that is not a whitelisted plain file name and
 // says why. It is the single gate the apply path uses, so the rule cannot drift
@@ -72,7 +106,8 @@ func CheckName(name string) error {
 		return fmt.Errorf("file name %q must not contain a directory part", name)
 	}
 	if !IsManaged(name) {
-		return fmt.Errorf("file %q is not a managed file (allowed: %s)", name, strings.Join(ManagedNames, ", "))
+		return fmt.Errorf("file %q is not a managed file (allowed: %s, or %s<id>.pem / %s<id>.pem)",
+			name, strings.Join(ManagedNames, ", "), CertPrefix, KeyPrefix)
 	}
 	return nil
 }
@@ -81,10 +116,14 @@ func CheckName(name string) error {
 // instance (design section 3.5). config.yml and the four JSON files are baked
 // into the instance at construction time, so they need a reload; the two geo
 // databases are read by xray on demand, so a change is picked up by the next
-// connection and no reload is needed.
+// connection and no reload is needed. A certificate is not an xray file at
+// all: the kernel never reads it, and the instances that do are restarted by
+// the applier (ACME-1).
 func NeedsRebuild(name string) bool {
-	switch name {
-	case NameGeoIP, NameGeoSite:
+	switch {
+	case IsCert(name):
+		return false
+	case name == NameGeoIP, name == NameGeoSite:
 		return false
 	default:
 		return true

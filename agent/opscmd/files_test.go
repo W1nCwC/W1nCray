@@ -201,6 +201,55 @@ func TestFilesApplyReportsARefusal(t *testing.T) {
 	}
 }
 
+// TestFilesApplyReportsTheRestartedInstances is the ACME-1 answer shape: a
+// certificate-only apply (no xray reload) reports which instances picked the
+// new file up and which could not, and it never promises health through
+// applied_pending (the panel has nothing to watch for a certificate).
+func TestFilesApplyReportsTheRestartedInstances(t *testing.T) {
+	files := &fakeFiles{applyRes: filesync.Result{
+		Status:          filesync.StatusDone,
+		Reload:          filesync.ReloadNotNeeded,
+		Restart:         filesync.RestartFailed,
+		Restarted:       []string{"exit-a"},
+		RestartFailures: []string{"instance exit-b: process did not start"},
+		Files:           []filesync.FileResult{{Name: "cert-7.pem", SHA256: strings.Repeat("a", 64), Size: 10, Bytes: 10}},
+	}}
+	sink := &recordingSink{}
+	reg := mustRegistry(t, Deps{Files: files})
+	reg.SetSink(sink)
+
+	if status, _ := reg.Execute(context.Background(), panelclient.Command{ID: "c5", Type: panelclient.CmdFilesApply}); status != panelclient.ResultAccepted {
+		t.Fatalf("status = %q", status)
+	}
+	got := sink.wait(t, 1)
+	var body struct {
+		Status          string   `json:"status"`
+		Reload          string   `json:"reload"`
+		Restart         string   `json:"restart"`
+		Restarted       []string `json:"restarted"`
+		RestartFailures []string `json:"restart_failures"`
+		AppliedPending  bool     `json:"applied_pending"`
+	}
+	if err := json.Unmarshal(got[0].data, &body); err != nil {
+		t.Fatalf("late body %s: %v", got[0].data, err)
+	}
+	if body.Status != filesync.StatusDone || body.Reload != filesync.ReloadNotNeeded {
+		t.Errorf("body = %s", got[0].data)
+	}
+	if body.Restart != filesync.RestartFailed {
+		t.Errorf("restart = %q, want failed", body.Restart)
+	}
+	if len(body.Restarted) != 1 || body.Restarted[0] != "exit-a" {
+		t.Errorf("restarted = %v", body.Restarted)
+	}
+	if len(body.RestartFailures) != 1 || !strings.Contains(body.RestartFailures[0], "exit-b") {
+		t.Errorf("restart_failures = %v", body.RestartFailures)
+	}
+	if body.AppliedPending {
+		t.Errorf("applied_pending promised for a certificate-only apply: %s", got[0].data)
+	}
+}
+
 // TestFilesApplyReportsAProtocolFailureAsFailed: when the apply cannot even
 // start (no desired state), the late result is a failed one with the error.
 func TestFilesApplyReportsAProtocolFailureAsFailed(t *testing.T) {

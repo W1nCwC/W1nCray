@@ -156,6 +156,19 @@ func filesApplyResult(res filesync.Result) json.RawMessage {
 	if res.Reason != "" {
 		body["reason"] = res.Reason
 	}
+	// The instances that were restarted because a file they reference changed
+	// (a renewed certificate, ACME-1). The panel sees which ones picked the new
+	// bytes up and which failed; a failure never rolls the files back, so it is
+	// reported here rather than as a failed apply.
+	if res.Restart != "" {
+		body["restart"] = res.Restart
+	}
+	if len(res.Restarted) > 0 {
+		body["restarted"] = res.Restarted
+	}
+	if len(res.RestartFailures) > 0 {
+		body["restart_failures"] = res.RestartFailures
+	}
 	// The reload was asked for (successfully or not): from here on the panel
 	// watches hello/telemetry and sends files_rollback when the machine does not
 	// come back.
