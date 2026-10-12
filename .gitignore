@@ -7,3 +7,4 @@
 # agent worktrees and dsh scratch
 /.claude/worktrees/
 /.dsh/
+/.wt-*/
