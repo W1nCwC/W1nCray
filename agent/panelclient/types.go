@@ -71,9 +71,29 @@ type KernelCatalogEntry struct {
 
 // KernelInstallArgs is the args of kernel_install. An empty Version selects the
 // newest version the manifest offers for this machine.
+//
+// A non-empty URL switches the command to the manifest-free direct path
+// (v0.8.0): the panel pins the asset itself and carries url/sha256/size (plus
+// the optional archive format and member names) in the args, so the agent
+// never consults the manifest. Without a URL the command keeps its historical
+// manifest behaviour.
 type KernelInstallArgs struct {
 	Name    string `json:"name"`
 	Version string `json:"version,omitempty"`
+	// URL is the asset to install; non-empty selects the direct path.
+	URL string `json:"url,omitempty"`
+	// SHA256 is the optional hex sha256 of the archive (direct path only).
+	SHA256 string `json:"sha256,omitempty"`
+	// Size is the optional archive size in bytes (direct path only).
+	Size int64 `json:"size,omitempty"`
+	// Archive is the optional format: gz (default) or tar.gz (direct path).
+	Archive string `json:"archive,omitempty"`
+	// From is the optional archive member a tar.gz takes the binary from;
+	// empty means To (direct path).
+	From string `json:"from,omitempty"`
+	// To is the optional installed file name; empty is the kernel's default
+	// binary (direct path).
+	To string `json:"to,omitempty"`
 }
 
 // KernelRemoveArgs is the args of kernel_remove.

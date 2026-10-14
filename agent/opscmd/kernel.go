@@ -195,6 +195,13 @@ func (k *kernelCmds) kernelInstall(ctx context.Context, req Request, complete Co
 	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
 		return k.xrayInstall(ctx, version, complete)
 	}
+	// The direct path (v0.8.0): the panel pins the asset in the args and the
+	// manifest is not consulted. The Xray kernel is a service and keeps its
+	// own install flow above, which still resolves through the manifest; a
+	// direct URL for it is refused rather than silently downgraded.
+	if a.URL != "" {
+		return k.kernelInstallDirect(ctx, a, version, complete)
+	}
 	pin := spec.KernelPin{Name: a.Name, Version: version}
 	wanted := version
 	if wanted == "" {
@@ -213,6 +220,50 @@ func (k *kernelCmds) kernelInstall(ctx context.Context, req Request, complete Co
 		}
 		k.reg.logf().Infof("opscmd: kernel_install %s@%s done", a.Name, inst.Version)
 		k.reg.event("kernel.installed", "info", fmt.Sprintf("kernel %s@%s installed", a.Name, inst.Version))
+		complete(StatusDone, mustJSON(installedResult{Name: a.Name, Version: inst.Version, Path: inst.Path}), nil)
+	}()
+	return accepted(), nil
+}
+
+// kernelInstallDirect answers kernel_install on the manifest-free direct
+// path: the args carry the asset URL (and the optional sha256/size/format/
+// member names), so the install needs no manifest at all. It is the long
+// command shape of kernelInstall and reports through the same sink.
+func (k *kernelCmds) kernelInstallDirect(ctx context.Context, a panelclient.KernelInstallArgs, version string, complete Completion) (Result, error) {
+	// The installer is reached through an optional capability of the kernel
+	// manager so the fake in the tests (and any older wiring) keeps working
+	// unchanged; a direct URL without the capability is a wiring error, not a
+	// manifest lookup.
+	dir, ok := k.deps.Kernels.(interface {
+		InstallDirect(ctx context.Context, di install.DirectInstall) (driver.Installed, error)
+	})
+	if !ok {
+		return Result{}, coded("not_supported", errors.New("this agent has no direct kernel installer wired"))
+	}
+	di := install.DirectInstall{
+		Name:    a.Name,
+		Version: version,
+		URL:     a.URL,
+		SHA256:  a.SHA256,
+		Size:    a.Size,
+		Archive: a.Archive,
+		From:    a.From,
+		To:      a.To,
+	}
+	wanted := version
+	if wanted == "" {
+		wanted = "self-check"
+	}
+	k.reg.logf().Infof("opscmd: kernel_install %s@%s accepted (direct)", a.Name, wanted)
+	go func() {
+		inst, err := dir.InstallDirect(ctx, di)
+		if err != nil {
+			k.reg.logf().Warnf("opscmd: kernel_install %s@%s (direct) failed: %v", a.Name, wanted, err)
+			complete(StatusFailed, nil, err)
+			return
+		}
+		k.reg.logf().Infof("opscmd: kernel_install %s@%s done (direct)", a.Name, inst.Version)
+		k.reg.event("kernel.installed", "info", fmt.Sprintf("kernel %s@%s installed (direct)", a.Name, inst.Version))
 		complete(StatusDone, mustJSON(installedResult{Name: a.Name, Version: inst.Version, Path: inst.Path}), nil)
 	}()
 	return accepted(), nil

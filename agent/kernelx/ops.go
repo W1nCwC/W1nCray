@@ -15,9 +15,14 @@ import (
 	"context"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
+	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
+
+// The Ensurer is the updater's installer, so it must keep satisfying the
+// direct staging capability a self_update with a sha256 is routed through.
+var _ selfupdate.DirectStager = (*Ensurer)(nil)
 
 // List returns every installed kernel version, sorted by name then version
 // descending. It reads the kernel directory and needs no manifest.
@@ -63,6 +68,30 @@ func (e *Ensurer) DownloadFor(ctx context.Context, name, version, dir string) (m
 // install.Installer.VerifyArchiveFor.
 func (e *Ensurer) VerifyArchiveFor(ctx context.Context, name, version, archivePath, dest string) (manifest.Target, string, error) {
 	return e.in.VerifyArchiveFor(ctx, name, version, archivePath, dest)
+}
+
+// StageAgentDirect stages the agent's own next version straight from a
+// release URL, without a manifest (see install.Installer.StageAgentDirect).
+// It is the DirectStager capability agent/selfupdate looks for when a
+// self_update command carries a sha256.
+func (e *Ensurer) StageAgentDirect(ctx context.Context, ad install.AgentDirect, archiveDir, dest string) (string, error) {
+	return e.in.StageAgentDirect(ctx, ad, archiveDir, dest)
+}
+
+// InstallDirect installs a kernel straight from a URL carried by the
+// kernel_install command, without a signed manifest (v0.8.0 direct path). It
+// is the operator path for kernels the panel pins itself; the manifest path
+// (Ensure/EnsureForce) stays the fallback for panels that predate it.
+//
+// Like Ensure and Rollback it labels the kernel tree for SELinux afterwards
+// (best effort).
+func (e *Ensurer) InstallDirect(ctx context.Context, di install.DirectInstall) (driver.Installed, error) {
+	inst, err := e.in.InstallDirect(ctx, di)
+	if err != nil {
+		return inst, err
+	}
+	e.labelBestEffort(ctx)
+	return inst, nil
 }
 
 // InstallLocal installs a kernel from a file already on this machine, without

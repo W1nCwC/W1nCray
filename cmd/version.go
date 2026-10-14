@@ -9,7 +9,10 @@ import (
 )
 
 // Set at build time with -ldflags "-X github.com/W1nCwC/W1nCray/cmd.version=...".
-var version = "dev"
+// The default is the next release in development (0.8.0-dev): the manifest
+// version_regex "W1nCray v?([0-9][0-9.]*)" parses it as 0.8.0, so a manifest
+// entry built from this tree self-checks against the right version.
+var version = "0.8.0-dev"
 
 func init() {
 	rootCmd.AddCommand(&cobra.Command{

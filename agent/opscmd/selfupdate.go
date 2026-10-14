@@ -35,10 +35,15 @@ type SelfUpdateOps interface {
 	RespawnHelper() error
 }
 
-// selfUpdateArgs is the args of self_update: the target version, which must be
-// listed for the reserved manifest kernel name "agent".
+// selfUpdateArgs is the args of self_update. version is the target version.
+// sha256, when set, selects the manifest-free direct path (v0.8.0): the
+// command builds the conventional GitHub release URL and the hash pins the
+// archive, so no manifest is consulted. Without a sha256 the command keeps
+// its historical behaviour and resolves the version through the signed
+// manifest, which is what the agents a manifest still bootstraps expect.
 type selfUpdateArgs struct {
 	Version string `json:"version"`
+	SHA256  string `json:"sha256,omitempty"`
 }
 
 // selfUpdateResult is the final result of a successful self_update.
@@ -101,8 +106,24 @@ func (c *selfUpdateCmds) selfUpdate(ctx context.Context, req Request, complete C
 	c.reg.logf().Infof("opscmd: self_update to %s accepted", version)
 	c.reg.event("self_update.started", "info", "self_update to "+version+" started")
 
+	// The direct path needs the DirectStager capability on the updater; a
+	// panel that sends a sha256 to an agent without it is refused instead of
+	// silently falling back to a manifest the panel has stopped publishing.
+	stage := func(ctx context.Context) (selfupdate.Staged, error) {
+		if a.SHA256 != "" {
+			ds, ok := c.up.(interface {
+				StageDirect(ctx context.Context, version, url, sha256 string) (selfupdate.Staged, error)
+			})
+			if !ok {
+				return selfupdate.Staged{}, coded("not_supported", errors.New("this agent cannot self-update from a release URL"))
+			}
+			return ds.StageDirect(ctx, version, selfupdate.ReleaseURLFor(version), a.SHA256)
+		}
+		return c.up.Stage(ctx, version)
+	}
+
 	go func() {
-		staged, err := c.up.Stage(ctx, version)
+		staged, err := stage(ctx)
 		if err != nil {
 			c.reg.logf().Warnf("opscmd: self_update to %s failed: %v", version, err)
 			complete(StatusFailed, nil, err)
