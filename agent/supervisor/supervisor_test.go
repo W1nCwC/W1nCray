@@ -3,6 +3,7 @@ package supervisor
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -161,6 +162,51 @@ func newSup(t *testing.T, o Options) *Supervisor {
 }
 
 func bg() context.Context { return context.Background() }
+
+// fakeLabeler records the binaries the supervisor labels before it starts them.
+type fakeLabeler struct {
+	mu    sync.Mutex
+	paths []string
+	err   error
+}
+
+func (f *fakeLabeler) EnsureBinT(_ context.Context, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paths = append(f.paths, path)
+	return f.err
+}
+
+func (f *fakeLabeler) seen() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.paths...)
+}
+
+// TestStartLabelsTheBinary is the SELinux requirement for the kernels the agent
+// runs as children (gost, realm, frp): the binary carries bin_t before it is
+// executed, and a labelling failure stops the start instead of producing a
+// process SELinux will kill.
+func TestStartLabelsTheBinary(t *testing.T) {
+	lab := &fakeLabeler{}
+	s := newSup(t, Options{Labeler: lab})
+	p := helperSpec(t, "gost/main", "sleep")
+	if err := s.Start(bg(), p); err != nil {
+		t.Fatal(err)
+	}
+	if got := lab.seen(); len(got) != 1 || got[0] != p.Path {
+		t.Fatalf("labelled = %v, want [%s]", got, p.Path)
+	}
+
+	lab2 := &fakeLabeler{err: errors.New("chcon: exit status 1")}
+	s2 := newSup(t, Options{Labeler: lab2})
+	if err := s2.Start(bg(), helperSpec(t, "realm/1", "sleep")); err == nil || !strings.Contains(err.Error(), "chcon") {
+		t.Fatalf("Start error = %v, want the labelling failure", err)
+	}
+	if s2.Status("realm/1").Running {
+		t.Fatal("a process was started despite the labelling failure")
+	}
+}
 
 func waitDead(t *testing.T, pid int) {
 	t.Helper()

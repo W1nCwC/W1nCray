@@ -6,7 +6,7 @@
       "id": "web-80",
       "name": "TCP直连转发：本机20080转到203.0.113.10:80，空闲上限1小时",
       "enabled": true,
-      "engine": "xray",
+      "engine": "gost",
       "kind": "forward",
       "listen": { "addr": "0.0.0.0", "ports": "20080" },
       "network": ["tcp"],

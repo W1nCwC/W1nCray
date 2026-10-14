@@ -51,8 +51,16 @@ func capsReason(c driver.Caps, in spec.Instance, requireStats bool) string {
 		if !hasString(c.TunnelTypes, in.Tunnel.Type) {
 			return fmt.Sprintf("tunnel type %q is not supported", in.Tunnel.Type)
 		}
-		if in.Tunnel.Security == "vless_enc" && c.Name != spec.EngineXray {
-			return "vless_enc security requires the xray engine"
+		if in.Tunnel.Security == "vless_enc" {
+			// Validation refuses this before engine selection; the reason is
+			// kept here too so a directly built state cannot slip through.
+			return "vless_enc 已随 xray 转发引擎移除"
+		}
+		// tls_self derives a self-signed certificate; realm verifies against
+		// the public CA roots only, so it can never accept one. Saying so here
+		// keeps "auto" from selecting realm (and gives the panel the reason).
+		if in.Tunnel.Security == "tls_self" && c.Name == spec.EngineRealm {
+			return "tls_self security cannot be verified by the realm engine (use gost)"
 		}
 	}
 	if in.ProxyProtocolOut > 0 && !c.ProxyOut {

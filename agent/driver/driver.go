@@ -142,6 +142,25 @@ type Driver interface {
 	// last applied (kept in rt.StateDir), changes as little as possible,
 	// keeps the previous good configuration, and on failure restores it.
 	Apply(ctx context.Context, rt Runtime, set []Rendered) (ApplyResult, error)
+	// RestartInstances makes the named instances of the last applied set pick
+	// up data they read from outside their own desired state — today the
+	// certificate files that a managed-file change replaced — using the same
+	// restart semantics a spec change uses for that engine:
+	//
+	//   - an engine with one process per instance restarts only the named
+	//     instances' processes (never the whole component, never by process
+	//     name);
+	//   - an engine that hosts several instances in one process recreates only
+	//     the named instances' services, so the other instances (and their
+	//     established connections) are untouched.
+	//
+	// It never touches an instance that is not in the last applied set and
+	// never applies a desired state: the ids are data, not a new
+	// configuration. The returned slice names the instances that were really
+	// restarted; an error says why the rest failed and must leave the
+	// instances that did not restart as they were. An empty ids slice is a
+	// no-op.
+	RestartInstances(ctx context.Context, rt Runtime, ids []string) (restarted []string, err error)
 	// Rollback restores the last good configuration written by Apply.
 	Rollback(ctx context.Context, rt Runtime) error
 	// Stop stops the given instances (all if ids is empty) and cuts their

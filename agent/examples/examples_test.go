@@ -20,7 +20,6 @@ import (
 	"github.com/W1nCwC/W1nCray/driver/frp"
 	"github.com/W1nCwC/W1nCray/driver/gost"
 	"github.com/W1nCwC/W1nCray/driver/realm"
-	"github.com/W1nCwC/W1nCray/driver/xray"
 )
 
 // placeholderSecret is the secret every sample uses. The tests insist on it so
@@ -49,17 +48,21 @@ func (fakeResolver) LookupNetIP(_ context.Context, _, _ string) ([]netip.Addr, e
 	return []netip.Addr{netip.MustParseAddr("203.0.113.250")}, nil
 }
 
-func validateOpts() validate.Options { return validate.Options{Resolver: fakeResolver{}} }
+// validateOpts returns the production validator options plus the offline
+// resolver. No engine override is set: the samples must validate exactly like
+// production does (PLAN v11 §2.5 removed the embedded xray engine, so
+// engine=xray is refused by the default validator).
+func validateOpts() validate.Options {
+	return validate.Options{Resolver: fakeResolver{}}
+}
 
-// realDrivers builds the same engine set as bootstrap.buildDrivers (xray with
-// the local policy and no certificate roots, the others with zero options),
-// except that xray gets no Host: Validate and Render never use it.
-func realDrivers(pol spec.Policy) map[string]driver.Driver {
-	pol = validate.NormalizePolicy(pol)
+// realDrivers builds the same engine set as bootstrap.buildDrivers, with zero
+// options: the samples are validated and rendered, never applied to a kernel.
+// The policy is part of the signature because callers share one helper.
+func realDrivers(_ spec.Policy) map[string]driver.Driver {
 	return map[string]driver.Driver{
-		spec.EngineXray:  xray.New(nil, xray.Options{Policy: &pol}),
 		spec.EngineGost:  gost.New(gost.Options{}),
-		spec.EngineFrp:   frp.New(),
+		spec.EngineFrp:   frp.New(frp.Options{}),
 		spec.EngineRealm: realm.New(realm.Options{}),
 	}
 }
@@ -105,9 +108,8 @@ func TestCoverage(t *testing.T) {
 		"forward-tcp", "forward-udp", "forward-tcp-udp", "forward-port-range", "forward-port-map",
 		"forward-balance", "forward-acl", "forward-gost-limits",
 		"proxy-send", "proxy-accept", "proxy-passthrough",
-		"tunnel-vless-enc-entry", "tunnel-vless-enc-exit", "tunnel-tls-pin-entry", "tunnel-tls-pin-exit",
+		"tunnel-tls-self-entry", "tunnel-tls-self-exit",
 		"reverse-frp-portal", "reverse-frp-bridge", "reverse-gost-portal", "reverse-gost-bridge",
-		"reverse-xray-portal", "reverse-xray-bridge",
 		"realm-relay", "realm-wss-entry", "realm-wss-exit", "gost-wss-entry", "gost-wss-exit",
 		"engine-auto",
 	} {
@@ -274,41 +276,28 @@ func TestPairs(t *testing.T) {
 			}
 		}
 	}
-	if pairs < 6 {
-		t.Errorf("only %d pairs of samples, want at least 6", pairs)
+	if pairs < 5 {
+		t.Errorf("only %d pairs of samples, want at least 5", pairs)
 	}
 }
 
-// TestXrayReverseSemantics pins the reverse proxy contract the xray driver
-// shares with gost and frp: the portal has no targets, the bridge's targets
-// decide the destinations, and the old "portal decides" settings are refused
-// by the layer that owns them.
-func TestXrayReverseSemantics(t *testing.T) {
-	by := map[string]spec.Instance{}
-	for _, ex := range List() {
-		if strings.HasPrefix(ex.Name, "reverse-xray-") {
-			by[ex.Name] = ex.Desired.Instances[0]
-		}
-	}
-	portal, bridge := by["reverse-xray-portal"], by["reverse-xray-bridge"]
-	if portal.ID == "" || bridge.ID == "" {
-		t.Fatal("the xray reverse samples are missing")
-	}
+// TestReverseSemantics pins the reverse proxy contract shared by gost and frp:
+// the portal has no targets, the bridge's targets decide the destinations, and
+// the old "portal decides" settings are refused by the layer that owns them.
+func TestReverseSemantics(t *testing.T) {
+	portal := sample(t, "reverse-gost-portal").Instances[0]
+	bridge := sample(t, "reverse-gost-bridge").Instances[0]
 	if len(portal.Targets) != 0 || len(portal.Listen.PortMap) != 0 {
 		t.Errorf("the portal sample must not name destinations: %+v", portal.Targets)
 	}
 	if len(bridge.Targets) == 0 {
 		t.Error("the bridge sample must name its destinations")
 	}
-	if bridge.Reverse != nil && len(bridge.Reverse.BridgeAllow) != 0 {
-		t.Error("the bridge sample must not use bridge_allow (xray refuses it; targets are the allow list)")
-	}
 
 	pol := testPolicy()
-	xr := realDrivers(pol)[spec.EngineXray]
 
-	// The layer above refuses a portal with targets; the driver refuses that
-	// too, and a bridge with bridge_allow.
+	// The layer above refuses a portal with targets: the destinations are the
+	// bridge's decision, never the portal's.
 	withTargets := portal
 	withTargets.Targets = bridge.Targets
 	one := spec.Desired{Version: spec.Version, Revision: 1, Instances: []spec.Instance{withTargets}}
@@ -320,16 +309,6 @@ func TestXrayReverseSemantics(t *testing.T) {
 	}
 	if !refused {
 		t.Error("validate no longer refuses targets on a reverse_portal")
-	}
-	if err := xr.Validate(withTargets); err == nil {
-		t.Error("xray accepts a reverse_portal with targets")
-	}
-	allow := bridge
-	rv := *bridge.Reverse
-	rv.BridgeAllow = []spec.Allow{{Host: bridge.Targets[0].Host, Ports: bridge.Targets[0].Ports}}
-	allow.Reverse = &rv
-	if err := xr.Validate(allow); err == nil || !strings.Contains(err.Error(), "bridge_allow") {
-		t.Errorf("xray bridge with bridge_allow: %v", err)
 	}
 }
 
@@ -370,24 +349,10 @@ func checkPair(t *testing.T, dial, accept spec.Desired) {
 	if dt.PinSHA256 != at.PinSHA256 {
 		t.Errorf("pins differ")
 	}
-	if at.Security == "tls_pin" && at.Cert != nil && at.Cert.Mode == "self" && d.Engine == spec.EngineXray {
-		// The xray driver derives the self-signed certificate from the secret
-		// and the SNI, so the pin in the sample is checkable.
-		want, err := xray.SelfCertPin(a.Secret, at.SNI)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.EqualFold(at.PinSHA256, want) {
-			t.Errorf("pin_sha256 is %s, but the certificate the exit presents has pin %s", at.PinSHA256, want)
-		}
-	}
 	switch a.Kind {
 	case spec.KindTunnelExit:
-		// The exit relays only to what it declares; the entry asks for the
-		// same destination (xray carries it; gost/realm leave it to the exit).
-		if d.Engine == spec.EngineXray && !sameTargets(d.Targets, a.Targets) {
-			t.Errorf("entry and exit targets differ: %+v vs %+v", d.Targets, a.Targets)
-		}
+		// Nothing to check here: gost and realm leave the destination to the
+		// exit, which relays only to what it declares.
 	case spec.KindReversePortal:
 		if d.Reverse == nil || a.Reverse == nil || d.Reverse.Link != a.Reverse.Link || d.Reverse.Domain != a.Reverse.Domain {
 			t.Errorf("reverse link/domain differ")
@@ -396,12 +361,6 @@ func checkPair(t *testing.T, dial, accept spec.Desired) {
 			t.Errorf("the bridge must name the portal's public ports in listen.ports")
 		}
 	}
-}
-
-func sameTargets(a, b []spec.Target) bool {
-	x, _ := json.Marshal(a)
-	y, _ := json.Marshal(b)
-	return string(x) == string(y)
 }
 
 // ---- end-to-end through the reconciler (no kernel, no network) ----------------
@@ -475,18 +434,19 @@ func newReconciler(t *testing.T, pol spec.Policy, engines ...string) *reconcile.
 	}
 }
 
-// autoWant is the engine each "auto" instance resolves to when all four
-// engines are registered, and what docs/AGENT.md says about it.
+// autoWant is the engine each "auto" instance resolves to when every external
+// engine is registered, and what docs/AGENT.md says about it: no builtin engine
+// exists any more, so the smallest capable external kernel wins.
 var autoWant = map[string]string{
-	"auto-simple": spec.EngineXray,  // builtin engine first
-	"auto-iphash": spec.EngineRealm, // xray lacks iphash; realm is the smaller external kernel
+	"auto-simple": spec.EngineRealm, // smallest capable kernel (realm)
+	"auto-iphash": spec.EngineRealm, // realm supports iphash
 }
 
 // TestPipeline applies every sample through the real reconciler and checks the
 // report: applied, every instance running, no secret anywhere in it.
 func TestPipeline(t *testing.T) {
 	pol := testPolicy()
-	all := []string{spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
+	all := []string{spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
 	for _, ex := range List() {
 		ex := ex
 		t.Run(ex.Name, func(t *testing.T) {
@@ -537,7 +497,7 @@ func TestPipeline(t *testing.T) {
 // built-in default policy (loopback listeners only): most are refused, and the
 // refusal report must not leak the secret either.
 func TestRejectedReportHasNoSecret(t *testing.T) {
-	all := []string{spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
+	all := []string{spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
 	rejected := 0
 	for _, ex := range List() {
 		ex := ex
@@ -563,9 +523,10 @@ func TestRejectedReportHasNoSecret(t *testing.T) {
 }
 
 // TestAutoNeedsExternalEngines documents what engine auto does when only some
-// engines exist: `agent-apply` registers no xray, so auto-simple lands on the
-// smallest external kernel, and with no engine able to run the instance the
-// apply is rejected with every engine's reason (no silent degrade).
+// engines exist: every engine is external now (PLAN v11 §2.5 removed the
+// builtin one), so auto-simple lands on the smallest capable kernel, and with
+// no engine able to run the instance the apply is rejected with every engine's
+// reason (no silent degrade).
 func TestAutoNeedsExternalEngines(t *testing.T) {
 	var auto spec.Desired
 	for _, ex := range List() {
@@ -576,7 +537,7 @@ func TestAutoNeedsExternalEngines(t *testing.T) {
 	if len(auto.Instances) == 0 {
 		t.Fatal("engine-auto sample missing")
 	}
-	t.Run("without-xray", func(t *testing.T) {
+	t.Run("all-external", func(t *testing.T) {
 		r := newReconciler(t, testPolicy(), spec.EngineGost, spec.EngineFrp, spec.EngineRealm)
 		rep, err := r.Apply(context.Background(), auto)
 		if err != nil {
@@ -587,7 +548,7 @@ func TestAutoNeedsExternalEngines(t *testing.T) {
 			got[ir.ID] = ir.Engine
 		}
 		if got["auto-simple"] != spec.EngineRealm || got["auto-iphash"] != spec.EngineRealm {
-			t.Errorf("without xray both instances should land on realm, got %v", got)
+			t.Errorf("both instances should land on the smallest capable kernel (realm), got %v", got)
 		}
 	})
 	t.Run("only-frp", func(t *testing.T) {
@@ -662,33 +623,29 @@ func TestLocalPolicyNeeds(t *testing.T) {
 
 // policyNeeds is the table docs/AGENT.md prints.
 var policyNeeds = map[string]string{
-	"engine-auto":            "listen",
-	"forward-acl":            "listen",
-	"forward-balance":        "listen",
-	"forward-gost-limits":    "listen",
-	"forward-port-map":       "listen",
-	"forward-port-range":     "listen",
-	"forward-tcp":            "listen",
-	"forward-tcp-udp":        "listen",
-	"forward-udp":            "listen",
-	"gost-wss-entry":         "listen",
-	"gost-wss-exit":          "listen",
-	"proxy-accept":           "default",
-	"proxy-passthrough":      "default",
-	"proxy-send":             "listen",
-	"realm-relay":            "listen",
-	"realm-wss-entry":        "listen",
-	"realm-wss-exit":         "listen",
-	"reverse-frp-bridge":     "private",
-	"reverse-frp-portal":     "listen",
-	"reverse-gost-bridge":    "private",
-	"reverse-gost-portal":    "listen",
-	"reverse-xray-bridge":    "private",
-	"reverse-xray-portal":    "listen",
-	"tunnel-tls-pin-entry":   "listen",
-	"tunnel-tls-pin-exit":    "listen",
-	"tunnel-vless-enc-entry": "listen",
-	"tunnel-vless-enc-exit":  "listen",
+	"engine-auto":           "listen",
+	"forward-acl":           "listen",
+	"forward-balance":       "listen",
+	"forward-gost-limits":   "listen",
+	"forward-port-map":      "listen",
+	"forward-port-range":    "listen",
+	"forward-tcp":           "listen",
+	"forward-tcp-udp":       "listen",
+	"forward-udp":           "listen",
+	"gost-wss-entry":        "listen",
+	"gost-wss-exit":         "listen",
+	"proxy-accept":          "default",
+	"proxy-passthrough":     "default",
+	"proxy-send":            "listen",
+	"realm-relay":           "listen",
+	"realm-wss-entry":       "listen",
+	"realm-wss-exit":        "listen",
+	"reverse-frp-bridge":    "private",
+	"reverse-frp-portal":    "listen",
+	"reverse-gost-bridge":   "private",
+	"reverse-gost-portal":   "listen",
+	"tunnel-tls-self-entry": "listen",
+	"tunnel-tls-self-exit":  "listen",
 }
 
 // TestHealthSamples: the two samples that carry a balance.health section run
@@ -703,7 +660,7 @@ func TestHealthSamples(t *testing.T) {
 			if in.Balance == nil || in.Balance.Health == nil || in.Balance.Strategy != "failover" {
 				t.Fatalf("sample must carry failover + health: %+v", in.Balance)
 			}
-			r := newReconciler(t, testPolicy(), spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm)
+			r := newReconciler(t, testPolicy(), spec.EngineGost, spec.EngineFrp, spec.EngineRealm)
 			rep, err := r.Apply(context.Background(), d)
 			if err != nil {
 				raw, _ := json.MarshalIndent(rep, "", "  ")

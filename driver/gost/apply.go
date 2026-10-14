@@ -40,7 +40,38 @@ func (d *Driver) Apply(ctx context.Context, rt driver.Runtime, set []driver.Rend
 	if err != nil {
 		return driver.ApplyResult{Failed: map[string]string{}}, err
 	}
+	// The tls_self certificate (and key) travels in the artifact: write it
+	// next to the fragment, 0600, before gost is asked to serve it. The
+	// fragment references it by relative name, and gost runs with the state
+	// directory as its working directory (procSpec.WorkDir).
+	if err := writeArtifactFiles(rt, set); err != nil {
+		return driver.ApplyResult{Failed: map[string]string{}}, err
+	}
 	return d.apply(ctx, rt, desired, true)
+}
+
+// writeArtifactFiles writes every artifact file except the fragment (today the
+// tls_self certificate and key) into the driver's state directory with mode
+// 0600. The names are plain file names: a name that could escape the state
+// directory is refused rather than joined.
+func writeArtifactFiles(rt driver.Runtime, set []driver.Rendered) error {
+	for _, r := range set {
+		for name, data := range r.Artifact.Files {
+			if name == fragmentFile {
+				continue
+			}
+			if name == "" || name != filepath.Base(name) || strings.Contains(name, "..") {
+				return fmt.Errorf("gost: artifact file name %q is not a plain file name", name)
+			}
+			if rt.StateDir == "" || !filepath.IsAbs(rt.StateDir) {
+				return errors.New("gost: runtime state dir must be absolute")
+			}
+			if err := writeFileAtomic(filepath.Join(rt.StateDir, name), data, 0o600); err != nil {
+				return fmt.Errorf("gost: write %s: %w", name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // desiredFromRendered checks that every artifact is genuine: it must be what
@@ -281,6 +312,92 @@ func (d *Driver) Stop(ctx context.Context, rt driver.Runtime, ids ...string) err
 		return fmt.Errorf("gost: stop incomplete: %d instance(s) failed", len(res.Failed))
 	}
 	return nil
+}
+
+// RestartInstances implements driver.Driver: it recreates the gost services of
+// each named instance through the API, with the same definition the instance
+// is already running, so files gost read while the service was created (a
+// tunnel certificate pair that a managed-file change replaced) are read again
+// (see the package comment: a service's TLSConfig is built once, at creation).
+//
+// The gost process hosts every instance, so a restart of the process would
+// drop the other instances' connections. Recreating a service only affects
+// that service: gost's API PUT closes the listener and builds it again from
+// the definition, while the other services keep serving (the package comment
+// documents this, and the driver never uses the process-wide reload).
+//
+// The definition comes from the applied state, not from the caller: the ids
+// are data. An id that is not part of the applied state is skipped, and a
+// failure is reported per instance while the rest are still attempted (a
+// service whose recreation fails is restored to its previous definition by the
+// same transaction the Apply path uses).
+func (d *Driver) RestartInstances(ctx context.Context, rt driver.Runtime, ids []string) ([]string, error) {
+	d.rt.mu.Lock()
+	defer d.rt.mu.Unlock()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if err := checkRuntime(rt); err != nil {
+		return nil, err
+	}
+	if !rt.Sup.Status(procID).Running {
+		return nil, errors.New("gost: the process is not running")
+	}
+	old, err := loadApplied(rt.StateDir, appliedFile)
+	if err != nil {
+		return nil, err
+	}
+	if len(old.Instances) == 0 {
+		return nil, nil
+	}
+	// Talk to the process that is already running. ensureProcess must NOT be
+	// used here: it would start (and therefore replace) the process when the
+	// API does not answer, which would drop every instance's connections — the
+	// one thing this restart must never do. An unreachable API is a failure of
+	// the restart, reported per instance below.
+	ep, err := loadEndpoint(rt.StateDir)
+	if err != nil {
+		return nil, redactErr(fmt.Errorf("gost: reading the api endpoint: %w", err), stateSecrets(old, nil))
+	}
+	api := newAPIClient(ep, d.opts.APITimeout)
+	secrets := stateSecrets(old, nil)
+	var (
+		out  []string
+		errs []error
+	)
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	for _, id := range sortedSet(want) {
+		ai, known := old.Instances[id]
+		if !known {
+			continue
+		}
+		// changeFragment removes the instance's old objects and creates the
+		// new ones from the same fragment, which re-reads every file the
+		// services reference.
+		if err := d.changeFragment(ctx, rt, api, id, &ai.Fragment, &ai.Fragment); err != nil {
+			errs = append(errs, fmt.Errorf("instance %s: %w", id, redactErr(err, secrets)))
+			continue
+		}
+		out = append(out, id)
+		logf(rt, "info", "gost: instance %s restarted (a managed file it references changed)", id)
+	}
+	if len(errs) > 0 {
+		return out, errors.Join(errs...)
+	}
+	return out, nil
+}
+
+// sortedSet returns the keys of set, sorted.
+func sortedSet(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func checkRuntime(rt driver.Runtime) error {

@@ -328,6 +328,61 @@ func TestBackoffClearedOnSuccess(t *testing.T) {
 	}
 }
 
+// TestEnsureForceBypassesAndClearsBackoff covers D-M3: the back-off exists to
+// stop the automatic reconcile loop from hammering a broken mirror. An
+// operator-initiated install (the panel's kernel_install, a manual reinstall
+// after a rollback) must not be refused by that timer, and must clear the
+// record so the attempt really runs.
+func TestEnsureForceBypassesAndClearsBackoff(t *testing.T) {
+	f := newFixture(t)
+	fs := newFileServer(t)
+	k, archive := f.build(kern{Name: "gost", Version: "3.3.0", URLs: []string{fs.URL + "/a"}})
+	fs.status["/a"] = 503
+	in := f.installer(t.TempDir(), func(c *Config) { c.Retries = 1; c.BackoffBase = time.Hour; c.BackoffMax = time.Hour })
+	if err := in.LoadManifest(f.sign(k)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.Ensure(context.Background(), pin("gost", "3.3.0")); !errors.Is(err, kernel.ErrDownload) {
+		t.Fatalf("first Ensure = %v, want ErrDownload", err)
+	}
+	if _, err := in.Ensure(context.Background(), pin("gost", "3.3.0")); !errors.Is(err, kernel.ErrBackoff) {
+		t.Fatalf("second Ensure = %v, want ErrBackoff", err)
+	}
+
+	// The operator asks again explicitly while the mirror is still broken: the
+	// attempt must run and report the real error, not the back-off, and the
+	// counter starts over.
+	hits := fs.hitCount("/a")
+	if _, err := in.EnsureForce(context.Background(), pin("gost", "3.3.0")); !errors.Is(err, kernel.ErrDownload) {
+		t.Fatalf("EnsureForce = %v, want the real ErrDownload", err)
+	}
+	if fs.hitCount("/a") == hits {
+		t.Error("EnsureForce did not contact the source")
+	}
+	if b := in.st.Bad["gost@3.3.0"]; b == nil || b.Fails != 1 {
+		t.Errorf("failure record = %+v, want a fresh count of 1", b)
+	}
+	// The automatic path still honours what the forced attempt recorded: the
+	// counter was reset, not the feature disabled.
+	if _, err := in.Ensure(context.Background(), pin("gost", "3.3.0")); !errors.Is(err, kernel.ErrBackoff) {
+		t.Fatalf("Ensure after a forced failure = %v, want ErrBackoff", err)
+	}
+
+	// With the mirror fixed, a forced install succeeds and clears the record
+	// without waiting for the back-off window.
+	fs.mu.Lock()
+	delete(fs.status, "/a")
+	fs.mu.Unlock()
+	fs.put("/a", archive)
+	inst, err := in.EnsureForce(context.Background(), pin("gost", "3.3.0"))
+	if err != nil || inst.Version != "3.3.0" {
+		t.Fatalf("EnsureForce after the fix = (%+v, %v)", inst, err)
+	}
+	if in.st.Bad["gost@3.3.0"] != nil {
+		t.Error("failure record must be cleared after a successful forced install")
+	}
+}
+
 func TestMirrorFallback(t *testing.T) {
 	f := newFixture(t)
 	fs := newFileServer(t)
@@ -380,6 +435,24 @@ func TestPlainHTTPRefusedByDefault(t *testing.T) {
 	}
 	if fs.hitCount("/gost-3.3.0.bin") != 0 {
 		t.Error("http source was contacted")
+	}
+}
+
+// TestPlainHTTPAllowedWhenConfigured is the D-M1 counterpart of
+// TestPlainHTTPRefusedByDefault: Config.AllowHTTP is what a local agent.yml
+// switch drives, and when it is on the http source is really used (the
+// signature and the per-asset sha256 are still enforced).
+func TestPlainHTTPAllowedWhenConfigured(t *testing.T) {
+	f := newFixture(t)
+	fs := newFileServer(t)
+	k := publish(t, f, fs, kern{Name: "gost", Version: "3.3.0"})
+	in := f.installer(t.TempDir(), func(c *Config) { c.AllowHTTP = true })
+	if err := in.LoadManifest(f.sign(k)); err != nil {
+		t.Fatal(err)
+	}
+	mustEnsure(t, in, "gost", "3.3.0")
+	if fs.hitCount("/gost-3.3.0.bin") == 0 {
+		t.Error("the http source was never contacted")
 	}
 }
 

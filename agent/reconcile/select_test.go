@@ -10,9 +10,10 @@ import (
 )
 
 // Capability sets copied from the real drivers (driver/gost, driver/frp,
-// driver/realm, driver/xray Caps()), reduced to what capsReason looks at.
+// driver/realm Caps()), reduced to what capsReason looks at.
 func realGostCaps() driver.Caps {
 	return driver.Caps{
+		Name:        spec.EngineGost,
 		Kinds:       []spec.Kind{spec.KindForward, spec.KindTunnelEntry, spec.KindTunnelExit, spec.KindReversePortal, spec.KindReverseBridge},
 		Network:     []string{"tcp", "udp"},
 		TunnelTypes: []string{"tcp", "tls", "ws", "wss", "grpc"},
@@ -23,6 +24,7 @@ func realGostCaps() driver.Caps {
 
 func realFrpCaps() driver.Caps {
 	return driver.Caps{
+		Name:        spec.EngineFrp,
 		Kinds:       []spec.Kind{spec.KindReversePortal, spec.KindReverseBridge},
 		Network:     []string{"tcp", "udp"},
 		TunnelTypes: []string{"tcp", "tls", "ws", "wss"},
@@ -33,6 +35,7 @@ func realFrpCaps() driver.Caps {
 
 func realRealmCaps() driver.Caps {
 	return driver.Caps{
+		Name:        spec.EngineRealm,
 		Kinds:       []spec.Kind{spec.KindForward, spec.KindTunnelEntry, spec.KindTunnelExit},
 		Network:     []string{"tcp", "udp"},
 		TunnelTypes: []string{"tcp", "tls", "ws", "wss"},
@@ -150,5 +153,55 @@ func TestExplicitPassiveEngineAcceptsHealth(t *testing.T) {
 	ir := inst(e.mustApply(desired(1, healthInst(t, "gost"))), "h")
 	if ir.Engine != "gost" {
 		t.Fatalf("%+v", ir)
+	}
+}
+
+// TestCapsReasonTLSSelf covers the engine rule for security tls_self: realm
+// verifies against the public CA roots only, so it can never accept a derived
+// self-signed certificate. Saying so in capsReason is what keeps "auto" from
+// selecting it (the realm driver's own Validate refuses it too).
+func TestCapsReasonTLSSelf(t *testing.T) {
+	in := spec.Instance{
+		Kind: spec.KindTunnelEntry, Network: []string{"tcp"},
+		Tunnel: &spec.Tunnel{Type: "tls", Security: "tls_self", SNI: "tun.example.com"},
+	}
+	if got := capsReason(realRealmCaps(), in, false); !strings.Contains(got, "tls_self") {
+		t.Fatalf("realm must refuse tls_self, got %q", got)
+	}
+	if got := capsReason(realGostCaps(), in, false); got != "" {
+		t.Fatalf("gost accepts tls_self on a TLS carrier, got %q", got)
+	}
+	// capsReason only owns what a Caps set can express: the pin rules belong
+	// to each driver's Validate (gost refuses tls_pin there, xray accepts it),
+	// so a tls_pin instance is not judged here.
+	pin := in
+	pin.Tunnel = &spec.Tunnel{Type: "tls", Security: "tls_pin", PinSHA256: strings.Repeat("a", 64)}
+	if got := capsReason(realGostCaps(), pin, false); got != "" {
+		t.Fatalf("capsReason must not invent a pin rule: %q", got)
+	}
+}
+
+// TestAutoNeverSelectsRealmForTLSSelf is the selection half: with realm as the
+// only engine, an "auto" instance with tls_self is refused with the reason
+// instead of being handed to an engine that cannot verify the certificate.
+func TestAutoNeverSelectsRealmForTLSSelf(t *testing.T) {
+	e := newEnv(t)
+	e.r.Drivers = map[string]driver.Driver{"realm": e.realm}
+	in := entry(t, "a", "auto", "0123456789abcdef-secret")
+	in.Tunnel.Type, in.Tunnel.Security, in.Tunnel.SNI = "tls", "tls_self", "tun.example.com"
+	rep, err := e.apply(desired(1, in))
+	if !errors.Is(err, ErrRejected) {
+		t.Fatalf("err = %v\n%s", err, dumpReport(rep))
+	}
+	if got := inst(rep, "a").Error; !strings.Contains(got, "tls_self") {
+		t.Fatalf("the refusal must name tls_self: %q", got)
+	}
+	// With xray present, "auto" picks it (the embedded engine comes first) and
+	// the instance applies.
+	e2 := newEnv(t)
+	in2 := entry(t, "a", "auto", "0123456789abcdef-secret")
+	in2.Tunnel.Type, in2.Tunnel.Security, in2.Tunnel.SNI = "tls", "tls_self", "tun.example.com"
+	if got := inst(e2.mustApply(desired(1, in2)), "a").Engine; got != "xray" {
+		t.Fatalf("auto selected %q, want xray", got)
 	}
 }

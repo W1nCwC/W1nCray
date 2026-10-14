@@ -5,106 +5,27 @@ package node
 import (
 	"time"
 
-	"github.com/W1nCwC/W1nCray/common/cert"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
-// APIConfig is the "ApiConfig" section of a node (XrayR compatible).
-type APIConfig struct {
-	APIHost      string  `mapstructure:"ApiHost"`
-	Key          string  `mapstructure:"ApiKey"`
-	NodeID       int     `mapstructure:"NodeID"`
-	NodeType     string  `mapstructure:"NodeType"`
-	Timeout      int     `mapstructure:"Timeout"`
-	SpeedLimit   float64 `mapstructure:"SpeedLimit"`  // Mbps, overrides the panel when > 0
-	DeviceLimit  int     `mapstructure:"DeviceLimit"` // overrides the panel when > 0
-	RuleListPath string  `mapstructure:"RuleListPath"`
-
-	// Deprecated XrayR options, accepted so old configs still load.
-	EnableVless         bool   `mapstructure:"EnableVless"`
-	VlessFlow           string `mapstructure:"VlessFlow"`
-	DisableCustomConfig bool   `mapstructure:"DisableCustomConfig"`
-
-	// Machine mode, set by the panel (Agent.Panel) and never by the node's
-	// YAML: the machine token identifies this host and the panel decides which
-	// nodes it runs. Both fields must be set.
-	MachineID    int    `mapstructure:"-"`
-	MachineToken string `mapstructure:"-"`
-}
-
-// Config is the "ControllerConfig" section of a node (XrayR compatible).
-type Config struct {
-	ListenIP             string                `mapstructure:"ListenIP"`
-	SendIP               string                `mapstructure:"SendIP"`
-	UpdatePeriodic       int                   `mapstructure:"UpdatePeriodic"`
-	EnableDNS            bool                  `mapstructure:"EnableDNS"`
-	DNSType              string                `mapstructure:"DNSType"`
-	DisableUploadTraffic bool                  `mapstructure:"DisableUploadTraffic"`
-	DisableGetRule       bool                  `mapstructure:"DisableGetRule"`
-	EnableProxyProtocol  bool                  `mapstructure:"EnableProxyProtocol"`
-	DisableSniffing      bool                  `mapstructure:"DisableSniffing"`
-	DisableWebSocket     bool                  `mapstructure:"DisableWebSocket"`
-	BlockPrivateIP       *bool                 `mapstructure:"BlockPrivateIP"`
-	AutoSpeedLimitConfig *AutoSpeedLimitConfig `mapstructure:"AutoSpeedLimitConfig"`
-	EnableFallback       bool                  `mapstructure:"EnableFallback"`
-	FallBackConfigs      []*FallBackConfig     `mapstructure:"FallBackConfigs"`
-	EnableREALITY        bool                  `mapstructure:"EnableREALITY"`
-	REALITYConfigs       *REALITYConfig        `mapstructure:"REALITYConfigs"`
-	CertConfig           *cert.Config          `mapstructure:"CertConfig"`
-
-	// Deprecated XrayR options, accepted so old configs still load.
-	DisableIVCheck            bool           `mapstructure:"DisableIVCheck"`
-	DisableLocalREALITYConfig bool           `mapstructure:"DisableLocalREALITYConfig"`
-	GlobalDeviceLimitConfig   map[string]any `mapstructure:"GlobalDeviceLimitConfig"`
-}
-
-// AutoSpeedLimitConfig limits users that exceed a speed for a while.
-type AutoSpeedLimitConfig struct {
-	Limit         int `mapstructure:"Limit"`         // Mbps
-	WarnTimes     int `mapstructure:"WarnTimes"`     // consecutive warnings before limiting
-	LimitSpeed    int `mapstructure:"LimitSpeed"`    // Mbps
-	LimitDuration int `mapstructure:"LimitDuration"` // minutes
-}
-
-// FallBackConfig is a VLESS/Trojan fallback.
-type FallBackConfig struct {
-	SNI              string `mapstructure:"SNI"`
-	Alpn             string `mapstructure:"Alpn"`
-	Path             string `mapstructure:"Path"`
-	Dest             string `mapstructure:"Dest"`
-	ProxyProtocolVer uint64 `mapstructure:"ProxyProtocolVer"`
-}
-
-// REALITYConfig is a local REALITY config that overrides the panel's.
-type REALITYConfig struct {
-	Show             bool     `mapstructure:"Show"`
-	Dest             string   `mapstructure:"Dest"`
-	ProxyProtocolVer uint64   `mapstructure:"ProxyProtocolVer"`
-	ServerNames      []string `mapstructure:"ServerNames"`
-	PrivateKey       string   `mapstructure:"PrivateKey"`
-	MinClientVer     string   `mapstructure:"MinClientVer"`
-	MaxClientVer     string   `mapstructure:"MaxClientVer"`
-	MaxTimeDiff      uint64   `mapstructure:"MaxTimeDiff"`
-	ShortIds         []string `mapstructure:"ShortIds"`
-}
+// The node configuration types live in nodecfg, which does not depend on the
+// Xray kernel; the aliases keep every existing caller (and the panel's config
+// loader) working with the same names.
+type (
+	APIConfig            = nodecfg.APIConfig
+	Config               = nodecfg.Config
+	AutoSpeedLimitConfig = nodecfg.AutoSpeedLimitConfig
+	FallBackConfig       = nodecfg.FallBackConfig
+	REALITYConfig        = nodecfg.REALITYConfig
+)
 
 // DefaultConfig returns XrayR's controller defaults.
-func DefaultConfig() *Config {
-	return &Config{
-		ListenIP: "0.0.0.0",
-		SendIP:   "0.0.0.0",
-		DNSType:  "AsIs",
-	}
-}
+func DefaultConfig() *Config { return nodecfg.DefaultConfig() }
 
-func (c *Config) blockPrivateIP() bool {
-	return c.BlockPrivateIP == nil || *c.BlockPrivateIP
-}
-
-func (c *Config) autoSpeedLimit() *AutoSpeedLimitConfig {
-	if c.AutoSpeedLimitConfig == nil || c.AutoSpeedLimitConfig.Limit <= 0 {
-		return nil
-	}
-	return c.AutoSpeedLimitConfig
+// ControllerConfigWithDefaults returns a fresh ControllerConfig holding src's
+// fields over the node defaults.
+func ControllerConfigWithDefaults(src *Config) *Config {
+	return nodecfg.ControllerConfigWithDefaults(src)
 }
 
 const (

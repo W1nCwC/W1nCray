@@ -1,13 +1,17 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,10 +19,11 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
-	"github.com/W1nCwC/W1nCray/common/cert"
-	"github.com/W1nCwC/W1nCray/node"
-	"github.com/W1nCwC/W1nCray/panel"
+	"github.com/W1nCwC/W1nCray/common/certcfg"
+	"github.com/W1nCwC/W1nCray/config"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 // linkOptions configures `W1nCray link`.
@@ -32,25 +37,49 @@ type linkOptions struct {
 	DryRun             bool
 	IgnoreAPIOverrides bool
 	SkipCheck          bool
+	// NoTerminal writes Terminal: {Enabled: false} to agent.yml. The terminal
+	// is ON by default (ruling 17), so only the opt-out is ever written.
+	NoTerminal bool
+	// Force allows link to replace an existing agent.yml. The old file is
+	// backed up first.
+	Force bool
+	// Split is the layout-only migration (runSplit): move the existing Agent:
+	// block to agent.yml without converting any node.
+	Split bool
+	// XrayBin is the W1nCray-xray executable used for the offline Xray check
+	// ("" = search the default locations).
+	XrayBin string
 }
 
 func init() {
 	var opts linkOptions
 	c := &cobra.Command{
 		Use:   "link",
-		Short: "Turn the static Nodes of config.yml into panel machine mode (Agent.Panel)",
+		Short: "Turn the static Nodes of config.yml into panel machine mode (agent.yml)",
 		Long: "Rewrite config.yml in place so the nodes of one panel run in machine mode:\n" +
 			"every matching Nodes entry is commented out (for rollback) and its\n" +
-			"ControllerConfig is copied, verbatim, under Agent.Panel.NodeControllers[<node id>].\n" +
-			"The file is edited line by line, so comments and unrelated keys survive.\n" +
+			"ControllerConfig is copied, verbatim, under Panel.NodeControllers[<node id>]\n" +
+			"in <config dir>/agent.yml.\n" +
+			"The agent configuration no longer lives in config.yml: an existing Agent:\n" +
+			"block is migrated to agent.yml and replaced by a one-line comment. An\n" +
+			"agent.yml that is already there is never overwritten unless --force is\n" +
+			"given, and then only after a backup. agent.yml is written atomically.\n" +
+			"The files are edited line by line, so comments and unrelated keys survive.\n" +
 			"The machine token is written to <config dir>/agent.token (0600) and never\n" +
-			"appears in config.yml, on stdout or in an error.",
+			"appears in config.yml, agent.yml, on stdout or in an error.\n" +
+			"The interactive terminal is ON by default; --noterminal writes\n" +
+			"Terminal: {Enabled: false} to agent.yml.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, err := findConfig()
 			if err != nil {
 				return err
 			}
-			setAssetLocation(path)
+			// The offline Xray check is served by the kernel program; resolve
+			// it once per run ("" = not installed, the check is skipped).
+			linkXrayBin = resolveXrayBin(opts.XrayBin)
+			if opts.Split {
+				return runSplit(path, opts, os.Stdout)
+			}
 			return runLink(path, opts, os.Stdout)
 		},
 	}
@@ -63,6 +92,10 @@ func init() {
 	c.Flags().BoolVar(&opts.DryRun, "dry-run", false, "only print what would be done (writes nothing, not even the token)")
 	c.Flags().BoolVar(&opts.IgnoreAPIOverrides, "ignore-api-overrides", false, "convert nodes whose ApiConfig has local overrides (SpeedLimit/DeviceLimit/RuleListPath)")
 	c.Flags().BoolVar(&opts.SkipCheck, "skip-check", false, "write the converted config without validating it first")
+	c.Flags().BoolVar(&opts.NoTerminal, "noterminal", false, "write Terminal: {Enabled: false} to agent.yml (the terminal is ON by default)")
+	c.Flags().BoolVar(&opts.Force, "force", false, "replace an existing agent.yml (a backup is written first)")
+	c.Flags().BoolVar(&opts.Split, "split", false, "layout only: move the existing Agent: block of config.yml to agent.yml (machines already in machine mode); ignores --panel/--machine/--token")
+	c.Flags().StringVar(&opts.XrayBin, "xray-bin", "", "W1nCray-xray executable used for the offline Xray check (default: next to this binary, then PATH)")
 	rootCmd.AddCommand(c)
 }
 
@@ -76,16 +109,90 @@ type linkValidation struct {
 	added []string
 }
 
-// checkConfigFailures runs the full offline validation of one config and
-// returns its failure items. The items are the ones `W1nCray check` prints
-// with a "✗", plus the machine-mode controller problems that only matter once
-// the node runs and that the offline check therefore does not look at.
-func checkConfigFailures(path string) []string {
-	failures, _ := panel.CheckReport(path, false, io.Discard)
-	if cfg, err := panel.LoadConfig(path); err == nil {
+// linkXrayBin is the W1nCray-xray executable the offline Xray check runs
+// ("" = not found: the check is skipped and explained once per run).
+var linkXrayBin string
+
+// linkXrayNotice suppresses the repeated "kernel not found" line: the check
+// runs twice (baseline and converted config).
+var linkXrayNotice bool
+
+// checkConfigFailures runs the offline validation of one config and returns its
+// failure items. The Xray side is checked by the W1nCray-xray program (the
+// agent does not link Xray-core): its `check` prints the same "✗" lines the
+// old in-process check did, so the baseline comparison keeps working. When the
+// kernel is not installed the Xray check is skipped and explained; the
+// machine-mode controller problems the kernel check does not look at are
+// always reported.
+func checkConfigFailures(path string, out io.Writer) []string {
+	var failures []string
+	if linkXrayBin == "" {
+		if !linkXrayNotice {
+			linkXrayNotice = true
+			fmt.Fprintln(out, "  ! 未找到 W1nCray-xray（可用 --xray-bin <路径> 指定）：跳过 Xray 内核离线检查")
+		}
+	} else {
+		items, err := runXrayCheck(linkXrayBin, path)
+		if err != nil {
+			failures = append(failures, "✗ Xray 内核检查: "+err.Error())
+		}
+		failures = append(failures, items...)
+	}
+	if cfg, err := config.Load(path); err == nil {
 		failures = append(failures, linkMachineNodeFailures(cfg)...)
 	}
 	return failures
+}
+
+// runXrayCheck runs `<bin> check -c <config>` and returns the failure items it
+// printed (the lines starting with "✗"). A non-zero exit with no item is
+// reported as one error.
+func runXrayCheck(bin, configPath string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "check", "-c", configPath)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	runErr := cmd.Run()
+	out := buf.String()
+	var items []string
+	for _, line := range strings.Split(out, "\n") {
+		s := strings.TrimSpace(line)
+		if strings.HasPrefix(s, "✗") {
+			items = append(items, s)
+		}
+	}
+	if runErr != nil && len(items) == 0 {
+		return nil, fmt.Errorf("%s check: %w: %s", bin, runErr, strings.TrimSpace(out))
+	}
+	return items, nil
+}
+
+// resolveXrayBin finds the W1nCray-xray executable: the --xray-bin path when
+// given, then next to this binary, then on PATH. It returns "" when there is
+// none (the offline Xray check is then skipped).
+func resolveXrayBin(explicit string) string {
+	if explicit != "" {
+		if abs, err := filepath.Abs(explicit); err == nil {
+			return abs
+		}
+		return explicit
+	}
+	name := "W1nCray-xray"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if exe, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(exe), name)
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand
+		}
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	return ""
 }
 
 // linkMachineNodeFailures reports the machine-mode controller settings the
@@ -95,11 +202,19 @@ func checkConfigFailures(path string) []string {
 // generated NodeControllers entry so a value machine mode cannot use is
 // reported as a problem the conversion introduced instead of being written
 // silently. It never prints credentials.
-func linkMachineNodeFailures(cfg *panel.Config) []string {
+func linkMachineNodeFailures(cfg *config.Config) []string {
 	if cfg.Agent == nil || cfg.Agent.Panel == nil {
 		return nil
 	}
-	pc := cfg.Agent.Panel
+	return linkPanelCertModeFailures(cfg.Agent.Panel)
+}
+
+// linkPanelCertModeFailures is linkMachineNodeFailures for an agent panel
+// section that was loaded on its own (the generated agent.yml).
+func linkPanelCertModeFailures(pc *agentcfg.PanelConfig) []string {
+	if pc == nil {
+		return nil
+	}
 	ids := make([]int, 0, len(pc.NodeControllers))
 	for id := range pc.NodeControllers {
 		ids = append(ids, id)
@@ -119,12 +234,12 @@ func linkMachineNodeFailures(cfg *panel.Config) []string {
 
 // linkCertModeFailure reports an unusable CertConfig.CertMode ("" when the
 // mode is one of the supported values or the config has no certificate).
-func linkCertModeFailure(where string, cc *node.Config) string {
+func linkCertModeFailure(where string, cc *nodecfg.Config) string {
 	if cc == nil || cc.CertConfig == nil {
 		return ""
 	}
 	switch strings.ToLower(strings.TrimSpace(cc.CertConfig.CertMode)) {
-	case "", cert.ModeNone, cert.ModeFile, cert.ModeContent, cert.ModeSelf, cert.ModeHTTP, cert.ModeTLS, cert.ModeDNS:
+	case "", certcfg.ModeNone, certcfg.ModeFile, certcfg.ModeContent, certcfg.ModeSelf, certcfg.ModeHTTP, certcfg.ModeTLS, certcfg.ModeDNS:
 		return ""
 	}
 	return fmt.Sprintf("✗ %s.CertConfig.CertMode: 不支持的证书模式 %q（可选 none/file/content/self/http/tls/dns）", where, cc.CertConfig.CertMode)
@@ -138,7 +253,7 @@ func linkCertModeFailure(where string, cc *node.Config) string {
 // The comparison key of an item strips the volatile parts of a single run (the
 // two temporary file names, any timestamp), so a problem the original config
 // already had compares equal and does not block the conversion.
-func validateLinkOutput(configPath string, raw []byte, newPath string) (linkValidation, error) {
+func validateLinkOutput(configPath string, raw []byte, newPath string, out io.Writer) (linkValidation, error) {
 	basePath, cleanup, err := writeBaselineCopy(configPath, raw)
 	if err != nil {
 		return linkValidation{}, err
@@ -146,8 +261,8 @@ func validateLinkOutput(configPath string, raw []byte, newPath string) (linkVali
 	defer cleanup()
 
 	volatile := []string{basePath, newPath}
-	baseFailures := dedupeFailures(checkConfigFailures(basePath))
-	newFailures := checkConfigFailures(newPath)
+	baseFailures := dedupeFailures(checkConfigFailures(basePath, out))
+	newFailures := checkConfigFailures(newPath, out)
 
 	inBaseline := make(map[string]bool, len(baseFailures))
 	for _, f := range baseFailures {
@@ -176,7 +291,7 @@ func validateLinkWrite(configPath string, raw []byte, newPath string, skipCheck 
 		fmt.Fprintln(out, "⚠ 已跳过写入前校验（--skip-check）：生成的配置未经验证")
 		return nil
 	}
-	res, err := validateLinkOutput(configPath, raw, newPath)
+	res, err := validateLinkOutput(configPath, raw, newPath, out)
 	if err != nil {
 		return fmt.Errorf("写入前校验失败，未改动任何文件: %w", err)
 	}
@@ -200,6 +315,94 @@ func validateLinkWrite(configPath string, raw []byte, newPath string, skipCheck 
 		}
 	}
 	return nil
+}
+
+// validateAgentYML validates the generated agent.yml on its own. It is only
+// needed when an agent.yml already exists: the temporary config used by
+// validateLinkWrite resolves that file (agent.yml wins as a whole), so the new
+// agent.yml would otherwise never be checked. Only a problem the old agent.yml
+// did not have stops the write, exactly like validateLinkWrite.
+func validateAgentYML(dir string, plan *linkPlan, skipCheck bool, out io.Writer) error {
+	if skipCheck {
+		return nil
+	}
+	tmp, err := os.CreateTemp(dir, ".link-agent-*.yml")
+	if err != nil {
+		return fmt.Errorf("创建 agent 校验文件失败: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.WriteString(plan.renderAgent()); err != nil {
+		tmp.Close()
+		return fmt.Errorf("写入 agent 校验文件失败: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("设置 agent 校验文件权限失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭 agent 校验文件失败: %w", err)
+	}
+
+	oldPath := filepath.Join(dir, agentcfg.FileName)
+	volatile := []string{oldPath, tmpPath}
+	inOld := make(map[string]bool)
+	for _, f := range agentYMLFailures(oldPath) {
+		inOld[linkFailureKey(f, volatile...)] = true
+	}
+	var added []string
+	for _, f := range agentYMLFailures(tmpPath) {
+		if inOld[linkFailureKey(f, volatile...)] {
+			continue
+		}
+		added = append(added, f)
+	}
+	if len(added) > 0 {
+		fmt.Fprintln(out, "生成的 agent.yml 未通过校验：")
+		for _, f := range added {
+			fmt.Fprintf(out, "  %s\n", f)
+		}
+		return errors.New("生成的 agent.yml 未通过校验，未改动任何文件")
+	}
+	return nil
+}
+
+// agentYMLFailures runs the offline validation of one agent.yml and returns the
+// failure items, in the same "✗" form `W1nCray check` prints. It reads the
+// token file (so a bad mode is caught) but never prints the token.
+func agentYMLFailures(path string) []string {
+	cfg, err := agentcfg.Load(path)
+	if err != nil {
+		return []string{fmt.Sprintf("✗ agent.yml 解析失败（agent 将无法启动）: %v", err)}
+	}
+	if cfg == nil {
+		return nil
+	}
+	resolveAgentPaths(cfg, filepath.Dir(path))
+	var out []string
+	if err := cfg.Validate(); err != nil {
+		out = append(out, "✗ "+err.Error())
+	}
+	if cfg.Panel != nil && cfg.Panel.Enabled {
+		if _, err := cfg.Panel.ResolveToken(); err != nil {
+			out = append(out, "✗ "+err.Error())
+		}
+	}
+	return append(out, linkPanelCertModeFailures(cfg.Panel)...)
+}
+
+// resolveAgentPaths applies the agent.yml path defaults the way
+// panel.LoadConfig does, so the standalone validation of a staged file reads
+// the same token file as the final one.
+func resolveAgentPaths(cfg *agentcfg.Config, base string) {
+	if cfg.StateDir == "" {
+		cfg.StateDir = filepath.Join(base, "state")
+	} else if !filepath.IsAbs(cfg.StateDir) {
+		cfg.StateDir = filepath.Join(base, cfg.StateDir)
+	}
+	if cfg.Panel != nil && cfg.Panel.TokenFile != "" && !filepath.IsAbs(cfg.Panel.TokenFile) {
+		cfg.Panel.TokenFile = filepath.Join(base, cfg.Panel.TokenFile)
+	}
 }
 
 // writeBaselineCopy writes raw to a temporary file in the config's directory
@@ -307,7 +510,7 @@ func runLink(configPath string, opts linkOptions, out io.Writer) error {
 		fmt.Fprint(out, plan.text(tokenPath, ""))
 		return errors.New("没有可转换的节点：所有节点的 ApiHost 与 --panel 不一致，或存在机器模式无法表达的本地覆盖")
 	}
-	plan.agentLines = buildAgentLines(stateDir, panelURL, tokenPath, opts.Machine, opts.AllowHTTP, portLo, portHi, plan.overrides())
+	plan.agentLines = plan.buildAgentYML(panelURL, tokenPath, stateDir, opts, portLo, portHi)
 
 	fmt.Fprint(out, plan.text(tokenPath, ""))
 	if opts.DryRun {
@@ -328,6 +531,48 @@ func runLink(configPath string, opts linkOptions, out io.Writer) error {
 		}
 	}
 
+	// Stage the config for the pre-write validation with the generated agent
+	// section inlined as the Agent: block: the validation then checks the agent
+	// configuration link is about to write even though it will live in
+	// agent.yml. The staged file is thrown away; what replaces config.yml is
+	// rendered again without the Agent block below.
+	checkTmp, err := os.CreateTemp(dir, ".link-check-*.yml")
+	if err != nil {
+		cleanupToken()
+		return fmt.Errorf("创建校验临时文件失败: %w", err)
+	}
+	checkPath := checkTmp.Name()
+	defer os.Remove(checkPath)
+	if _, err := checkTmp.WriteString(plan.renderForCheck()); err != nil {
+		checkTmp.Close()
+		cleanupToken()
+		return fmt.Errorf("写入校验临时文件失败: %w", err)
+	}
+	if err := checkTmp.Chmod(0o600); err != nil {
+		checkTmp.Close()
+		cleanupToken()
+		return fmt.Errorf("设置校验临时文件权限失败: %w", err)
+	}
+	if err := checkTmp.Close(); err != nil {
+		cleanupToken()
+		return fmt.Errorf("关闭校验临时文件失败: %w", err)
+	}
+
+	if err := validateLinkWrite(configPath, raw, checkPath, opts.SkipCheck, out); err != nil {
+		cleanupToken()
+		return err
+	}
+	// When an agent.yml is already there, the temporary config resolves that
+	// file instead of the inlined block, so the new agent.yml is validated on
+	// its own as well.
+	if plan.agentExists {
+		if err := validateAgentYML(dir, plan, opts.SkipCheck, out); err != nil {
+			cleanupToken()
+			return err
+		}
+	}
+
+	// Stage the file that actually replaces config.yml (no Agent block).
 	tmp, err := os.CreateTemp(dir, ".link-*.yml")
 	if err != nil {
 		cleanupToken()
@@ -350,22 +595,30 @@ func runLink(configPath string, opts linkOptions, out io.Writer) error {
 		return fmt.Errorf("关闭临时文件失败: %w", err)
 	}
 
-	if err := validateLinkWrite(configPath, raw, tmpPath, opts.SkipCheck, out); err != nil {
-		cleanupToken()
-		return err
-	}
-
 	backupPath, err := backupConfig(configPath, raw, time.Now().Format("20060102-150405"))
 	if err != nil {
 		cleanupToken()
 		return err
 	}
+	// agent.yml is written atomically (temporary file + rename) and an existing
+	// one is backed up first (agentcfg.WriteFile owns both rules).
+	agentBackup, err := agentcfg.WriteFile(plan.agentPath, []byte(plan.renderAgent()))
+	if err != nil {
+		cleanupToken()
+		return fmt.Errorf("写入 %s 失败（%s 已备份到 %s）: %w", plan.agentPath, configPath, backupPath, err)
+	}
 	if err := os.Rename(tmpPath, configPath); err != nil {
+		restoreAgentYML(plan.agentPath, agentBackup, plan.agentExists)
 		cleanupToken()
 		return fmt.Errorf("替换 %s 失败（原文件已备份到 %s）: %w", configPath, backupPath, err)
 	}
 
 	fmt.Fprintf(out, "已更新 %s（原文件备份 %s）\n", configPath, backupPath)
+	if plan.agentExists {
+		fmt.Fprintf(out, "已更新 %s（原文件备份 %s）\n", plan.agentPath, agentBackup)
+	} else {
+		fmt.Fprintf(out, "已写入 %s（0600）\n", plan.agentPath)
+	}
 	if created {
 		fmt.Fprintf(out, "已写入 token 文件 %s（0600）\n", tokenPath)
 	} else {
@@ -373,6 +626,22 @@ func runLink(configPath string, opts linkOptions, out io.Writer) error {
 	}
 	printNextSteps(out, opts.Machine, plan.convertedIDs(), backupPath, false)
 	return nil
+}
+
+// restoreAgentYML puts the previous agent.yml back after a failed config.yml
+// replacement, so the two files never describe different machines. It is a
+// best-effort rollback on an error path: the backup itself is kept.
+func restoreAgentYML(agentPath, agentBackup string, existed bool) {
+	if !existed {
+		os.Remove(agentPath)
+		return
+	}
+	if agentBackup == "" {
+		return
+	}
+	if data, err := os.ReadFile(agentBackup); err == nil {
+		os.WriteFile(agentPath, data, 0o600)
+	}
 }
 
 // printNextSteps prints the Chinese follow-up (never restarts anything).
@@ -872,6 +1141,20 @@ type linkPlan struct {
 	date        string
 	agentLines  []string
 	convertedAt map[int]*linkNode
+
+	// agent.yml layout. agentPath is where the agent section is written,
+	// agentExists says whether it was already there (only --force may replace
+	// it) and hasAgentBlock/agentStart/agentEnd describe the config.yml
+	// "Agent:" block that is migrated into agent.yml. migrated holds the
+	// dedented block body without the sections link writes itself, and
+	// panelExtras the Panel keys link does not own.
+	agentPath     string
+	agentExists   bool
+	hasAgentBlock bool
+	agentStart    int
+	agentEnd      int
+	migrated      []string
+	panelExtras   []string
 }
 
 func splitRaw(raw string) ([]string, string) {
@@ -895,44 +1178,43 @@ func planLink(raw, configPath string, opts linkOptions, panelOrigin string) (*li
 	for i, s := range rawLines {
 		lines[i] = makeLine(s)
 	}
+	dir := filepath.Dir(configPath)
+	agentPath := filepath.Join(dir, agentcfg.FileName)
+
+	// Refuse to touch a config that was already converted. This runs before the
+	// entry check so a fully converted config (its Nodes are all commented out)
+	// still reports the clear "already converted" error instead of "no Nodes
+	// entries".
+	if !opts.Force && strings.Contains(raw, "#LINKED-") {
+		return nil, errors.New("配置已经转换过（发现 #LINKED- 标记），拒绝覆盖；如需重做请先恢复备份")
+	}
+	// An existing agent.yml is the live agent configuration: overwriting it
+	// without --force would silently discard it. --force backs it up first.
+	agentExists := false
+	switch _, err := os.Stat(agentPath); {
+	case err == nil:
+		agentExists = true
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return nil, fmt.Errorf("检查 %s 失败: %w", agentPath, err)
+	}
+	if agentExists && !opts.Force {
+		return nil, fmt.Errorf("%s 已存在：已有关联配置，拒绝覆盖；如需重做请先恢复备份，或用 --force 覆盖（会先备份）", agentPath)
+	}
+
 	nodesIdx, ok := topLevelKey(lines, "Nodes")
 	if !ok {
 		return nil, errors.New("配置里没有 Nodes: 段")
 	}
 	nodesEnd := blockEnd(lines, nodesIdx, len(lines), 0)
 
-	// Refuse to touch a config that is already linked: overwriting it would
-	// silently discard the operator's own Agent section. This runs before the
-	// entry check so a fully converted config (its Nodes are all commented
-	// out) still reports the clear "already linked" error.
+	// The old single-file layout keeps the agent configuration in config.yml.
+	// It is migrated to agent.yml instead of being refused, so an existing
+	// deployment moves to the separated layout without a manual merge.
 	agentIdx, hasAgent := topLevelKey(lines, "Agent")
+	agentEnd := -1
 	if hasAgent {
-		agentEnd := blockEnd(lines, agentIdx, len(lines), 0)
-		panelIdx := -1
-		for i := agentIdx + 1; i < agentEnd; i++ {
-			if k, _, ok := lineKey(lines[i]); ok && k == "Panel" && lines[i].indent > 0 {
-				panelIdx = i
-				break
-			}
-		}
-		if panelIdx >= 0 {
-			enabled := false
-			panelEnd := blockEnd(lines, panelIdx, agentEnd, lines[panelIdx].indent)
-			for i := panelIdx + 1; i < panelEnd; i++ {
-				if k, v, ok := lineKey(lines[i]); ok && k == "Enabled" && strings.EqualFold(scalarValue(v), "true") {
-					enabled = true
-					break
-				}
-			}
-			if enabled {
-				if strings.Contains(raw, "#LINKED-") {
-					return nil, errors.New("配置已经转换过（发现 #LINKED- 标记）且 Agent.Panel 已启用，拒绝重复转换；如需重做请先恢复备份")
-				}
-				return nil, errors.New("配置已关联面板（Agent.Panel.Enabled: true），拒绝覆盖；如需合并请手工处理")
-			}
-			return nil, errors.New("配置里已有 Agent.Panel 段但未启用；为避免猜错位置，请手工合并（参考 docs/AGENT.md）")
-		}
-		return nil, errors.New("配置里已有 Agent: 块但没有 Agent.Panel:；为避免猜错位置，请手工把 Panel 段合并进去（参考 docs/AGENT.md）")
+		agentEnd = blockEnd(lines, agentIdx, len(lines), 0)
 	}
 
 	starts := entryStarts(lines, nodesIdx+1, nodesEnd)
@@ -941,12 +1223,20 @@ func planLink(raw, configPath string, opts linkOptions, panelOrigin string) (*li
 	}
 
 	p := &linkPlan{
-		raw:         rawLines,
-		eol:         eol,
-		configPath:  configPath,
-		machineID:   opts.Machine,
-		date:        time.Now().Format("2006-01-02"),
-		convertedAt: make(map[int]*linkNode),
+		raw:           rawLines,
+		eol:           eol,
+		configPath:    configPath,
+		machineID:     opts.Machine,
+		date:          time.Now().Format("2006-01-02"),
+		convertedAt:   make(map[int]*linkNode),
+		agentPath:     agentPath,
+		agentExists:   agentExists,
+		hasAgentBlock: hasAgent,
+		agentStart:    agentIdx,
+		agentEnd:      agentEnd,
+	}
+	if hasAgent {
+		p.migrated, p.panelExtras = migrateAgentBlock(lines, agentIdx, agentEnd, opts.NoTerminal)
 	}
 	seen := make(map[int]bool)
 	for _, st := range starts {
@@ -962,6 +1252,133 @@ func planLink(raw, configPath string, opts linkOptions, panelOrigin string) (*li
 		p.nodes = append(p.nodes, n)
 	}
 	return p, nil
+}
+
+// migrateAgentBlock turns the config.yml "Agent:" block into the root of
+// agent.yml: the body is dedented and the sub-sections link writes itself
+// (Panel, and Terminal when --noterminal is given) are dropped, so the
+// operator's local settings survive without a duplicated key. Enabled: true is
+// ensured: a machine that runs link is a machine the agent has to be on for.
+//
+// The Panel block is regenerated from the flags, but its keys link does not own
+// (ManifestSync, the intervals, the NodeController template, ...) are returned
+// separately so the caller can put them back inside the new Panel section
+// instead of silently resetting them to their defaults.
+func migrateAgentBlock(lines []linkLine, start, end int, dropTerminal bool) (body, panelExtras []string) {
+	// The block's direct children share one indentation; it is the dedent base
+	// for agent.yml's root.
+	base := -1
+	for i := start + 1; i < end; i++ {
+		if strings.TrimSpace(lines[i].text) == "" {
+			continue
+		}
+		if lines[i].indent > lines[start].indent && (base < 0 || lines[i].indent < base) {
+			base = lines[i].indent
+		}
+	}
+	if base < 0 {
+		base = lines[start].indent + 2
+	}
+
+	// The Panel keys link writes itself; everything else in the block is the
+	// operator's.
+	managed := map[string]bool{
+		"Enabled": true, "URL": true, "MachineID": true, "Token": true,
+		"TokenFile": true, "AllowInsecureHTTP": true, "MachineNodes": true,
+		"NodeControllers": true,
+	}
+	skip := make(map[int]bool)
+	for i := start + 1; i < end; i++ {
+		k, _, ok := lineKey(lines[i])
+		if !ok {
+			continue
+		}
+		switch {
+		case k == "Panel":
+			panelEnd := blockEnd(lines, i, end, lines[i].indent)
+			skip[i] = true
+			childIndent := -1
+			for j := i + 1; j < panelEnd; j++ {
+				if strings.TrimSpace(lines[j].text) == "" {
+					continue
+				}
+				if childIndent < 0 && lines[j].indent > lines[i].indent {
+					childIndent = lines[j].indent
+				}
+				if lines[j].indent != childIndent {
+					continue
+				}
+				if k2, _, ok2 := lineKey(lines[j]); ok2 && managed[k2] {
+					for m := j; m < blockEnd(lines, j, panelEnd, lines[j].indent); m++ {
+						skip[m] = true
+					}
+				}
+			}
+		case dropTerminal && k == "Terminal":
+			for j := i; j < blockEnd(lines, i, end, lines[i].indent); j++ {
+				skip[j] = true
+			}
+		}
+	}
+
+	// Panel extras are collected with the same dedent as the body, so they sit
+	// at the right indentation inside the generated Panel section.
+	panelStart, panelEnd := -1, -1
+	for i := start + 1; i < end; i++ {
+		if k, _, ok := lineKey(lines[i]); ok && k == "Panel" && lines[i].indent == base {
+			panelStart, panelEnd = i, blockEnd(lines, i, end, lines[i].indent)
+			break
+		}
+	}
+	if panelStart >= 0 {
+		for i := panelStart + 1; i < panelEnd; i++ {
+			if skip[i] || strings.TrimSpace(lines[i].text) == "" {
+				continue
+			}
+			panelExtras = append(panelExtras, dedent(lines[i].text, base))
+		}
+	}
+
+	for i := start + 1; i < end; i++ {
+		if skip[i] {
+			continue
+		}
+		if strings.TrimSpace(lines[i].text) == "" {
+			body = append(body, "")
+			continue
+		}
+		body = append(body, dedent(lines[i].text, base))
+	}
+	enabledAt := -1
+	for i, l := range body {
+		ml := makeLine(l)
+		if ml.indent != 0 {
+			continue
+		}
+		if k, _, ok := lineKey(ml); ok && k == "Enabled" {
+			enabledAt = i
+			break
+		}
+	}
+	if enabledAt >= 0 {
+		body[enabledAt] = "Enabled: true"
+	} else {
+		body = append([]string{"Enabled: true"}, body...)
+	}
+	return body, panelExtras
+}
+
+// dedent removes up to n leading spaces from a line. A blank line stays blank
+// and a line that is less indented than n loses only the spaces it has.
+func dedent(line string, n int) string {
+	if strings.TrimSpace(line) == "" {
+		return ""
+	}
+	i := 0
+	for i < n && i < len(line) && line[i] == ' ' {
+		i++
+	}
+	return line[i:]
 }
 
 // parseLinkNode reads one Nodes entry and decides whether it is converted.
@@ -1099,7 +1516,9 @@ func (p *linkPlan) convertedIDs() []int {
 	return ids
 }
 
-// overrides returns the NodeControllers entries (ids sorted, lines shifted).
+// overrides returns the NodeControllers entries (ids sorted). The lines are the
+// verbatim ControllerConfig body of the node, at the indentation it had under
+// Nodes; the writer indents them for its target file.
 func (p *linkPlan) overrides() []linkOverride {
 	var ids []int
 	for _, n := range p.nodes {
@@ -1112,7 +1531,7 @@ func (p *linkPlan) overrides() []linkOverride {
 	for _, id := range ids {
 		for _, n := range p.nodes {
 			if n.convert && n.id == id && len(n.ccLines) > 0 {
-				out = append(out, linkOverride{id: id, lines: shiftRight(n.ccLines, 2)})
+				out = append(out, linkOverride{id: id, lines: n.ccLines})
 				break
 			}
 		}
@@ -1120,11 +1539,17 @@ func (p *linkPlan) overrides() []linkOverride {
 	return out
 }
 
-// render rebuilds the whole file: converted entries are commented out, the
-// Agent block is appended. Nothing else is touched.
+// render rebuilds config.yml: converted entries are commented out and the old
+// Agent block is replaced by a one-line comment that points at agent.yml.
+// Nothing else is touched.
 func (p *linkPlan) render() string {
 	var out []string
 	for i := 0; i < len(p.raw); {
+		if p.hasAgentBlock && i == p.agentStart {
+			out = append(out, fmt.Sprintf("# Agent: 段已迁移到 %s（W1nCray link %s）；本文件不再包含 Agent 配置", agentcfg.FileName, p.date))
+			i = p.agentEnd
+			continue
+		}
 		n, ok := p.convertedAt[i]
 		if !ok {
 			out = append(out, p.raw[i])
@@ -1137,11 +1562,26 @@ func (p *linkPlan) render() string {
 		}
 		i = n.entryEnd
 	}
-	if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) != "" {
-		out = append(out, "")
+	if len(out) == 0 {
+		return p.eol
 	}
-	out = append(out, p.agentLines...)
 	return strings.Join(out, p.eol) + p.eol
+}
+
+// renderForCheck is render with the generated agent section inlined as the
+// Agent: block. The pre-write validation loads this file, so it checks the
+// agent configuration link is about to write even though it will live in
+// agent.yml afterwards.
+func (p *linkPlan) renderForCheck() string {
+	lines := append([]string{"Agent:"}, shiftRight(p.agentLines, 2)...)
+	return p.render() + p.eol + strings.Join(lines, p.eol) + p.eol
+}
+
+// renderAgent renders agent.yml: the root of the file is the agent
+// configuration itself (no "Agent:" wrapper), so a field name means the same
+// thing in both files (ruling 1).
+func (p *linkPlan) renderAgent() string {
+	return strings.Join(p.agentLines, p.eol) + p.eol
 }
 
 // text renders the plan report.
@@ -1165,6 +1605,13 @@ func (p *linkPlan) text(tokenPath, backupPath string) string {
 		}
 	}
 	fmt.Fprintf(&b, "  配置文件: %s\n", p.configPath)
+	fmt.Fprintf(&b, "  agent 配置: %s\n", p.agentPath)
+	if p.hasAgentBlock {
+		fmt.Fprintf(&b, "    config.yml 的 Agent: 段将迁移到 agent.yml，原处留一行注释\n")
+	}
+	if p.agentExists {
+		fmt.Fprintf(&b, "    agent.yml 已存在：先备份再覆盖（--force）\n")
+	}
 	if backupPath == "" {
 		backupPath = p.configPath + ".bak-link-<时间戳>"
 	}
@@ -1188,31 +1635,61 @@ func shiftRight(lines []string, n int) []string {
 	return out
 }
 
-func buildAgentLines(stateDir, panelURL, tokenPath string, machineID int, allowHTTP bool, portLo, portHi int, overrides []linkOverride) []string {
+// buildAgentYML returns the agent.yml lines: the operator's migrated Agent
+// block when config.yml still had one, plus the panel link and the local
+// terminal switch this run writes.
+func (p *linkPlan) buildAgentYML(panelURL, tokenPath, stateDir string, opts linkOptions, portLo, portHi int) []string {
 	ls := []string{
-		"Agent:",
+		"# W1nCray agent configuration (agent.yml).",
+		"# This file wins as a whole over the Agent: block of config.yml, which is ignored.",
+	}
+	if p.hasAgentBlock {
+		ls = append(ls, fmt.Sprintf("# The Agent: block of config.yml was migrated here by `W1nCray link` on %s.", p.date))
+	} else {
+		ls = append(ls, fmt.Sprintf("# Written by `W1nCray link` on %s.", p.date))
+	}
+	ls = append(ls, "# The interactive terminal is ON by default; Terminal: {Enabled: false} turns it off locally.")
+	ls = append(ls, "")
+	if p.hasAgentBlock {
+		ls = append(ls, p.migrated...)
+	} else {
+		ls = append(ls, "Enabled: true")
+		ls = append(ls, "StateDir: "+yamlDQ(stateDir))
+		ls = append(ls, "Policy:")
+		ls = append(ls, `  AllowListen: ["0.0.0.0"]`)
+		ls = append(ls, fmt.Sprintf("  PortRange: [%d, %d]", portLo, portHi))
+	}
+	if opts.NoTerminal {
+		ls = append(ls, "Terminal: {Enabled: false}")
+	}
+	ls = append(ls, buildPanelLines(panelURL, tokenPath, opts.Machine, opts.AllowHTTP, p.panelExtras, p.overrides())...)
+	return ls
+}
+
+// buildPanelLines renders the Panel section at agent.yml's root indentation.
+// extras are the migrated Panel keys link does not own (ManifestSync, the
+// intervals, the NodeController template, ...); they keep their relative
+// indentation and are written before the generated NodeControllers.
+func buildPanelLines(panelURL, tokenPath string, machineID int, allowHTTP bool, extras []string, overrides []linkOverride) []string {
+	ls := []string{
+		"Panel:",
 		"  Enabled: true",
-		"  StateDir: " + yamlDQ(stateDir),
-		"  Policy:",
-		`    AllowListen: ["0.0.0.0"]`,
-		fmt.Sprintf("    PortRange: [%d, %d]", portLo, portHi),
-		"  Panel:",
-		"    Enabled: true",
-		"    URL: " + yamlDQ(panelURL),
-		fmt.Sprintf("    MachineID: %d", machineID),
-		"    TokenFile: " + yamlDQ(tokenPath),
+		"  URL: " + yamlDQ(panelURL),
+		fmt.Sprintf("  MachineID: %d", machineID),
+		"  TokenFile: " + yamlDQ(tokenPath),
 	}
 	if allowHTTP {
-		ls = append(ls, "    AllowInsecureHTTP: true")
+		ls = append(ls, "  AllowInsecureHTTP: true")
 	}
-	ls = append(ls, "    MachineNodes: true")
+	ls = append(ls, "  MachineNodes: true")
+	ls = append(ls, extras...)
 	if len(overrides) == 0 {
-		ls = append(ls, "    NodeControllers: {}")
+		ls = append(ls, "  NodeControllers: {}")
 		return ls
 	}
-	ls = append(ls, "    NodeControllers:")
+	ls = append(ls, "  NodeControllers:")
 	for _, ov := range overrides {
-		ls = append(ls, fmt.Sprintf("      %d:", ov.id))
+		ls = append(ls, fmt.Sprintf("    %d:", ov.id))
 		ls = append(ls, ov.lines...)
 	}
 	return ls

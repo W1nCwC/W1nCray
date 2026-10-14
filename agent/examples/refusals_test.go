@@ -113,10 +113,10 @@ func TestRefusals(t *testing.T) {
 		{name: "name-resolves-private", sample: "forward-tcp", resolver: toPrivate, policy: listenOnly,
 			mutate: func(d *spec.Desired) { inst(d).Targets[0].Host = "backend.example.com" },
 			want:   "resolves to 10.0.0.5: private address (policy.allow_private is off)"},
-		{name: "any-target", sample: "tunnel-vless-enc-exit", policy: fullPolicy(),
+		{name: "any-target", sample: "tunnel-tls-self-exit", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Targets, inst(d).AllowAnyTarget = nil, true },
 			want:   "allow_any_target: not allowed by the local policy"},
-		{name: "exit-without-target", sample: "tunnel-vless-enc-exit", policy: fullPolicy(),
+		{name: "exit-without-target", sample: "tunnel-tls-self-exit", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Targets = nil },
 			want:   "tunnel_exit needs fixed targets or allow_any_target"},
 		{name: "accept-proxy-public", sample: "proxy-accept", policy: fullPolicy(),
@@ -125,18 +125,18 @@ func TestRefusals(t *testing.T) {
 		{name: "proxy-out-with-udp", sample: "forward-tcp", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Network, inst(d).ProxyProtocolOut = []string{"tcp", "udp"}, 2 },
 			want:   "PROXY protocol is TCP only and cannot be combined with network udp"},
-		{name: "secret-charset", sample: "tunnel-vless-enc-entry", policy: fullPolicy(),
+		{name: "secret-charset", sample: "tunnel-tls-self-entry", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Secret = placeholderSecret + "!" },
 			want:   "secret: must be 16-256 characters of [A-Za-z0-9_.+/=-]"},
-		// '~' was legal in the validator but xray refuses it; ':' and '@' are
-		// refused by frp. Now none of them gets past the validator.
+		// '~' is outside the accepted set; ':' and '@' are refused by frp. None
+		// of them gets past the validator.
 		{name: "secret-tilde", sample: "reverse-frp-bridge", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Secret = placeholderSecret + "~" },
 			want:   "secret: must be 16-256 characters of [A-Za-z0-9_.+/=-]"},
-		{name: "secret-colon", sample: "tunnel-vless-enc-entry", policy: fullPolicy(),
+		{name: "secret-colon", sample: "tunnel-tls-self-entry", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Secret = placeholderSecret + ":@" },
 			want:   "secret: must be 16-256 characters of [A-Za-z0-9_.+/=-]"},
-		{name: "secret-missing", sample: "tunnel-vless-enc-entry", policy: fullPolicy(),
+		{name: "secret-missing", sample: "tunnel-tls-self-entry", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Secret = "" },
 			want:   `required for kind "tunnel_entry" (at least 16 characters)`},
 		{name: "range-length", sample: "forward-port-range", policy: fullPolicy(),
@@ -156,14 +156,14 @@ func TestRefusals(t *testing.T) {
 				d.Instances = append(d.Instances, second)
 			},
 			want: "duplicate id (also used by instances[0])"},
-		{name: "engine-not-allowed", sample: "forward-tcp", policy: spec.Policy{AllowListen: []string{"0.0.0.0"}, AllowEngines: []string{"gost"}},
-			want: `engine "xray" is not allowed by the local policy`},
+		{name: "engine-not-allowed", sample: "forward-tcp", policy: spec.Policy{AllowListen: []string{"0.0.0.0"}, AllowEngines: []string{"realm"}},
+			want: `engine "gost" is not allowed by the local policy`},
 		{name: "kind-unsupported-by-engine", sample: "reverse-frp-portal", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Engine = spec.EngineRealm },
 			want:   `engine "realm" cannot run this instance: kind "reverse_portal" is not supported`},
 		{name: "strategy-unsupported-by-engine", sample: "forward-balance", policy: fullPolicy(),
-			mutate: func(d *spec.Desired) { inst(d).Balance.Strategy = "iphash" },
-			want:   `balance strategy "iphash" is not supported`},
+			mutate: func(d *spec.Desired) { inst(d).Engine, inst(d).Balance.Strategy = spec.EngineRealm, "random" },
+			want:   `balance strategy "random" is not supported`},
 		{name: "realm-health", sample: "forward-gost-limits", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) {
 				inst(d).Engine, inst(d).Limits = spec.EngineRealm, nil
@@ -190,35 +190,29 @@ func TestRefusals(t *testing.T) {
 				inst(d).ACL = &spec.ACL{Allow: []string{"198.51.100.0/24"}}
 			},
 			want: "realm has no access control"},
-		{name: "xray-limits", sample: "forward-gost-limits", policy: fullPolicy(),
-			mutate: func(d *spec.Desired) { inst(d).Engine, inst(d).Balance = spec.EngineXray, nil },
-			want:   "limits (max_conns, rate_up_bps, rate_down_bps) are not supported by the xray driver"},
-		{name: "vless-enc-needs-xray", sample: "tunnel-vless-enc-entry", policy: fullPolicy(),
-			mutate: func(d *spec.Desired) { inst(d).Engine = spec.EngineGost },
-			want:   "vless_enc is only supported by the xray engine"},
-		{name: "xray-self-cert-needs-pin", sample: "tunnel-tls-pin-exit", policy: fullPolicy(),
-			mutate: func(d *spec.Desired) { inst(d).Tunnel.Security, inst(d).Tunnel.PinSHA256 = "tls", "" },
-			want:   "a self-signed certificate needs security tls_pin"},
-		{name: "xray-cert-file", sample: "tunnel-tls-pin-exit", policy: fullPolicy(),
-			mutate: func(d *spec.Desired) {
-				inst(d).Tunnel.Cert = &spec.Cert{Mode: "file", CertFile: "/etc/ssl/relay/fullchain.pem", KeyFile: "/etc/ssl/relay/privkey.pem"}
-			},
-			want: "certificate files are not allowed (no certificate root configured)"},
+		// PLAN v11 §2.5: vless_enc was the embedded xray engine's tunnel
+		// security and is refused by validation now.
+		{name: "vless-enc-removed", sample: "tunnel-tls-self-entry", policy: fullPolicy(),
+			mutate: func(d *spec.Desired) { inst(d).Tunnel.Security = "vless_enc" },
+			want:   "vless_enc 已随 xray 转发引擎移除"},
 		{name: "realm-self-cert", sample: "realm-wss-exit", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Tunnel.Cert = &spec.Cert{Mode: "self"} },
 			want:   "a self-signed certificate cannot be verified by a realm entry"},
 		{name: "realm-udp-tunnel", sample: "realm-wss-entry", policy: fullPolicy(),
 			mutate: func(d *spec.Desired) { inst(d).Network = []string{"tcp", "udp"} },
 			want:   "realm tunnels carry TCP only"},
-		// `W1nCray agent-apply` registers no builtin xray engine.
-		{name: "xray-not-registered", sample: "forward-tcp", policy: fullPolicy(),
+		// `W1nCray agent-apply` registers no builtin xray engine, and the
+		// production validator refuses engine=xray before engine selection
+		// (PLAN v11 §2.5 removed the forwarding engine entirely).
+		{name: "xray-engine-removed", sample: "forward-tcp", policy: fullPolicy(),
+			mutate:  func(d *spec.Desired) { inst(d).Engine = spec.EngineXray },
 			engines: []string{spec.EngineGost, spec.EngineFrp, spec.EngineRealm},
-			want:    `engine "xray" cannot run this instance: no driver for this engine`},
+			want:    "xray 转发引擎已移除，请使用 gost 或 realm"},
 		{name: "no-manifest", sample: "forward-gost-limits", policy: fullPolicy(), noManifest: true,
 			want: "no signed kernel manifest loaded (set Agent.ManifestPath)"},
 	}
 
-	all := []string{spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
+	all := []string{spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {

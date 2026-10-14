@@ -14,24 +14,119 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
+	"github.com/W1nCwC/W1nCray/agent/wsproto"
 )
 
 // Schema is the version of the wire contract spoken by this package.
 const Schema = 1
 
-// Command types the agent executes (contract section 3.5). Anything else is
-// answered with a "failed" result and never executed.
+// Command types the agent executes (contract section 3.5 and
+// docs/WS-PROTOCOL.md section 4). Anything not registered is answered with a
+// "failed" result and never executed. Only refresh and dump_state are built in;
+// the others are served by agent/opscmd, which registers them.
 const (
-	CmdRefresh   = "refresh"
-	CmdDumpState = "dump_state"
+	CmdRefresh          = "refresh"
+	CmdDumpState        = "dump_state"
+	CmdKernelList       = "kernel_list"
+	CmdKernelInstall    = "kernel_install"
+	CmdKernelRemove     = "kernel_remove"
+	CmdKernelRollback   = "kernel_rollback"
+	CmdComponentRestart = "component_restart"
+	CmdSelfUpdate       = "self_update"
+	CmdFileList         = "file_list"
+	CmdFileRead         = "file_read"
+	CmdFileWrite        = "file_write"
+	CmdFileDelete       = "file_delete"
+	CmdFileMkdir        = "file_mkdir"
+	CmdFileRename       = "file_rename"
+	CmdFilesApply       = "files_apply"
+	// CmdFilesValidate stages and validates the managed files without writing
+	// or reloading anything; CmdFilesRollback restores the last good set and
+	// reloads (docs/WS-PROTOCOL.md section 7 ruling 9).
+	CmdFilesValidate = "files_validate"
+	CmdFilesRollback = "files_rollback"
 )
 
 // Command result statuses.
 const (
-	ResultDone    = "done"
-	ResultFailed  = "failed"
-	ResultExpired = "expired"
+	ResultDone     = "done"
+	ResultFailed   = "failed"
+	ResultExpired  = "expired"
+	ResultAccepted = "accepted"
 )
+
+// KernelListResult is the result of kernel_list: the installed versions and the
+// versions the signed manifest offers for this machine.
+type KernelListResult struct {
+	Kernels []wsproto.KernelEntry `json:"kernels"`
+	Catalog []KernelCatalogEntry  `json:"catalog"`
+}
+
+// KernelCatalogEntry is one kernel name of the signed manifest with every
+// version it lists.
+type KernelCatalogEntry struct {
+	Name     string   `json:"name"`
+	Versions []string `json:"versions"`
+}
+
+// KernelInstallArgs is the args of kernel_install. An empty Version selects the
+// newest version the manifest offers for this machine.
+//
+// A non-empty URL switches the command to the manifest-free direct path
+// (v0.8.0): the panel pins the asset itself and carries url/sha256/size (plus
+// the optional archive format and member names) in the args, so the agent
+// never consults the manifest. Without a URL the command keeps its historical
+// manifest behaviour.
+type KernelInstallArgs struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+	// URL is the asset to install; non-empty selects the direct path.
+	URL string `json:"url,omitempty"`
+	// SHA256 is the optional hex sha256 of the archive (direct path only).
+	SHA256 string `json:"sha256,omitempty"`
+	// Size is the optional archive size in bytes (direct path only).
+	Size int64 `json:"size,omitempty"`
+	// Archive is the optional format: gz (default) or tar.gz (direct path).
+	Archive string `json:"archive,omitempty"`
+	// From is the optional archive member a tar.gz takes the binary from;
+	// empty means To (direct path).
+	From string `json:"from,omitempty"`
+	// To is the optional installed file name; empty is the kernel's default
+	// binary (direct path).
+	To string `json:"to,omitempty"`
+}
+
+// KernelRemoveArgs is the args of kernel_remove.
+type KernelRemoveArgs struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+// KernelRemoveResult is the result of a successful kernel_remove. AlreadyAbsent
+// is true when there was nothing to remove: kernel_remove is idempotent, so an
+// already-absent target is a success, not a failure (D-M2).
+//
+// Uninstalled is set only for the Xray kernel when the requested version was
+// its current one: Xray is a service, so removing the current version means
+// uninstalling the kernel (the service is stopped and disabled, its unit file
+// and every installed version are deleted, config.yml is kept). The flag lets
+// the panel and an operator tell that answer apart from the removal of an
+// older version, which leaves the running service untouched.
+type KernelRemoveResult struct {
+	FreedBytes    int64 `json:"freed_bytes"`
+	AlreadyAbsent bool  `json:"already_absent,omitempty"`
+	Uninstalled   bool  `json:"uninstalled,omitempty"`
+}
+
+// KernelRollbackArgs is the args of kernel_rollback.
+type KernelRollbackArgs struct {
+	Name string `json:"name"`
+}
+
+// ComponentRestartArgs is the args of component_restart.
+type ComponentRestartArgs struct {
+	Name string `json:"name"`
+}
 
 // Platform identifies the machine for the panel's capability greying.
 type Platform struct {
@@ -50,6 +145,15 @@ type ConfigRequest struct {
 	Platform     Platform          `json:"platform"`
 	Engines      []string          `json:"engines"`
 	Kernels      map[string]string `json:"kernels,omitempty"`
+	// KernelEntries is the structured installed-kernel list, the same shape the
+	// WebSocket hello carries in hello.kernels. The legacy Kernels map is sent
+	// alongside for one release (design section 3.3).
+	KernelEntries []wsproto.KernelEntry `json:"kernel_entries,omitempty"`
+	// Features is the same capability list the agent declared in
+	// hello.capabilities (docs/WS-PROTOCOL.md section 7 ruling 1). The panel
+	// must only put a desired key into a revision for an agent that declared
+	// the matching capability, because the agent decodes desired strictly.
+	Features []string `json:"features,omitempty"`
 }
 
 // Command is a whitelisted panel command.
@@ -123,6 +227,11 @@ type InstanceStat struct {
 	BytesDown   *uint64 `json:"bytes_down,omitempty"`
 	ConnsActive *uint64 `json:"conns_active,omitempty"`
 	ConnsTotal  *uint64 `json:"conns_total,omitempty"`
+	// FirewallOpen mirrors reconcile.InstanceReport.FirewallOpen: true when the
+	// agent has opened this instance's public ports in the machine's firewall.
+	// The panel reads it against hello.policy.firewall.auto_open, which says
+	// whether this machine manages its firewall at all.
+	FirewallOpen bool `json:"firewall_open"`
 }
 
 // HostStat is the optional machine load; unavailable fields are nil.
@@ -150,7 +259,9 @@ type ReportRequest struct {
 	Health          reconcile.HealthReport `json:"health"`
 	Instances       []InstanceStat         `json:"instances"`
 	Kernels         map[string]string      `json:"kernels,omitempty"`
-	Host            *HostStat              `json:"host,omitempty"`
+	// KernelEntries is the structured installed-kernel list (see ConfigRequest).
+	KernelEntries []wsproto.KernelEntry `json:"kernel_entries,omitempty"`
+	Host          *HostStat             `json:"host,omitempty"`
 }
 
 // ReportResponse is the answer of POST /report. Commands is the fast channel
@@ -184,6 +295,31 @@ type ManifestResponse struct {
 	Raw         []byte // the signed manifest document (200 only)
 	ETag        string // entity tag of Raw (200 only; may be empty)
 }
+
+// BlobRequest is the query of GET /file/<sha256>. SHA256 is the content address
+// of the managed file (lowercase hex); ETag is the entity tag the agent already
+// holds for it and is sent as If-None-Match. The address *is* the content hash,
+// so a 304 can only mean "this machine already has exactly these bytes"
+// (design section 3.6).
+type BlobRequest struct {
+	SHA256 string
+	ETag   string
+}
+
+// BlobResponse is the answer of GET /file/<sha256>. NotModified is true for
+// 304: Raw and ETag are then empty and the cached blob is still current.
+type BlobResponse struct {
+	NotModified bool
+	Raw         []byte // the file content (200 only)
+	ETag        string // entity tag of Raw (200 only; may be empty)
+}
+
+// MaxBlobBytes is the largest managed-file blob the HTTP client accepts. It
+// matches the transport limit of the managed-file path (64 MiB); a bigger body
+// is refused before it is buffered in full. It is independent of
+// maxManifestBytes: the geo files are several megabytes and must not raise the
+// manifest limit.
+const MaxBlobBytes = 64 << 20 // 64 MiB
 
 // APIError is a non-2xx answer of the panel ({"error","message"} body).
 type APIError struct {

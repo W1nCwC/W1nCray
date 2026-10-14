@@ -64,14 +64,32 @@ lib() {
 
 # ---- fixtures ---------------------------------------------------------------
 
+# make_fake_bin PATH [flavor] writes a stand-in for the v11 agent: `version`
+# prints the split format "(agent, <flavor>)", every other command echoes its
+# arguments, and every call is appended to $W1NCRAY_ROOT/bin.log so a test can
+# check the order of the steps.
 make_fake_bin() { # path [flavor]
 	cat >"$1" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >>"${W1NCRAY_ROOT:-/dev/null}/bin.log" 2>/dev/null || true
 case "$1" in
-version) echo "W1nCray vTEST (Xray-core 26.3.27, ${FAKE_FLAVOR:-full})" ;;
+version) echo "W1nCray vTEST (agent, ${FAKE_FLAVOR:-full})" ;;
 init) mkdir -p "$3" && echo "Nodes: []" >"$3/config.yml" && echo "init $3" ;;
 migrate) [ -n "$FAKE_NOWRITE" ] && { echo "ARGS: $*"; exit 0; }; mkdir -p "$5" && echo "migrated" >"$5/config.yml" && echo "migrate $*" ;;
 check) echo "check ok ARGS: $*"; exit "${FAKE_CHECK_RC:-0}" ;;
+*) echo "ARGS: $*" ;;
+esac
+EOF
+	chmod 755 "$1"
+}
+
+# make_single_bin PATH writes a stand-in for a pre-v11 single program: `version`
+# prints the old "(Xray-core ...)" format, which is what marks it for migration.
+make_single_bin() {
+	cat >"$1" <<'EOF'
+#!/bin/sh
+case "$1" in
+version) echo "W1nCray v0.5.3 (Xray-core 26.3.27, full)" ;;
 *) echo "ARGS: $*" ;;
 esac
 EOF
@@ -154,10 +172,12 @@ mock_downloads() {
 	}
 }
 
-# publish ASSETNAME BINFILE adds <asset>.gz and its SHA256SUMS line.
+# publish ASSETNAME BINFILE adds <asset>.gz, its per-asset .sha256 and its
+# SHA256SUMS line (both checksum conventions install.sh accepts).
 publish() {
 	mkdir -p "$W1NCRAY_ROOT/release"
 	gzip -c "$2" >"$W1NCRAY_ROOT/release/$1"
+	sha256sum "$W1NCRAY_ROOT/release/$1" | awk '{print $1}' >"$W1NCRAY_ROOT/release/$1.sha256"
 	printf '%s *%s\n' "$(sha256sum "$W1NCRAY_ROOT/release/$1" | awk '{print $1}')" "$1" >>"$W1NCRAY_ROOT/release/SHA256SUMS"
 }
 
@@ -205,8 +225,17 @@ t_arch() {
 	eq "arm fallbacks v7" "$(arch_fallbacks armv7)" "armv7 armv6 armv5"
 	eq "arm fallbacks v6" "$(arch_fallbacks armv6)" "armv6 armv5"
 	eq "no fallbacks for amd64" "$(arch_fallbacks amd64)" "amd64"
-	eq "asset full" "$(asset_name armv7 full)" "W1nCray-linux-armv7.gz"
-	eq "asset lite" "$(asset_name mipsle lite)" "W1nCray-linux-mipsle-lite.gz"
+	eq "asset full" "$(asset_name v0.7.0 armv7 full)" "w1ncray-v0.7.0-linux-armv7.gz"
+	eq "asset lite" "$(asset_name v0.7.0 mipsle lite)" "w1ncray-v0.7.0-linux-mipsle-lite.gz"
+	eq "legacy asset full" "$(legacy_asset_name armv7 full)" "W1nCray-linux-armv7.gz"
+	eq "legacy asset lite" "$(legacy_asset_name mipsle lite)" "W1nCray-linux-mipsle-lite.gz"
+	# gzip detection: a real gzip stream, a bare ELF, and a missing file.
+	printf 'payload' | gzip -c >"$W1NCRAY_ROOT/gz"
+	printf '\177ELF\002\001\001\000' >"$W1NCRAY_ROOT/elf"
+	check "is_gzip accepts a gzip stream" is_gzip "$W1NCRAY_ROOT/gz"
+	refute "is_gzip rejects a bare ELF" is_gzip "$W1NCRAY_ROOT/elf"
+	refute "is_gzip rejects a missing file" is_gzip "$W1NCRAY_ROOT/nope"
+	rm -f "$W1NCRAY_ROOT/gz" "$W1NCRAY_ROOT/elf"
 }
 
 t_endian_dd_and_hexdump() {
@@ -259,6 +288,15 @@ t_verify() {
 	echo "payload" >"$W1NCRAY_ROOT/f.gz"
 	h="$(sha256sum "$W1NCRAY_ROOT/f.gz" | awk '{print $1}')"
 	mkdir -p "$W1NCRAY_ROOT/release"
+	# v0.7.0+ form: a per-asset <asset>.sha256 next to the asset.
+	printf '%s\n' "$h" >"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	check "matching per-asset checksum passes" verify_sha256 "$W1NCRAY_ROOT/f.gz" w1ncray-v1.2.3-linux-amd64.gz v1.2.3
+	echo tampered >>"$W1NCRAY_ROOT/f.gz"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" w1ncray-v1.2.3-linux-amd64.gz v1.2.3 ) >/dev/null 2>&1 && fail "tampered per-asset file accepted" || pass "a tampered file is rejected against its .sha256"
+	rm -f "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	echo "payload" >"$W1NCRAY_ROOT/f.gz"
+	h="$(sha256sum "$W1NCRAY_ROOT/f.gz" | awk '{print $1}')"
+	# Pre-v0.7.0 form: the combined SHA256SUMS (still the fallback).
 	printf '%s *W1nCray-linux-amd64.gz\n0000 *other.gz\n' "$h" >"$W1NCRAY_ROOT/release/SHA256SUMS"
 	check "matching checksum passes" verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1
 	echo tampered >>"$W1NCRAY_ROOT/f.gz"
@@ -270,7 +308,7 @@ t_verify() {
 	( verify_sha256 "$W1NCRAY_ROOT/f.gz" bad.gz v1 ) >/dev/null 2>&1 && fail "non-hex checksum accepted" || pass "non-hex checksum value is rejected"
 	( verify_sha256 "$W1NCRAY_ROOT/f.gz" empty.gz v1 ) >/dev/null 2>&1 && fail "empty checksum accepted" || pass "empty checksum value is rejected"
 	rm -f "$W1NCRAY_ROOT/release/SHA256SUMS"
-	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "missing SHA256SUMS accepted" || pass "a release without SHA256SUMS is refused"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "missing SHA256SUMS accepted" || pass "a release without any checksum is refused"
 	has "the refusal names the opt-out" "$(cat "$W1NCRAY_ROOT/out")" "--insecure-skip-verify"
 	h="$(sha256sum "$W1NCRAY_ROOT/f.gz" | awk '{print $1}')"
 	printf '%s *W1nCray-linux-amd64.gz\n' "$h" >"$W1NCRAY_ROOT/release/SHA256SUMS"
@@ -279,6 +317,10 @@ t_verify() {
 	# Upper-case hex digests are accepted when they match.
 	printf '%s *W1nCray-linux-amd64.gz\n' "$(printf '%s' "$h" | tr 'a-f' 'A-F')" >"$W1NCRAY_ROOT/release/SHA256SUMS"
 	check "an upper-case digest that matches passes" verify_sha256 "$W1NCRAY_ROOT/f.gz" W1nCray-linux-amd64.gz v1
+	# A malformed per-asset file must not silently fall through to nothing.
+	printf 'not-a-digest\n' >"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	( verify_sha256 "$W1NCRAY_ROOT/f.gz" w1ncray-v1.2.3-linux-amd64.gz v1.2.3 ) >/dev/null 2>&1 && fail "malformed per-asset digest accepted" || pass "a malformed per-asset digest is rejected"
+	rm -f "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
 }
 
 t_verify_opt_out() {
@@ -319,7 +361,8 @@ t_generated_scripts() {
 	be_systemd_install
 	u="$(cat "$W1NCRAY_ROOT/etc/systemd/system/W1nCray.service")"
 	has "systemd unit runs the binary with the config" "$u" "ExecStart=/usr/local/W1nCray/W1nCray -c /etc/W1nCray/config.yml"
-	has "systemd unit restarts on failure" "$u" "Restart=on-failure"
+	has "systemd unit restarts always (ruling 3)" "$u" "Restart=always"
+	hasnt "systemd unit no longer stops after a failure" "$u" "Restart=on-failure"
 	has "systemd unit raises the file limit" "$u" "LimitNOFILE=1048576"
 	hasnt "systemd unit has no placeholders left" "$u" "@"
 
@@ -371,6 +414,8 @@ t_install_fresh() {
 	has "service started" "$(cat "$CALLS")" "start W1nCray"
 	check "geo files downloaded off OpenWRT" test -s "$CONF_DIR/geoip.dat"
 	hasnt "no temp download dir left behind" "$(ls -a "$BIN_DIR")" ".dl."
+	hasnt "a fresh install does not install the Xray kernel" "$(cat "$CALLS")" "W1nCray-xray"
+	has "a fresh install points at the Xray kernel" "$out" "W1nCray xray install"
 }
 
 t_install_xrayr_present() {
@@ -469,7 +514,7 @@ t_install_from_release() {
 	d="$(cat "$DL_LOG")"
 	has "newest release tag is used" "$d" "/releases/download/v9.9.9/W1nCray-linux-armv7.gz"
 	has "falls back to a lower GOARM when the binary cannot run" "$d" "/releases/download/v9.9.9/W1nCray-linux-armv6.gz"
-	has "checksums are fetched" "$d" "/releases/download/v9.9.9/SHA256SUMS"
+	has "checksums are fetched" "$d" "/releases/download/v9.9.9/W1nCray-linux-armv7.gz.sha256"
 	has "fallback is announced" "$out" "尝试更低要求"
 	check "armv6 binary installed" test -x "$BIN"
 	eq "installed binary runs" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
@@ -500,12 +545,13 @@ t_install_verify_policy() {
 	make_fake_bin "$W1NCRAY_ROOT/fakebin"
 	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
 	before="$(cat "$BIN")"
-	# The release has the asset but no SHA256SUMS.
+	# The release has the asset but neither checksum form.
 	mkdir -p "$W1NCRAY_ROOT/release"
 	printf '#!/bin/sh\necho "W1nCray vNEW"\n' >"$W1NCRAY_ROOT/newbin"
+	rm -f "$W1NCRAY_ROOT/release/W1nCray-linux-amd64.gz.sha256"
 	gzip -c "$W1NCRAY_ROOT/newbin" >"$W1NCRAY_ROOT/release/W1nCray-linux-amd64.gz"
 
-	( cmd_install --version v1.2.3 --no-geo ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "unverifiable release installed" || pass "a release without SHA256SUMS is refused"
+	( cmd_install --version v1.2.3 --no-geo ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "unverifiable release installed" || pass "a release without any checksum is refused"
 	has "the refusal names the opt-out" "$(cat "$W1NCRAY_ROOT/out")" "--insecure-skip-verify"
 	eq "binary unchanged after the refusal" "$(cat "$BIN")" "$before"
 	hasnt "no temp download dir left after the refusal" "$(ls -a "$BIN_DIR")" ".dl."
@@ -530,6 +576,57 @@ t_install_verify_policy() {
 	has "help documents the flag" "$(usage)" "--insecure-skip-verify"
 }
 
+# The v0.7.0 asset convention: versioned names plus a per-asset <asset>.sha256,
+# and the bare (ungzipped) primary asset.
+t_install_versioned_asset() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	make_fake_bin "$W1NCRAY_ROOT/vbin"
+	mkdir -p "$W1NCRAY_ROOT/release"
+	# The .gz form, with its per-asset checksum.
+	gzip -c "$W1NCRAY_ROOT/vbin" >"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz"
+	printf '%s\n' "$(sha256sum "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz" | awk '{print $1}')" \
+		>"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	: >"$DL_LOG"
+	cmd_install --version v1.2.3 --no-geo >/dev/null 2>&1
+	d="$(cat "$DL_LOG")"
+	has "the versioned asset name is used" "$d" "/releases/download/v1.2.3/w1ncray-v1.2.3-linux-amd64.gz"
+	has "the per-asset checksum is fetched" "$d" "/releases/download/v1.2.3/w1ncray-v1.2.3-linux-amd64.gz.sha256"
+	hasnt "no legacy name is tried when the versioned one exists" "$d" "W1nCray-linux-amd64.gz"
+	eq "the versioned asset is installed" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
+
+	# The bare (ungzipped) primary asset installs too: gzip magic decides.
+	rm -f "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.gz"*
+	cp "$W1NCRAY_ROOT/vbin" "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64"
+	printf '%s\n' "$(sha256sum "$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64" | awk '{print $1}')" \
+		>"$W1NCRAY_ROOT/release/w1ncray-v1.2.3-linux-amd64.sha256"
+	: >"$DL_LOG"
+	cmd_install --version v1.2.3 --no-geo >/dev/null 2>&1
+	has "the bare asset is tried first" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/w1ncray-v1.2.3-linux-amd64"
+	eq "the bare asset is installed" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
+	hasnt "no .gz name is needed for a bare asset" "$(cat "$DL_LOG")" "w1ncray-v1.2.3-linux-amd64.gz"
+}
+
+# A release that only has the pre-v0.7.0 names still installs (the fallback).
+t_install_legacy_name_fallback() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	make_fake_bin "$W1NCRAY_ROOT/lbin"
+	publish W1nCray-linux-amd64.gz "$W1NCRAY_ROOT/lbin"
+	: >"$DL_LOG"
+	cmd_install --version v0.6.0 --no-geo >/dev/null 2>&1
+	d="$(cat "$DL_LOG")"
+	has "the versioned name is tried first" "$d" "/releases/download/v0.6.0/w1ncray-v0.6.0-linux-amd64.gz"
+	has "the legacy name is the fallback" "$d" "/releases/download/v0.6.0/W1nCray-linux-amd64.gz"
+	eq "the legacy release still installs" "$("$BIN" version | head -n1 | cut -c1-13)" "W1nCray vTEST"
+}
+
 t_update_version_shorthand() {
 	mock_backend
 	mock_downloads
@@ -545,6 +642,117 @@ t_update_version_shorthand() {
 	: >"$DL_LOG"
 	cmd_update --version v1.2.4 --no-geo >/dev/null 2>&1
 	has "update --version still works" "$(cat "$DL_LOG")" "/releases/download/v1.2.4/W1nCray-linux-amd64.gz"
+}
+
+# A pre-v11 single program with Xray nodes migrates to agent + kernel: both
+# downloads happen before the old service stops, and the kernel service starts
+# before the agent comes back.
+t_update_migrates_single_program() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	mkdir -p "$BIN_DIR" "$CONF_DIR"
+	make_single_bin "$BIN"
+	printf 'Nodes:\n  - ApiConfig:\n      ApiHost: "a"\n    NodeID: 173\n' >"$CONF"
+	: >"$ST/W1nCray.exists"
+	: >"$ST/W1nCray.active"
+	: >"$ST/W1nCray.enabled"
+	# The new agent logs its own invocations into the same calls.log, so the
+	# order of the whole sequence is observable in one file.
+	cat >"$W1NCRAY_ROOT/newbin" <<'EOF'
+#!/bin/sh
+printf 'bin %s\n' "$*" >>"$W1NCRAY_ROOT/calls.log"
+case "$1" in
+version) echo "W1nCray vTEST (agent, full)" ;;
+*) echo "ARGS: $*" ;;
+esac
+EOF
+	chmod 755 "$W1NCRAY_ROOT/newbin"
+	publish W1nCray-linux-amd64.gz "$W1NCRAY_ROOT/newbin"
+	make_fake_bin "$W1NCRAY_ROOT/xraybin"
+	publish W1nCray-xray-linux-amd64.gz "$W1NCRAY_ROOT/xraybin"
+	: >"$DL_LOG"
+	: >"$CALLS"
+	out="$(cmd_install --version v1.2.3 --no-geo 2>&1)"
+	has "migration downloads the agent" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/W1nCray-linux-amd64.gz"
+	has "migration downloads the Xray kernel" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/W1nCray-xray-linux-amd64.gz"
+	has "the kernel is installed from the file" "$(cat "$CALLS")" "xray install --file"
+	has "the sha256 is passed through" "$(cat "$CALLS")" "--sha256"
+	has "the interruption is explained" "$out" "中断"
+	_stop="$(grep -n '^stop W1nCray$' "$CALLS" | head -n1 | cut -d: -f1)"
+	_kern="$(grep -n 'bin .*xray install' "$CALLS" | head -n1 | cut -d: -f1)"
+	_restart="$(grep -n '^restart W1nCray$' "$CALLS" | head -n1 | cut -d: -f1)"
+	if [ -n "$_stop" ] && [ -n "$_kern" ] && [ -n "$_restart" ] && [ "$_stop" -lt "$_kern" ] && [ "$_kern" -lt "$_restart" ]; then
+		pass "order: stop old -> install Xray kernel -> start agent"
+	else
+		fail "order: stop old -> install Xray kernel -> start agent (stop=$_stop kernel=$_kern restart=$_restart)"
+	fi
+}
+
+# A v11 agent with nodes only updates the agent: the Xray kernel asset is never
+# downloaded and no kernel install is attempted.
+t_update_agent_only() {
+	mock_backend
+	mock_downloads
+	W1NCRAY_SELF="$SCRIPT"
+	W1NCRAY_UNAME_M=x86_64
+	export W1NCRAY_UNAME_M
+	mkdir -p "$BIN_DIR" "$CONF_DIR"
+	make_fake_bin "$BIN"
+	printf 'Nodes:\n  - ApiConfig:\n      ApiHost: "a"\n    NodeID: 173\n' >"$CONF"
+	: >"$ST/W1nCray.exists"
+	: >"$ST/W1nCray.active"
+	publish W1nCray-linux-amd64.gz "$W1NCRAY_ROOT/fakebin"
+	: >"$DL_LOG"
+	: >"$W1NCRAY_ROOT/bin.log"
+	cmd_install --version v1.2.3 --no-geo >/dev/null 2>&1
+	has "the agent is downloaded" "$(cat "$DL_LOG")" "/releases/download/v1.2.3/W1nCray-linux-amd64.gz"
+	hasnt "no Xray kernel asset is downloaded" "$(cat "$DL_LOG")" "W1nCray-xray-linux"
+	hasnt "no Xray kernel is installed" "$(cat "$W1NCRAY_ROOT/bin.log")" "xray install"
+}
+
+# Uninstall stops and removes the Xray kernel service through the program's own
+# command; when that command fails the script cleans the service up by backend.
+t_uninstall_removes_xray() {
+	mock_backend
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	: >"$W1NCRAY_ROOT/bin.log"
+	cmd_uninstall -y >/dev/null 2>&1
+	has "uninstall runs the program's xray remove" "$(cat "$W1NCRAY_ROOT/bin.log")" "xray remove"
+	refute "binary removed" test -e "$BIN"
+}
+
+t_uninstall_xray_backend_fallback() {
+	mock_backend
+	W1NCRAY_SELF="$SCRIPT"
+	cat >"$W1NCRAY_ROOT/fakebin" <<'EOF'
+#!/bin/sh
+case "$1" in
+version) echo "W1nCray vTEST (agent, full)" ;;
+init) mkdir -p "$3" && echo "Nodes: []" >"$3/config.yml" ;;
+check) exit 0 ;;
+*) exit 1 ;;
+esac
+EOF
+	chmod 755 "$W1NCRAY_ROOT/fakebin"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo >/dev/null 2>&1
+	: >"$CALLS"
+	cmd_uninstall -y >/dev/null 2>&1
+	has "fallback stops the Xray service" "$(cat "$CALLS")" "stop W1nCray-xray"
+	has "fallback removes the Xray service file" "$(cat "$CALLS")" "remove W1nCray-xray"
+}
+
+t_xray_dispatch() {
+	mock_backend
+	mkdir -p "$BIN_DIR"
+	make_fake_bin "$BIN"
+	AS_MANAGER=1
+	eq "xray status passes through with the config" "$(dispatch xray status 2>&1)" "ARGS: -c $CONF xray status"
+	eq "xray install passes its flags through" "$(dispatch xray install --file /tmp/x.gz --sha256 ab 2>&1)" "ARGS: -c $CONF xray install --file /tmp/x.gz --sha256 ab"
 }
 
 t_space_check() {
@@ -648,6 +856,27 @@ t_manager_dispatch() {
 	has "installer without arguments prints usage" "$(dispatch </dev/null 2>&1)" "W1nCray 管理命令"
 }
 
+t_log_hint() {
+	mock_backend
+	BACKEND=systemd
+	eq "systemd log" "$(log_hint)" "journalctl -u W1nCray"
+	eq "systemd follow" "$(log_hint follow)" "journalctl -u W1nCray -f"
+	BACKEND=openrc
+	eq "OpenRC log" "$(log_hint)" "tail -n 100 $ROOT/var/log/W1nCray.log"
+	eq "OpenRC follow" "$(log_hint follow)" "tail -f $ROOT/var/log/W1nCray.log"
+	BACKEND=procd
+	eq "procd log" "$(log_hint)" "logread -e W1nCray"
+	eq "procd follow" "$(log_hint follow)" "logread -f -e W1nCray"
+	# The hints must never name a `log` subcommand the program does not have
+	# (REG2 observation 2): they name the detected backend's real command.
+	hasnt "panel hint does not name a log subcommand" "$(panel_hint https://panel.example 7 0 2>&1)" "W1nCray log"
+	has "panel hint names the backend command" "$(panel_hint https://panel.example 7 0 2>&1)" "logread -f -e W1nCray"
+	has "usage names the backend command" "$(usage 2>&1)" "logread -f -e W1nCray"
+	hasnt "usage does not advertise a log subcommand" "$(usage 2>&1)" "W1nCray log"
+	# The Xray kernel's own commands are not agent subcommands.
+	hasnt "usage does not pass x25519 to the agent" "$(usage 2>&1)" "W1nCray x25519"
+}
+
 t_menu() {
 	mock_backend
 	mkdir -p "$BIN_DIR"
@@ -658,6 +887,7 @@ t_menu() {
 	has "menu shows the title" "$out" "W1nCray 管理菜单"
 	has "menu shows the state" "$out" "运行中"
 	has "choice 4 runs status" "$out" "服务管理器: mock"
+	has "menu lists the Xray kernel" "$out" "Xray 内核"
 	has "invalid choices are rejected" "$out" "无效的选择"
 	out="$(printf '2\n0\n' | menu 2>&1)"
 	refute "choice 2 stops the service" be_mock_active W1nCray
@@ -773,17 +1003,21 @@ t_install_panel() {
 		"$(wc -c <"$CONF_DIR/agent.token" | tr -d '[:space:]')" \
 		"$(printf '%s' "$tok" | wc -c | tr -d '[:space:]')"
 	cfg="$(cat "$CONF")"
-	check "config enables the agent" grep -qx 'Agent:' "$CONF"
-	check "config enables the panel" grep -qx '  Panel:' "$CONF"
-	check "config has the state dir" grep -qx "  StateDir: \"$CONF_DIR/state\"" "$CONF"
-	check "config has the default port range" grep -qx '    PortRange: \[20000, 40000\]' "$CONF"
-	refute "config does not restrict the engines" grep -q 'AllowEngines' "$CONF"
-	check "config listens on all addresses" grep -qx '    AllowListen: \["0.0.0.0"\]' "$CONF"
-	check "the trailing slash is stripped from the URL" grep -qx '    URL: "https://panel.example.com"' "$CONF"
-	check "config has the machine id" grep -qx '    MachineID: 3' "$CONF"
-	check "config points at the token file" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$CONF"
-	check "config turns on machine nodes" grep -qx '    MachineNodes: true' "$CONF"
-	hasnt "config never contains the token" "$cfg" "$tok"
+	agent="$(cat "$AGENT_CONF")"
+	refute "config.yml has no Agent block any more" grep -qx 'Agent:' "$CONF"
+	check "agent.yml enables the agent" grep -qx 'Enabled: true' "$AGENT_CONF"
+	check "agent.yml enables the panel" grep -qx 'Panel:' "$AGENT_CONF"
+	check "agent.yml has the state dir" grep -qx "StateDir: \"$CONF_DIR/state\"" "$AGENT_CONF"
+	check "agent.yml has the default port range" grep -qx '  PortRange: \[20000, 40000\]' "$AGENT_CONF"
+	refute "agent.yml does not restrict the engines" grep -q 'AllowEngines' "$AGENT_CONF"
+	check "agent.yml listens on all addresses" grep -qx '  AllowListen: \["0.0.0.0"\]' "$AGENT_CONF"
+	check "the trailing slash is stripped from the URL" grep -qx '  URL: "https://panel.example.com"' "$AGENT_CONF"
+	check "agent.yml has the machine id" grep -qx '  MachineID: 3' "$AGENT_CONF"
+	check "agent.yml points at the token file" grep -qx "  TokenFile: \"$CONF_DIR/agent.token\"" "$AGENT_CONF"
+	check "agent.yml turns on machine nodes" grep -qx '  MachineNodes: true' "$AGENT_CONF"
+	refute "agent.yml leaves the terminal at its default (ON)" grep -qx 'Terminal: {Enabled: false}' "$AGENT_CONF"
+	hasnt "config.yml never contains the token" "$cfg" "$tok"
+	hasnt "agent.yml never contains the token" "$agent" "$tok"
 	hasnt "the installer never prints the token" "$out" "$tok"
 	has "the installer reports the panel link" "$out" "已关联面板"
 	has "the installer points at the log" "$out" "查看日志"
@@ -811,6 +1045,8 @@ t_install_panel_missing_args() {
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --port-range 20000-30000 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--port-range without --panel accepted" || pass "--port-range without --panel is refused"
 	has "the refusal explains the scope" "$(cat "$W1NCRAY_ROOT/out")" "--panel"
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --allow-http ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--allow-http without --panel accepted" || pass "--allow-http without --panel is refused"
+	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --noterminal ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "--noterminal without --panel accepted" || pass "--noterminal without --panel is refused"
+	has "that refusal names --noterminal too" "$(cat "$W1NCRAY_ROOT/out")" "--noterminal"
 	refute "nothing is installed after a bad invocation" test -e "$BIN"
 	refute "no token file after a bad invocation" test -e "$CONF_DIR/agent.token"
 }
@@ -840,13 +1076,14 @@ t_install_panel_http() {
 	refute "nothing is installed after an http refusal" test -e "$BIN"
 	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel http://panel.example.com --machine 3 --token t --allow-http 2>&1)"
 	eq "--allow-http installs" "$?" 0
-	check "the config records the insecure-http opt-in" grep -qx '    AllowInsecureHTTP: true' "$CONF"
-	# A loopback http panel is allowed without the opt-in.
-	rm -f "$CONF"
+	check "agent.yml records the insecure-http opt-in" grep -qx '  AllowInsecureHTTP: true' "$AGENT_CONF"
+	# A loopback http panel is allowed without the opt-in. A live agent.yml is
+	# never overwritten, so the fixture is removed first.
+	rm -f "$CONF" "$AGENT_CONF"
 	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel http://127.0.0.1:8080 --machine 3 --token t 2>&1)"
 	eq "loopback http is allowed" "$?" 0
-	check "the loopback URL is kept" grep -qx '    URL: "http://127.0.0.1:8080"' "$CONF"
-	refute "loopback http needs no opt-in" grep -qx '    AllowInsecureHTTP: true' "$CONF"
+	check "the loopback URL is kept" grep -qx '  URL: "http://127.0.0.1:8080"' "$AGENT_CONF"
+	refute "loopback http needs no opt-in" grep -qx '  AllowInsecureHTTP: true' "$AGENT_CONF"
 	# Other schemes are refused.
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel ftp://panel.example.com --machine 3 --token t ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "ftp accepted" || pass "a non-http scheme is refused"
 	has "the refusal asks for https" "$(cat "$W1NCRAY_ROOT/out")" "https://"
@@ -866,8 +1103,9 @@ t_install_panel_token_file() {
 	eq "the copied token has no newline" \
 		"$(wc -c <"$CONF_DIR/agent.token" | tr -d '[:space:]')" \
 		"$(printf '%s' "$tok" | wc -c | tr -d '[:space:]')"
-	check "config points at the copied token" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$CONF"
-	hasnt "the config never holds the token" "$(cat "$CONF")" "$tok"
+	check "agent.yml points at the copied token" grep -qx "  TokenFile: \"$CONF_DIR/agent.token\"" "$AGENT_CONF"
+	hasnt "config.yml never holds the token" "$(cat "$CONF")" "$tok"
+	hasnt "agent.yml never holds the token" "$(cat "$AGENT_CONF")" "$tok"
 	hasnt "the output never holds the token" "$out" "$tok"
 	# A missing token file is refused before anything is installed.
 	rm -rf "$BIN_DIR" "$CONF_DIR"
@@ -890,23 +1128,26 @@ t_install_panel_keeps_config() {
 	make_fake_bin "$W1NCRAY_ROOT/fakebin"
 	W1NCRAY_SELF="$SCRIPT"
 	mkdir -p "$CONF_DIR"
-	# An existing config without static `Nodes:` entries: the machine-mode
-	# config still goes to config.panel.yml.new for a manual merge.
+	# An existing config without static `Nodes:` entries: config.yml is kept and
+	# the agent configuration is written to its own agent.yml.
 	printf 'Log: {Level: info}\nAgent:\n  Enabled: false\n' >"$CONF"
 	before="$(cat "$CONF")"
 	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
 		--panel https://panel.example.com --machine 9 --token t --port-range 30000-31000 2>&1)"
 	eq "an existing config does not fail the install" "$?" 0
 	eq "the existing config is untouched" "$(cat "$CONF")" "$before"
-	new="$CONF_DIR/config.panel.yml.new"
-	check "the new config goes to config.panel.yml.new" test -f "$new"
-	check ".new has the requested port range" grep -qx '    PortRange: \[30000, 31000\]' "$new"
-	check ".new has the machine id" grep -qx '    MachineID: 9' "$new"
-	check ".new points at the token file" grep -qx "    TokenFile: \"$CONF_DIR/agent.token\"" "$new"
-	refute ".new does not restrict the engines" grep -q 'AllowEngines' "$new"
+	new="$AGENT_CONF"
+	check "the agent config goes to agent.yml" test -f "$new"
+	refute "no config.panel.yml.new is written any more" test -e "$CONF_DIR/config.panel.yml.new"
+	check "agent.yml has the requested port range" grep -qx '  PortRange: \[30000, 31000\]' "$new"
+	check "agent.yml has the machine id" grep -qx '  MachineID: 9' "$new"
+	check "agent.yml points at the token file" grep -qx "  TokenFile: \"$CONF_DIR/agent.token\"" "$new"
+	refute "agent.yml does not restrict the engines" grep -q 'AllowEngines' "$new"
 	has "the admin is warned the config was kept" "$out" "未覆盖"
-	has "the admin is told how to merge" "$out" "合并"
-	has "the pending hint says the link is not active yet" "$out" "配置尚未生效"
+	has "the admin is told no manual merge is needed" "$out" "无需手工合并"
+	has "the stale config.yml Agent block is called out" "$out" "会被忽略"
+	has "the panel hint says the link is active" "$out" "已关联面板"
+	hasnt "the link is no longer pending" "$out" "配置尚未生效"
 	check "the token file is written even then" test -f "$CONF_DIR/agent.token"
 	has "the service still starts" "$(cat "$CALLS")" "start W1nCray"
 	# A malformed range is refused.
@@ -914,10 +1155,11 @@ t_install_panel_keeps_config() {
 	has "the refusal explains the range" "$(cat "$W1NCRAY_ROOT/out")" "--port-range"
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 9 --token t --port-range 20000 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a range without '-' was accepted" || pass "a range without '-' is refused"
 	( cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel https://p.example.com --machine 9 --token t --port-range 0-100 ) >"$W1NCRAY_ROOT/out" 2>&1 && fail "a zero port was accepted" || pass "a zero port is refused"
-	# A '#' in the URL must survive YAML quoting.
-	rm -f "$CONF"
+	# A '#' in the URL must survive YAML quoting. A live agent.yml is never
+	# overwritten, so the fixture is removed first.
+	rm -f "$CONF" "$AGENT_CONF"
 	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo --panel 'https://panel.example.com/x#y' --machine 9 --token t >/dev/null 2>&1
-	check "a # in the URL is quoted so YAML keeps it" grep -qx '    URL: "https://panel.example.com/x#y"' "$CONF"
+	check "a # in the URL is quoted so YAML keeps it" grep -qx '  URL: "https://panel.example.com/x#y"' "$AGENT_CONF"
 }
 
 t_install_panel_static_nodes() {
@@ -956,6 +1198,46 @@ t_install_panel_static_nodes() {
 	hasnt "link is never run by the installer" "$out" "ARGS: link"
 	check "the token file is written" test -f "$CONF_DIR/agent.token"
 	has "the service still starts" "$(cat "$CALLS")" "start W1nCray"
+}
+
+t_install_panel_agent_yml() {
+	mock_backend
+	mock_downloads
+	make_fake_bin "$W1NCRAY_ROOT/fakebin"
+	W1NCRAY_SELF="$SCRIPT"
+	# A fresh install with --noterminal writes the local opt-out into agent.yml.
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t --noterminal 2>&1)"
+	eq "--noterminal installs" "$?" 0
+	check "--noterminal disables the terminal in agent.yml" grep -qx 'Terminal: {Enabled: false}' "$AGENT_CONF"
+	check "agent.yml links machine 4" grep -qx '  MachineID: 4' "$AGENT_CONF"
+	# A repeat install is idempotent: a live agent.yml is not touched and no
+	# backup is made for it. --noterminal cannot be applied to a kept file, so
+	# the installer says so.
+	before="$(cat "$AGENT_CONF")"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t --noterminal 2>&1)"
+	eq "a repeat install succeeds" "$?" 0
+	eq "the live agent.yml is untouched" "$(cat "$AGENT_CONF")" "$before"
+	has "the admin is told the file was kept" "$out" "未覆盖"
+	has "the ignored --noterminal is called out" "$out" "--noterminal 未写入"
+	refute "no backup is written for a kept agent.yml" sh -c 'ls "$1".bak-* >/dev/null 2>&1' sh "$AGENT_CONF"
+	# An agent.yml that does not link to a panel is replaced, with a backup.
+	printf 'Enabled: true\nStateDir: old\n' >"$AGENT_CONF"
+	cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t >/dev/null 2>&1
+	check "the panel link replaced the stale agent.yml" grep -qx '  MachineID: 4' "$AGENT_CONF"
+	eq "the previous agent.yml was backed up" \
+		"$(ls "$AGENT_CONF".bak-* 2>/dev/null | wc -l | tr -d '[:space:]')" 1
+	check "the backup holds the previous content" grep -qx 'StateDir: old' "$AGENT_CONF".bak-*
+	# --noterminal is forwarded to the link command printed for static nodes.
+	rm -f "$AGENT_CONF" "$CONF"
+	printf 'Nodes:\n  - ApiConfig: {ApiHost: "https://x", ApiKey: k, NodeID: 173}\n' >"$CONF"
+	out="$(cmd_install --binary "$W1NCRAY_ROOT/fakebin" --no-geo \
+		--panel https://panel.example.com --machine 4 --token t --noterminal 2>&1)"
+	eq "a static-node install succeeds" "$?" 0
+	has "the link hint carries --noterminal" "$out" "--token-file $CONF_DIR/agent.token --noterminal --dry-run"
+	refute "no agent.yml is written for static nodes" test -e "$AGENT_CONF"
 }
 
 t_install_without_panel_unchanged() {
@@ -1004,10 +1286,12 @@ run() { # name
 
 for t in t_arch t_endian_dd_and_hexdump t_flavor_and_backend t_latest_tag t_verify t_verify_opt_out t_generated_scripts \
 	t_install_fresh t_install_xrayr_present t_install_check_fails t_install_openwrt \
-	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy t_update_version_shorthand t_space_check t_switch_rollback \
-	t_manager_dispatch t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
+	t_install_flavor_prefix_upgrade t_install_from_release t_install_verify_policy \
+	t_install_versioned_asset t_install_legacy_name_fallback t_update_version_shorthand t_space_check t_switch_rollback \
+	t_update_migrates_single_program t_update_agent_only t_uninstall_removes_xray t_uninstall_xray_backend_fallback t_xray_dispatch \
+	t_manager_dispatch t_log_hint t_menu t_uninstall t_uninstall_openwrt_sysupgrade t_uninstall_refuses_odd_paths t_none_backend \
 	t_install_panel t_install_panel_missing_args t_install_panel_bad_id t_install_panel_http \
-	t_install_panel_token_file t_install_panel_keeps_config t_install_panel_static_nodes t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
+	t_install_panel_token_file t_install_panel_keeps_config t_install_panel_static_nodes t_install_panel_agent_yml t_install_without_panel_unchanged t_uninstall_removes_agent_token; do
 	run "$t"
 done
 

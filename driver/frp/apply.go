@@ -486,6 +486,67 @@ func (d *Driver) settle(ctx context.Context, a adminInfo) {
 	}
 }
 
+// RestartInstances implements driver.Driver: it restarts the frps/frpc process
+// of each named instance with the same configuration it is already running, so
+// files the process read at start-up (a tunnel certificate pair, or the trust
+// anchor a bridge verifies the portal with, that a managed-file change
+// replaced) are read again.
+//
+// frp has one process per instance (frps for a portal, frpc for a bridge), so
+// only the named instances' processes are replaced; every other instance keeps
+// its process and its connections. The process id is the one the supervisor
+// owns (procID(u)): no process is ever looked up or killed by name. An id that
+// is not part of the current set is skipped, and a restart failure is reported
+// per instance while the rest are still attempted.
+func (d *Driver) RestartInstances(ctx context.Context, rt driver.Runtime, ids []string) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if rt.Sup == nil {
+		return nil, errors.New("frp: no supervisor in runtime")
+	}
+	sup, ok := rt.Sup.(interface {
+		Restart(ctx context.Context, id string) error
+	})
+	if !ok {
+		return nil, errors.New("frp: this supervisor cannot restart a single process")
+	}
+	if err := d.loadCurrent(rt); err != nil {
+		return nil, err
+	}
+	cur := d.snapshotCurrent()
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	var (
+		out  []string
+		errs []error
+	)
+	for _, id := range sortedKeys(want) {
+		u, known := cur[id]
+		if !known || !rt.Sup.Status(procID(u)).Running {
+			continue
+		}
+		if err := sup.Restart(ctx, procID(u)); err != nil {
+			errs = append(errs, fmt.Errorf("instance %s: %w", id, err))
+			continue
+		}
+		// A restarted frps starts its traffic counters from zero again.
+		d.rebaseStats(id)
+		out = append(out, id)
+		if rt.Log != nil {
+			rt.Log.Infof("frp: instance %s restarted (a managed file it references changed)", id)
+		}
+	}
+	if len(errs) > 0 {
+		return out, errors.Join(errs...)
+	}
+	return out, nil
+}
+
 // Stop implements driver.Driver: it stops the processes of the given
 // instances (all when ids is empty). Stopping the process closes every
 // established connection of that instance.

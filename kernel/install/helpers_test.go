@@ -99,6 +99,21 @@ func sum(b []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
+// mkGz is a raw gzip stream: exactly one file, no member name. It is the shape
+// release/build.sh produces (dist/W1nCray-linux-<arch>.gz).
+func mkGz(t testing.TB, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
 // fakeBin is a stand-in executable whose "version" the test Check reads.
 func fakeBin(version string, pad int) []byte {
 	return append([]byte("#!/bin/sh\n# FAKEKERNEL version="+version+"\n"), bytes.Repeat([]byte("x"), pad)...)
@@ -185,6 +200,7 @@ type kern struct {
 	Archive       []byte // the archive served
 	Members       map[string][]byte
 	Extract       map[string]string // member -> to
+	RunBinary     string            // manifest run.binary; "gost" when empty
 	URLs          []string
 	Variant       string
 	Null          bool // target null for the fixture platform
@@ -209,22 +225,34 @@ func (f *fixture) build(k kern) (manifest.Kernel, []byte) {
 	if k.Mode == "" {
 		k.Mode = "0755"
 	}
+	if k.RunBinary == "" {
+		k.RunBinary = "gost"
+	}
 	archive := k.Archive
 	if archive == nil {
-		var es []tarEntry
-		for n, d := range k.Members {
-			es = append(es, tarEntry{Name: n, Data: d})
-		}
-		if k.Format == manifest.ArchiveZip {
-			archive = mkZip(f.t, es...)
+		if k.Format == manifest.ArchiveGz {
+			// A raw gzip stream holds one file; the single extract member names it.
+			var data []byte
+			for member := range k.Extract {
+				data = k.Members[member]
+			}
+			archive = mkGz(f.t, data)
 		} else {
-			archive = mkTarGz(f.t, es...)
+			var es []tarEntry
+			for n, d := range k.Members {
+				es = append(es, tarEntry{Name: n, Data: d})
+			}
+			if k.Format == manifest.ArchiveZip {
+				archive = mkZip(f.t, es...)
+			} else {
+				archive = mkTarGz(f.t, es...)
+			}
 		}
 	}
 	mk := manifest.Kernel{
 		Name: k.Name, Version: k.Version, Channel: "stable", MinAgent: k.MinAgent,
 		License: manifest.License{SPDX: "MIT", SourceURL: "https://example.com/src"},
-		Run:     manifest.Run{Binary: "gost", VersionCmd: []string{"-V"}},
+		Run:     manifest.Run{Binary: k.RunBinary, VersionCmd: []string{"-V"}},
 		Targets: map[string]*manifest.Target{},
 		Revoked: k.Revoked,
 	}

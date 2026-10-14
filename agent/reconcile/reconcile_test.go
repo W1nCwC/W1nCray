@@ -24,6 +24,11 @@ import (
 const secretA = "SECRET-AAAAAAAAAAAAAAAA-1"
 const secretB = "SECRET-BBBBBBBBBBBBBBBB-2"
 
+// fakeEngines keeps the engine-agnostic reconciler tests driving a fake engine
+// named "xray": the real forwarding engine was removed (PLAN v11 §2.5), but
+// the reconciler machinery is tested with fakes and the name is only a label.
+var fakeEngines = []string{spec.EngineAuto, spec.EngineXray, spec.EngineGost, spec.EngineFrp, spec.EngineRealm}
+
 // ---- fakes ---------------------------------------------------------------
 
 type testLog struct {
@@ -157,7 +162,7 @@ func (e *env) newReconciler() *Reconciler {
 		State:           e.st,
 		Ports:           e.ports,
 		Log:             e.log,
-		ValidateOpts:    validate.Options{Resolver: noDNS{}},
+		ValidateOpts:    validate.Options{Resolver: noDNS{}, Engines: fakeEngines},
 		HealthWindow:    300 * time.Millisecond,
 		HealthInterval:  10 * time.Millisecond,
 		RollbackTimeout: 5 * time.Second,
@@ -331,7 +336,7 @@ func TestExplicitEngineCapabilityRefusals(t *testing.T) {
 			in := entry(t, "x", "gost", secretA)
 			in.Tunnel.Security = "vless_enc"
 			return in
-		}, nil, "only supported by the xray engine"}, // caught by validation before engines are considered
+		}, nil, "已随 xray 转发引擎移除"}, // caught by validation before engines are considered
 		{"unknown driver", func(t *testing.T) spec.Instance { return fwd(t, "x", "frp") }, nil, "no driver for this engine"},
 		{"proxy out unsupported", func(t *testing.T) spec.Instance {
 			in := realmFwd(t)
@@ -375,20 +380,26 @@ func TestExplicitEngineCapabilityRefusals(t *testing.T) {
 	}
 }
 
-func TestVlessEncAutoSelectsOnlyXray(t *testing.T) {
+// TestVlessEncRemoved pins PLAN v11 §2.5: the vless_enc tunnel security existed
+// for the embedded xray engine only and is refused by validation now, before
+// any engine is considered.
+func TestVlessEncRemoved(t *testing.T) {
 	e := newEnv(t)
 	in := entry(t, "v", "auto", secretA)
 	in.Tunnel.Type = "tcp"
 	in.Tunnel.Security = "vless_enc"
-	rep := e.mustApply(desired(1, in))
-	if got := inst(rep, "v"); got.Engine != "xray" {
-		t.Fatalf("%+v", got)
+	rep, err := e.apply(desired(1, in))
+	if !errors.Is(err, ErrRejected) || len(rep.ValidationErrors) == 0 {
+		t.Fatalf("%v\n%s", err, dumpReport(rep))
 	}
-	// without xray there is no engine, and the reason says why
+	if got := inst(rep, "v"); !strings.Contains(got.Error, "vless_enc 已随 xray 转发引擎移除") {
+		t.Fatalf("instance error = %q", got.Error)
+	}
+	// It is refused whatever engines are registered: no driver is consulted.
 	e2 := newEnv(t)
 	e2.r.Drivers = map[string]driver.Driver{"gost": e2.gost}
-	rep, err := e2.apply(desired(1, in))
-	if !errors.Is(err, ErrRejected) || !strings.Contains(inst(rep, "v").Error, "gost: vless_enc security requires the xray engine") {
+	rep, err = e2.apply(desired(1, in))
+	if !errors.Is(err, ErrRejected) || !strings.Contains(inst(rep, "v").Error, "vless_enc 已随 xray 转发引擎移除") {
 		t.Fatalf("%v\n%s", err, dumpReport(rep))
 	}
 }

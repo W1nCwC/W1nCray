@@ -60,6 +60,8 @@ func (d *Driver) tunnelCommon(in spec.Instance, tcp, udp bool) (tunnelInfo, erro
 		}
 	case "tls_pin":
 		return ti, fieldErr("tunnel.security", "realm cannot pin certificates (it verifies against the built-in Mozilla roots only)")
+	case "tls_self":
+		return ti, fieldErr("tunnel.security", "realm cannot verify a self-signed certificate (it trusts the built-in public CA roots only); use the gost or xray engine for security tls_self")
 	case "vless_enc":
 		return ti, fieldErr("tunnel.security", "VLESS encryption exists in the xray engine only")
 	default:

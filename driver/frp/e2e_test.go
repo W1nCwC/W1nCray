@@ -56,7 +56,7 @@ func newEnv(t testing.TB) *env {
 	if err := os.Chmod(e.state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	e.d = New()
+	e.d = New(Options{})
 	e.rt = driver.Runtime{
 		Kernel:   driver.Installed{Path: e.frps, Version: "test"},
 		StateDir: e.state,
