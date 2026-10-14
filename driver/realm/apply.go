@@ -483,6 +483,72 @@ func (d *Driver) restore(ctx context.Context, rt driver.Runtime, id string, g in
 	return d.waitReady(ctx, rt, id, g.portClaims(id))
 }
 
+// RestartInstances implements driver.Driver: it restarts the supervised
+// process of each named instance with the same configuration it is already
+// running, so files the process read at start-up (a tunnel certificate pair
+// that a managed-file change replaced) are read again.
+//
+// realm has one process per instance, so only the named instances' processes
+// are replaced; every other instance keeps its process and its connections.
+// The process id is the one the supervisor owns (procPrefix + id): no process
+// is ever looked up or killed by name. An id that is not part of the last
+// applied state is skipped (it is not running), and a restart failure is
+// reported per instance while the rest are still attempted.
+func (d *Driver) RestartInstances(ctx context.Context, rt driver.Runtime, ids []string) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if err := checkRuntime(rt); err != nil {
+		return nil, err
+	}
+	sup, ok := rt.Sup.(interface {
+		Restart(ctx context.Context, id string) error
+	})
+	if !ok {
+		return nil, errors.New("realm: this supervisor cannot restart a single process")
+	}
+	st, err := loadState(rt)
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	var (
+		out  []string
+		errs []error
+	)
+	for _, id := range sortedSet(want) {
+		_, known := st.Applied[id]
+		if !known || !rt.Sup.Status(procPrefix+id).Running {
+			continue
+		}
+		if err := sup.Restart(ctx, procPrefix+id); err != nil {
+			errs = append(errs, fmt.Errorf("instance %s: %w", id, err))
+			continue
+		}
+		out = append(out, id)
+		logf(rt, "info", "realm: instance %s restarted (a managed file it references changed)", id)
+	}
+	if len(errs) > 0 {
+		return out, errors.Join(errs...)
+	}
+	return out, nil
+}
+
+// sortedSet returns the keys of set, sorted.
+func sortedSet(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Rollback restores the last good configuration written by Apply: every
 // instance whose running configuration differs from its last verified one is
 // switched back; instances that never became good are stopped.

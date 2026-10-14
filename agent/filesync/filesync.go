@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/W1nCwC/W1nCray/agent/certreload"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 )
@@ -29,6 +30,17 @@ const (
 	ReloadReloaded  = "reloaded"
 	ReloadNotNeeded = "not_needed"
 	ReloadFailed    = "failed"
+)
+
+// Restart outcomes of the instances that reference a replaced file (the
+// certificate files the panel manages, ACME-1). They mirror the reload
+// vocabulary: "restarted" when every affected instance was restarted,
+// "not_needed" when no running instance references the changed files, and
+// "failed" when at least one instance could not be restarted.
+const (
+	RestartRestarted = "restarted"
+	RestartNotNeeded = "not_needed"
+	RestartFailed    = "failed"
 )
 
 // Reload reasons reported to the reloader.
@@ -83,6 +95,43 @@ type SourceFunc func() []spec.FileRef
 // DesiredFiles implements Source.
 func (f SourceFunc) DesiredFiles() []spec.FileRef { return f() }
 
+// DesiredSource is the richer form of Source: the whole desired state of the
+// last accepted revision, not only its files section. The applier needs it to
+// tell which running instances reference a changed file (the instance ids live
+// in the desired state, and the reconciler owns the applied set).
+//
+// A source that only reports the files (a hand-built one, a test fake) is
+// still valid: nothing is then restarted, which is the safe answer.
+type DesiredSource interface {
+	Source
+	Desired() spec.Desired
+}
+
+// Restarter restarts the instances of the last applied state that reference a
+// changed managed file, so they re-read the new bytes. It is the reconciler
+// (agent/reconcile.RestartInstances): the applier computes which instances a
+// set of changed paths affects (agent/certreload) and asks it to restart them.
+//
+// The implementation never applies a new desired state and never restarts an
+// instance that is not affected. A nil Restarter leaves the applier without
+// that step: a replaced file is then simply reported with restart
+// "not_needed" (the engines that read their files per connection pick the new
+// bytes up by themselves, and an engine that read them at start-up keeps the
+// old ones until its next spec change).
+type Restarter interface {
+	// RestartInstances restarts the given instances and returns the ids that
+	// were really restarted; an error reports which ones failed.
+	RestartInstances(ctx context.Context, ids []string) ([]string, error)
+}
+
+// RestarterFunc adapts a function to Restarter.
+type RestarterFunc func(ctx context.Context, ids []string) ([]string, error)
+
+// RestartInstances implements Restarter.
+func (f RestarterFunc) RestartInstances(ctx context.Context, ids []string) ([]string, error) {
+	return f(ctx, ids)
+}
+
 // Options configures an Applier. ConfigDir, StateDir, Fetch and Validate are
 // required.
 type Options struct {
@@ -100,6 +149,10 @@ type Options struct {
 	Reload Reloader
 	// Source reports the managed files of the last desired state.
 	Source Source
+	// Restart restarts the running instances that reference a changed file
+	// (the reconciler). Nil means this agent does not restart instances: a
+	// replaced file is then reported with restart "not_needed".
+	Restart Restarter
 	// ConfigPath is the live config.yml; it is only used for logging.
 	ConfigPath string
 	// LayoutSeparated reports whether the machine uses the agent.yml layout
@@ -137,6 +190,16 @@ type Result struct {
 	Files []FileResult `json:"files,omitempty"`
 	// Reload is "reloaded", "not_needed" (geo-only change) or "failed".
 	Reload string `json:"reload,omitempty"`
+	// Restart is the outcome of the instances that reference a replaced file:
+	// "restarted", "not_needed" (no running instance references it) or
+	// "failed".
+	Restart string `json:"restart,omitempty"`
+	// Restarted lists the instances that were restarted because a file they
+	// reference changed.
+	Restarted []string `json:"restarted,omitempty"`
+	// RestartFailures names the instances whose restart failed, with the
+	// reason. The files stay in place (see the Apply documentation).
+	RestartFailures []string `json:"restart_failures,omitempty"`
 	// RolledBack is true when the previous files were restored.
 	RolledBack bool `json:"rolled_back,omitempty"`
 	// Reason is the human-readable cause of a rollback or a failure.
@@ -182,8 +245,9 @@ type Applier struct {
 	// their staging and replacement.
 	mu sync.Mutex
 	// wireMu guards the wiring (opts.Fetch, opts.Reload, opts.Validate,
-	// opts.Source) that bootstrap installs once the panel link exists. It is a
-	// lock of its own because an apply holds mu for its whole run.
+	// opts.Source, opts.Restart) that bootstrap installs once the panel link
+	// exists. It is a lock of its own because an apply holds mu for its whole
+	// run.
 	wireMu sync.Mutex
 }
 
@@ -262,12 +326,21 @@ func (a *Applier) SetSource(s Source) {
 	a.wireMu.Unlock()
 }
 
-// wiring returns the fetch, validate and reload functions under one lock, so an
-// apply sees a consistent set.
-func (a *Applier) wiring() (BlobFetcher, Validator, Reloader, Source) {
+// SetRestarter installs the instance restarter (the reconciler's
+// RestartInstances), which makes a replaced certificate file take effect in
+// the instances that reference it.
+func (a *Applier) SetRestarter(r Restarter) {
+	a.wireMu.Lock()
+	a.opts.Restart = r
+	a.wireMu.Unlock()
+}
+
+// wiring returns the fetch, validate, reload, source and restart functions
+// under one lock, so an apply sees a consistent set.
+func (a *Applier) wiring() (BlobFetcher, Validator, Reloader, Source, Restarter) {
 	a.wireMu.Lock()
 	defer a.wireMu.Unlock()
-	return a.opts.Fetch, a.opts.Validate, a.opts.Reload, a.opts.Source
+	return a.opts.Fetch, a.opts.Validate, a.opts.Reload, a.opts.Source, a.opts.Restart
 }
 
 // LayoutSeparated reports whether the agent.yml layout is in use on this
@@ -295,12 +368,21 @@ type plan struct {
 	current string
 }
 
-// Apply stages, validates, replaces and reloads the given managed files.
+// Apply stages, validates, replaces, restarts and reloads the given managed
+// files.
 //
 // Nothing is written before every file has been fetched, hash-checked and
 // validated; the previous content is snapshotted as last_good before the first
 // replacement; and a reload failure restores the snapshot. A validation failure
 // never replaces a file and never reloads (design section 3.4).
+//
+// Once the files are in place the instances that reference them are restarted
+// (one merged round for the whole apply, so several files changed together
+// restart each affected instance once): a certificate the panel renewed has to
+// reach the engines that read it at start-up, which no xray reload touches. A
+// restart failure is reported, never rolled back: the new file is valid and
+// already in place, and restoring the previous bytes would undo the renewal
+// (the panel decides what to do with the failed instances).
 func (a *Applier) Apply(ctx context.Context, refs []spec.FileRef) (Result, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -311,7 +393,7 @@ func (a *Applier) Apply(ctx context.Context, refs []spec.FileRef) (Result, error
 	if len(refs) == 0 {
 		return Result{}, errors.New("filesync: no managed files in the desired state")
 	}
-	fetch, validate, reload, _ := a.wiring()
+	fetch, validate, reload, source, restart := a.wiring()
 	if validate == nil {
 		return Result{}, errors.New("filesync: no validator is wired")
 	}
@@ -335,10 +417,10 @@ func (a *Applier) Apply(ctx context.Context, refs []spec.FileRef) (Result, error
 	if len(stage) == 0 {
 		// Everything the panel asked for is already on disk. Record it, so the
 		// next call short-circuits the same way, and answer without touching the
-		// instance.
+		// instance: nothing was replaced, so no instance is restarted either.
 		a.remember(plans)
 		a.log.Infof("filesync: %d managed file(s) already current; nothing to do", len(plans))
-		return Result{Status: StatusDone, Files: result, Reload: ReloadNotNeeded}, nil
+		return Result{Status: StatusDone, Files: result, Reload: ReloadNotNeeded, Restart: RestartNotNeeded}, nil
 	}
 
 	a.store.PruneStages()
@@ -398,15 +480,19 @@ func (a *Applier) Apply(ctx context.Context, refs []spec.FileRef) (Result, error
 		result = append(result, FileResult{Name: p.ref.Name, SHA256: p.ref.SHA256, Size: p.ref.Size, Bytes: downloaded[p.ref.Name]})
 	}
 
-	// Every file is in place. A geo-only change needs no reload: xray reads the
-	// databases when it evaluates a rule, so the next connection picks them up
-	// (design section 3.5).
+	// Every file is in place. A geo-only or certificate change needs no xray
+	// reload: xray reads the databases when it evaluates a rule and never reads
+	// a certificate, so the next connection picks a geo change up (design
+	// section 3.5) and a certificate reaches the instances that reference it
+	// through the restart below. The restart is about the engines' own files,
+	// not about the xray kernel, so it happens either way.
 	needsReload := NeedsRebuildAll(names)
 	res := Result{Status: StatusDone, Files: result}
 	if !needsReload {
+		a.restartAffected(ctx, restart, source, replaced, &res)
 		res.Reload = ReloadNotNeeded
 		a.remember(plans)
-		a.log.Infof("filesync: applied %d geo file(s); no reload needed", len(names))
+		a.log.Infof("filesync: applied %d managed file(s); no xray reload needed", len(names))
 		return res, nil
 	}
 	if reload == nil {
@@ -442,6 +528,7 @@ func (a *Applier) Apply(ctx context.Context, refs []spec.FileRef) (Result, error
 		}, nil
 	}
 	res.Reload = ReloadReloaded
+	a.restartAffected(ctx, restart, source, replaced, &res)
 	a.remember(plans)
 	a.log.Infof("filesync: applied %d managed file(s) and initiated a reload", len(names))
 	return res, nil
@@ -457,7 +544,7 @@ func (a *Applier) Validate(ctx context.Context) (Result, error) {
 	if len(refs) == 0 {
 		return Result{}, errors.New("filesync: no managed files in the desired state")
 	}
-	fetch, validate, _, _ := a.wiring()
+	fetch, validate, _, _, _ := a.wiring()
 	if validate == nil {
 		return Result{}, errors.New("filesync: no validator is wired")
 	}
@@ -499,9 +586,10 @@ func (a *Applier) Validate(ctx context.Context) (Result, error) {
 	return Result{Status: StatusDone, Files: result, Reload: ReloadNotNeeded}, nil
 }
 
-// Rollback restores the last_good snapshot and reloads the instance. It is what
-// the panel sends after a managed-file change left the machine unhealthy
-// (protocol ruling 9).
+// Rollback restores the last_good snapshot, restarts the instances that
+// reference a restored file and reloads the instance. It is what the panel
+// sends after a managed-file change left the machine unhealthy (protocol
+// ruling 9).
 func (a *Applier) Rollback(ctx context.Context) (Result, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -509,7 +597,7 @@ func (a *Applier) Rollback(ctx context.Context) (Result, error) {
 	if !a.store.HasLastGood() {
 		return Result{}, errors.New("filesync: no last_good snapshot to roll back to")
 	}
-	_, _, reload, _ := a.wiring()
+	_, _, reload, source, restart := a.wiring()
 	names, err := a.store.RestoreLastGood(a.opts.ConfigDir)
 	if err != nil {
 		return Result{}, err
@@ -522,6 +610,10 @@ func (a *Applier) Rollback(ctx context.Context) (Result, error) {
 		}
 		res.Files = append(res.Files, FileResult{Name: n, SHA256: st.SHA256, Size: st.Size})
 	}
+	// The restored bytes have to reach the engines that read them at start-up
+	// too: a rollback of a broken certificate must not leave the instances on
+	// the file the panel just rejected.
+	a.restartAffected(ctx, restart, source, names, &res)
 	if NeedsRebuildAll(names) {
 		if reload == nil {
 			res.Reload = ReloadFailed
@@ -543,6 +635,51 @@ func (a *Applier) Rollback(ctx context.Context) (Result, error) {
 	a.forget(names)
 	a.log.Infof("filesync: rolled back %d managed file(s)", len(names))
 	return res, nil
+}
+
+// restartAffected restarts the running instances that reference one of the
+// files just replaced (names, in the configuration directory), and records the
+// outcome in res. One call per apply: several files that changed together are
+// one restart round, so an instance that references two of them is restarted
+// once.
+//
+// It is a no-op without a restarter or without an affected instance. A failure
+// is reported (Restart "failed" plus the per-instance reasons) and never
+// rolled back: the file is valid and in place, and the panel decides what to
+// do with the instances that could not pick it up.
+func (a *Applier) restartAffected(ctx context.Context, restart Restarter, src Source, names []string, res *Result) {
+	if restart == nil || len(names) == 0 {
+		res.Restart = RestartNotNeeded
+		return
+	}
+	ds, ok := src.(DesiredSource)
+	if !ok {
+		// The source cannot name an instance (a hand-built one): nothing is
+		// restarted, which is the safe answer.
+		res.Restart = RestartNotNeeded
+		return
+	}
+	changed := make([]certreload.Ref, 0, len(names))
+	for _, n := range names {
+		changed = append(changed, certreload.Ref{Name: n, Path: filepath.Join(a.opts.ConfigDir, n)})
+	}
+	ids := certreload.Changed(ds.Desired(), changed)
+	if len(ids) == 0 {
+		res.Restart = RestartNotNeeded
+		return
+	}
+	restarted, err := restart.RestartInstances(ctx, ids)
+	if err != nil {
+		res.Restart = RestartFailed
+		res.RestartFailures = append(res.RestartFailures, err.Error())
+		a.log.Warnf("filesync: restarting the instances that reference the changed files: %v", err)
+	} else {
+		res.Restart = RestartRestarted
+	}
+	res.Restarted = restarted
+	if len(restarted) > 0 {
+		a.log.Infof("filesync: restarted %d instance(s) that reference the changed file(s)", len(restarted))
+	}
 }
 
 // content returns the content of one file: from the blob cache when the digest

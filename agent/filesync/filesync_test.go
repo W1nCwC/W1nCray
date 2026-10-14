@@ -239,6 +239,31 @@ func TestCheckNameRefusesEverythingOutsideTheWhitelist(t *testing.T) {
 			t.Errorf("IsManaged(%q) = false", name)
 		}
 	}
+	// The managed certificate family (ACME-1) is accepted by pattern, and only
+	// by the exact panel pattern: a malformed id, a missing extension or a
+	// traversal is refused like any other unknown name.
+	for _, name := range []string{"cert-1.pem", "key-42.pem", "cert-9999999999999999.pem"} {
+		if err := CheckName(name); err != nil {
+			t.Errorf("CheckName(%q) = %v, want nil", name, err)
+		}
+		if !IsManaged(name) || !IsCert(name) {
+			t.Errorf("IsManaged/IsCert(%q) = false", name)
+		}
+		// A certificate is not an xray file: replacing it must not ask the
+		// kernel for a reload.
+		if NeedsRebuild(name) {
+			t.Errorf("NeedsRebuild(%q) = true", name)
+		}
+	}
+	for _, name := range []string{"cert-0.pem", "cert-.pem", "cert-1.PEM", "cert-1.pem.bak",
+		"key-01.pem", "cert-1.pem/x", "../cert-1.pem", "cert-12345678901234567.pem", "cert-abc.pem"} {
+		if err := CheckName(name); err == nil {
+			t.Errorf("CheckName(%q) accepted a malformed certificate name", name)
+		}
+		if IsCert(name) {
+			t.Errorf("IsCert(%q) = true", name)
+		}
+	}
 }
 
 // TestApplyRefusesNamesOutsideTheWhitelist covers acceptance 3 end to end: a

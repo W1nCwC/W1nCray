@@ -97,8 +97,10 @@ type RemoteOptions struct {
 	OnRestart func()
 }
 
-// filesSource adapts a Runtime to filesync.Source: the managed files of the
-// desired state the reconciler last applied.
+// filesSource adapts a Runtime to filesync.Source and filesync.DesiredSource:
+// the managed files of the desired state the reconciler last applied, and the
+// whole desired state, which is what lets the applier tell which instances
+// reference a changed file.
 type filesSource struct{ rt *Runtime }
 
 func (s filesSource) DesiredFiles() []spec.FileRef {
@@ -106,6 +108,26 @@ func (s filesSource) DesiredFiles() []spec.FileRef {
 		return nil
 	}
 	return s.rt.Reconciler.LastDesired().Files
+}
+
+// Desired returns the desired state of the last accepted revision.
+func (s filesSource) Desired() spec.Desired {
+	if s.rt == nil || s.rt.Reconciler == nil {
+		return spec.Desired{}
+	}
+	return s.rt.Reconciler.LastDesired()
+}
+
+// filesRestarter adapts the reconciler to filesync.Restarter: the instances
+// whose desired state references a file that just changed are restarted one by
+// one (agent/reconcile.RestartInstances), never by a full re-apply.
+type filesRestarter struct{ rt *Runtime }
+
+func (r filesRestarter) RestartInstances(ctx context.Context, ids []string) ([]string, error) {
+	if r.rt == nil || r.rt.Reconciler == nil {
+		return nil, nil
+	}
+	return r.rt.Reconciler.RestartInstances(ctx, ids)
 }
 
 // desiredSync adapts the runtime and the panel runner to opscmd.DesiredSync:
@@ -273,6 +295,10 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	if r.Files != nil && r.Files.Enabled() && r.Ops != nil {
 		r.Files.applier.SetFetch(blobFetcher{api: client})
 		r.Files.applier.SetSource(filesSource{rt: r})
+		// The instance restart is the reconciler's: a file the panel replaced
+		// (a renewed certificate) has to reach the instances that reference
+		// it, which no xray reload touches (ACME-1).
+		r.Files.applier.SetRestarter(filesRestarter{rt: r})
 		if o.Reloader != nil {
 			r.Files.applier.SetReload(o.Reloader)
 		}

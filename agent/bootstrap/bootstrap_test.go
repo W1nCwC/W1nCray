@@ -149,6 +149,30 @@ func closeRun(r *fakeRun) {
 	r.ls, r.pcs = nil, nil
 }
 
+// RestartInstances implements driver.Driver: the fake rebinds the named
+// instances' listeners (a restart) and leaves every other instance alone.
+func (f *fakeDriver) RestartInstances(ctx context.Context, rt driver.Runtime, ids []string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, id := range ids {
+		run, ok := f.current[id]
+		if !ok {
+			continue
+		}
+		closeRun(run)
+		next, err := f.start(run.art)
+		if err != nil {
+			delete(f.current, id)
+			continue
+		}
+		f.current[id] = next
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (f *fakeDriver) Rollback(ctx context.Context, rt driver.Runtime) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

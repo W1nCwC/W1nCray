@@ -289,6 +289,35 @@ func closeAll(r *running) {
 	r.listeners = nil
 }
 
+// RestartInstances implements driver.Driver: it rebinds the listeners of the
+// named instances (a restart drops and re-establishes what the instance
+// serves), leaving every other instance alone. The call is recorded as
+// "restart:<id>" per instance, so a test can count how many rounds happened.
+func (f *Fake) RestartInstances(ctx context.Context, rt driver.Runtime, ids []string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, id := range ids {
+		f.calls = append(f.calls, "restart:"+id)
+		run, ok := f.current[id]
+		if !ok {
+			continue
+		}
+		closeAll(run)
+		next, err := f.start(run.r)
+		if err != nil {
+			// The port is taken (or the address is gone): the instance is no
+			// longer serving, exactly as a failed restart leaves it.
+			delete(f.current, id)
+			continue
+		}
+		f.current[id] = next
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // Rollback implements driver.Driver: back to the set before the last Apply.
 func (f *Fake) Rollback(ctx context.Context, rt driver.Runtime) error {
 	f.record("rollback")
