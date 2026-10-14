@@ -152,7 +152,7 @@ func (d *Driver) apply(ctx context.Context, rt driver.Runtime, desired []desired
 			continue
 		}
 		of := base.Instances[id].Fragment
-		if err := d.changeFragment(ctx, rt, api, id, &of, nil); err != nil {
+		if err := d.changeFragment(ctx, rt, api, id, &of, nil, false); err != nil {
 			res.Failed[id] = redactStr(err.Error(), secrets)
 			continue
 		}
@@ -171,7 +171,7 @@ func (d *Driver) apply(ctx context.Context, rt driver.Runtime, desired []desired
 			oldFrag = &prev.Fragment
 		}
 		f := di.frag
-		if err := d.changeFragment(ctx, rt, api, di.id, oldFrag, &f); err != nil {
+		if err := d.changeFragment(ctx, rt, api, di.id, oldFrag, &f, false); err != nil {
 			res.Failed[di.id] = redactStr(err.Error(), secrets)
 			logf(rt, "gost: instance %s failed: %s", di.id, redactStr(err.Error(), secrets))
 			continue
@@ -375,14 +375,17 @@ func (d *Driver) RestartInstances(ctx context.Context, rt driver.Runtime, ids []
 			continue
 		}
 		// changeFragment removes the instance's old objects and creates the
-		// new ones from the same fragment, which re-reads every file the
-		// services reference.
-		if err := d.changeFragment(ctx, rt, api, id, &ai.Fragment, &ai.Fragment); err != nil {
+		// new ones from the same fragment. force matters here: the fragment
+		// is byte-identical (the spec references the certificate *path*, and
+		// only the file content changed), so without it the staleness check
+		// would keep every service and gost would go on serving the old
+		// certificate from memory while the restart reported success.
+		if err := d.changeFragment(ctx, rt, api, id, &ai.Fragment, &ai.Fragment, true); err != nil {
 			errs = append(errs, fmt.Errorf("instance %s: %w", id, redactErr(err, secrets)))
 			continue
 		}
 		out = append(out, id)
-		logf(rt, "info", "gost: instance %s restarted (a managed file it references changed)", id)
+		logf(rt, "gost: instance %s restarted (a managed file it references changed)", id)
 	}
 	if len(errs) > 0 {
 		return out, errors.Join(errs...)
@@ -721,7 +724,12 @@ func singular(kind string) string { return strings.TrimSuffix(kind, "s") }
 
 // changeFragment moves instance id from old to nw (either may be nil). On any
 // failure everything done for the instance is undone and the error returned.
-func (d *Driver) changeFragment(ctx context.Context, rt driver.Runtime, api *apiClient, id string, old, nw *fragment) error {
+// force replaces every service of the fragment even when its body is
+// unchanged: the restart path needs it, because a managed file (a
+// certificate) changes only the content behind a path the spec references,
+// and gost reads that file when it builds the service — a no-op "replace"
+// would leave the old bytes in memory.
+func (d *Driver) changeFragment(ctx context.Context, rt driver.Runtime, api *apiClient, id string, old, nw *fragment, force bool) error {
 	oldS, newS := old.objects(), nw.objects()
 	oldDeps, newDeps := byName(oldS.deps), byName(newS.deps)
 	oldSvcs := byName(oldS.svcs)
@@ -772,7 +780,7 @@ func (d *Driver) changeFragment(ctx context.Context, rt driver.Runtime, api *api
 			touched = append(touched, o.name)
 			continue
 		}
-		stale := !bytes.Equal(prev.body, o.body)
+		stale := force || !bytes.Equal(prev.body, o.body)
 		for _, r := range newS.refs[o.name] {
 			if changedDeps[r] {
 				stale = true

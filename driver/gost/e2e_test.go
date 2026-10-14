@@ -32,6 +32,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -1176,3 +1179,89 @@ func TestE2EGostReloadIsNotUsedBecause(t *testing.T) {
 }
 
 var _ = rand.Reader
+
+// A managed certificate file changes only its *content* — the spec references
+// the path and stays byte-identical. RestartInstances must therefore replace
+// the service even when the fragment did not change, so gost re-reads the
+// file; a no-op "restart" leaves the old certificate in memory (the bug that
+// shipped in the first managed-certificate rollout).
+func TestE2ERestartInstancesReloadsChangedCertificate(t *testing.T) {
+	exit := newNode(t, Options{})
+	be := startBackend(t, "")
+	dir1, dir2 := t.TempDir(), t.TempDir()
+	cert1, key1 := writeCert(t, dir1)
+	cert2, key2 := writeCert(t, dir2)
+	if bytes.Equal(certDER(t, cert1), certDER(t, cert2)) {
+		t.Fatal("the two generated certificates are identical")
+	}
+	ctl, be2 := freePorts(t, 1), freePorts(t, 1)
+	_ = be2
+	ex := spec.Instance{
+		ID: "ex", Enabled: true, Engine: spec.EngineGost, Kind: spec.KindTunnelExit, Secret: e2eSecret,
+		Tunnel:  &spec.Tunnel{Type: "tls", Listen: addr(ctl), Security: "tls", Cert: &spec.Cert{Mode: "file", CertFile: cert1, KeyFile: key1}},
+		Targets: []spec.Target{{Host: "127.0.0.1", Ports: fmt.Sprint(be.Port)}},
+	}
+	exit.apply(ex)
+
+	first := servedCert(t, ctl)
+	if !bytes.Equal(first, certDER(t, cert1)) {
+		t.Fatal("gost is not serving the configured certificate")
+	}
+
+	// The managed-file channel overwrites the file in place (same path, new
+	// bytes) and asks the driver to restart the instances that reference it.
+	for from, to := range map[string]string{cert1: cert2, key1: key2} {
+		data, err := os.ReadFile(to)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(from, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := exit.d.RestartInstances(context.Background(), exit.rt, []string{"ex"})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("RestartInstances = (%v, %v)", got, err)
+	}
+
+	eventually(t, 10*time.Second, "gost serving the new certificate", func() bool {
+		return bytes.Equal(servedCert(t, ctl), certDER(t, cert2))
+	})
+	if !bytes.Equal(servedCert(t, ctl), certDER(t, cert2)) {
+		t.Error("gost still serves the old certificate after RestartInstances")
+	}
+}
+
+// servedCert dials the TLS listener and returns the DER of the certificate
+// the server presents.
+func servedCert(t *testing.T, port int) []byte {
+	t.Helper()
+	d, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr(port), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // the test reads the peer certificate, it does not trust it
+	if err != nil {
+		t.Fatalf("tls dial: %v", err)
+	}
+	defer d.Close()
+	certs := d.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		t.Fatal("the server presented no certificate")
+	}
+	return certs[0].Raw
+}
+
+// certDER returns the DER bytes of the first certificate in a PEM file.
+func certDER(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		t.Fatalf("%s holds no PEM block", path)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert.Raw
+}
