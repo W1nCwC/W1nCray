@@ -66,7 +66,65 @@ func Ready(exePath string) error {
 		return fmt.Errorf("selfupdate: no service unit runs %s (checked %s); run the agent from its installed service before updating it in place",
 			resolved, strings.Join(serviceUnits, ", "))
 	}
+	if err := unitRestarts(resolved); err != nil {
+		return err
+	}
 	return nil
+}
+
+// restartCoversCleanExit lists the systemd Restart= values that bring a process
+// back after it exits cleanly (status 0) — which is exactly how a committed
+// self-update asks for the new binary to be started. Restart=on-failure does
+// NOT cover it: the agent's exit is a success, so the unit stays dead until the
+// watchdog gives up and rolls the update back (found in production: both
+// machines carried a unit written by an older install.sh, and every upgrade
+// cost a minute of no agent before the rollback).
+var restartCoversCleanExit = []string{"always", "on-success"}
+
+// unitRestarts reports why the init file that runs exe would not bring the
+// process back after a committed self-update exits cleanly. OpenRC and procd
+// respawn their command by default, so only systemd units are inspected.
+func unitRestarts(exe string) error {
+	for _, path := range serviceUnits {
+		if !strings.HasSuffix(path, ".service") {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if !unitMentions(string(b), exe) {
+			continue
+		}
+		if !restartValueCoversCleanExit(string(b)) {
+			return fmt.Errorf("selfupdate: %s runs %s but would not start it again after the clean exit a self-update ends with (Restart= must be %s); fix the unit first, or the update is rolled back and the agent is down until it is",
+				path, exe, strings.Join(restartCoversCleanExit, " or "))
+		}
+	}
+	return nil
+}
+
+// restartValueCoversCleanExit reports whether a systemd unit's Restart= value
+// starts the process again after a clean exit. A unit without the directive
+// takes systemd's default ("no"), which is the same failure.
+func restartValueCoversCleanExit(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "Restart=") {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(line, "Restart="))
+		for _, ok := range restartCoversCleanExit {
+			if value == ok {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // ServiceExecutable returns the executable a service manager runs for this

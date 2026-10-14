@@ -192,3 +192,30 @@ func TestServiceExecutableReadsTheInstallerUnits(t *testing.T) {
 		t.Errorf("commandExecutable(commented) = %q, want empty", got)
 	}
 }
+
+// TestRestartValueCoversCleanExit pins the restart policy the self-update
+// depends on: the agent exits with status 0, so only always / on-success make
+// systemd start the new binary. on-failure is the one that bit production.
+func TestRestartValueCoversCleanExit(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"always", "[Service]\nExecStart=/usr/local/bin/W1nCray\nRestart=always\n", true},
+		{"on-success", "[Service]\nRestart=on-success\n", true},
+		{"on-failure", "[Service]\nRestart=on-failure\n", false},
+		{"on-abnormal", "[Service]\nRestart=on-abnormal\n", false},
+		{"no", "[Service]\nRestart=no\n", false},
+		{"missing directive", "[Service]\nExecStart=/usr/local/bin/W1nCray\n", false},
+		{"commented out", "[Service]\n# Restart=always\n", false},
+		{"spaced", "[Service]\nRestart = always\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := restartValueCoversCleanExit(tc.text); got != tc.want {
+				t.Errorf("restartValueCoversCleanExit(%q) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
