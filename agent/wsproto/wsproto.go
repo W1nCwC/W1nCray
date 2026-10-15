@@ -11,6 +11,7 @@ const (
 	TypeHelloOK    = "hello.ok"
 	TypeTelemetry  = "telemetry"
 	TypeComponents = "components"
+	TypeAuditLog   = "audit.log"
 	TypeCmd        = "cmd"
 	TypeCmdResult  = "cmd.result"
 	TypeHint       = "hint"
@@ -37,11 +38,24 @@ const (
 	CapUpgrade   = "upgrade"
 	CapTerminal  = "terminal"
 	CapXrayNodes = "xray_nodes"
+	// CapAudit promises the panel that this agent can answer audit.log frames:
+	// it reads the kernel's access-log collector over the kernel's local status
+	// endpoint and forwards bounded batches. It says nothing about whether
+	// collection is on right now — that is hello.ok.audit.enabled.
+	CapAudit = "audit"
 )
 
 // CapabilitiesAll is the closed set a hello.capabilities may contain. The
 // panel must not gate a feature on anything outside this list.
-var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapTelemetry}
+var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapAudit, CapTelemetry}
+
+// Audit bounds. MaxAuditItems is both the largest batch a single audit.log
+// frame may carry and the largest max a page request may ask the kernel for;
+// MaxAuditLine is the longest access-log line a collector entry may hold.
+const (
+	MaxAuditItems = 400
+	MaxAuditLine  = 512
+)
 
 // Error codes used in an "error" frame's d.code.
 const (
@@ -87,6 +101,16 @@ type HelloOK struct {
 	ServerTime int64     `json:"server_time"`
 	Intervals  Intervals `json:"intervals"`
 	Session    string    `json:"session"`
+	// Audit turns the kernel access-log collection on or off. It is omitted by
+	// a panel that does not manage it, which leaves the agent's current state
+	// alone (the default is off).
+	Audit *AuditCtl `json:"audit,omitempty"`
+}
+
+// AuditCtl is the panel's audit switch in hello.ok. A nil pointer means "not
+// mentioned", never "off".
+type AuditCtl struct {
+	Enabled bool `json:"enabled"`
 }
 
 // Intervals tells the agent how often to send telemetry and components.
@@ -227,6 +251,32 @@ type Net struct {
 type Conns struct {
 	TCP int `json:"tcp"`
 	UDP int `json:"udp"`
+}
+
+// AuditLog is the payload of the "audit.log" message: one bounded page of the
+// kernel's access-log entries, oldest first.
+//
+// Epoch is the kernel process start (unix seconds) the sequence numbers belong
+// to; a change of Epoch means the kernel restarted and the agent must start a
+// new page at the kernel's current position. FromSeq/ToSeq are the sequence
+// numbers of Items[0] and Items[len-1]; both are 0 for an empty page. Dropped
+// counts the entries the kernel discarded between the caller's previous cursor
+// and FromSeq (its bounded buffer overflowed, or the buffer was emptied by an
+// off switch), so it is the loss this page reports and never repeats on the
+// next one.
+type AuditLog struct {
+	Epoch   int64       `json:"epoch"`
+	FromSeq uint64      `json:"from_seq"`
+	ToSeq   uint64      `json:"to_seq"`
+	Dropped uint64      `json:"dropped"`
+	Items   []AuditItem `json:"items"`
+}
+
+// AuditItem is one access-log line. T is when the kernel handled it (unix ms)
+// and L is the line itself, at most MaxAuditLine bytes.
+type AuditItem struct {
+	T int64  `json:"t"`
+	L string `json:"l"`
 }
 
 // Components is the payload of the "components" message.
