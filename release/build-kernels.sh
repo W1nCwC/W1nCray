@@ -49,7 +49,7 @@ verify_file="$out/UPSTREAM-VERIFY.txt"
 
 gost_ver=3.3.0
 realm_ver=2.9.6
-frp_ver=0.71.0
+frp_ver=0.71.1
 
 # ---- platform maps (copied from tools/manifestgen/kernels.example.yaml) ------
 # An empty value means the platform is null in the manifest: no artifact.
