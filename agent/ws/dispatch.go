@@ -75,6 +75,11 @@ type Hooks struct {
 	// (Handler.Disconnected). It is what lets a sink that owns per-connection
 	// state — the terminal — clean up.
 	Disconnect func(err error)
+	// Error reports a panel "error" frame after the dispatcher logged it. It
+	// is what lets a stream the panel refused (audit.log answered with
+	// unknown_type or not_supported) stop sending for the rest of the session.
+	// Nil ignores it.
+	Error func(body wsproto.ErrorBody)
 	// Log receives the dispatcher's own events; never a token or a payload.
 	Log driver.Logger
 	// Now is the clock used for the error rate limit; nil uses time.Now. It is
@@ -155,6 +160,9 @@ func (d *Dispatcher) Frame(env wsproto.Envelope) {
 		var body wsproto.ErrorBody
 		if err := Decode(env, &body); err == nil {
 			d.logf().Warnf("ws: panel error %s: %s", body.Code, body.Message)
+			if d.hooks.Error != nil {
+				d.hooks.Error(body)
+			}
 		} else {
 			d.logf().Warnf("ws: panel error frame: %v", err)
 		}

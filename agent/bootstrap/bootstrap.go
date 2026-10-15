@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
@@ -132,6 +133,10 @@ type Options struct {
 	// kernel (config.yml has Nodes, or machine mode is on). It gates the
 	// start-up migration.
 	XrayNeeded bool
+	// XrayAuditBaseURL overrides the kernel endpoint of the access-log client
+	// (tests: an httptest server). Empty resolves the kernel's local endpoint
+	// from XrayConfigPath exactly like the status client does.
+	XrayAuditBaseURL string
 }
 
 // Runtime is a booted agent. It owns the supervisor and the reconciler.
@@ -165,11 +170,21 @@ type Runtime struct {
 	// XrayManager manages the Xray kernel service (nil when it is unavailable
 	// on this machine).
 	XrayManager *xraysvc.Manager
+	// Audit is the client of the kernel's access-log collector (/audit and
+	// /audit/ctl, W1NCRAY-D2). It is nil when this machine has no Xray kernel
+	// configuration at all; the WebSocket channel then declares no audit
+	// capability and audit_ctl answers not_supported.
+	Audit *xraysvc.AuditClient
 	// xrayNeeded is Options.XrayNeeded: whether the start-up migration should
 	// bring the Xray kernel service up.
 	xrayNeeded bool
 	// xrayOnce makes the start-up migration run once per process.
 	xrayOnce sync.Once
+	// auditSupported is the Xray kernel's own "I serve the access-log
+	// collector" bit, published by the WebSocket channel's audit loop
+	// (runtimeStreams.SetAuditSupported). It is false until a kernel status
+	// said otherwise, so the capability is never declared on a guess.
+	auditSupported atomic.Bool
 	// cfg is the local agent configuration the capability list and the policy
 	// gates are read from (nil means the defaults).
 	cfg *agentcfg.Config
@@ -269,6 +284,23 @@ func Boot(opts Options) (*Runtime, error) {
 		Xray:        opts.Xray,
 		XrayManager: xrayMgr,
 		xrayNeeded:  opts.XrayNeeded,
+	}
+	// The access-log collector client (W1NCRAY-D2) needs the kernel's local
+	// endpoint and, for the support bit, the kernel's status document. Both
+	// come from the same configuration the status client uses, so a machine
+	// without an Xray kernel has no audit client at all and never declares the
+	// capability.
+	if opts.XrayConfigPath != "" {
+		audit, aerr := xraysvc.NewAuditClient(xraysvc.AuditOptions{
+			BaseURL:    opts.XrayAuditBaseURL,
+			ConfigPath: opts.XrayConfigPath,
+			Status:     rt.Xray,
+		})
+		if aerr != nil {
+			log.Warnf("bootstrap: Xray access-log client unavailable: %v", aerr)
+		} else {
+			rt.Audit = audit
+		}
 	}
 	// The interactive terminal (D8) exists only when the local switch is on and
 	// this machine can really create a PTY. A nil manager is what makes the

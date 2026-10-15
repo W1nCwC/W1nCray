@@ -22,6 +22,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
 	"github.com/W1nCwC/W1nCray/agent/ws"
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
+	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 )
 
 // RemoteOptions configures StartRemote: the link between the agent and a panel
@@ -66,6 +67,11 @@ type RemoteOptions struct {
 	// re-fetch the machine's node list now, and degrades to its 60 s poll when
 	// the kernel is absent, too old, or the call fails.
 	WSNodes ws.NodeToggle
+	// WSAudit overrides the access-log collector the WebSocket channel pulls
+	// from (tests). nil uses the runtime's kernel audit client (W1NCRAY-D2):
+	// the audit capability is declared only when that kernel reports it serves
+	// the collector, and nothing is ever pulled until the panel enables it.
+	WSAudit ws.AuditSource
 
 	// ManifestSync enables the signed kernel manifest sync loop: the link
 	// fetches GET /manifest and the runtime's kernel Ensurer verifies it
@@ -379,6 +385,16 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		if agentOpts.Nodes == nil {
 			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), xray: r.Xray, log: log}
 		}
+		// The access-log stream (W1NCRAY-D2) is wired only when this machine
+		// has a kernel to read it from; a nil source is what keeps the audit
+		// capability out of hello and answers audit_ctl with not_supported.
+		// The support bit the kernel reports is published back into the
+		// capability list through runtimeStreams.
+		if source := o.WSAudit; source != nil {
+			agentOpts.Audit = source
+		} else if r.Audit != nil {
+			agentOpts.Audit = auditSource{client: r.Audit}
+		}
 		// The interactive terminal is wired only when this machine really has
 		// one; a nil sink is what answers term.error{terminal_disabled}
 		// (WP-G6 acceptance 3). The local switch was already applied at Boot,
@@ -404,6 +420,13 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 			c.client = wsClient
 		}
 		late.ws = wsClient
+		// The audit_ctl command switches the stream the socket owns, so the
+		// registry is wired to the agent (W1NCRAY-D2). Without a socket the
+		// command stays registered and answers not_supported, which is the
+		// truth: the stream exists only on the WebSocket channel.
+		if r.Ops != nil {
+			r.Ops.SetAudit(wsAgent)
+		}
 		// kernel.installed / kernel.removed (protocol ruling 10). The event
 		// frame is the WebSocket's; without a socket there is no event channel
 		// in the HTTP contract, so nothing is sent.
@@ -581,3 +604,34 @@ func (c *wsCommands) Execute(ctx context.Context, id string, cmd wsproto.Cmd, ex
 }
 
 func (c *wsCommands) Refresh() { c.runner.RequestRefresh() }
+
+// ---- access-log audit wiring (W1NCRAY-D2) ----------------------------------
+
+// auditSource adapts the kernel's audit client (agent/xraysvc) to the
+// WebSocket channel's source. It is the only place that translates the two
+// wire shapes, so neither package has to know the other: an old kernel's
+// "route missing" error becomes ws.ErrAuditUnsupported, and a kernel page
+// becomes the channel's page type.
+type auditSource struct{ client *xraysvc.AuditClient }
+
+var _ ws.AuditSource = auditSource{}
+
+func (s auditSource) Supported(ctx context.Context) (bool, error) {
+	return s.client.Supported(ctx)
+}
+
+func (s auditSource) Batch(ctx context.Context, after uint64, max int) (ws.AuditPage, error) {
+	page, err := s.client.Batch(ctx, after, max)
+	if err != nil {
+		return ws.AuditPage{}, err
+	}
+	return ws.AuditPage{Batch: page.Batch, Supported: page.Supported}, nil
+}
+
+func (s auditSource) SetEnabled(ctx context.Context, enabled bool) error {
+	err := s.client.SetEnabled(ctx, enabled)
+	if err != nil && xraysvc.IsAuditUnsupported(err) {
+		return ws.ErrAuditUnsupported
+	}
+	return err
+}
