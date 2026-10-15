@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
@@ -192,13 +193,24 @@ func (k *kernelCmds) kernelInstall(ctx context.Context, req Request, complete Co
 		return Result{}, err
 	}
 	version := manifest.NormalizeVersion(a.Version)
+	// The Xray kernel is a service, so its kernel_install goes through the
+	// service manager (install when nothing is installed, upgrade when a
+	// version already is). Since v0.8.4 that manager also answers the
+	// manifest-free direct path: a URL in the args pins the release asset
+	// (url/sha256/size/archive) and the manifest is not consulted at all. The
+	// asset is installed by the kernel installer and then activated by the very
+	// same service flow as the manifest path, so an xray URL is no longer
+	// silently ignored (DEC-4).
 	if a.Name == xrayapi.KernelName && k.deps.Xray != nil {
-		return k.xrayInstall(ctx, version, complete)
+		if a.URL != "" {
+			return k.xrayInstallDirect(ctx, a, version, complete)
+		}
+		return k.xrayInstallFromManifest(ctx, version, complete)
 	}
 	// The direct path (v0.8.0): the panel pins the asset in the args and the
-	// manifest is not consulted. The Xray kernel is a service and keeps its
-	// own install flow above, which still resolves through the manifest; a
-	// direct URL for it is refused rather than silently downgraded.
+	// manifest is not consulted. A direct URL for the Xray kernel without its
+	// service manager stays a clear refusal rather than a silent downgrade to
+	// the manifest.
 	if a.URL != "" {
 		return k.kernelInstallDirect(ctx, a, version, complete)
 	}
@@ -233,7 +245,8 @@ func (k *kernelCmds) kernelInstallDirect(ctx context.Context, a panelclient.Kern
 	// The installer is reached through an optional capability of the kernel
 	// manager so the fake in the tests (and any older wiring) keeps working
 	// unchanged; a direct URL without the capability is a wiring error, not a
-	// manifest lookup.
+	// manifest lookup. The sha256 stays optional on this historical path (the
+	// xray service path requires one); kernel/install verifies it when set.
 	dir, ok := k.deps.Kernels.(interface {
 		InstallDirect(ctx context.Context, di install.DirectInstall) (driver.Installed, error)
 	})
@@ -269,11 +282,72 @@ func (k *kernelCmds) kernelInstallDirect(ctx context.Context, a panelclient.Kern
 	return accepted(), nil
 }
 
-// xrayInstall answers kernel_install for the Xray kernel through the service
-// manager: the kernel runs as a service of its own, so installing means
+// xrayDirectInstallOps is the optional capability behind kernel_install for
+// the Xray kernel with a pinned release asset: the service manager installs
+// the kernel straight from the URL (url/sha256/size/archive), without a signed
+// manifest, and then runs its own activate / health check / rollback flow.
+// *xraysvc.Manager implements it. It is an optional assertion, like
+// removeCurrentOps below, so a manager without it (an older wiring, a fake)
+// keeps working and keeps the manifest path.
+type xrayDirectInstallOps interface {
+	InstallDirect(ctx context.Context, di install.DirectInstall) error
+}
+
+// xrayInstallDirect answers kernel_install for the Xray kernel when the args
+// pin the release asset: the kernel is installed straight from the URL and
+// then activated by the service manager with the same health check and failure
+// rollback as the manifest path. An already installed kernel is an upgrade; a
+// machine with none is a fresh install. The long-command shape is the same as
+// the manifest path: accepted first, the outcome through the registry's sink.
+func (k *kernelCmds) xrayInstallDirect(ctx context.Context, a panelclient.KernelInstallArgs, version string, complete Completion) (Result, error) {
+	// The asset hash is the anchor of the manifest-free path: the panel pins it
+	// from the release, so an empty one is a protocol error, refused before
+	// anything is downloaded (a service kernel is never installed on HTTPS
+	// alone). The panel gates this on agent_version >= 0.8.4.
+	if strings.TrimSpace(a.SHA256) == "" {
+		return Result{}, coded("invalid_args", errors.New("sha256 is required to install the Xray kernel from a url"))
+	}
+	dir, ok := k.deps.Xray.(xrayDirectInstallOps)
+	if !ok {
+		return Result{}, coded("not_supported", errors.New("this agent has no direct Xray kernel installer wired"))
+	}
+	// The service manager builds the DirectInstall itself: the installed file
+	// name and the version self-check are fixed there (W1nCray-xray), so a
+	// panel-supplied To/From cannot point the service at another file.
+	di := install.DirectInstall{
+		Name:    a.Name,
+		Version: version,
+		URL:     a.URL,
+		SHA256:  a.SHA256,
+		Size:    a.Size,
+		Archive: a.Archive,
+	}
+	wanted := version
+	if wanted == "" {
+		wanted = "self-check"
+	}
+	k.reg.logf().Infof("opscmd: kernel_install xray@%s accepted (direct, service)", wanted)
+	go func() {
+		if err := dir.InstallDirect(ctx, di); err != nil {
+			k.reg.logf().Warnf("opscmd: kernel_install xray@%s (direct) failed: %v", wanted, err)
+			complete(StatusFailed, nil, err)
+			return
+		}
+		inst := k.currentOf(xrayapi.KernelName)
+		k.reg.logf().Infof("opscmd: kernel_install xray@%s done (direct, service)", inst.Version)
+		k.reg.event("kernel.installed", "info", fmt.Sprintf("kernel xray@%s installed and running as a service (direct)", inst.Version))
+		complete(StatusDone, mustJSON(installedResult{Name: xrayapi.KernelName, Version: inst.Version, Path: inst.Path}), nil)
+	}()
+	return accepted(), nil
+}
+
+// xrayInstallFromManifest answers kernel_install for the Xray kernel through the
+// service manager: the kernel runs as a service of its own, so installing means
 // installing the service too. A version that is already installed is upgraded
 // (with automatic rollback on a failed health check) instead of reinstalled.
-func (k *kernelCmds) xrayInstall(ctx context.Context, version string, complete Completion) (Result, error) {
+// It is the historical manifest path and stays exactly as it was for a panel
+// that does not pin a release asset.
+func (k *kernelCmds) xrayInstallFromManifest(ctx context.Context, version string, complete Completion) (Result, error) {
 	wanted := version
 	if wanted == "" {
 		wanted = "newest"

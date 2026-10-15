@@ -27,11 +27,35 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 	"github.com/W1nCwC/W1nCray/kernel"
 	"github.com/W1nCwC/W1nCray/kernel/install"
+	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
 
 // ServiceName is the fixed name of the service, its unit file and its init
 // script. It is never taken from the panel.
 const ServiceName = "W1nCray-xray"
+
+// XrayBinaryName is the installed file name of the Xray kernel. It is the
+// binary the manifest entry names (run.binary in
+// tools/manifestgen/examples/v11.yaml) and the one the service definitions
+// execute, so a direct install produces exactly the same layout as a manifest
+// install. It is deliberately a constant: the panel names an asset URL, never
+// a path inside the kernel directory.
+const XrayBinaryName = "W1nCray-xray"
+
+// xrayRun is the version self-check of the Xray kernel, mirroring the manifest
+// entry and cmd/xray.go exactly:
+//
+//	W1nCray-xray v0.8.2 (Xray-core 26.3.27)  ->  0.8.2
+//
+// install.DefaultKernelRun("xray") is deliberately not used here: it names the
+// binary "xray" (not the W1nCray-xray the manifest installs and the unit
+// executes) and leaves the version regex empty, so a release banner would be
+// parsed by the generic first-dotted-number rule instead of the pinned one.
+var xrayRun = manifest.Run{
+	Binary:       XrayBinaryName,
+	VersionCmd:   []string{"version"},
+	VersionRegex: `W1nCray-xray v?([0-9][0-9.]*)`,
+}
 
 // Backends: how the Xray kernel is supervised on this machine.
 const (
@@ -365,6 +389,79 @@ func (m *Manager) restoreAfterFailedInstall(ctx context.Context, cause error, in
 		return fmt.Errorf("%w（已回滚到 %s，但服务仍未通过健康检查: %v）", cause, rb.Version, werr)
 	}
 	return fmt.Errorf("安装 %s 失败，已恢复到安装前运行的 %s: %w", inst.Version, rb.Version, cause)
+}
+
+// directInstaller is the optional kernel-manager capability behind the
+// manifest-free install: the panel pins the release asset (URL, sha256, size,
+// format) in the kernel_install args and the manifest is never consulted. It
+// is a type assertion, like removeCurrentOps in agent/opscmd, so a manager
+// that cannot install from a URL (an older wiring, a fake) keeps working and
+// keeps answering the manifest path; *kernelx.Ensurer implements it.
+type directInstaller interface {
+	InstallDirect(ctx context.Context, di install.DirectInstall) (driver.Installed, error)
+}
+
+// InstallDirect installs the Xray kernel straight from the release asset
+// described by di (url/sha256/size/archive), without a signed manifest, and
+// then runs the very same activate / health check / failure rollback the
+// manifest path runs: a version that is already installed is upgraded (and
+// rolled back to the version it was running when the new one does not come up
+// healthy), a machine with no installed version gets a fresh install.
+//
+// It is the direct-path counterpart of Install and Upgrade, and it is an
+// optional capability of this Manager, not part of the XrayService interface
+// agent/opscmd depends on: the command layer asserts for it and falls back to
+// the manifest path when it is absent.
+//
+// Trust: the sha256 in di is the anchor (the panel pins it from the release
+// asset). This method refuses an empty one instead of relying on HTTPS alone,
+// and it never lets di override the installed binary name: the file is always
+// the W1nCray-xray the service definitions and the manifest installs use.
+func (m *Manager) InstallDirect(ctx context.Context, di install.DirectInstall) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	dir, ok := m.opts.Kernels.(directInstaller)
+	if !ok {
+		return errors.New("xraysvc: 本 agent 没有接入直连内核安装器（kernel_install 需要 url + sha256）")
+	}
+	if strings.TrimSpace(di.SHA256) == "" {
+		return errors.New("xraysvc: 直连安装 Xray 内核必须带 sha256（仅靠 HTTPS 不足以校验发布产物）")
+	}
+	// The asset is one gz member, so the installed name and the self-check are
+	// fixed here: the manifest installs W1nCray-xray and the unit executes it.
+	di.Name = xrayapi.KernelName
+	di.Run = xrayRun
+	di.To = xrayRun.Binary
+	if di.Archive == "" {
+		di.Archive = manifest.ArchiveGz
+	}
+	// A gz stream carries exactly one file, so the member name is meaningless:
+	// dropping it also keeps the panel from naming a path inside the kernel
+	// directory.
+	di.From = ""
+
+	// What has to survive a failed install is read before the installing flag
+	// hides it, exactly like Install: Status reports "installing" while the
+	// flag is set.
+	prev, perr := m.opts.Kernels.Current(xrayapi.KernelName)
+	// An installed version (even one that cannot be read back cleanly) makes
+	// this an upgrade: activate must replace a process that may already be
+	// serving, not just start one.
+	upgrade := perr == nil && prev.Path != ""
+	wasRunning := m.serviceRunning(ctx)
+
+	m.installing.Store(true)
+	defer m.installing.Store(false)
+
+	inst, err := dir.InstallDirect(ctx, di)
+	if err != nil {
+		return err
+	}
+	if err := m.activate(ctx, inst, upgrade); err != nil {
+		return m.restoreAfterFailedInstall(ctx, err, inst, prev, perr, wasRunning)
+	}
+	return nil
 }
 
 // Upgrade installs version, repoints the service at it, restarts and checks
