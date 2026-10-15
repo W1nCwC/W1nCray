@@ -40,6 +40,20 @@ func (p *fakeProbe) ServiceComponents() []wsproto.Component {
 	return p.services
 }
 
+// indexComponents maps the reported components by name and fails when a name
+// is reported twice: the contract allows exactly one Component per name.
+func indexComponents(t *testing.T, items []wsproto.Component) map[string]wsproto.Component {
+	t.Helper()
+	byName := make(map[string]wsproto.Component, len(items))
+	for _, it := range items {
+		if _, dup := byName[it.Name]; dup {
+			t.Fatalf("component %q reported twice: %+v", it.Name, items)
+		}
+		byName[it.Name] = it
+	}
+	return byName
+}
+
 func TestComponentsWithNilProbeReportsTheAgent(t *testing.T) {
 	swap(t, &selfRSSBytes, func() (uint64, bool) { return 4096, true })
 	got := New(Options{AgentVersion: "1.2.3"}).Components(context.Background())
@@ -250,6 +264,101 @@ func TestServiceComponentComesFromTheServiceManager(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("an uninstalled service kernel must still be listed: %+v", got.Items)
+	}
+}
+
+// A service kernel is listed once per installed version, but the contract
+// allows one component per name: the installed-kernel list must not duplicate
+// the service component the service manager already describes.
+func TestComponentsReportOneComponentPerServiceKernelName(t *testing.T) {
+	p := &fakeProbe{
+		kernels: []wsproto.KernelEntry{
+			{Name: "xray", Version: "0.8.2", Current: true},
+			{Name: "xray", Version: "0.6.0", Previous: true},
+		},
+		services: []wsproto.Component{{
+			Name: "xray", Kind: "kernel", Version: "0.8.2", State: wsproto.StateRunning, UptimeS: 30,
+			Instances: []wsproto.ComponentInstance{{ID: "node1@m1", State: wsproto.StateRunning, Conns: 3}},
+		}},
+	}
+	got := New(Options{AgentVersion: "v", Components: p}).Components(context.Background())
+
+	byName := indexComponents(t, got.Items) // fails on the duplicated xray
+	if len(got.Items) != 2 {
+		t.Fatalf("items = %+v, want the agent and one xray", got.Items)
+	}
+	if got.Items[0].Name != "agent" || got.Items[1].Name != "xray" {
+		t.Fatalf("component order = %v, want [agent xray]", []string{got.Items[0].Name, got.Items[1].Name})
+	}
+	x := byName["xray"]
+	if x.State != wsproto.StateRunning || x.Version != "0.8.2" || x.UptimeS != 30 {
+		t.Fatalf("xray component = %+v, want the service-manager view", x)
+	}
+	if len(x.Instances) != 1 || x.Instances[0].ID != "node1@m1" {
+		t.Fatalf("xray instances = %+v", x.Instances)
+	}
+}
+
+// One name, one component: the version shown is the one the current pointer
+// selects, and without a current pointer the highest installed version.
+func TestComponentsPreferCurrentThenHighestInstalledVersion(t *testing.T) {
+	cases := []struct {
+		name    string
+		kernels []wsproto.KernelEntry
+		want    string
+	}{
+		{
+			// The installed list is version-descending, so the current
+			// version comes first and the older one must not win.
+			"current beats an older version",
+			[]wsproto.KernelEntry{
+				{Name: "gost", Version: "3.1.0", Current: true},
+				{Name: "gost", Version: "3.0.0", Previous: true},
+			},
+			"3.1.0",
+		},
+		{
+			// Numeric, not lexicographic: 2.10.0 > 2.9.0.
+			"highest version when nothing is current",
+			[]wsproto.KernelEntry{
+				{Name: "realm", Version: "2.10.0"},
+				{Name: "realm", Version: "2.9.0"},
+			},
+			"2.10.0",
+		},
+		{
+			"current beats a higher version",
+			[]wsproto.KernelEntry{
+				{Name: "frp", Version: "1.2.0", Current: true},
+				{Name: "frp", Version: "1.3.0"},
+			},
+			"1.2.0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			name := tc.kernels[0].Name
+			p := &fakeProbe{kernels: tc.kernels}
+			got := New(Options{AgentVersion: "v", Components: p}).Components(context.Background())
+
+			byName := indexComponents(t, got.Items)
+			if len(got.Items) != 2 {
+				t.Fatalf("items = %+v, want the agent and one %s", got.Items, name)
+			}
+			comp, ok := byName[name]
+			if !ok {
+				t.Fatalf("no %s component: %+v", name, got.Items)
+			}
+			if comp.State != wsproto.StateStopped {
+				t.Fatalf("%s state = %q, want %q (installed, not selected)", name, comp.State, wsproto.StateStopped)
+			}
+			if comp.Version != tc.want {
+				t.Fatalf("%s version = %q, want %q", name, comp.Version, tc.want)
+			}
+			if comp.Instances == nil || len(comp.Instances) != 0 {
+				t.Fatalf("%s instances = %+v, want an empty list", name, comp.Instances)
+			}
+		})
 	}
 }
 
