@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
+	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
 
 // ComponentProbe is what telemetry needs from the agent runtime. bootstrap
@@ -75,14 +76,24 @@ func (c *Collector) componentsFrom(now time.Time) []wsproto.Component {
 
 	byDriver := make(map[string][]SupervisedProcess, len(procs))
 	var names []string
+	// The contract allows exactly one Component per name, so every source
+	// below registers its name through addName: a kernel installed in several
+	// versions contributes its name once, not once per version.
+	seen := make(map[string]bool, len(procs)+len(kernels))
+	seen["agent"] = true // already emitted above
+	addName := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
 	for _, p := range procs {
 		if p.Driver == "" {
 			continue
 		}
-		if _, ok := byDriver[p.Driver]; !ok {
-			names = append(names, p.Driver)
-		}
 		byDriver[p.Driver] = append(byDriver[p.Driver], p)
+		addName(p.Driver)
 	}
 
 	installed := make(map[string]wsproto.KernelEntry, len(kernels))
@@ -90,10 +101,10 @@ func (c *Collector) componentsFrom(now time.Time) []wsproto.Component {
 		if k.Name == "" {
 			continue
 		}
-		installed[k.Name] = k
-		if _, ok := byDriver[k.Name]; !ok {
-			names = append(names, k.Name)
+		if prev, ok := installed[k.Name]; !ok || preferInstalled(prev, k) {
+			installed[k.Name] = k
 		}
+		addName(k.Name)
 	}
 
 	// A kernel that runs as its own service (the Xray kernel) has no
@@ -107,11 +118,7 @@ func (c *Collector) componentsFrom(now time.Time) []wsproto.Component {
 			continue
 		}
 		serviceByName[comp.Name] = comp
-		if _, ok := byDriver[comp.Name]; !ok {
-			if _, ok := installed[comp.Name]; !ok {
-				names = append(names, comp.Name)
-			}
-		}
+		addName(comp.Name)
 	}
 
 	sort.Strings(names)
@@ -125,6 +132,17 @@ func (c *Collector) componentsFrom(now time.Time) []wsproto.Component {
 		})
 	}
 	return items
+}
+
+// preferInstalled reports whether candidate describes the same kernel name
+// better than the entry already recorded for it: the version the current
+// pointer selects wins, and without one the highest version wins (the
+// installed list carries one entry per version).
+func preferInstalled(prev, candidate wsproto.KernelEntry) bool {
+	if prev.Current != candidate.Current {
+		return candidate.Current
+	}
+	return manifest.CompareVersions(candidate.Version, prev.Version) > 0
 }
 
 // componentFor folds the supervised processes of one driver into the single

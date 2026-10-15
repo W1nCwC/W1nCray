@@ -101,6 +101,14 @@ type Service struct {
 	// TCP listener on Windows); statusAddr is what it is reachable at.
 	statusListener interface{ Close() error }
 	statusAddr     string
+
+	// audit is the bounded access-log collector served by /audit. It lives on
+	// the service, not on an xray instance, so it survives every rebuild; its
+	// epoch is the kernel process start.
+	audit *Collector
+	// auditHandler is the log handler of the running instance (nil before the
+	// first start, and again after shutdown).
+	auditHandler *auditHandler
 }
 
 // New creates a service for the config file at path.
@@ -111,6 +119,7 @@ func New(path string, cfg *Config) *Service {
 		reloadCh: make(chan struct{}, 1),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
+		audit:    NewCollector(time.Now().Unix()),
 	}
 }
 
@@ -310,7 +319,16 @@ func (s *Service) startXrayLocked(cfg *Config) (err error) {
 		ns = append(ns, n.NameServers()...)
 	}
 
-	cr, cerr := core.New(coreOptions(cfg, ns))
+	// Install the access-log collector's handler after the instance started
+	// (AfterStart): app/log registers the instance's own handler while the
+	// instance is being created, so installing earlier would be overwritten.
+	// The handler forwards every message to a replacement logger built from the
+	// same configuration, which is what keeps the console/file output unchanged
+	// (see audit.go). It is reinstalled on every rebuild, so the switch survives
+	// a reload.
+	opts := coreOptions(cfg, ns)
+	opts.AfterStart = func() { s.installAuditLocked(cfg) }
+	cr, cerr := core.New(opts)
 	if cerr != nil {
 		return cerr
 	}
@@ -341,6 +359,10 @@ func (s *Service) stopXrayLocked() {
 	// Stop the machine-node tasks first: no discovery or watch may race the
 	// teardown below. They never take s.mu, so waiting here cannot deadlock.
 	s.stopMachineLocked()
+	// Release the log handler this instance installed before the instance's own
+	// app/log closes its writers: the handler owns a replacement logger over the
+	// same access/error paths.
+	s.closeAuditHandlerLocked()
 	var wg sync.WaitGroup
 	for _, n := range s.nodes {
 		wg.Add(1)
@@ -363,6 +385,45 @@ func (s *Service) stopXrayLocked() {
 	}
 	s.nodes, s.core, s.running = nil, nil, false
 }
+
+// installAuditLocked installs the access-log collector's handler over the one
+// the freshly started xray instance registered. It is called from the core's
+// AfterStart hook, so it runs on every (re)start and the collector's switch
+// survives a reload. The caller must hold s.mu.
+//
+// A handler that cannot be installed is logged and skipped: audit collection
+// is a diagnostic feature and must never keep the kernel from serving.
+func (s *Service) installAuditLocked(cfg *Config) {
+	s.closeAuditHandlerLocked()
+	h, err := installAuditHandler(s.audit, cfg.LogConfig)
+	if err != nil {
+		log.Warnf("audit log: cannot install the access-log handler: %v", err)
+		return
+	}
+	s.auditHandler = h
+}
+
+// closeAuditHandlerLocked releases the replacement logger of the running
+// instance. The caller must hold s.mu.
+func (s *Service) closeAuditHandlerLocked() {
+	if s.auditHandler == nil {
+		return
+	}
+	s.auditHandler.Close()
+	s.auditHandler = nil
+}
+
+// AuditBatch returns one bounded page of the kernel's access-log collector.
+func (s *Service) AuditBatch(after uint64, max int) xrayapi.AuditBatch {
+	return s.audit.Batch(after, max)
+}
+
+// SetAuditEnabled turns access-log collection on or off. Turning it off empties
+// the buffer.
+func (s *Service) SetAuditEnabled(on bool) { s.audit.SetEnabled(on) }
+
+// AuditEnabled reports whether access-log collection is on.
+func (s *Service) AuditEnabled() bool { return s.audit.Enabled() }
 
 // discoverMachineNodes asks the panel which nodes this machine runs and appends
 // a controller for each of them to nodes. It returns the machine client (for
@@ -776,6 +837,10 @@ func (s *Service) Status() xrayapi.Status {
 		Nodes:             make([]xrayapi.NodeStatus, 0, len(s.nodes)),
 		ConfigFingerprint: s.fingerprint,
 		LastReloadAt:      s.lastReloadAt.Load(),
+		// Audit reports that this kernel serves /audit and /audit/ctl. It is
+		// independent of whether collection is on, and an old agent that does
+		// not know the field ignores it.
+		Audit: true,
 	}
 	if p := s.lastError.Load(); p != nil {
 		st.LastError = *p

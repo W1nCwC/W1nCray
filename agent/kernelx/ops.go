@@ -38,6 +38,15 @@ func (e *Ensurer) Catalog() ([]install.CatalogEntry, error) { return e.in.Catalo
 // previous pointer.
 func (e *Ensurer) Remove(name, version string) error { return e.in.Remove(name, version) }
 
+// RemoveCurrent deletes one installed version even when it is the current one,
+// promoting the previous version to current (or clearing the pointer when
+// there is none). It is the operator path behind kernel_remove for the
+// supervised kernels, which first establishes that nothing executes the
+// version; the reconciler and the drivers keep using the conservative Remove.
+func (e *Ensurer) RemoveCurrent(name, version string) error {
+	return e.in.RemoveCurrent(name, version)
+}
+
 // Rollback makes the previous version current again and marks the version that
 // was current as bad (with back-off), so a later Ensure of the same pin does
 // not immediately switch back. It returns the now-current kernel, after

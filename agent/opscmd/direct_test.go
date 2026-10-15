@@ -133,14 +133,14 @@ func TestKernelInstallDirectRefusesWrongHash(t *testing.T) {
 	}
 }
 
-// A direct URL for the Xray kernel is refused: the Xray service keeps its own
-// (manifest-driven) install flow, and silently downgrading it is worse than a
-// clear refusal.
+// A direct URL for the Xray kernel on a machine whose kernel manager has no
+// direct installer is a clear refusal, never a silent downgrade to the manifest
+// (DEC-4: the args used to be ignored and the manifest was consulted instead).
 func TestKernelInstallDirectRefusesXrayService(t *testing.T) {
 	reg := mustRegistry(t, Deps{Kernels: fakeKernels{}})
 	status, res := reg.Execute(context.Background(), panelclient.Command{
 		ID: "d3", Type: panelclient.CmdKernelInstall,
-		Args: json.RawMessage(`{"name":"xray","version":"1.0.0","url":"https://example.com/x.gz"}`),
+		Args: json.RawMessage(`{"name":"xray","version":"1.0.0","url":"https://example.com/x.gz","sha256":"` + strings.Repeat("01", 32) + `"}`),
 	})
 	if status != panelclient.ResultFailed {
 		t.Fatalf("status = %q (%s), want failed", status, res)

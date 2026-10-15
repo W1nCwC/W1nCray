@@ -29,6 +29,22 @@ const (
 	// no path, no command, no node data. A kernel older than this route answers
 	// HTTP 404, which the caller degrades to the poll.
 	NodesSyncPath = "/nodes/sync"
+	// AuditPath is the HTTP path that returns one bounded page of the kernel's
+	// access-log collector. It is served on the same local endpoint as
+	// StatusPath and takes two optional query parameters: after=<seq> (the
+	// first sequence number the caller has not seen; 0 or absent means "from
+	// the oldest entry kept") and max=<n> (the page size, default and cap
+	// MaxAuditItems). A kernel older than this route answers HTTP 404, which
+	// the caller degrades to "no audit log".
+	AuditPath = "/audit"
+	// AuditCtlPath is the HTTP path that turns access-log collection on or
+	// off. It takes a POST with an AuditCtlRequest body and is served on the
+	// same local endpoint as StatusPath.
+	AuditCtlPath = "/audit/ctl"
+	// MaxAuditItems is the largest page a single AuditPath request returns and
+	// the cap on its max parameter. It is the same bound wsproto.MaxAuditItems
+	// puts on one audit.log frame, so a page always fits one frame.
+	MaxAuditItems = 400
 	// RuntimeDirName is the directory under /run that holds the kernel's
 	// runtime files. The systemd unit asks systemd to create it
 	// (RuntimeDirectory=W1nCray); the kernel creates it itself when it is not
@@ -60,6 +76,53 @@ type Status struct {
 	LastReloadAt int64 `json:"last_reload_at"`
 	// LastError is the last reload error, "" when there is none.
 	LastError string `json:"last_error,omitempty"`
+	// Audit reports whether this kernel supports the access-log collector
+	// (AuditPath and AuditCtlPath). It is independent of whether collection is
+	// switched on right now, so an old agent that ignores it is unaffected.
+	Audit bool `json:"audit,omitempty"`
+}
+
+// AuditBatch is the JSON body of GET AuditPath: one bounded page of the
+// kernel's access-log entries, oldest first.
+//
+// Epoch is the kernel process start (unix seconds) the sequence numbers belong
+// to; a change of Epoch means the kernel restarted and a caller that had a
+// cursor must start again at the kernel's current position. FromSeq/ToSeq are
+// the sequence numbers of Items[0] and Items[len-1] (both 0 for an empty
+// page). Dropped counts the entries the kernel discarded between the caller's
+// previous cursor and FromSeq (the bounded buffer overflowed, or an off switch
+// emptied it), so it is the loss this page reports and never repeats on the
+// next one. More reports that entries beyond ToSeq are already buffered, so the
+// caller should ask again immediately.
+//
+// It carries no dependency on agent/wsproto: the agent maps this document onto
+// the panel's audit.log frame itself.
+type AuditBatch struct {
+	Epoch   int64       `json:"epoch"`
+	FromSeq uint64      `json:"from_seq"`
+	ToSeq   uint64      `json:"to_seq"`
+	Dropped uint64      `json:"dropped"`
+	Items   []AuditItem `json:"items"`
+	More    bool        `json:"more"`
+}
+
+// AuditItem is one access-log line: T is when the kernel handled it (unix ms)
+// and L is the line, at most MaxAuditLine bytes. The JSON keys are the ones
+// wsproto.AuditItem uses, so the agent can copy the item as it is.
+type AuditItem struct {
+	T int64  `json:"t"`
+	L string `json:"l"`
+}
+
+// MaxAuditLine is the longest access-log line the kernel keeps; a longer one is
+// truncated on a UTF-8 boundary. It is the same bound wsproto.MaxAuditLine
+// puts on one audit.log item.
+const MaxAuditLine = 512
+
+// AuditCtlRequest is the JSON body of POST AuditCtlPath. Disabling collection
+// discards the kernel's buffer, so a later enable starts a fresh page.
+type AuditCtlRequest struct {
+	Enabled bool `json:"enabled"`
 }
 
 // NodeStatus is one entry of Status.Nodes.

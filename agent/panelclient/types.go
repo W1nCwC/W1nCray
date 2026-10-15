@@ -32,14 +32,19 @@ const (
 	CmdKernelRemove     = "kernel_remove"
 	CmdKernelRollback   = "kernel_rollback"
 	CmdComponentRestart = "component_restart"
-	CmdSelfUpdate       = "self_update"
-	CmdFileList         = "file_list"
-	CmdFileRead         = "file_read"
-	CmdFileWrite        = "file_write"
-	CmdFileDelete       = "file_delete"
-	CmdFileMkdir        = "file_mkdir"
-	CmdFileRename       = "file_rename"
-	CmdFilesApply       = "files_apply"
+	// CmdAuditCtl is the panel's switch for the Xray kernel's access-log
+	// stream (W1NCRAY-D2): {"enabled":bool}. It is a command of this agent
+	// build; a machine whose kernel predates the collector answers
+	// not_supported, and an older panel never sends it at all.
+	CmdAuditCtl   = "audit_ctl"
+	CmdSelfUpdate = "self_update"
+	CmdFileList   = "file_list"
+	CmdFileRead   = "file_read"
+	CmdFileWrite  = "file_write"
+	CmdFileDelete = "file_delete"
+	CmdFileMkdir  = "file_mkdir"
+	CmdFileRename = "file_rename"
+	CmdFilesApply = "files_apply"
 	// CmdFilesValidate stages and validates the managed files without writing
 	// or reloading anything; CmdFilesRollback restores the last good set and
 	// reloads (docs/WS-PROTOCOL.md section 7 ruling 9).

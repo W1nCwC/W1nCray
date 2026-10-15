@@ -200,6 +200,10 @@ type Registry struct {
 	// the panel link is built; until then the file commands answer
 	// "not_supported" instead of running half-wired.
 	files FilesOps
+	// audit is the access-log stream switch (audit_ctl). It is installed by
+	// bootstrap once the WebSocket channel exists (SetAudit); until then the
+	// command answers not_supported instead of pretending a stream is running.
+	audit AuditControl
 	// desired lets files_apply wait for the revision it was enqueued for.
 	desired DesiredSync
 	log     driver.Logger
@@ -233,6 +237,12 @@ func New(d Deps) (*Registry, error) {
 		return nil, err
 	}
 	if err := registerFiles(r, d); err != nil {
+		return nil, err
+	}
+	// audit_ctl (W1NCRAY-D2) is registered unconditionally: it is part of this
+	// agent build, and a machine without the collector answers not_supported
+	// rather than looking like an agent that never heard of the command.
+	if err := registerAudit(r, d); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -300,6 +310,22 @@ func (r *Registry) SetFiles(f FilesOps) {
 	r.mu.Lock()
 	r.files = f
 	r.mu.Unlock()
+}
+
+// SetAudit installs the access-log stream switch (audit_ctl, W1NCRAY-D2).
+// bootstrap calls it once the WebSocket channel exists; it replaces a
+// previously installed one, so a re-link cannot register twice.
+func (r *Registry) SetAudit(a AuditControl) {
+	r.mu.Lock()
+	r.audit = a
+	r.mu.Unlock()
+}
+
+// auditControl returns the installed access-log switch (nil when none).
+func (r *Registry) auditControl() AuditControl {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.audit
 }
 
 // DesiredSync is the agent's view of the desired state it last applied, plus

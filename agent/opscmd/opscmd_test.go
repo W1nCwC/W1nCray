@@ -76,6 +76,23 @@ func (f fakeKernels) Rollback(name string) (driver.Installed, error) {
 }
 func (f fakeKernels) RunningVersion(name string) (string, bool) { return f.running, f.exact }
 
+// fakeKernelsRemoveCurrent is fakeKernels plus the optional RemoveCurrent
+// capability (DEC-3). The plain fakeKernels deliberately does not have that
+// method, so a test can prove that a manager without it keeps the
+// conservative in_use refusal. removeCurrentFn is called for the current
+// version after removeFn refused it with ErrInUse; nil makes it succeed.
+type fakeKernelsRemoveCurrent struct {
+	fakeKernels
+	removeCurrentFn func(name, version string) error
+}
+
+func (f fakeKernelsRemoveCurrent) RemoveCurrent(name, version string) error {
+	if f.removeCurrentFn != nil {
+		return f.removeCurrentFn(name, version)
+	}
+	return nil
+}
+
 // fakeXray is the XrayService surface.
 type fakeXray struct {
 	calls  []string
@@ -137,10 +154,13 @@ func decodeFailure(t *testing.T, res json.RawMessage) failure {
 // with the historical "unsupported command" failure, never executed. The file
 // commands are registered too: a registry without a file applier answers them
 // with an explicit not_supported rather than pretending the type does not
-// exist (protocol ruling 5).
+// exist (protocol ruling 5). audit_ctl (W1NCRAY-D2) is the same shape: it is
+// registered by this agent build and answers not_supported until the WebSocket
+// channel installs the stream switch (SetAudit).
 func TestRegistryWhitelistIsTheRegisteredTypes(t *testing.T) {
 	reg := mustRegistry(t, Deps{})
 	want := []string{
+		panelclient.CmdAuditCtl,
 		panelclient.CmdComponentRestart,
 		panelclient.CmdFilesApply,
 		panelclient.CmdFilesRollback,
