@@ -1,10 +1,10 @@
 # W1nCray
 
-对接 [Xboard](https://github.com/cedar2025/Xboard) 节点 API 的节点后端，基于官方稳定版 Xray-core 构建（XrayR 的重写）。
+对接 W1nCBoard 节点 API 的节点后端，基于官方稳定版 Xray-core 构建（XrayR 的重写）。
 
-## 与 Xboard 的关系
+## 与 W1nCBoard 的关系
 
-W1nCray 作为 Xboard 的**节点后端**运行：它按 Xboard 的 UniProxy 节点 API 拉取节点配置与用户，在本机用 Xray 内核把节点跑起来，并把流量、在线 IP 与节点负载回传给面板。
+W1nCray 作为 W1nCBoard 的**节点后端**运行：它按 W1nCBoard 的 UniProxy 节点 API 拉取节点配置与用户，在本机用 Xray 内核把节点跑起来，并把流量、在线 IP 与节点负载回传给面板。
 
 - 普通节点模式：`/api/v1/server/UniProxy/{config,user,push,alive,alivelist,status}`（`api/xboard/client.go:5–10`）。
 - 机器（Machine）模式：`/api/v2/server/machine/agent/node/*`，由面板决定这台机器跑哪些节点（`api/xboard/client.go:14–20,40`）。
