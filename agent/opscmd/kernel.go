@@ -329,14 +329,30 @@ func (k *kernelCmds) anyInstalled(name string) bool {
 	return false
 }
 
+// removeCurrentOps is the optional capability behind "uninstall the current
+// version too": the kernel manager answers it when the underlying installer
+// can delete a current version and keep the current/previous pointers
+// consistent (kernel/install.Installer.RemoveCurrent). It is an optional
+// assertion, like the direct installer in kernelInstallDirect, so a manager
+// without it keeps working and keeps refusing the current version.
+type removeCurrentOps interface {
+	RemoveCurrent(name, version string) error
+}
+
 // kernelRemove answers kernel_remove. It is quick (no network), so it finishes
 // inline. A version that is executing right now is refused even when the
 // current pointer already moved on, which a rollback can leave behind.
 //
 // It is a version-level command: one installed version is deleted and the
-// others stay. The Xray kernel is the single exception to the "the current
-// version is refused" rule, because it is a service: naming its current version
-// means uninstalling the kernel. xrayRemove below spells that out.
+// others stay. The Xray kernel is the single exception to "the current version
+// is refused", because it is a service: naming its current version means
+// uninstalling the kernel. xrayRemove below spells that out.
+//
+// For the supervised kernels (gost/realm/frp) the current version is refused
+// only while it may still be executing; once nothing runs it, removing it is
+// allowed and the installer promotes the previous version (DEC-3). Nothing is
+// stopped automatically: the operator stops the instances or the forwarding
+// rules that use the kernel first, and the refusal says so.
 func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Completion) (Result, error) {
 	var a panelclient.KernelRemoveArgs
 	if err := decodeArgs(req.Args, &a); err != nil {
@@ -374,13 +390,30 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 		return Result{}, coded("invalid_args", errors.New("version is required"))
 	}
 	version := manifest.NormalizeVersion(a.Version)
-	if running, exact := k.deps.Kernels.RunningVersion(a.Name); exact && running == version {
-		return Result{}, coded("in_use", fmt.Errorf("kernel %s@%s is running; ensure or roll back to another version first", a.Name, version))
+	// Nothing is stopped automatically: a version a live process executes is
+	// refused first, even when the current pointer moved on (a rollback can
+	// leave exactly that behind). The check is exact when the platform can name
+	// the running binary; when it cannot (exact=false) the current pointer is
+	// the only evidence there is, so a current version is refused as "cannot
+	// prove nothing runs it" rather than deleted under a live process.
+	running, exact := k.deps.Kernels.RunningVersion(a.Name)
+	if (exact && running == version) || (!exact && k.isCurrent(a.Name, version)) {
+		return Result{}, coded("in_use", fmt.Errorf("kernel %s@%s is running or is the version in use; stop the instances or forwarding rules that use this kernel first, then remove it again", a.Name, version))
 	}
 	// The declared installed size is what the version occupied; it is read
 	// before the removal because afterwards the entry is gone.
 	freed := k.installedSizeOf(a.Name, version)
-	if err := k.deps.Kernels.Remove(a.Name, version); err != nil {
+	// The current version is removable only when the manager can keep the
+	// pointers consistent (RemoveCurrent). A manager without that capability
+	// (an older wiring, a fake) keeps the conservative Remove and its in_use
+	// answer.
+	err := k.deps.Kernels.Remove(a.Name, version)
+	if errors.Is(err, kernel.ErrInUse) {
+		if rc, ok := k.deps.Kernels.(removeCurrentOps); ok {
+			err = rc.RemoveCurrent(a.Name, version)
+		}
+	}
+	if err != nil {
 		// An already removed version is the desired state of kernel_remove:
 		// report success with already_absent instead of failing the command
 		// (D-M2). This makes gost/realm/frp removal idempotent too.
@@ -393,6 +426,25 @@ func (k *kernelCmds) kernelRemove(ctx context.Context, req Request, complete Com
 	k.reg.logf().Infof("opscmd: kernel_remove %s@%s done (%d bytes freed)", a.Name, version, freed)
 	k.reg.event("kernel.removed", "info", fmt.Sprintf("kernel %s@%s removed", a.Name, version))
 	return done(panelclient.KernelRemoveResult{FreedBytes: freed}), nil
+}
+
+// isCurrent reports whether an installed version is the one the current
+// pointer names. It is read from the kernel list (KernelOps deliberately has
+// no Current: the pointer is an installer detail) and is only consulted when
+// the process check cannot be exact.
+func (k *kernelCmds) isCurrent(name, version string) bool {
+	list, err := k.deps.Kernels.List()
+	if err != nil {
+		// Unreadable list: refuse the removal rather than delete a version we
+		// cannot classify (the caller reports in_use).
+		return true
+	}
+	for _, e := range list {
+		if e.Name == name && e.Version == version {
+			return e.Current
+		}
+	}
+	return false
 }
 
 // xrayRemove answers kernel_remove for the Xray kernel service. The requested

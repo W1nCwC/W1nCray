@@ -76,6 +76,23 @@ func (f fakeKernels) Rollback(name string) (driver.Installed, error) {
 }
 func (f fakeKernels) RunningVersion(name string) (string, bool) { return f.running, f.exact }
 
+// fakeKernelsRemoveCurrent is fakeKernels plus the optional RemoveCurrent
+// capability (DEC-3). The plain fakeKernels deliberately does not have that
+// method, so a test can prove that a manager without it keeps the
+// conservative in_use refusal. removeCurrentFn is called for the current
+// version after removeFn refused it with ErrInUse; nil makes it succeed.
+type fakeKernelsRemoveCurrent struct {
+	fakeKernels
+	removeCurrentFn func(name, version string) error
+}
+
+func (f fakeKernelsRemoveCurrent) RemoveCurrent(name, version string) error {
+	if f.removeCurrentFn != nil {
+		return f.removeCurrentFn(name, version)
+	}
+	return nil
+}
+
 // fakeXray is the XrayService surface.
 type fakeXray struct {
 	calls  []string
