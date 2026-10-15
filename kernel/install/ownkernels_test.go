@@ -258,15 +258,15 @@ func TestOwnKernelsArmFallback(t *testing.T) {
 		f := newFixture(t)
 		own := newFileServer(t)
 		plat := platform.Info{GOOS: "linux", GOARCH: "arm", ARM: 6, Libc: "musl"}
-		ownTable(t, ownFrpRow(t, own, "0.71.0", "linux/armv5", "/frp-armv5.tar.gz", 64))
+		ownTable(t, ownFrpRow(t, own, "0.71.1", "linux/armv5", "/frp-armv5.tar.gz", 64))
 		in := ownInstaller(t, f, t.TempDir(), plat)
 
 		inst, err := in.Ensure(context.Background(), pin("frp", ""))
 		if err != nil {
 			t.Fatalf("Ensure(frp@\"\") on armv6: %v", err)
 		}
-		if inst.Version != "0.71.0" {
-			t.Fatalf("installed version = %q, want 0.71.0", inst.Version)
+		if inst.Version != "0.71.1" {
+			t.Fatalf("installed version = %q, want 0.71.1", inst.Version)
 		}
 		if n := own.hitCount("/frp-armv5.tar.gz"); n != 1 {
 			t.Fatalf("the armv5 fallback asset hits = %d, want 1", n)
@@ -278,17 +278,17 @@ func TestOwnKernelsArmFallback(t *testing.T) {
 		own := newFileServer(t)
 		plat := platform.Info{GOOS: "linux", GOARCH: "arm", ARM: 7, Libc: "musl"}
 		ownTable(t,
-			ownFrpRow(t, own, "0.71.0", "linux/armv5", "/frp-armv5.tar.gz", 64),
-			ownFrpRow(t, own, "0.71.0", "linux/armv7", "/frp-armv7.tar.gz", 96),
+			ownFrpRow(t, own, "0.71.1", "linux/armv5", "/frp-armv5.tar.gz", 64),
+			ownFrpRow(t, own, "0.71.1", "linux/armv7", "/frp-armv7.tar.gz", 96),
 		)
 		in := ownInstaller(t, f, t.TempDir(), plat)
 
-		inst, err := in.Ensure(context.Background(), pin("frp", "0.71.0"))
+		inst, err := in.Ensure(context.Background(), pin("frp", "0.71.1"))
 		if err != nil {
-			t.Fatalf("Ensure(frp@0.71.0) on armv7: %v", err)
+			t.Fatalf("Ensure(frp@0.71.1) on armv7: %v", err)
 		}
-		if inst.Version != "0.71.0" {
-			t.Fatalf("installed version = %q, want 0.71.0", inst.Version)
+		if inst.Version != "0.71.1" {
+			t.Fatalf("installed version = %q, want 0.71.1", inst.Version)
 		}
 		if n := own.hitCount("/frp-armv7.tar.gz"); n != 1 {
 			t.Fatalf("the armv7 asset hits = %d, want 1", n)
@@ -304,12 +304,12 @@ func TestOwnKernelsArmFallback(t *testing.T) {
 func TestOwnKernelsFrpInstallsBothMembers(t *testing.T) {
 	f := newFixture(t)
 	own := newFileServer(t)
-	ownTable(t, ownFrpRow(t, own, "0.71.0", "linux/amd64", "/frp.tar.gz", 64))
+	ownTable(t, ownFrpRow(t, own, "0.71.1", "linux/amd64", "/frp.tar.gz", 64))
 	in := ownInstaller(t, f, t.TempDir(), f.plat)
 
-	inst, err := in.Ensure(context.Background(), pin("frp", "0.71.0"))
+	inst, err := in.Ensure(context.Background(), pin("frp", "0.71.1"))
 	if err != nil {
-		t.Fatalf("Ensure(frp@0.71.0): %v", err)
+		t.Fatalf("Ensure(frp@0.71.1): %v", err)
 	}
 	if filepath.Base(inst.Path) != "frpc" {
 		t.Fatalf("installed path = %q, want the frp run binary frpc", inst.Path)
@@ -463,7 +463,7 @@ func TestOwnKernelsOtherNamesUnchanged(t *testing.T) {
 }
 
 var (
-	reOwnURL = regexp.MustCompile(`^https://github\.com/W1nCwC/W1nCray/releases/download/(gost-v3\.3\.0|realm-v2\.9\.6|frp-v0\.71\.0)/W1nCray-(gost|realm|frp)-linux-[a-z0-9]+\.(gz|tar\.gz)$`)
+	reOwnURL = regexp.MustCompile(`^https://github\.com/W1nCwC/W1nCray/releases/download/(gost-v3\.3\.0|realm-v2\.9\.6|frp-v0\.71\.1)/W1nCray-(gost|realm|frp)-linux-[a-z0-9]+\.(gz|tar\.gz)$`)
 	reOwnSHA = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
