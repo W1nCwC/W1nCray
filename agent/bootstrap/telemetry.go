@@ -98,7 +98,27 @@ func (s runtimeStreams) Capabilities() []string {
 	if s.rt.upgradeCapable() {
 		caps = append(caps, wsproto.CapUpgrade)
 	}
+	// audit is a promise that this agent can answer audit.log frames: the
+	// kernel's own status document said it serves the access-log collector
+	// (W1NCRAY-D2). The bit is published by the WebSocket channel's audit loop
+	// and is false until a kernel said otherwise, so the capability is never
+	// declared on a guess — and never declared for a kernel that predates the
+	// route.
+	if s.rt != nil && s.rt.Audit != nil && s.rt.auditSupported.Load() {
+		caps = append(caps, wsproto.CapAudit)
+	}
 	return caps
+}
+
+// SetAuditSupported records the kernel's "I serve /audit" bit, which the
+// capability list above reads. The WebSocket channel's audit loop calls it
+// whenever the answer changes, so the panel sees the capability appear (or
+// disappear) on the next hello.
+func (s runtimeStreams) SetAuditSupported(supported bool) {
+	if s.rt == nil {
+		return
+	}
+	s.rt.auditSupported.Store(supported)
 }
 
 // TerminalSupported reports whether this machine can really serve a terminal
@@ -356,6 +376,11 @@ func (p runtimeProbe) SupervisedProcesses() []telemetry.SupervisedProcess {
 // service (the Xray kernel). The state and backend come from the service
 // manager, the version, node list, online users and last error from the
 // kernel's status endpoint. A machine without such a kernel returns nil.
+//
+// The same status read keeps the audit capability honest (W1NCRAY-D2): it is
+// the periodic check that notices a kernel that was installed, replaced or
+// removed while the agent runs, so the WebSocket audit loop needs no probe
+// schedule of its own beyond the bounded one it runs at start-up.
 func (p runtimeProbe) ServiceComponents() []wsproto.Component {
 	if p.rt == nil || p.rt.XrayManager == nil {
 		return nil
@@ -364,6 +389,7 @@ func (p runtimeProbe) ServiceComponents() []wsproto.Component {
 	defer cancel()
 	st, err := p.rt.XrayManager.Status(ctx)
 	if err != nil {
+		p.rt.auditSupported.Store(false)
 		return nil
 	}
 	comp := wsproto.Component{
@@ -375,6 +401,11 @@ func (p runtimeProbe) ServiceComponents() []wsproto.Component {
 	}
 	if p.rt.Xray != nil {
 		if ks, kerr := p.rt.Xray.Status(ctx); kerr == nil {
+			// The kernel's own "I serve /audit" bit. It is read here, on the
+			// components cadence, because this is the one periodic status read
+			// the agent already performs: the audit capability then costs
+			// nothing extra and still follows a kernel that was upgraded.
+			p.rt.auditSupported.Store(ks.Audit)
 			if comp.Version == "" {
 				comp.Version = ks.Version
 			}

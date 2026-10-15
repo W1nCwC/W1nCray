@@ -18,6 +18,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 )
 
 // CommandQueueTimeout bounds how long a cmd.result waits for room in the send
@@ -61,6 +62,138 @@ const maxEventSendAttempts = 3
 type pendingEvent struct {
 	env      wsproto.Envelope
 	attempts int
+}
+
+// Audit stream bounds. They are the contract's (wsproto) plus the pull loop's
+// own cadence, and they live here so a test can pin them.
+const (
+	// DefaultAuditPullInterval is how often the agent asks the kernel for the
+	// next page while collection is on. more=true makes the loop pull again
+	// immediately instead of waiting for this tick.
+	DefaultAuditPullInterval = 3 * time.Second
+	// AuditMaxFrameRate is the contract's send cap: at most five audit.log
+	// frames per second, whatever the kernel offers.
+	AuditMaxFrameRate = 5
+	// auditMinFrameGap is the minimum spacing between two audit.log frames.
+	auditMinFrameGap = time.Second / AuditMaxFrameRate
+	// MaxAuditFrameBytes caps one audit.log frame at 128 KiB, below the
+	// transport's wsproto.MaxFrame: a page is trimmed to fit rather than
+	// refused, so a kernel line of the maximum length cannot make the agent
+	// drop the whole page.
+	MaxAuditFrameBytes = 128 << 10
+	// auditProbeFirstDelay and auditProbeMaxDelay shape the bounded support
+	// probe: a machine whose kernel has no collector is asked a handful of
+	// times after start-up (and again after a failed pull) and then left alone,
+	// because "off" must not cost a periodic request forever.
+	auditProbeFirstDelay = time.Second
+	auditProbeMaxDelay   = 32 * time.Second
+	// auditFailBackoffMin/Max bound the retry delay after a failed pull, so a
+	// kernel that is restarting is retried quickly and a broken one is not
+	// hammered.
+	auditFailBackoffMin = time.Second
+	auditFailBackoffMax = 30 * time.Second
+	// auditMaxBurst bounds how many pages one iteration may follow when the
+	// kernel keeps reporting more=true. The frame rate cap already bounds the
+	// rate; this only keeps one loop pass finite.
+	auditMaxBurst = 8
+)
+
+// auditProbeDelays is the fixed probe schedule: eight bounded attempts, then
+// silence until a pull fails (which re-arms the probe).
+var auditProbeDelays = []time.Duration{
+	0,
+	auditProbeFirstDelay,
+	2 * auditProbeFirstDelay,
+	4 * auditProbeFirstDelay,
+	8 * auditProbeFirstDelay,
+	16 * auditProbeFirstDelay,
+	auditProbeMaxDelay,
+	auditProbeMaxDelay,
+}
+
+// ErrAuditUnsupported is what an AuditSource returns from SetEnabled when the
+// kernel predates the collector. The kernel client (agent/xraysvc) has its own
+// sentinel; bootstrap's adapter maps it onto this one, so this package never
+// imports the kernel layer.
+var ErrAuditUnsupported = errors.New("ws: the kernel does not serve the access-log collector")
+
+// AuditSource is the kernel side of the audit stream: the local access-log
+// collector (agent/xraysvc.AuditClient implements it through a small adapter in
+// bootstrap). A nil source means this agent has no Xray kernel at all: the
+// capability is not declared, audit_ctl answers not_supported, and nothing is
+// ever pulled.
+type AuditSource interface {
+	// Supported reports whether the kernel serves the collector (its status
+	// document's audit bit, or the route itself). An error means "not known
+	// yet", which is treated as unsupported.
+	Supported(ctx context.Context) (bool, error)
+	// Batch pulls one bounded page with a sequence number greater than after.
+	Batch(ctx context.Context, after uint64, max int) (AuditPage, error)
+	// SetEnabled turns the kernel's collection on or off. It returns
+	// ErrAuditUnsupported when the kernel has no collector.
+	SetEnabled(ctx context.Context, enabled bool) error
+}
+
+// AuditPage is one page of the kernel's collector. Supported is false when the
+// kernel predates the route; Batch then carries nothing.
+type AuditPage struct {
+	Batch     xrayapi.AuditBatch
+	Supported bool
+}
+
+// auditSupportSink is the optional extension of Streams that lets the audit
+// loop publish the kernel's support bit into the capability set. bootstrap's
+// runtimeStreams implements it; a fake that does not is simply not told, and
+// declares the capability from its own Capabilities list.
+type auditSupportSink interface {
+	// SetAuditSupported records what the kernel's status reported.
+	SetAuditSupported(bool)
+}
+
+// auditState is the audit stream's state. It is touched by the reader
+// (helloOK, panel errors), by the command path (SetAuditEnabled) and by the
+// sender goroutine (the pull loop), so every field is guarded by mu.
+type auditState struct {
+	// session is the panel session whose hello.ok was adopted. The pull loop
+	// does nothing until it equals the client's current session: a capability
+	// the panel never answered must not start a stream.
+	session string
+	// enabled is what the panel asked for: hello.ok.audit.enabled, or an
+	// audit_ctl command. It survives a reconnect when a command set it, and is
+	// re-stated by every hello.ok (the panel is the authority).
+	enabled bool
+	// applied is what the agent last told the kernel (SetEnabled). It is the
+	// kernel's state as far as the agent knows, so an enable is sent once.
+	applied bool
+	// appliedEpoch is the kernel epoch the applied state belongs to. A new
+	// epoch means the kernel restarted, its switch is off again, and the
+	// enable must be re-sent.
+	appliedEpoch int64
+	// cursor is the last sequence number the panel acknowledged by receiving a
+	// frame. It only moves after a successful send, so a frame that never left
+	// is retried instead of being skipped.
+	cursor uint64
+	// pending is a page that is ready but was not sent yet because the frame
+	// rate cap (five per second) was reached.
+	pending *wsproto.AuditLog
+	// stopped is set for the rest of a session when the panel answers an
+	// audit.log frame with unknown_type or not_supported: the panel does not
+	// manage audit here, so the agent stops sending until the next session.
+	stopped bool
+	// nextProbe is when the support probe runs, and probeLeft is what is left
+	// of the bounded schedule (nil once it ran out).
+	probeLeft []time.Duration
+	nextProbe time.Time
+	// probing is set while the schedule is exhausted: no more probes until a
+	// pull fails.
+	probing bool
+	// failBackoff is the current retry delay after a failed pull, and nextPull
+	// is when the next request to the kernel may be made (zero = now).
+	failBackoff time.Duration
+	nextPull    time.Time
+	// lastFrame is when the last audit.log frame was handed to the transport,
+	// which is what the frame rate cap measures.
+	lastFrame time.Time
 }
 
 // eventBacklog is the sender's bounded queue of event frames that could not be
@@ -198,6 +331,13 @@ type AgentOptions struct {
 	// Files is the managed-file hook (a "files" hint, D4/D5). It may be nil:
 	// the hint is then answered with not_supported instead of being ignored.
 	Files FileSync
+	// Audit is the Xray kernel's access-log collector (W1NCRAY-D2). It may be
+	// nil: the "audit" capability is then never declared, no frame is ever
+	// pulled and audit_ctl answers not_supported.
+	Audit AuditSource
+	// AuditPullInterval overrides the pull cadence (default
+	// DefaultAuditPullInterval). Tests use it so a case does not sleep 3 s.
+	AuditPullInterval time.Duration
 	// Log receives the agent's events.
 	Log driver.Logger
 	// InstanceID is reported in hello.instance_id.
@@ -219,11 +359,29 @@ type Agent struct {
 	nodes      NodeToggle
 	files      FileSync
 	terminal   TerminalSink
+	auditSrc   AuditSource
+	auditEvery time.Duration
 	log        driver.Logger
 	instanceID string
 	version    string
 
 	events chan wsproto.Envelope
+
+	// auditMu guards audit. The reader (helloOK, panel errors), the command
+	// path and the sender goroutine all touch it; the lock is never held
+	// across a request.
+	auditMu sync.Mutex
+	audit   auditState
+
+	// auditWake asks the sender to re-evaluate the audit state right away
+	// (a hello.ok arrived, audit_ctl ran, or the socket came back) instead of
+	// waiting for the next pull tick.
+	auditWake chan struct{}
+
+	// supportMu guards supportSeen, the last support verdict published to the
+	// Streams: the loop only tells it when the answer changed.
+	supportMu   sync.Mutex
+	supportSeen bool
 
 	// backlog holds event frames that could not be delivered yet: the session
 	// is not up, or a send failed. It is replayed in order once a session
@@ -271,15 +429,32 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		nodes:      a.Nodes,
 		files:      a.Files,
 		terminal:   a.Terminal,
+		auditSrc:   a.Audit,
+		auditEvery: a.AuditPullInterval,
 		log:        a.Log,
 		instanceID: a.InstanceID,
 		version:    a.AgentVersion,
 		events:     make(chan wsproto.Envelope, eventQueueSize),
 		backlog:    newEventBacklog(),
 		wake:       make(chan struct{}, 1),
+		auditWake:  make(chan struct{}, 1),
 		telemetry:  time.Duration(DefaultTelemetryIntervalS) * time.Second,
 		comp:       time.Duration(DefaultComponentsIntervalS) * time.Second,
 		nowFn:      a.Now,
+	}
+	if ag.auditEvery <= 0 {
+		ag.auditEvery = DefaultAuditPullInterval
+	}
+	ag.audit = auditState{
+		probeLeft:   append([]time.Duration(nil), auditProbeDelays...),
+		failBackoff: auditFailBackoffMin,
+	}
+	// One bounded support probe before the first hello, so a machine whose
+	// kernel serves the collector declares the capability in its very first
+	// hello instead of after a capability reconnect. The call is bounded by the
+	// source's own timeout, and its failure only means "not declared yet".
+	if ag.auditSrc != nil {
+		ag.probeAuditSupport(context.Background())
 	}
 	disp := NewDispatcher(Hooks{
 		Hello:      ag.hello,
@@ -290,6 +465,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		Log:        a.Log,
 		Terminal:   a.Terminal, // nil = term.error{terminal_disabled}
 		Disconnect: ag.onDisconnect,
+		Error:      ag.onErrorFrame,
 	})
 	ag.dispatcher = disp
 
@@ -344,6 +520,15 @@ func (a *Agent) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// The sender is the goroutine that talks to the kernel (the audit
+		// stream) as well as to the panel. A panic there must never take the
+		// agent down with it: it is logged and the sender ends, which leaves
+		// the socket to the reconnect loop.
+		defer func() {
+			if r := recover(); r != nil {
+				a.logf().Errorf("ws: sender recovered from a panic: %v", r)
+			}
+		}()
 		a.sender(ctx)
 	}()
 	err := a.client.Run(ctx)
@@ -574,6 +759,18 @@ func (a *Agent) helloOK(ok wsproto.HelloOK) {
 	a.telemetry = time.Duration(iv.TelemetryS) * time.Second
 	a.comp = time.Duration(iv.ComponentsS) * time.Second
 	a.intMu.Unlock()
+	// The panel's audit switch belongs to this session: it is the authority
+	// (the state is in-memory only and is re-stated by every hello.ok). A
+	// panel that omits the field leaves the current state alone, which is what
+	// keeps an audit_ctl command in force.
+	a.adoptAuditSession(ok.Session)
+	if ok.Audit != nil {
+		a.auditMu.Lock()
+		a.audit.enabled = ok.Audit.Enabled
+		a.audit.stopped = false
+		a.auditMu.Unlock()
+	}
+	a.wakeAudit()
 	select {
 	case a.wake <- struct{}{}:
 	default:
@@ -598,18 +795,24 @@ func (a *Agent) sender(ctx context.Context) {
 		session   string
 		telemetry = time.NewTicker(time.Duration(DefaultTelemetryIntervalS) * time.Second)
 		comp      = time.NewTicker(time.Duration(DefaultComponentsIntervalS) * time.Second)
+		auditTick = time.NewTicker(a.auditEvery)
 		lastComp  []byte
 	)
 	defer telemetry.Stop()
 	defer comp.Stop()
+	defer auditTick.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			a.auditShutdown()
 			return
 		case <-a.wake:
 			// A session started: the check below adopts the cadence, sends
 			// the first frames right away and replays the event backlog.
+		case <-a.auditWake:
+			// The audit state changed (hello.ok, audit_ctl, a reconnect): the
+			// audit check below reacts without waiting for its tick.
 		case env := <-a.events:
 			a.enqueueEvent(env)
 		case <-telemetry.C:
@@ -627,6 +830,9 @@ func (a *Agent) sender(ctx context.Context) {
 				continue
 			}
 			lastComp = a.sendComponents(ctx)
+		case <-auditTick.C:
+			// The audit stream has its own cadence (3 s, or the test's), so it
+			// never rides on the telemetry interval the panel negotiated.
 		}
 
 		// A new session (first one, or after a reconnect) means: adopt the
@@ -651,6 +857,12 @@ func (a *Agent) sender(ctx context.Context) {
 		if a.client.Connected() {
 			a.flushEvents()
 		}
+
+		// The access-log stream: off by default, so this costs a couple of
+		// cheap checks and nothing else until the panel (or a command) turns
+		// it on. A page waiting for room under the frame rate cap is retried
+		// on the audit tick above.
+		a.sendAudit(ctx)
 
 		// The capability set is not static: a signed kernel manifest arriving
 		// or an updater becoming ready makes a capability servable after the
@@ -743,6 +955,575 @@ func (a *Agent) sendOrDrop(env wsproto.Envelope) bool {
 		a.logf().Warnf("ws: cannot send %s: %v", env.T, err)
 	}
 	return false
+}
+
+// ---- access-log audit stream (W1NCRAY-D2) ----------------------------------
+//
+// The kernel keeps the access lines in its own bounded ring buffer; this side
+// only asks for the next page and forwards it. The rules the stream follows:
+//
+//   - off by default, and only the panel turns it on: hello.ok.audit.enabled or
+//     an audit_ctl command. Nothing is pulled and nothing is sent before that,
+//     so a machine that never enables audit pays for nothing;
+//   - at most one page per pull tick (3 s), immediately again while the kernel
+//     reports more=true, and never more than five frames per second;
+//   - the cursor only moves after a frame was really handed to the transport,
+//     so a page that could not be sent is retried, not skipped;
+//   - the switch is in-memory only: every session re-states it in hello.ok, and
+//     a kernel that restarted (a new epoch) is enabled again;
+//   - a panel that answers unknown_type or not_supported stops the stream for
+//     the rest of the session.
+
+// AuditSupported reports whether the audit capability is declared right now: a
+// source is wired and the kernel's status reported the collector. bootstrap's
+// Streams calls it for hello.capabilities.
+func (a *Agent) AuditSupported() bool {
+	return a != nil && a.auditSrc != nil && a.auditSupport()
+}
+
+// SetAuditEnabled turns the access-log stream on or off (the audit_ctl
+// command). It never blocks: the state is applied by the sender, which is also
+// where the kernel's own switch is written. It reports the state that will be
+// in force.
+func (a *Agent) SetAuditEnabled(enabled bool) bool {
+	if a == nil || a.auditSrc == nil {
+		return false
+	}
+	a.auditMu.Lock()
+	a.audit.enabled = enabled
+	// A command is an explicit instruction for this session: it overrides the
+	// "the panel said no" latch, so turning audit back on works.
+	a.audit.stopped = false
+	a.auditMu.Unlock()
+	a.wakeAudit()
+	return enabled
+}
+
+// AuditEnabled reports whether the stream is on right now.
+func (a *Agent) AuditEnabled() bool {
+	if a == nil || a.auditSrc == nil {
+		return false
+	}
+	a.auditMu.Lock()
+	defer a.auditMu.Unlock()
+	return a.audit.enabled
+}
+
+// AuditSource returns the wired kernel collector (nil when there is none).
+func (a *Agent) AuditSource() AuditSource {
+	if a == nil {
+		return nil
+	}
+	return a.auditSrc
+}
+
+// wakeAudit asks the sender to re-evaluate the audit state now.
+func (a *Agent) wakeAudit() {
+	if a == nil || a.auditWake == nil {
+		return
+	}
+	select {
+	case a.auditWake <- struct{}{}:
+	default:
+		// A wake-up is already pending: the sender will see the state.
+	}
+}
+
+// auditSession adopts the current session once the panel answered it. Until
+// then the stream does nothing, because hello.ok is the panel's permission (and
+// its audit switch) and a capability nobody answered must not start a pull. It
+// returns the adopted session ("" when there is none).
+func (a *Agent) auditSession(current string) string {
+	if current == "" {
+		return ""
+	}
+	a.auditMu.Lock()
+	defer a.auditMu.Unlock()
+	if a.audit.session != current {
+		// A new panel session: a rejection belonged to the previous one, and a
+		// page that was waiting for room belongs to it too.
+		a.audit.stopped = false
+		a.audit.pending = nil
+		a.audit.session = ""
+		return ""
+	}
+	return a.audit.session
+}
+
+// adoptAuditSession records that the panel answered session (helloOK).
+func (a *Agent) adoptAuditSession(session string) {
+	if session == "" {
+		return
+	}
+	a.auditMu.Lock()
+	a.audit.session = session
+	a.auditMu.Unlock()
+}
+
+// auditWanted is the state the loop must bring about for the adopted session:
+// the session, and whether the stream must be on.
+func (a *Agent) auditWanted(current string) (session string, on bool) {
+	a.auditMu.Lock()
+	defer a.auditMu.Unlock()
+	if a.audit.session == "" || a.audit.session != current {
+		return "", false
+	}
+	if a.audit.stopped {
+		return a.audit.session, false
+	}
+	return a.audit.session, a.audit.enabled
+}
+
+// sendAudit is one iteration of the audit stream, driven by the sender loop. It
+// is cheap when the feature is off or unavailable.
+func (a *Agent) sendAudit(ctx context.Context) {
+	if a.auditSrc == nil {
+		return
+	}
+	current := a.client.Session()
+	if !a.client.Connected() || current == "" {
+		// Offline: nothing is pulled (the kernel's ring buffer keeps the lines
+		// and its dropped counter reports what overflowed). A page waiting for
+		// room belongs to the connection that was lost.
+		a.auditMu.Lock()
+		a.audit.pending = nil
+		a.auditMu.Unlock()
+		return
+	}
+	a.auditSession(current)
+	session, on := a.auditWanted(current)
+	if session == "" {
+		// The panel has not answered this session yet: only keep the
+		// capability knowledge fresh, so a hello built later can declare it.
+		a.probeAuditSupport(ctx)
+		return
+	}
+	if !on {
+		a.applyAudit(ctx, false)
+		a.auditMu.Lock()
+		a.audit.pending = nil
+		a.auditMu.Unlock()
+		return
+	}
+	if !a.auditSupport() {
+		// The kernel cannot serve the collector (or not yet): probe on the
+		// bounded schedule and send nothing.
+		a.probeAuditSupport(ctx)
+		return
+	}
+	a.applyAudit(ctx, true)
+	if !a.sendPendingAudit() {
+		// The frame rate cap (or a full send queue) is reached: the page stays
+		// pending and the audit tick retries it.
+		return
+	}
+	if a.auditBackoff(time.Now()) {
+		// A pull failed and its retry delay has not passed yet. A page that
+		// was refused by the transport is still retried above, so the back-off
+		// only delays new requests to a kernel that is not answering.
+		return
+	}
+	more := a.pullAudit(ctx)
+	// A page that reports more=true is followed immediately (bounded by the
+	// frame rate cap), so a kernel backlog is drained at the contract's five
+	// frames per second instead of one page per pull tick.
+	for i := 0; more && i < auditMaxBurst; i++ {
+		if !a.sendPendingAudit() {
+			return
+		}
+		more = a.pullAudit(ctx)
+	}
+}
+
+// auditBackoff reports whether a failed pull is still inside its retry delay.
+func (a *Agent) auditBackoff(now time.Time) bool {
+	a.auditMu.Lock()
+	defer a.auditMu.Unlock()
+	return !a.audit.nextPull.IsZero() && now.Before(a.audit.nextPull)
+}
+
+// sendPendingAudit sends the page that is waiting when the frame rate cap
+// allows it, and reports whether the loop may pull another one.
+func (a *Agent) sendPendingAudit() bool {
+	a.auditMu.Lock()
+	page := a.audit.pending
+	if page == nil {
+		a.auditMu.Unlock()
+		return true
+	}
+	if !a.auditFrameAllowed(time.Now()) {
+		a.auditMu.Unlock()
+		return false
+	}
+	a.auditMu.Unlock()
+
+	env, err := Encode(wsproto.TypeAuditLog, "", page)
+	if err != nil {
+		a.logf().Warnf("ws: cannot encode audit.log: %v", err)
+		return true
+	}
+	if !a.sendAuditFrame(env) {
+		// The frame did not enter the transport: the cursor must not move, so
+		// the page is kept and retried on the next iteration.
+		return false
+	}
+	a.auditMu.Lock()
+	a.auditFrameSent(time.Now())
+	a.audit.cursor = page.ToSeq
+	a.audit.pending = nil
+	a.auditMu.Unlock()
+	return true
+}
+
+// sendAuditFrame hands one audit.log frame to the transport. Unlike telemetry,
+// an audit page is not live data: a frame the queue could not accept must be
+// retried, never dropped, or the panel would silently lose access lines. A
+// connection that is already gone (ErrOffline) is the one exception: the page
+// cannot reach the panel anyway, so it is reported as sent and the cursor
+// moves on; the kernel keeps its own bounded buffer (and reports the overflow
+// in dropped) while the stream is paused, and the next session starts from a
+// fresh hello.ok.
+func (a *Agent) sendAuditFrame(env wsproto.Envelope) bool {
+	err := a.client.Send(env)
+	switch {
+	case err == nil:
+		return true
+	case err == ErrQueueFull:
+		a.logf().Debugf("ws: audit.log frame not queued (queue full); the page will be retried")
+		return false
+	case err == ErrOffline:
+		return true
+	default:
+		a.logf().Warnf("ws: cannot send audit.log: %v", err)
+		return true
+	}
+}
+
+// pullAudit asks the kernel for the next page and queues it for sending. The
+// cursor only moves when the frame really left (sendPendingAudit). It reports
+// whether the page the kernel answered says more=true, which is what makes the
+// loop pull again immediately.
+func (a *Agent) pullAudit(ctx context.Context) bool {
+	a.auditMu.Lock()
+	after := a.audit.cursor
+	a.auditMu.Unlock()
+
+	pctx, cancel := context.WithTimeout(ctx, a.auditEvery)
+	page, err := a.auditSrc.Batch(pctx, after, wsproto.MaxAuditItems)
+	cancel()
+	if err != nil {
+		a.auditFailed("拉取内核访问日志失败", err)
+		return false
+	}
+	if !page.Supported {
+		// The kernel predates the route: the capability is not real. Log it
+		// once and stop advertising it.
+		a.setAuditSupport(false)
+		a.auditFailed("Xray 内核不支持访问日志采集（/audit 不存在）", nil)
+		return false
+	}
+	a.setAuditSupport(true)
+	a.auditOK()
+
+	batch := page.Batch
+	a.auditMu.Lock()
+	if batch.Epoch != 0 && batch.Epoch != a.audit.appliedEpoch {
+		// The kernel restarted: the cursor belongs to a process that is gone
+		// and its switch is off again. Start from its current position, and
+		// let the next iteration send the enable again.
+		a.audit.appliedEpoch = batch.Epoch
+		a.audit.applied = false
+		a.audit.cursor = 0
+	}
+	a.auditMu.Unlock()
+
+	if len(batch.Items) == 0 {
+		return false
+	}
+	frame := auditFrame(batch)
+	if frame == nil {
+		return false
+	}
+	a.auditMu.Lock()
+	a.audit.pending = frame
+	a.auditMu.Unlock()
+	return batch.More
+}
+
+// auditFailed records a pull failure and backs off, re-arming the support probe
+// so a kernel that was replaced (or has not started yet) is re-checked.
+func (a *Agent) auditFailed(what string, err error) {
+	a.auditMu.Lock()
+	backoff := a.audit.failBackoff
+	if backoff <= 0 {
+		backoff = auditFailBackoffMin
+	}
+	a.audit.failBackoff = min(backoff*2, auditFailBackoffMax)
+	a.audit.probing = false
+	a.audit.probeLeft = append([]time.Duration(nil), auditProbeDelays...)
+	a.audit.nextProbe = time.Now().Add(backoff)
+	a.audit.nextPull = time.Now().Add(backoff)
+	a.auditMu.Unlock()
+	if err != nil {
+		a.logf().Warnf("ws: %s: %v", what, err)
+		return
+	}
+	a.logf().Warnf("ws: %s", what)
+}
+
+// auditOK resets the failure backoff after a good pull.
+func (a *Agent) auditOK() {
+	a.auditMu.Lock()
+	a.audit.failBackoff = auditFailBackoffMin
+	a.audit.nextPull = time.Time{}
+	a.auditMu.Unlock()
+}
+
+// applyAudit makes the kernel's switch match want, once. The state is
+// remembered per epoch: a kernel that restarted is enabled again, and an
+// unchanged state costs no request at all.
+func (a *Agent) applyAudit(ctx context.Context, want bool) {
+	a.auditMu.Lock()
+	if a.audit.applied == want {
+		a.auditMu.Unlock()
+		return
+	}
+	a.auditMu.Unlock()
+
+	sctx, cancel := context.WithTimeout(ctx, a.auditEvery)
+	err := a.auditSrc.SetEnabled(sctx, want)
+	cancel()
+	if err != nil {
+		if errors.Is(err, ErrAuditUnsupported) {
+			// An old kernel: a fact, not a transient failure. The capability
+			// goes away and the probe stops re-arming.
+			a.setAuditSupport(false)
+			a.auditMu.Lock()
+			a.audit.enabled = false
+			a.audit.probing = true
+			a.audit.probeLeft = nil
+			a.auditMu.Unlock()
+			a.logf().Warnf("ws: Xray 内核不支持访问日志采集，已关闭审计转发")
+			return
+		}
+		// The state is left as it was, so the next iteration retries.
+		a.logf().Warnf("ws: 设置内核访问日志采集开关失败: %v", err)
+		return
+	}
+	a.auditMu.Lock()
+	a.audit.applied = want
+	a.auditMu.Unlock()
+	if want {
+		a.logf().Infof("ws: 内核访问日志采集已开启，开始转发 audit.log")
+		return
+	}
+	a.logf().Infof("ws: 内核访问日志采集已关闭，停止转发 audit.log")
+}
+
+// auditFrameAllowed reports whether the frame rate cap (five audit.log frames
+// per second) allows a send now. It does not record anything: auditFrameSent
+// does that once the frame really entered the transport, so a frame the queue
+// refused does not consume the budget of a frame that never left. The caller
+// holds auditMu.
+func (a *Agent) auditFrameAllowed(now time.Time) bool {
+	if a.audit.lastFrame.IsZero() {
+		return true
+	}
+	return now.Sub(a.audit.lastFrame) >= auditMinFrameGap
+}
+
+// auditFrameSent records that one audit.log frame entered the transport, which
+// is what the frame rate cap measures. The caller holds auditMu.
+func (a *Agent) auditFrameSent(now time.Time) {
+	a.audit.lastFrame = now
+}
+
+// probeAuditSupport asks the kernel whether it serves the collector, on the
+// bounded schedule, and publishes the answer into the capability set. It never
+// blocks the sender for long: the answer is what a hello built later carries.
+func (a *Agent) probeAuditSupport(ctx context.Context) {
+	a.auditMu.Lock()
+	if a.audit.probing || a.audit.probeLeft == nil {
+		a.auditMu.Unlock()
+		return
+	}
+	now := time.Now()
+	if !a.audit.nextProbe.IsZero() && now.Before(a.audit.nextProbe) {
+		a.auditMu.Unlock()
+		return
+	}
+	delay := a.audit.probeLeft[0]
+	a.audit.probeLeft = a.audit.probeLeft[1:]
+	if len(a.audit.probeLeft) == 0 {
+		// The schedule ran out: stay quiet until a pull fails.
+		a.audit.probing = true
+	}
+	a.audit.nextProbe = now.Add(delay)
+	a.auditMu.Unlock()
+
+	pctx, cancel := context.WithTimeout(ctx, a.auditEvery)
+	supported, err := a.auditSrc.Supported(pctx)
+	cancel()
+	switch {
+	case err != nil:
+		// Not known yet (the kernel may still be starting): leave the
+		// capability as it is and let the next probe decide.
+		a.logf().Debugf("ws: 探测内核审计支持失败: %v", err)
+	case supported:
+		a.setAuditSupport(true)
+		// The kernel serves the collector; from here on the answer is kept
+		// fresh by the status reads the components view already performs, so
+		// the probe schedule is not needed.
+		a.auditMu.Lock()
+		a.audit.probing = true
+		a.audit.probeLeft = nil
+		a.auditMu.Unlock()
+	default:
+		a.setAuditSupport(false)
+		// The kernel answered and does not serve the collector: that is a fact
+		// about this kernel version, so the schedule ends here.
+		a.auditMu.Lock()
+		a.audit.probing = true
+		a.audit.probeLeft = nil
+		a.auditMu.Unlock()
+	}
+}
+
+// auditSupport reports the current support bit.
+func (a *Agent) auditSupport() bool {
+	a.supportMu.Lock()
+	defer a.supportMu.Unlock()
+	return a.supportSeen
+}
+
+// setAuditSupport publishes the kernel's support bit to the Streams (which is
+// what hello.capabilities reads) and remembers it.
+func (a *Agent) setAuditSupport(supported bool) {
+	a.supportMu.Lock()
+	changed := a.supportSeen != supported
+	a.supportSeen = supported
+	a.supportMu.Unlock()
+	if !changed {
+		return
+	}
+	if sink, ok := a.streams.(auditSupportSink); ok && sink != nil {
+		sink.SetAuditSupported(supported)
+	}
+	if supported {
+		a.logf().Infof("ws: Xray 内核支持访问日志采集，hello 将声明 audit 能力")
+		return
+	}
+	a.logf().Infof("ws: Xray 内核不支持访问日志采集，hello 不声明 audit 能力")
+}
+
+// onPanelAuditError stops the audit stream for the rest of the session. The
+// panel answers a frame type it does not know with unknown_type and a feature
+// it does not serve with not_supported; either way this panel does not manage
+// audit here, and continuing to send would only repeat the error.
+func (a *Agent) onPanelAuditError() {
+	if a.auditSrc == nil {
+		return
+	}
+	a.auditMu.Lock()
+	already := a.audit.stopped
+	a.audit.stopped = true
+	a.audit.pending = nil
+	a.auditMu.Unlock()
+	if already {
+		return
+	}
+	a.logf().Warnf("ws: 面板不接受 audit.log（unknown_type/not_supported），本会话停止发送审计日志")
+}
+
+// onErrorFrame is the dispatcher's Error hook: it decides whether a panel error
+// was about the audit stream. The panel answers an unknown frame type with
+// unknown_type and an unsupported feature with not_supported, and audit.log is
+// the one stream an older panel may not know. Everything else is left to the
+// log the dispatcher already wrote.
+func (a *Agent) onErrorFrame(body wsproto.ErrorBody) {
+	if a.auditSrc == nil {
+		return
+	}
+	switch body.Code {
+	case wsproto.ErrCodeUnknownType, wsproto.ErrCodeNotSupported:
+		a.onPanelAuditError()
+	}
+}
+
+// auditShutdown turns the kernel's collection off when the agent stops. The
+// kernel outlives the agent, and a collector nobody consumes would only fill
+// its ring buffer.
+func (a *Agent) auditShutdown() {
+	if a.auditSrc == nil {
+		return
+	}
+	a.auditMu.Lock()
+	applied := a.audit.applied
+	a.auditMu.Unlock()
+	if !applied {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.auditSrc.SetEnabled(ctx, false); err != nil {
+		a.logf().Debugf("ws: 关闭内核访问日志采集: %v", err)
+		return
+	}
+	a.auditMu.Lock()
+	a.audit.applied = false
+	a.auditMu.Unlock()
+}
+
+// auditFrame maps one kernel page onto the panel's audit.log payload and trims
+// it to MaxAuditFrameBytes. The mapping is a copy: the wire types are
+// deliberately independent, so the kernel cannot change the panel's contract by
+// accident. A page whose first item alone does not fit is dropped rather than
+// sent, and the cursor then stays where it is.
+func auditFrame(batch xrayapi.AuditBatch) *wsproto.AuditLog {
+	if len(batch.Items) == 0 {
+		return nil
+	}
+	items := make([]wsproto.AuditItem, 0, len(batch.Items))
+	for _, it := range batch.Items {
+		items = append(items, wsproto.AuditItem{T: it.T, L: it.L})
+	}
+	frame := &wsproto.AuditLog{
+		Epoch:   batch.Epoch,
+		FromSeq: batch.FromSeq,
+		ToSeq:   batch.ToSeq,
+		Dropped: batch.Dropped,
+		Items:   items,
+	}
+	// Trim to the frame bound: the kernel's own cap (400 items of up to 512
+	// bytes) can exceed 128 KiB once the JSON overhead is counted.
+	for len(frame.Items) > 1 {
+		if auditFrameSize(frame) <= MaxAuditFrameBytes {
+			break
+		}
+		frame.Items = frame.Items[:len(frame.Items)-1]
+		frame.ToSeq = frame.FromSeq + uint64(len(frame.Items)) - 1
+	}
+	if auditFrameSize(frame) > MaxAuditFrameBytes {
+		// Even one item does not fit: this page cannot be forwarded, and the
+		// cursor stays so the loss is a visible gap rather than a lie.
+		return nil
+	}
+	return frame
+}
+
+// auditFrameSize is the encoded size of one audit.log frame. The envelope's
+// fixed overhead is included through Encode, so the bound is the real wire size
+// and not just the payload.
+func auditFrameSize(frame *wsproto.AuditLog) int {
+	env, err := Encode(wsproto.TypeAuditLog, "", frame)
+	if err != nil {
+		return MaxAuditFrameBytes + 1
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		return MaxAuditFrameBytes + 1
+	}
+	return len(raw)
 }
 
 // execute runs one command and answers it with cmd.result. A result that

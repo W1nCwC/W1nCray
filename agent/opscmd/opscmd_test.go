@@ -154,10 +154,13 @@ func decodeFailure(t *testing.T, res json.RawMessage) failure {
 // with the historical "unsupported command" failure, never executed. The file
 // commands are registered too: a registry without a file applier answers them
 // with an explicit not_supported rather than pretending the type does not
-// exist (protocol ruling 5).
+// exist (protocol ruling 5). audit_ctl (W1NCRAY-D2) is the same shape: it is
+// registered by this agent build and answers not_supported until the WebSocket
+// channel installs the stream switch (SetAudit).
 func TestRegistryWhitelistIsTheRegisteredTypes(t *testing.T) {
 	reg := mustRegistry(t, Deps{})
 	want := []string{
+		panelclient.CmdAuditCtl,
 		panelclient.CmdComponentRestart,
 		panelclient.CmdFilesApply,
 		panelclient.CmdFilesRollback,
