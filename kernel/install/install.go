@@ -44,6 +44,13 @@ type Config struct {
 	// Platform overrides detection (tests, cross-installs).
 	Platform *platform.Info
 
+	// OwnKernels serves gost, realm and frp from the built-in W1nCray release
+	// table (ownkernels.go, generated into ownkernels_gen.go) instead of the
+	// signed manifest: a version or platform the table does not hold is
+	// refused, never resolved from a manifest. Off by default, so the manifest
+	// path keeps its exact behaviour; kernelx turns it on.
+	OwnKernels bool
+
 	HTTPClient *http.Client // nil: netutil.NewClient() (proxy env incl. socks5)
 	AllowHTTP  bool         // permit http:// sources (tests only; hashes still apply)
 
@@ -347,6 +354,13 @@ func (in *Installer) EnsureForce(ctx context.Context, pin spec.KernelPin) (drive
 func (in *Installer) ensure(ctx context.Context, pin spec.KernelPin, force bool) (driver.Installed, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+
+	// gost, realm and frp come from the built-in W1nCray release table when the
+	// caller asked for it; that path never reads the manifest. Everything else
+	// (and every Installer with the default Config) is unchanged.
+	if in.cfg.OwnKernels && isOwnKernel(pin.Name) {
+		return in.ensureOwn(ctx, pin, force)
+	}
 
 	name, version := pin.Name, manifest.NormalizeVersion(pin.Version)
 	k, key, t, err := in.resolve(name, version)

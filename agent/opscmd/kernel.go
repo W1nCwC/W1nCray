@@ -263,6 +263,14 @@ func (k *kernelCmds) kernelInstallDirect(ctx context.Context, a panelclient.Kern
 		From:    a.From,
 		To:      a.To,
 	}
+	// The multi-file form is opt-in through the args: an old panel never sends
+	// it and a nil slice keeps the single-file path exactly as it was.
+	if len(a.Members) > 0 {
+		di.Members = make([]install.DirectMember, 0, len(a.Members))
+		for _, m := range a.Members {
+			di.Members = append(di.Members, install.DirectMember{From: m.From, To: m.To})
+		}
+	}
 	wanted := version
 	if wanted == "" {
 		wanted = "self-check"

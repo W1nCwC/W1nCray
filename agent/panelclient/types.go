@@ -74,6 +74,14 @@ type KernelCatalogEntry struct {
 	Versions []string `json:"versions"`
 }
 
+// KernelMember is one file a multi-file tar.gz installs (direct path).
+type KernelMember struct {
+	// From is the member path inside the archive; empty means To.
+	From string `json:"from"`
+	// To is the installed file name in the version directory.
+	To string `json:"to"`
+}
+
 // KernelInstallArgs is the args of kernel_install. An empty Version selects the
 // newest version the manifest offers for this machine.
 //
@@ -99,6 +107,12 @@ type KernelInstallArgs struct {
 	// To is the optional installed file name; empty is the kernel's default
 	// binary (direct path).
 	To string `json:"to,omitempty"`
+	// Members is the optional multi-file tar.gz form (frp ships frpc and frps
+	// in one archive): when non-empty, Archive must be tar.gz and From/To must
+	// be empty. An old panel does not send it, so nothing changes there; only
+	// agents that carry the field (>= 0.8.7) may be sent one, because
+	// decodeArgs refuses unknown fields.
+	Members []KernelMember `json:"members,omitempty"`
 }
 
 // KernelRemoveArgs is the args of kernel_remove.
