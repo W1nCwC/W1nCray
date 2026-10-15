@@ -165,6 +165,93 @@ func (in *Installer) Remove(name, version string) error {
 	return os.RemoveAll(in.verDir(name, version))
 }
 
+// RemoveCurrent deletes one installed version even when it is the version the
+// current pointer names, provided the caller has established that nothing is
+// executing it. It is the operator path behind kernel_remove for the
+// supervised kernels (gost/realm/frp): a machine that runs a single version
+// could never remove it otherwise, because that version is always current.
+//
+// The current pointer is kept consistent while the version goes away:
+//
+//   - the version is current and a previous version exists: the previous one
+//     becomes current and the previous pointer is cleared (there is no second
+//     candidate left to keep as previous);
+//   - the version is current and there is no previous one: the current pointer
+//     is removed, and if that leaves the kernel with no version at all the
+//     whole kernel directory goes and its failure records are forgotten;
+//   - the version is not current (or there is no current pointer): this is
+//     exactly Installer.Remove, so the previous-pointer cleanup and the
+//     ErrNotInstalled contract are the ones Remove already has.
+//
+// Remove itself keeps refusing the current version: it is the conservative
+// path the reconciler and the drivers use. No manifest is read here, so an
+// offline machine can uninstall.
+func (in *Installer) RemoveCurrent(name, version string) error {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if err := validName(name); err != nil {
+		return err
+	}
+	version = manifest.NormalizeVersion(version)
+	if !reVersionDir.MatchString(version) {
+		return kernel.Newf(kernel.ErrNotInstalled, name, version, "invalid version")
+	}
+	cur, _ := readPointer(in.curPath(name))
+	if cur != version {
+		// Not the current version: the plain per-version removal already has
+		// the right semantics (including the previous pointer and its errors).
+		if _, err := os.Stat(in.verDir(name, version)); err != nil {
+			return kernel.Newf(kernel.ErrNotInstalled, name, version, "not installed")
+		}
+		if prev, _ := readPointer(in.prevPath(name)); prev == version {
+			removePointer(in.prevPath(name))
+		}
+		return os.RemoveAll(in.verDir(name, version))
+	}
+	if _, err := os.Stat(in.verDir(name, version)); err != nil {
+		return kernel.Newf(kernel.ErrNotInstalled, name, version, "not installed")
+	}
+	prev, _ := readPointer(in.prevPath(name))
+	// The directory goes first: if that fails the pointers still describe what
+	// is on disk, so the operator can simply retry.
+	if err := os.RemoveAll(in.verDir(name, version)); err != nil {
+		return err
+	}
+	if prev == version {
+		prev = ""
+	}
+	if prev != "" {
+		if err := writePointer(in.curPath(name), prev); err != nil {
+			return err
+		}
+		removePointer(in.prevPath(name))
+		return nil
+	}
+	removePointer(in.curPath(name))
+	removePointer(in.prevPath(name))
+	// Last version of the kernel: leave no empty kernel directory and no
+	// failure record behind, exactly like Remove("") does.
+	if vers, err := os.ReadDir(in.nameDir(name)); err == nil {
+		left := false
+		for _, v := range vers {
+			if v.IsDir() && reVersionDir.MatchString(v.Name()) {
+				left = true
+				break
+			}
+		}
+		if !left {
+			for k := range in.st.Bad {
+				if len(k) > len(name) && k[:len(name)+1] == name+"@" {
+					delete(in.st.Bad, k)
+				}
+			}
+			_ = in.saveState()
+			return os.RemoveAll(in.nameDir(name))
+		}
+	}
+	return nil
+}
+
 // Rollback makes the previous version current again and marks the version
 // that was current as bad (with back-off) so a later Ensure of the same pin
 // does not immediately switch back. It returns the now-current kernel.

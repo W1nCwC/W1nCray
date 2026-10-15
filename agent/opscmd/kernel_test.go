@@ -191,8 +191,22 @@ func (r *kernelRig) ensurePinWith(ctx context.Context, pin spec.KernelPin, ensur
 }
 
 // ops exposes the installer through the opscmd surface. running/exact stand in
-// for the process check: the rig never runs a kernel binary.
+// for the process check: the rig never runs a kernel binary. The returned
+// manager carries the optional RemoveCurrent capability, so the command layer
+// reaches the real installer for a current version too (DEC-3); a test that
+// wants a manager without it passes rig.opsNoRemoveCurrent.
 func (r *kernelRig) ops(running string, exact bool) KernelOps {
+	return fakeKernelsRemoveCurrent{fakeKernels: r.opsBase(running, exact), removeCurrentFn: r.in.RemoveCurrent}
+}
+
+// opsNoRemoveCurrent is the same manager without the optional RemoveCurrent
+// capability: the command layer must then keep the conservative in_use
+// refusal for a current version.
+func (r *kernelRig) opsNoRemoveCurrent(running string, exact bool) KernelOps {
+	return r.opsBase(running, exact)
+}
+
+func (r *kernelRig) opsBase(running string, exact bool) fakeKernels {
 	return fakeKernels{
 		running:       running,
 		exact:         exact,
@@ -337,49 +351,170 @@ func TestKernelInstallBypassesTheRollbackBackoff(t *testing.T) {
 	}
 }
 
-// TestKernelRemoveRefusesTheVersionInUseAndRemovesPrevious covers the removal
-// contract against the real installer: the current version is refused with a
-// recognisable code, the previous version is removed and its pointer cleared.
-func TestKernelRemoveRefusesTheVersionInUseAndRemovesPrevious(t *testing.T) {
+// TestKernelRemoveAllowsTheCurrentVersionWhenNothingRuns covers DEC-3 against
+// the real installer: a machine with a single installed version (which is
+// therefore current) can uninstall it, the previous version is promoted when
+// there is one, and a version that is not current is removed exactly as before.
+func TestKernelRemoveAllowsTheCurrentVersionWhenNothingRuns(t *testing.T) {
 	rig := newKernelRig(t)
 	rig.addVersion("1.0.0")
 	rig.addVersion("2.0.0")
 	rig.ensure("1.0.0")
 	rig.ensure("2.0.0")
-	reg := mustRegistry(t, Deps{Kernels: rig.ops("", false)})
+	// Nothing runs the kernel: the process check is exact and reports nothing.
+	reg := mustRegistry(t, Deps{Kernels: rig.ops("", true)})
 	ctx := context.Background()
 
 	status, res := reg.Execute(ctx, panelclient.Command{
 		ID: "r1", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"2.0.0"}`),
 	})
-	if status != panelclient.ResultFailed {
-		t.Fatalf("removing the current version = (%q, %s), want failed", status, res)
+	if status != panelclient.ResultDone {
+		t.Fatalf("removing the current version = (%q, %s), want done", status, res)
 	}
-	if f := decodeFailure(t, res); f.Code != "in_use" {
-		t.Errorf("failure = %+v, want code in_use", f)
+	var out panelclient.KernelRemoveResult
+	if err := json.Unmarshal(res, &out); err != nil {
+		t.Fatalf("remove result %s: %v", res, err)
 	}
-	if _, ok := rig.entry("2.0.0"); !ok {
-		t.Error("the refused version was deleted anyway")
+	if out.AlreadyAbsent || out.FreedBytes <= 0 {
+		t.Errorf("remove result = %+v, want a real removal with freed bytes", out)
+	}
+	if _, ok := rig.entry("2.0.0"); ok {
+		t.Error("the current version is still installed")
+	}
+	// The previous version took over, and no previous pointer is left behind.
+	if e, ok := rig.entry("1.0.0"); !ok || !e.Current || e.Previous {
+		t.Errorf("1.0.0 = %+v (present=%v), want it promoted to current", e, ok)
 	}
 
 	status, res = reg.Execute(ctx, panelclient.Command{
 		ID: "r2", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"1.0.0"}`),
 	})
 	if status != panelclient.ResultDone {
-		t.Fatalf("removing the previous version = (%q, %s), want done", status, res)
+		t.Fatalf("removing the last (current) version = (%q, %s), want done", status, res)
 	}
-	var out panelclient.KernelRemoveResult
-	if err := json.Unmarshal(res, &out); err != nil {
-		t.Fatalf("remove result %s: %v", res, err)
+	if _, ok := rig.entry("1.0.0"); ok {
+		t.Error("the last version is still installed")
 	}
-	if out.FreedBytes <= 0 {
-		t.Errorf("freed_bytes = %d, want > 0", out.FreedBytes)
+	if l := rig.list(); len(l) != 0 {
+		t.Errorf("List = %+v, want nothing installed", l)
+	}
+}
+
+// TestKernelRemoveRefusesTheVersionInUse covers the first half of DEC-3: a
+// version that is really running is refused with in_use, and the message tells
+// the operator to stop what uses the kernel first. The version stays on disk.
+func TestKernelRemoveRefusesTheVersionInUse(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.addVersion("2.0.0")
+	rig.ensure("1.0.0")
+	rig.ensure("2.0.0")
+	reg := mustRegistry(t, Deps{Kernels: rig.ops("2.0.0", true)})
+
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "r1", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"2.0.0"}`),
+	})
+	if status != panelclient.ResultFailed {
+		t.Fatalf("removing a running current version = (%q, %s), want failed", status, res)
+	}
+	f := decodeFailure(t, res)
+	if f.Code != "in_use" {
+		t.Errorf("failure = %+v, want code in_use", f)
+	}
+	if !strings.Contains(strings.ToLower(f.Error), "stop") {
+		t.Errorf("failure message = %q, want it to tell the operator to stop the instances first", f.Error)
+	}
+	if _, ok := rig.entry("2.0.0"); !ok {
+		t.Error("the refused version was deleted anyway")
+	}
+}
+
+// TestKernelRemoveRefusesAnUnknownRunningState covers the conservative choice
+// for exact=false: when the platform cannot name the running binary, the
+// current pointer is the only evidence there is, so the current version is
+// refused (never deleted under a process that might be executing it). A
+// non-current version is still removed.
+func TestKernelRemoveRefusesAnUnknownRunningState(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.addVersion("2.0.0")
+	rig.ensure("1.0.0")
+	rig.ensure("2.0.0")
+	// exact=false: the process check cannot prove which binary runs.
+	reg := mustRegistry(t, Deps{Kernels: rig.ops("", false)})
+	ctx := context.Background()
+
+	status, res := reg.Execute(ctx, panelclient.Command{
+		ID: "u1", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"2.0.0"}`),
+	})
+	if status != panelclient.ResultFailed {
+		t.Fatalf("removing the current version with an inexact process check = (%q, %s), want failed", status, res)
+	}
+	f := decodeFailure(t, res)
+	if f.Code != "in_use" {
+		t.Errorf("failure = %+v, want code in_use", f)
+	}
+	if !strings.Contains(strings.ToLower(f.Error), "stop") {
+		t.Errorf("failure message = %q, want a stop-the-instances hint", f.Error)
+	}
+	if _, ok := rig.entry("2.0.0"); !ok {
+		t.Error("the refused version was deleted anyway")
+	}
+	// The version that is not current is still removable.
+	status, res = reg.Execute(ctx, panelclient.Command{
+		ID: "u2", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"1.0.0"}`),
+	})
+	if status != panelclient.ResultDone {
+		t.Fatalf("removing the previous version with an inexact process check = (%q, %s), want done", status, res)
 	}
 	if _, ok := rig.entry("1.0.0"); ok {
 		t.Error("the previous version is still installed")
 	}
-	if e, ok := rig.entry("2.0.0"); !ok || e.Previous {
-		t.Errorf("2.0.0 = %+v (present=%v), want the previous pointer cleared", e, ok)
+}
+
+// TestKernelRemoveCurrentWithoutTheCapability covers the optional assertion: a
+// kernel manager that cannot remove a current version (no RemoveCurrent) keeps
+// the historical in_use refusal instead of losing the version silently.
+func TestKernelRemoveCurrentWithoutTheCapability(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.ensure("1.0.0")
+	reg := mustRegistry(t, Deps{Kernels: rig.opsNoRemoveCurrent("", true)})
+
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "nc1", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"1.0.0"}`),
+	})
+	if status != panelclient.ResultFailed || decodeFailure(t, res).Code != "in_use" {
+		t.Fatalf("remove current without the capability = (%q, %s), want failed/in_use", status, res)
+	}
+	if _, ok := rig.entry("1.0.0"); !ok {
+		t.Error("the refused version was deleted anyway")
+	}
+}
+
+// TestKernelRemoveRefusesAVersionThatIsStillRunning covers the process check:
+// a rollback moves the pointer without restarting anything, so the version a
+// live process executes must be refused even when it is no longer current.
+func TestKernelRemoveRefusesAVersionThatIsStillRunning(t *testing.T) {
+	rig := newKernelRig(t)
+	rig.addVersion("1.0.0")
+	rig.addVersion("2.0.0")
+	rig.ensure("1.0.0")
+	rig.ensure("2.0.0")
+	// 1.0.0 is the previous version, but a process still executes it.
+	reg := mustRegistry(t, Deps{Kernels: rig.ops("1.0.0", true)})
+
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "r3", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"1.0.0"}`),
+	})
+	if status != panelclient.ResultFailed {
+		t.Fatalf("removing a running version = (%q, %s), want failed", status, res)
+	}
+	if f := decodeFailure(t, res); f.Code != "in_use" {
+		t.Errorf("failure = %+v, want code in_use", f)
+	}
+	if _, ok := rig.entry("1.0.0"); !ok {
+		t.Error("the running version was deleted anyway")
 	}
 }
 
@@ -393,7 +528,9 @@ func TestKernelRemoveIsIdempotent(t *testing.T) {
 	rig.addVersion("2.0.0")
 	rig.ensure("1.0.0")
 	rig.ensure("2.0.0")
-	reg := mustRegistry(t, Deps{Kernels: rig.ops("", false)})
+	// exact=true with nothing running: this test is about idempotency, not
+	// about the process check.
+	reg := mustRegistry(t, Deps{Kernels: rig.ops("", true)})
 	ctx := context.Background()
 
 	remove := func(id, version string) (string, json.RawMessage) {
@@ -436,36 +573,22 @@ func TestKernelRemoveIsIdempotent(t *testing.T) {
 		t.Errorf("never-installed version = %+v, want already_absent", out)
 	}
 
-	// Idempotency never weakens in_use: the current version is still refused.
+	// Idempotency is not weakened by DEC-3: the current version is removed for
+	// real, and the removal of the last version succeeds and leaves the kernel
+	// absent rather than failing.
 	status, res = remove("i4", "2.0.0")
-	if status != panelclient.ResultFailed || decodeFailure(t, res).Code != "in_use" {
-		t.Errorf("removing the current version = (%q, %s), want failed/in_use", status, res)
+	if status != panelclient.ResultDone {
+		t.Fatalf("removing the current (last) version = (%q, %s), want done", status, res)
 	}
-}
-
-// TestKernelRemoveRefusesAVersionThatIsStillRunning covers the process check:
-// a rollback moves the pointer without restarting anything, so the version a
-// live process executes must be refused even when it is no longer current.
-func TestKernelRemoveRefusesAVersionThatIsStillRunning(t *testing.T) {
-	rig := newKernelRig(t)
-	rig.addVersion("1.0.0")
-	rig.addVersion("2.0.0")
-	rig.ensure("1.0.0")
-	rig.ensure("2.0.0")
-	// 1.0.0 is the previous version, but a process still executes it.
-	reg := mustRegistry(t, Deps{Kernels: rig.ops("1.0.0", true)})
-
-	status, res := reg.Execute(context.Background(), panelclient.Command{
-		ID: "r3", Type: panelclient.CmdKernelRemove, Args: json.RawMessage(`{"name":"gost","version":"1.0.0"}`),
-	})
-	if status != panelclient.ResultFailed {
-		t.Fatalf("removing a running version = (%q, %s), want failed", status, res)
+	if out := decode(res); out.AlreadyAbsent {
+		t.Errorf("the removal of the current version reported already_absent: %+v", out)
 	}
-	if f := decodeFailure(t, res); f.Code != "in_use" {
-		t.Errorf("failure = %+v, want code in_use", f)
+	status, res = remove("i5", "2.0.0")
+	if status != panelclient.ResultDone {
+		t.Fatalf("removing the already-removed current version = (%q, %s), want done", status, res)
 	}
-	if _, ok := rig.entry("1.0.0"); !ok {
-		t.Error("the running version was deleted anyway")
+	if out := decode(res); !out.AlreadyAbsent || out.FreedBytes != 0 {
+		t.Errorf("re-removal = %+v, want already_absent with no bytes freed", out)
 	}
 }
 
