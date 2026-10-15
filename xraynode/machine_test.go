@@ -238,6 +238,11 @@ func TestPanelMachineNodesVersionReload(t *testing.T) {
 	old := machinePollInterval
 	machinePollInterval = 100 * time.Millisecond
 	t.Cleanup(func() { machinePollInterval = old })
+	// The reload is debounced by machineDebounceWindow (30 s by default), so the
+	// window is shortened here as well; the test still waits for the debounce.
+	oldWindow := machineDebounceWindow
+	machineDebounceWindow = 50 * time.Millisecond
+	t.Cleanup(func() { machineDebounceWindow = oldWindow })
 
 	port1, port2 := freePort(t), freePort(t)
 	fp := newMachineFakePanel(t)
