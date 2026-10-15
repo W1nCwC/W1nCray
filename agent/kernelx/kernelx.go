@@ -23,6 +23,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/kernel/install"
 	"github.com/W1nCwC/W1nCray/kernel/manifest"
+	"github.com/W1nCwC/W1nCray/kernel/platform"
 )
 
 // Options configures an Ensurer.
@@ -41,6 +42,10 @@ type Options struct {
 	KeysPath string
 	// AgentVersion is compared with a kernel's min_agent ("" or "dev" skips).
 	AgentVersion string
+	// Platform overrides the detected machine (tests, cross-installs). Nil
+	// means detect. It is what decides the row of the built-in W1nCray release
+	// table the agent installs gost/realm/frp from.
+	Platform *platform.Info
 	// AllowHTTP permits http:// kernel sources (development/self-hosted only;
 	// content hashes still apply). Never enable in production.
 	AllowHTTP bool
@@ -84,8 +89,12 @@ func New(o Options) (*Ensurer, error) {
 		Dir:          o.Dir,
 		Keys:         keys,
 		AgentVersion: o.AgentVersion,
+		Platform:     o.Platform,
 		AllowHTTP:    o.AllowHTTP,
-		Log:          o.Log,
+		// gost, realm and frp are ours: the agent resolves them from the
+		// built-in W1nCray release table, never from the signed manifest.
+		OwnKernels: true,
+		Log:        o.Log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kernelx: %w", err)
@@ -228,8 +237,13 @@ func (e *Ensurer) labelBestEffort(ctx context.Context) {
 	}
 }
 
-// defaultVersion is the newest available version of a kernel in the manifest.
+// defaultVersion is the newest version of a kernel this agent can install: the
+// built-in W1nCray release table first (gost, realm and frp are served from it
+// and a manifest must not override our own mirror), then the manifest.
 func (e *Ensurer) defaultVersion(name string) (string, error) {
+	if v, ok := install.OwnKernelLatest(name, e.in.Platform()); ok {
+		return v, nil
+	}
 	m := e.in.Manifest()
 	if m == nil {
 		return "", fmt.Errorf("kernelx: no signed manifest loaded; cannot pick a default version for %q", name)

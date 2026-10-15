@@ -9,6 +9,12 @@
 #   dist-kernels/UPSTREAM-VERIFY.txt             which upstream asset, which
 #                                                hash, and how it was checked
 #
+# A complete run also rewrites kernel/install/ownkernels_gen.go, the Go table
+# the agent installs these kernels from without a signed manifest (URL, sha256,
+# size, archive format, variant and members of every artifact). GEN_ONLY=1
+# regenerates that file from an existing dist-kernels without downloading or
+# packaging anything.
+#
 # Only the upstream release is the source of bytes; every asset is verified
 # against the upstream checksum file (gost, frp) or the GitHub API asset digest
 # (realm, which ships no checksum file) before anything is unpacked. The
@@ -22,6 +28,10 @@
 #   KEEP_WORK=1               keep dist-kernels/.work on success
 #   REUSE_WORK=1              reuse an already downloaded upstream file
 #                             (still fully re-verified)
+#   GEN_ONLY=1                only regenerate kernel/install/ownkernels_gen.go
+#                             from the dist-kernels already on disk (no
+#                             download, no packaging, nothing written there);
+#                             it requires the complete, verified 30 artifacts
 # A proxy is honoured only through the environment (curl reads HTTPS_PROXY);
 # nothing here hardcodes one, and no token is read or written.
 set -euo pipefail
@@ -74,17 +84,46 @@ declare -A realm_assets=(
 )
 declare -A frp_assets=(
 	["386"]=""
-	["amd64"]=frp_0.71.0_linux_amd64.tar.gz
-	["arm64"]=frp_0.71.0_linux_arm64.tar.gz
-	["armv5"]=frp_0.71.0_linux_arm.tar.gz
+	["amd64"]=frp_0.71.1_linux_amd64.tar.gz
+	["arm64"]=frp_0.71.1_linux_arm64.tar.gz
+	["armv5"]=frp_0.71.1_linux_arm.tar.gz
 	["armv6"]=""
-	["armv7"]=frp_0.71.0_linux_arm_hf.tar.gz
-	["loong64"]=frp_0.71.0_linux_loong64.tar.gz
-	["mips"]=frp_0.71.0_linux_mips.tar.gz
-	["mipsle"]=frp_0.71.0_linux_mipsle.tar.gz
-	["mips64"]=frp_0.71.0_linux_mips64.tar.gz
-	["mips64le"]=frp_0.71.0_linux_mips64le.tar.gz
-	["riscv64"]=frp_0.71.0_linux_riscv64.tar.gz
+	["armv7"]=frp_0.71.1_linux_arm_hf.tar.gz
+	["loong64"]=frp_0.71.1_linux_loong64.tar.gz
+	["mips"]=frp_0.71.1_linux_mips.tar.gz
+	["mipsle"]=frp_0.71.1_linux_mipsle.tar.gz
+	["mips64"]=frp_0.71.1_linux_mips64.tar.gz
+	["mips64le"]=frp_0.71.1_linux_mips64le.tar.gz
+	["riscv64"]=frp_0.71.1_linux_riscv64.tar.gz
+)
+
+# ---- variant map (copied from tools/manifestgen/kernels.example.yaml) --------
+# The variant tokens the manifest carries for a target; an absent key means no
+# tokens. They decide whether a build can run on a machine (the agent's
+# platform.Info.Compatible refuses "hardfloat"/"sse2" on a softfloat build and
+# "glibc" on a musl host), and they travel into the built-in Go table.
+declare -A gost_variants=(
+	["386"]=sse2
+	["mips"]=softfloat
+	["mipsle"]=softfloat
+	["mips64"]=hardfloat
+	["mips64le"]=hardfloat
+)
+declare -A realm_variants=(
+	["amd64"]=musl-full
+	["arm64"]=musl-full
+	["armv6"]=musl-full
+	["armv7"]=musl-full
+	["mips"]="musl-full softfloat"
+	["mipsle"]="musl-full softfloat"
+	["mips64"]="musl-full hardfloat"
+	["mips64le"]="musl-full hardfloat"
+)
+declare -A frp_variants=(
+	["mips"]=softfloat
+	["mipsle"]=softfloat
+	["mips64"]=hardfloat
+	["mips64le"]=hardfloat
 )
 
 # ---- helpers -----------------------------------------------------------------
@@ -97,6 +136,8 @@ usage: bash release/build-kernels.sh
   KERNELS="gost realm frp"  kernels to build (default: all)
   KEEP_WORK=1               keep dist-kernels/.work after a successful run
   REUSE_WORK=1              reuse already downloaded upstream files (re-verified)
+  GEN_ONLY=1                only regenerate kernel/install/ownkernels_gen.go
+                            from the dist-kernels already on disk
 EOF
 }
 
@@ -137,6 +178,43 @@ tag_of() {
 asset_of() {
 	local -n _map="$(map_of "$1")"
 	printf '%s\n' "${_map[$2]:-}"
+}
+
+# ver_of KERNEL prints the kernel version without the leading v.
+ver_of() {
+	case "$1" in
+	gost) printf '%s\n' "$gost_ver" ;;
+	realm) printf '%s\n' "$realm_ver" ;;
+	frp) printf '%s\n' "$frp_ver" ;;
+	*) die "unknown kernel $1" ;;
+	esac
+}
+
+# release_tag KERNEL prints the W1nCray release tag of a kernel (gost-v3.3.0).
+release_tag() {
+	printf '%s-v%s\n' "$1" "$(ver_of "$1")"
+}
+
+# variant_of KERNEL ARCH prints the variant tokens of one build ("" = none).
+variant_of() {
+	local -n _v="${1}_variants"
+	printf '%s\n' "${_v[$2]:-}"
+}
+
+# product_of KERNEL ARCH prints the W1nCray asset name built for that platform.
+product_of() {
+	case "$1" in
+	frp) printf 'W1nCray-frp-linux-%s.tar.gz\n' "$2" ;;
+	*) printf 'W1nCray-%s-linux-%s.gz\n' "$1" "$2" ;;
+	esac
+}
+
+# archive_of KERNEL prints the archive format of its W1nCray asset.
+archive_of() {
+	case "$1" in
+	frp) printf 'tar.gz\n' ;;
+	*) printf 'gz\n' ;;
+	esac
 }
 
 # single_member KERNEL prints the one binary its upstream archive holds.
@@ -274,6 +352,117 @@ tar_create() {
 	fi
 }
 
+# ---- the built-in Go table ----------------------------------------------------
+#
+# kernel/install/ownkernels_gen.go mirrors the mirrored assets: one row per
+# artifact with its URL, sha256, size, archive format, variant and members. The
+# agent installs gost/realm/frp from it without a signed manifest. It is only
+# ever written from a complete, fully verified dist-kernels; a partial KERNELS
+# set prints one line and leaves the file alone.
+
+go_table=kernel/install/ownkernels_gen.go
+
+# gen_go_table rewrites $go_table from the artifacts in $out. It downloads
+# nothing, never writes into $out, and replaces $go_table only after every
+# check has passed.
+gen_go_table() {
+	local sums="$out/SHA256SUMS"
+	local dest="$go_table" tmp="$go_table.tmp.$$"
+	local kernel arch product hex file members rc n
+
+	if [ "$kernels" != "$all_kernels" ]; then
+		printf 'build-kernels: KERNELS is not the full set (%s); %s is not generated\n' \
+			"$all_kernels" "$dest" >&2
+		return 0
+	fi
+
+	[ -f "$sums" ] || die "$sums is missing; nothing to generate the built-in table from"
+	n="$(wc -l <"$sums" | tr -d ' ')"
+	[ "$n" -eq 30 ] || die "$sums has $n lines, want 30"
+
+	# Every line must name exactly one expected artifact with a well-formed
+	# digest; the file may use either sha256sum output form ("<hex>  <file>"
+	# or the binary form "<hex> *<file>").
+	local -A sha_of
+	local -A seen
+	while read -r hex file; do
+		# sha256sum writes "<hex>  <file>", or "<hex> *<file>" in binary
+		# mode; a line that is not of that shape is reported by its name.
+		if [ -z "$file" ]; then
+			file="$hex"
+			hex=""
+		fi
+		file="${file#\*}"
+		case "$file" in
+		W1nCray-gost-linux-*) kernel=gost ;;
+		W1nCray-realm-linux-*) kernel=realm ;;
+		W1nCray-frp-linux-*) kernel=frp ;;
+		*) die "$sums: unexpected artifact name \"$file\"" ;;
+		esac
+		arch="${file#W1nCray-$kernel-linux-}"
+		case "$arch" in
+		*.tar.gz) arch="${arch%.tar.gz}" ;;
+		*.gz) arch="${arch%.gz}" ;;
+		*) die "$sums: \"$file\" is not a W1nCray-<kernel>-linux-<arch> artifact" ;;
+		esac
+		[ -n "$(asset_of "$kernel" "$arch")" ] ||
+			die "$sums: \"$file\" is a platform the maps do not build ($kernel $arch)"
+		[ "$(product_of "$kernel" "$arch")" = "$file" ] ||
+			die "$sums: \"$file\" is not the artifact name of $kernel $arch"
+		case "$hex" in
+		*[!0-9a-f]* | "") die "$sums: \"$hex\" is not 64 lowercase hex characters" ;;
+		esac
+		[ "${#hex}" -eq 64 ] || die "$sums: \"$hex\" is not 64 lowercase hex characters"
+		[ -z "${seen[$file]:-}" ] || die "$sums: \"$file\" appears more than once"
+		seen[$file]=1
+		sha_of[$file]="$hex"
+	done <"$sums"
+
+	# ... and every artifact the maps expect must be there, with its digest.
+	for kernel in $all_kernels; do
+		for arch in $arch_order; do
+			[ -n "$(asset_of "$kernel" "$arch")" ] || continue
+			product="$(product_of "$kernel" "$arch")"
+			[ -f "$out/$product" ] || die "$out/$product is missing"
+			[ -n "${sha_of[$product]:-}" ] || die "$sums has no line for $product"
+		done
+	done
+
+	# The digests must really match the bytes on disk.
+	(cd "$out" && sha256sum -c SHA256SUMS >/dev/null) ||
+		die "$sums does not verify against the artifacts in $out"
+
+	rc=0
+	{
+		printf '// Code generated by release/build-kernels.sh, do not edit. DO NOT EDIT.\n'
+		printf '\n'
+		printf 'package install\n'
+		printf '\n'
+		printf '// ownKernelTable is the built-in W1nCray release table: the mirrored\n'
+		printf '// gost, realm and frp assets the agent installs without a manifest.\n'
+		printf 'var ownKernelTable = []ownKernel{\n'
+		for kernel in $all_kernels; do
+			for arch in $arch_order; do
+				[ -n "$(asset_of "$kernel" "$arch")" ] || continue
+				product="$(product_of "$kernel" "$arch")"
+				members=""
+				[ "$kernel" = frp ] && members=", Members: ownFrpMembers"
+				printf '\t{Name: "%s", Version: "%s", Platform: "linux/%s", Variant: "%s", URL: "https://github.com/W1nCwC/W1nCray/releases/download/%s/%s", SHA256: "%s", Size: %s, Archive: "%s"%s},\n' \
+					"$kernel" "$(ver_of "$kernel")" "$arch" "$(variant_of "$kernel" "$arch")" \
+					"$(release_tag "$kernel")" "$product" "${sha_of[$product]}" \
+					"$(wc -c <"$out/$product" | tr -d ' ')" "$(archive_of "$kernel")" "$members"
+			done
+		done
+		printf '}\n'
+	} >"$tmp" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		rm -f "$tmp"
+		die "writing $tmp failed"
+	fi
+	mv -f "$tmp" "$dest"
+	printf 'build-kernels: wrote %s (%s entries)\n' "$dest" "$(grep -c '{Name: ' "$dest")" >&2
+}
+
 # ---- argument sanity ---------------------------------------------------------
 
 for k in $kernels; do
@@ -282,6 +471,13 @@ for k in $kernels; do
 	*) usage; die "unknown kernel \"$k\" in KERNELS" ;;
 	esac
 done
+
+# ---- GEN_ONLY: regenerate the Go table from the dist-kernels on disk ---------
+
+if [ "${GEN_ONLY:-0}" = 1 ]; then
+	gen_go_table
+	exit 0
+fi
 
 # ---- build -------------------------------------------------------------------
 
@@ -409,3 +605,7 @@ else
 fi
 
 printf 'build-kernels: ok (%s artifacts)\n' "$products"
+
+# The built-in table is the last step of a complete build: the artifacts above
+# are the bytes it describes. A partial KERNELS set only prints one line.
+gen_go_table

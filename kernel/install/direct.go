@@ -171,7 +171,13 @@ type DirectInstall struct {
 func (in *Installer) InstallDirect(ctx context.Context, di DirectInstall) (driver.Installed, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	return in.installDirectLocked(ctx, di)
+}
 
+// installDirectLocked is the body of InstallDirect, for callers that already
+// hold in.mu: the built-in release table's ensureOwn runs under the same lock
+// (install.ensure) and must not take it a second time.
+func (in *Installer) installDirectLocked(ctx context.Context, di DirectInstall) (driver.Installed, error) {
 	name := di.Name
 	if err := validName(name); err != nil {
 		return driver.Installed{}, err
