@@ -8,6 +8,7 @@ import (
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/driver/frp"
+	"github.com/W1nCwC/W1nCray/kernel/manifest"
 )
 
 // nopSupervisor satisfies driver.Supervisor without running anything. Apply
@@ -85,5 +86,63 @@ func TestFrpInstalledPathFeedsDriver(t *testing.T) {
 	}
 	if _, err := d.Apply(context.Background(), rt, nil); err != nil {
 		t.Fatalf("frp Apply with the installed kernel: %v", err)
+	}
+}
+
+// TestFrpDirectMembersFeedsDriver is the direct-path counterpart of
+// TestFrpInstalledPathFeedsDriver: one upstream frp tar.gz is installed through
+// the multi-member direct path (no manifest at all), and the same driver chain
+// must accept the result. It is what release/build-kernels.sh feeds the agent.
+func TestFrpDirectMembersFeedsDriver(t *testing.T) {
+	f := newFixture(t)
+	frpcBin := fakeBin("0.71.0", 512)
+	frpsBin := fakeBin("0.71.0", 640)
+	archive := mkTarGz(t,
+		tarEntry{Name: "frp_0.71.0_linux_amd64/frpc", Data: frpcBin},
+		tarEntry{Name: "frp_0.71.0_linux_amd64/frps", Data: frpsBin},
+	)
+	fs := newFileServer(t)
+	url := fs.put("/W1nCray-frp-linux-amd64.tar.gz", archive)
+
+	in := f.installer(t.TempDir())
+	inst, err := in.InstallDirect(context.Background(), DirectInstall{
+		Name: "frp", Version: "0.71.0", URL: url,
+		SHA256: sum(archive), Archive: manifest.ArchiveTarGz,
+		Members: []DirectMember{
+			{From: "frp_0.71.0_linux_amd64/frpc", To: "frpc"},
+			{From: "frp_0.71.0_linux_amd64/frps", To: "frps"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InstallDirect: %v", err)
+	}
+	if filepath.Base(inst.Path) != "frpc" {
+		t.Fatalf("installed path = %q, want the frp run binary frpc", inst.Path)
+	}
+	frpsWant := filepath.Join(filepath.Dir(inst.Path), "frps")
+	if b, err := os.ReadFile(inst.Path); err != nil || string(b) != string(frpcBin) {
+		t.Errorf("installed frpc differs (err %v)", err)
+	}
+	if b, err := os.ReadFile(frpsWant); err != nil || string(b) != string(frpsBin) {
+		t.Errorf("installed frps differs (err %v)", err)
+	}
+
+	frps, frpc, err := frp.Binaries(inst.Path)
+	if err != nil {
+		t.Fatalf("frp.Binaries(%q): %v", inst.Path, err)
+	}
+	if frps != frpsWant || frpc != inst.Path {
+		t.Fatalf("Binaries = (%q, %q), want (%q, %q)", frps, frpc, frpsWant, inst.Path)
+	}
+
+	d := frp.New(frp.Options{})
+	rt := driver.Runtime{
+		Kernel:   inst,
+		StateDir: t.TempDir(),
+		Sup:      nopSupervisor{},
+		Log:      nopLogger{},
+	}
+	if _, err := d.Apply(context.Background(), rt, nil); err != nil {
+		t.Fatalf("frp Apply with the directly installed kernel: %v", err)
 	}
 }

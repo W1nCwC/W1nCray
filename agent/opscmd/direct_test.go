@@ -5,12 +5,15 @@
 package opscmd
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -245,6 +248,119 @@ func TestSelfUpdateSha256WithoutTheCapabilityIsRefused(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the refusal never arrived")
+	}
+}
+
+// tarGzBytes builds the upstream frp archive shape: one tar.gz holding both
+// binaries under a directory prefix.
+func tarGzBytes(t *testing.T, entries map[string][]byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, name := range []string{"frpc", "frps"} {
+		data := entries[name]
+		hdr := &tar.Header{Name: "frp_0.71.0_linux_amd64/" + name, Mode: 0o755, Size: int64(len(data))}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestKernelInstallDirectMembersInstallsBothBinaries: the args carry a
+// "members" list, so one frp tar.gz installs frpc and frps in one command.
+// The JSON field is what the panel sends for an agent >= 0.8.7.
+func TestKernelInstallDirectMembersInstallsBothBinaries(t *testing.T) {
+	rig := newKernelRig(t)
+	frpc := []byte("#!/bin/sh\n# FAKEKERNEL version=0.71.0\n" + strings.Repeat("x", 512))
+	frps := []byte("#!/bin/sh\n# FAKEKERNEL version=0.71.0\n" + strings.Repeat("y", 640))
+	archive := tarGzBytes(t, map[string][]byte{"frpc": frpc, "frps": frps})
+	url := directServer(t, "/W1nCray-frp-linux-amd64.tar.gz", archive)
+
+	calls := make(chan sinkCall, 4)
+	reg := mustRegistry(t, Deps{
+		Kernels: directKernels{fakeKernels: fakeKernels{}, in: rig.in},
+		Sink: SinkFunc(func(id, status string, data json.RawMessage) {
+			calls <- sinkCall{id: id, status: status, data: data}
+		}),
+	})
+	args := `{"name":"frp","version":"0.71.0","url":"` + url + `","sha256":"` + sha256Hex(archive) +
+		`","size":` + itoa(int64(len(archive))) +
+		`,"archive":"tar.gz","members":[{"from":"frp_0.71.0_linux_amd64/frpc","to":"frpc"},` +
+		`{"from":"frp_0.71.0_linux_amd64/frps","to":"frps"}]}`
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "dm1", Type: panelclient.CmdKernelInstall, Args: json.RawMessage(args),
+	})
+	if status != panelclient.ResultAccepted {
+		t.Fatalf("first answer = (%q, %s), want accepted", status, res)
+	}
+	var out installedResult
+	select {
+	case c := <-calls:
+		if c.status != panelclient.ResultDone {
+			t.Fatalf("final = %+v, want done", c)
+		}
+		if err := json.Unmarshal(c.data, &out); err != nil {
+			t.Fatalf("result %s: %v", c.data, err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("kernel_install (direct members) never finished")
+	}
+	if out.Name != "frp" || out.Version != "0.71.0" || out.Path == "" {
+		t.Fatalf("result = %+v", out)
+	}
+	dir := filepath.Dir(out.Path)
+	for _, want := range []struct {
+		name string
+		data []byte
+	}{{"frpc", frpc}, {"frps", frps}} {
+		b, err := os.ReadFile(filepath.Join(dir, want.name))
+		if err != nil {
+			t.Fatalf("%s: %v", want.name, err)
+		}
+		if string(b) != string(want.data) {
+			t.Errorf("%s differs from the archive member", want.name)
+		}
+	}
+	entries, err := rig.in.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current bool
+	for _, e := range entries {
+		if e.Name == "frp" && e.Version == "0.71.0" && e.Current {
+			current = true
+		}
+	}
+	if !current {
+		t.Errorf("frp@0.71.0 is not current: %+v", entries)
+	}
+}
+
+// TestKernelInstallArgsRejectUnknownFields: the strict decoder that makes
+// "members" safe to add — an unknown field is still invalid_args, so an old
+// agent refuses the field instead of ignoring it.
+func TestKernelInstallArgsRejectUnknownFields(t *testing.T) {
+	reg := mustRegistry(t, Deps{Kernels: fakeKernels{}})
+	status, res := reg.Execute(context.Background(), panelclient.Command{
+		ID: "dm2", Type: panelclient.CmdKernelInstall,
+		Args: json.RawMessage(`{"name":"frp","version":"0.71.0","memberz":[]}`),
+	})
+	if status != panelclient.ResultFailed {
+		t.Fatalf("status = %q (%s), want failed", status, res)
+	}
+	if code := decodeFailure(t, res).Code; code != "invalid_args" {
+		t.Errorf("code = %q, want invalid_args", code)
 	}
 }
 
