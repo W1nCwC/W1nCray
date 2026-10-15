@@ -65,6 +65,13 @@ type Options struct {
 	// the per-inbound/outbound byte counters. Nil (the default) leaves the
 	// generated config exactly as it is without forwarding.
 	Forward *ForwardOptions
+
+	// AfterStart, when set, is called by Start once the instance is running and
+	// before any caller can use it. It exists for hooks that must be installed
+	// after the instance's own features are up — the kernel's access-log
+	// collector replaces the log handler app/log registered while the instance
+	// was created, so it has to run after Start. It must not block.
+	AfterStart func()
 }
 
 // Core is a running Xray instance plus handles to the features nodes use.
@@ -77,6 +84,9 @@ type Core struct {
 	ibm   inbound.Manager
 	obm   outbound.Manager
 	stats stats.Manager
+
+	// afterStart is Options.AfterStart, run by Start (see its comment).
+	afterStart func()
 }
 
 // Conns returns the connection tracker. It tracks nothing until Watch is
@@ -130,19 +140,27 @@ func New(opts Options) (*Core, error) {
 
 	rm.router = inst.GetFeature(routing.RouterType()).(routing.Router)
 	return &Core{
-		Instance: inst,
-		Limiter:  l,
-		Rules:    rm,
-		conns:    d.Tracker(),
-		ibm:      inst.GetFeature(inbound.ManagerType()).(inbound.Manager),
-		obm:      inst.GetFeature(outbound.ManagerType()).(outbound.Manager),
-		stats:    inst.GetFeature(stats.ManagerType()).(stats.Manager),
+		Instance:   inst,
+		Limiter:    l,
+		Rules:      rm,
+		conns:      d.Tracker(),
+		ibm:        inst.GetFeature(inbound.ManagerType()).(inbound.Manager),
+		obm:        inst.GetFeature(outbound.ManagerType()).(outbound.Manager),
+		stats:      inst.GetFeature(stats.ManagerType()).(stats.Manager),
+		afterStart: opts.AfterStart,
 	}, nil
 }
 
-// Start starts the instance.
+// Start starts the instance. A configured Options.AfterStart hook runs once the
+// instance is up; it is not run when Start fails.
 func (c *Core) Start() error {
-	return c.Instance.Start()
+	if err := c.Instance.Start(); err != nil {
+		return err
+	}
+	if c.afterStart != nil {
+		c.afterStart()
+	}
+	return nil
 }
 
 // Close stops the instance.
