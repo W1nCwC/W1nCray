@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -25,6 +26,13 @@ const (
 	// machine's node list now (the agent's hint{what:"nodes"}). It shares the
 	// status endpoint and takes no parameter.
 	NodesSyncPath = xrayapi.NodesSyncPath
+	// AuditPath is the HTTP path that returns one bounded page of the kernel's
+	// access-log collector (the agent's audit.log source). It shares the status
+	// endpoint and takes after=<seq> and max=<n>.
+	AuditPath = xrayapi.AuditPath
+	// AuditCtlPath is the HTTP path that turns access-log collection on or off
+	// (POST AuditCtlRequest). It shares the status endpoint.
+	AuditCtlPath = xrayapi.AuditCtlPath
 )
 
 // StatusServer serves GET /status on the kernel's local endpoint.
@@ -51,6 +59,8 @@ func NewStatusServer(svc *Service, configDir string) (*StatusServer, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc(StatusPath, s.handleStatus)
 	mux.HandleFunc(NodesSyncPath, s.handleNodesSync)
+	mux.HandleFunc(AuditPath, s.handleAudit)
+	mux.HandleFunc(AuditCtlPath, s.handleAuditCtl)
 	s.srv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -112,6 +122,50 @@ func (s *StatusServer) handleNodesSync(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(xrayapi.NodesSyncResult{Changed: changed, Version: version})
+}
+
+// handleAudit answers GET /audit?after=<seq>&max=<n> with one bounded page of
+// the kernel's access-log collector. after is the first sequence number the
+// caller has not seen (0 or absent means "from the oldest entry kept"); max is
+// the page size, defaulting to and capped at xrayapi.MaxAuditItems. Both are
+// best-effort: a value that cannot be parsed is treated as absent, so a caller
+// never gets an error page instead of a batch.
+func (s *StatusServer) handleAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	var after uint64
+	if v, err := strconv.ParseUint(q.Get("after"), 10, 64); err == nil {
+		after = v
+	}
+	max := xrayapi.MaxAuditItems
+	if v, err := strconv.Atoi(q.Get("max")); err == nil && v > 0 {
+		max = v
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.svc.AuditBatch(after, max))
+}
+
+// handleAuditCtl answers POST /audit/ctl with {"enabled":bool}: it turns the
+// kernel's access-log collection on or off. Turning it off empties the buffer,
+// so a later enable starts a fresh page.
+func (s *StatusServer) handleAuditCtl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req xrayapi.AuditCtlRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
+	s.svc.SetAuditEnabled(req.Enabled)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(req)
 }
 
 // StatusSocketPath returns the path of the Unix socket (the runtime directory,
