@@ -64,7 +64,7 @@ mod=github.com/W1nCwC/W1nCray
 # The same version goes into both programs: cmd.version for the agent and
 # xraynode.Version for the kernel (which prints it as "W1nCray-xray v...").
 agent_ldflags="-s -w -X $mod/cmd.version=$version"
-xray_ldflags="-s -w -X $mod/xraynode.Version=$version"
+xray_ldflags="-s -w -X $mod/xraynode.Version=${version#v}"
 
 rm -rf dist
 mkdir -p dist
