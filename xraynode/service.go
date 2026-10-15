@@ -35,6 +35,12 @@ var (
 	// retried through the reload mechanism; the delay keeps a panel outage from
 	// turning into a tight restart loop.
 	machineRetryDelay = 30 * time.Second
+	// machineDebounceWindow is how long machineWatch waits after the first
+	// changed node-list version before it reloads. A change observed inside an
+	// open window only replaces the pending version, so a version that keeps
+	// changing still causes at most one reload per window. It is a variable so
+	// tests can shorten it.
+	machineDebounceWindow = 30 * time.Second
 )
 
 // machineRequestTimeout bounds one machine-node request.
@@ -510,34 +516,156 @@ func (s *Service) startMachineWatch(ctx context.Context, wg *sync.WaitGroup, c *
 	}()
 }
 
+// machineDebounce turns the raw "the reported version differs from the running
+// one" observation into "reload at most once per window". It keeps no clock of
+// its own: the caller passes the time in, so tests can drive it without waiting.
+// current is the version the running instance was built from, pending is the
+// latest version seen since the window opened, and deadline is when the window
+// expires.
+type machineDebounce struct {
+	current  string
+	pending  string
+	deadline time.Time
+	armed    bool
+}
+
+// observe records the version the panel reported at now. A version equal to the
+// running one cancels the window (the change was undone and must not reload); a
+// version seen while a window is open only replaces the pending one, so the
+// window is never extended; anything else opens a window ending at now+W.
+func (d *machineDebounce) observe(next string, now time.Time) {
+	if next == d.current {
+		d.pending, d.deadline, d.armed = "", time.Time{}, false
+		return
+	}
+	if d.armed {
+		d.pending = next
+		return
+	}
+	d.pending, d.deadline, d.armed = next, now.Add(machineDebounceWindow), true
+}
+
+// due reports the version to reload with once the window has expired. The window
+// is disarmed, so the same change is never reported twice; ok is false while the
+// window is still open and when there is nothing pending.
+func (d *machineDebounce) due(now time.Time) (version string, ok bool) {
+	if !d.armed || now.Before(d.deadline) {
+		return "", false
+	}
+	d.armed = false
+	return d.pending, true
+}
+
+// timeLeft is how long the caller should wait before calling due. It is negative
+// when no window is open.
+func (d *machineDebounce) timeLeft(now time.Time) time.Duration {
+	if !d.armed {
+		return -1
+	}
+	return d.deadline.Sub(now)
+}
+
 // machineWatch polls the machine's node list and asks for a reload when it
-// changes. It returns when the instance is shut down (ctx) or after it
-// requested a reload, which starts a fresh watcher.
+// changes. A change no longer reloads at once: it opens a machineDebounceWindow
+// window, changes observed inside the window only update the pending version,
+// and at the deadline the list is fetched once more to confirm the latest
+// version before the single reload. It returns when the instance is shut down
+// (ctx) or after it requested a reload, which starts a fresh watcher.
 func (s *Service) machineWatch(ctx context.Context, c *xboard.Client, version string) {
 	t := time.NewTicker(machinePollInterval)
 	defer t.Stop()
+
+	// window is nil while no debounce window is open; timerC is nil then too,
+	// so the deadline branch of the select cannot fire.
+	var window *time.Timer
+	var timerC <-chan time.Time
+	stopWindow := func() {
+		if window != nil {
+			window.Stop()
+		}
+		window, timerC = nil, nil
+	}
+	defer stopWindow()
+
+	d := machineDebounce{current: version}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-		}
-		reqCtx, cancel := context.WithTimeout(ctx, machineRequestTimeout)
-		_, next, err := c.ListMachineNodes(reqCtx)
-		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
+			next, ok := machineListVersion(ctx, c)
+			if !ok {
 				return
 			}
-			log.Warnf("machine nodes: %v", err)
+			if next == "" {
+				// The fetch failed and was logged; an open window stays open
+				// and the deadline is unchanged.
+				continue
+			}
+			wasArmed := d.armed
+			d.observe(next, time.Now())
+			if d.armed && !wasArmed {
+				log.Infof("machine node list changed (version %s), waiting %s before reloading", next, machineDebounceWindow)
+			}
+			if !d.armed {
+				stopWindow()
+				continue
+			}
+			if left := d.timeLeft(time.Now()); left > 0 {
+				// A fresh window was opened (or the pending version of an open
+				// one was replaced without moving the deadline).
+				if window == nil {
+					window = time.NewTimer(left)
+					timerC = window.C
+				}
+				continue
+			}
+			// The window already expired between two polls: fall through to the
+			// deadline handling below instead of re-arming.
+		case <-timerC:
+		}
+		// The debounce window expired: confirm the pending version once more
+		// before breaking every connection, because the panel may have moved on
+		// or gone back to the running list. A failed confirmation falls back to
+		// the version already seen and is logged as a warning.
+		pending, ok := d.due(time.Now())
+		if !ok {
 			continue
 		}
-		if next != version {
-			log.Infof("machine node list changed (version %s)", next)
-			s.requestReload("machine nodes changed")
+		confirmed, ok := machineListVersion(ctx, c)
+		if !ok {
 			return
 		}
+		if confirmed != "" {
+			pending = confirmed
+		}
+		if pending == version {
+			// The list returned to the running version while the window was
+			// open: nothing to reload.
+			continue
+		}
+		log.Infof("machine node list changed (version %s)", pending)
+		s.requestReload("machine nodes changed")
+		return
 	}
+}
+
+// machineListVersion fetches the machine's node-list version. The returned bool
+// is false when the watcher must stop (the instance context is done); an empty
+// version with true means the fetch failed and was logged, so the caller keeps
+// the state it has.
+func machineListVersion(ctx context.Context, c *xboard.Client) (string, bool) {
+	reqCtx, cancel := context.WithTimeout(ctx, machineRequestTimeout)
+	_, next, err := c.ListMachineNodes(reqCtx)
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		log.Warnf("machine nodes: %v", err)
+		return "", true
+	}
+	return next, true
 }
 
 // SyncMachineNodes asks the panel for this machine's node list right now and
