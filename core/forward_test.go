@@ -283,14 +283,23 @@ func TestForwardStats(t *testing.T) {
 				if runtime.GOOS != "linux" {
 					want["in down"], want["out down"] = inDown, outDown
 				}
+				// Report only the final state: an intermediate read of a
+				// counter that is still catching up is not a failure.
+				var problems []string
 				for name, ctr := range want {
 					if ctr == nil {
-						t.Errorf("%s counter missing", name)
+						problems = append(problems, fmt.Sprintf("%s counter missing", name))
 					} else if ctr.Value() != 10004 {
-						t.Errorf("%s counter = %d, want 10004", name, ctr.Value())
+						problems = append(problems, fmt.Sprintf("%s counter = %d, want 10004", name, ctr.Value()))
 					}
 				}
-				if inUp != nil && inUp.Value() == 10004 || time.Now().After(deadline) {
+				if len(problems) == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					for _, problem := range problems {
+						t.Error(problem)
+					}
 					break
 				}
 				time.Sleep(50 * time.Millisecond)
