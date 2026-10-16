@@ -545,6 +545,13 @@ func (c *Config) UnrestrictedEnabled() bool {
 	return c.TerminalEnabled()
 }
 
+// MachineNodesEnabled reports whether the kernel runs panel-assigned machine
+// nodes (Panel.Enabled and Panel.MachineNodes) and the local module gate
+// allows them. A nil config answers false.
+func (c *Config) MachineNodesEnabled() bool {
+	return c != nil && c.Panel != nil && c.Panel.Enabled && c.Panel.MachineNodes && c.XrayNodesEnabled()
+}
+
 // XrayNodesEnabled reports whether the local module gate allows node
 // controllers (D3, ruling 6). The default is on.
 func (c *Config) XrayNodesEnabled() bool {

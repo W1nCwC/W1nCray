@@ -185,6 +185,9 @@ type Runtime struct {
 	// (runtimeStreams.SetAuditSupported). It is false until a kernel status
 	// said otherwise, so the capability is never declared on a guess.
 	auditSupported atomic.Bool
+	// nodeRelay is set while the node API relay listens (agent/noderelay);
+	// the capability list declares node_relay from it.
+	nodeRelay atomic.Bool
 	// cfg is the local agent configuration the capability list and the policy
 	// gates are read from (nil means the defaults).
 	cfg *agentcfg.Config

@@ -15,3 +15,7 @@ func SocketPath(configDir string) string {
 func AddrPath(configDir string) string {
 	return filepath.Join(configDir, StatusAddrName)
 }
+
+// RelaySocketPath is empty on Windows: the node API relay is Unix only, so
+// the kernel always talks to the panel directly there.
+func RelaySocketPath() string { return "" }

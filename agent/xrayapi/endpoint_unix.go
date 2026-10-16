@@ -43,3 +43,9 @@ func LegacySocketPath(configDir string) string {
 func AddrPath(configDir string) string {
 	return filepath.Join(configDir, StatusAddrName)
 }
+
+// RelaySocketPath is where the agent serves the node API relay, next to the
+// status socket in the runtime directory.
+func RelaySocketPath() string {
+	return filepath.Join(RuntimeDir(), RelaySocketName)
+}

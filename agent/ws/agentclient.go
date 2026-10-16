@@ -338,6 +338,10 @@ type AgentOptions struct {
 	// AuditPullInterval overrides the pull cadence (default
 	// DefaultAuditPullInterval). Tests use it so a case does not sleep 3 s.
 	AuditPullInterval time.Duration
+	// NodeRelay is the local node API relay (agent/noderelay). It may be nil:
+	// node.res frames are then answered not_supported. The caller declares
+	// the node_relay capability through Streams.
+	NodeRelay NodeRelay
 	// Log receives the agent's events.
 	Log driver.Logger
 	// InstanceID is reported in hello.instance_id.
@@ -350,8 +354,20 @@ type AgentOptions struct {
 	Now func() time.Time
 }
 
+// NodeRelay is the agent side of the node API relay: it sends node.req frames
+// through the queue it is given and takes the panel's answers.
+type NodeRelay interface {
+	SetSend(func(wsproto.Envelope) error)
+	// SetPanel applies hello.ok.node_relay (nil: not offered).
+	SetPanel(*wsproto.NodeRelayCtl)
+	OnResponse(id string, res wsproto.NodeRes)
+	// Disconnected ends the session's forwarding.
+	Disconnected()
+}
+
 // Agent is the ready-to-run unit: it owns the Client and the periodic senders.
 type Agent struct {
+	nodeRelay  NodeRelay
 	client     *Client
 	dispatcher *Dispatcher
 	streams    Streams
@@ -431,6 +447,7 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		terminal:   a.Terminal,
 		auditSrc:   a.Audit,
 		auditEvery: a.AuditPullInterval,
+		nodeRelay:  a.NodeRelay,
 		log:        a.Log,
 		instanceID: a.InstanceID,
 		version:    a.AgentVersion,
@@ -467,6 +484,9 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 		Disconnect: ag.onDisconnect,
 		Error:      ag.onErrorFrame,
 	})
+	if a.NodeRelay != nil {
+		disp.hooks.NodeRes = a.NodeRelay.OnResponse
+	}
 	ag.dispatcher = disp
 
 	client, err := New(o, disp)
@@ -475,6 +495,9 @@ func NewAgent(o Options, a AgentOptions) (*Agent, error) {
 	}
 	ag.client = client
 	disp.SetSend(client.Send)
+	if a.NodeRelay != nil {
+		a.NodeRelay.SetSend(client.Send)
+	}
 	return ag, nil
 }
 
@@ -500,6 +523,9 @@ func (a *Agent) SendFrame(t string, body any) error {
 // session belongs to the connection that opened it (the panel deletes its own
 // state at the same moment).
 func (a *Agent) onDisconnect(error) {
+	if a.nodeRelay != nil {
+		a.nodeRelay.Disconnected()
+	}
 	d, ok := a.terminal.(TerminalDisconnecter)
 	if !ok {
 		return
@@ -764,6 +790,9 @@ func (a *Agent) helloOK(ok wsproto.HelloOK) {
 	// panel that omits the field leaves the current state alone, which is what
 	// keeps an audit_ctl command in force.
 	a.adoptAuditSession(ok.Session)
+	if a.nodeRelay != nil {
+		a.nodeRelay.SetPanel(ok.NodeRelay)
+	}
 	if ok.Audit != nil {
 		a.auditMu.Lock()
 		a.audit.enabled = ok.Audit.Enabled

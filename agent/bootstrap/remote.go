@@ -14,6 +14,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/filesync"
+	"github.com/W1nCwC/W1nCray/agent/noderelay"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
@@ -22,6 +23,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
 	"github.com/W1nCwC/W1nCray/agent/ws"
 	"github.com/W1nCwC/W1nCray/agent/wsproto"
+	"github.com/W1nCwC/W1nCray/agent/xrayapi"
 	"github.com/W1nCwC/W1nCray/agent/xraysvc"
 )
 
@@ -358,6 +360,7 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		r.Ops.SetDesiredSync(desiredSync{rt: r, runner: runner})
 	}
 
+	var relay *noderelay.Relay
 	if o.WS {
 		// The command entry point is shared with the HTTP runner: one
 		// whitelist, one id space, one answer per command (design 3.4).
@@ -394,6 +397,21 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 			agentOpts.Audit = source
 		} else if r.Audit != nil {
 			agentOpts.Audit = auditSource{client: r.Audit}
+		}
+		// The node API relay: the kernel's machine-node requests travel on
+		// this socket instead of one HTTPS request each, when the panel offers
+		// it (hello.ok.node_relay). Only with panel-assigned nodes; a socket
+		// that cannot be created just leaves the kernel on HTTPS.
+		if o.AgentConfig.MachineNodesEnabled() {
+			relay = noderelay.New(noderelay.Options{MachineID: o.MachineID, Token: o.Token, Log: log})
+			if err := relay.Listen(xrayapi.RelaySocketPath()); err != nil {
+				log.Infof("bootstrap: node relay not available: %v", err)
+				relay = nil
+			}
+		}
+		if relay != nil {
+			agentOpts.NodeRelay = relay
+			r.nodeRelay.Store(true)
 		}
 		// The interactive terminal is wired only when this machine really has
 		// one; a nil sink is what answers term.error{terminal_disabled}
@@ -498,6 +516,11 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 			if cancelWS != nil {
 				cancelWS()
 				<-wsDone
+			}
+			// The kernel goes back to HTTPS as soon as the socket is gone.
+			if relay != nil {
+				r.nodeRelay.Store(false)
+				relay.Close()
 			}
 			cancelHTTP()
 			<-runnerDone

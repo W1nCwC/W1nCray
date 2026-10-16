@@ -107,6 +107,11 @@ func (s runtimeStreams) Capabilities() []string {
 	if s.rt != nil && s.rt.Audit != nil && s.rt.auditSupported.Load() {
 		caps = append(caps, wsproto.CapAudit)
 	}
+	// node_relay: the relay socket is up, so the kernel's node requests can
+	// travel on this channel (agent/noderelay).
+	if s.rt != nil && s.rt.nodeRelay.Load() {
+		caps = append(caps, wsproto.CapNodeRelay)
+	}
 	return caps
 }
 

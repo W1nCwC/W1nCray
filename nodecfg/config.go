@@ -32,6 +32,9 @@ type APIConfig struct {
 	// nodes it runs. Both fields must be set.
 	MachineID    int    `mapstructure:"-"`
 	MachineToken string `mapstructure:"-"`
+	// RelaySocket is the agent's local node API relay (machine mode only, set
+	// by the kernel, never by YAML): requests go through it while it exists.
+	RelaySocket string `mapstructure:"-"`
 }
 
 // Config is the "ControllerConfig" section of a node (XrayR compatible).

@@ -80,6 +80,9 @@ type Hooks struct {
 	// unknown_type or not_supported) stop sending for the rest of the session.
 	// Nil ignores it.
 	Error func(body wsproto.ErrorBody)
+	// NodeRes takes the panel's node.res frames (the node API relay). Nil
+	// answers them with not_supported: this agent never sent a node.req.
+	NodeRes func(id string, res wsproto.NodeRes)
 	// Log receives the dispatcher's own events; never a token or a payload.
 	Log driver.Logger
 	// Now is the clock used for the error rate limit; nil uses time.Now. It is
@@ -168,6 +171,17 @@ func (d *Dispatcher) Frame(env wsproto.Envelope) {
 		}
 	case wsproto.TypeTermOpen, wsproto.TypeTermInput, wsproto.TypeTermResize, wsproto.TypeTermClose:
 		d.handleTerm(env)
+	case wsproto.TypeNodeRes:
+		if d.hooks.NodeRes == nil {
+			d.answerError(env.ID, wsproto.ErrCodeNotSupported, "the node relay is not wired")
+			return
+		}
+		var res wsproto.NodeRes
+		if err := Decode(env, &res); err != nil {
+			d.answerError(env.ID, wsproto.ErrCodeBadPayload, err.Error())
+			return
+		}
+		d.hooks.NodeRes(env.ID, res)
 	default:
 		// Unknown t: answer and keep going (docs/WS-PROTOCOL.md section 2).
 		d.answerError(env.ID, wsproto.ErrCodeUnknownType, "unknown message type "+env.T)

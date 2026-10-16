@@ -18,6 +18,9 @@ const (
 	KernelName = "xray"
 	// StatusSocketName is the Unix socket next to config.yml on Unix systems.
 	StatusSocketName = "xray.sock"
+	// RelaySocketName is the agent's node API relay (agent/noderelay): the
+	// kernel's machine-node requests go through it when it exists.
+	RelaySocketName = "panel-relay.sock"
 	// StatusAddrName is the file holding the loopback address on Windows.
 	StatusAddrName = "xray.addr"
 	// StatusPath is the HTTP path the status document is served on.

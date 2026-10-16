@@ -459,6 +459,9 @@ func (s *Service) discoverMachineNodes(pc *AgentPanelConfig, certs *cert.Manager
 				NodeType:     mn.Type,
 				MachineID:    pc.MachineID,
 				MachineToken: token,
+				// The agent's node API relay, used while the agent serves it;
+				// HTTPS to the panel otherwise.
+				RelaySocket: xrayapi.RelaySocketPath(),
 			},
 			Config: machineNodeConfig(pc, mn.ID),
 			Certs:  certs,

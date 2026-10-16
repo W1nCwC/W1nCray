@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -621,5 +622,29 @@ func TestAgentRunReturnsWhenContextIsCancelled(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Agent.Run did not return after cancel")
+	}
+}
+
+func TestNodeResGoesToTheRelayHook(t *testing.T) {
+	var gotID string
+	var got wsproto.NodeRes
+	d := NewDispatcher(Hooks{NodeRes: func(id string, res wsproto.NodeRes) { gotID, got = id, res }})
+	env, err := Encode(wsproto.TypeNodeRes, "nr1", wsproto.NodeRes{Status: 304, ETag: `"e"`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Frame(env)
+	if gotID != "nr1" || got.Status != 304 || got.ETag != `"e"` {
+		t.Fatalf("got %q %+v", gotID, got)
+	}
+}
+
+func TestNodeResWithoutARelayIsNotSupported(t *testing.T) {
+	var sent []wsproto.Envelope
+	d := NewDispatcher(Hooks{Send: func(env wsproto.Envelope) error { sent = append(sent, env); return nil }})
+	env, _ := Encode(wsproto.TypeNodeRes, "nr1", wsproto.NodeRes{Status: 200})
+	d.Frame(env)
+	if len(sent) != 1 || sent[0].T != wsproto.TypeError || !strings.Contains(string(sent[0].D), wsproto.ErrCodeNotSupported) {
+		t.Fatalf("sent %+v", sent)
 	}
 }

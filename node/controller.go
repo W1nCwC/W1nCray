@@ -99,6 +99,7 @@ func New(opts Options) *Controller {
 			Timeout:      timeout,
 			MachineID:    a.MachineID,
 			MachineToken: a.MachineToken,
+			RelaySocket:  a.RelaySocket,
 		}),
 		apiCfg:    a,
 		cfg:       opts.Config,

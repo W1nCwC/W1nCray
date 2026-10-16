@@ -28,6 +28,11 @@ const (
 	TypeTermData   = "term.data"
 	TypeTermExit   = "term.exit"
 	TypeTermError  = "term.error"
+
+	// Node API relay (capability node_relay): the agent forwards its kernel's
+	// machine-node requests as node.req and the panel answers node.res.
+	TypeNodeReq = "node.req"
+	TypeNodeRes = "node.res"
 )
 
 // Capabilities an agent may declare in hello.
@@ -43,11 +48,16 @@ const (
 	// endpoint and forwards bounded batches. It says nothing about whether
 	// collection is on right now — that is hello.ok.audit.enabled.
 	CapAudit = "audit"
+	// CapNodeRelay promises the panel that this agent serves the local node
+	// API relay: the kernel's machine-node requests (config, user, push,
+	// alive, alivelist, status) can travel as node.req frames on this socket.
+	// Whether the panel takes them is hello.ok.node_relay.enabled.
+	CapNodeRelay = "node_relay"
 )
 
 // CapabilitiesAll is the closed set a hello.capabilities may contain. The
 // panel must not gate a feature on anything outside this list.
-var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapAudit, CapTelemetry}
+var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapAudit, CapTelemetry, CapNodeRelay}
 
 // Audit bounds. MaxAuditItems is both the largest batch a single audit.log
 // frame may carry and the largest max a page request may ask the kernel for;
@@ -105,6 +115,44 @@ type HelloOK struct {
 	// a panel that does not manage it, which leaves the agent's current state
 	// alone (the default is off).
 	Audit *AuditCtl `json:"audit,omitempty"`
+	// NodeRelay answers the node_relay capability. It is omitted by a panel
+	// that does not relay node requests, which keeps the kernel on HTTPS.
+	NodeRelay *NodeRelayCtl `json:"node_relay,omitempty"`
+}
+
+// NodeRelayCtl is the panel's node relay switch in hello.ok.
+type NodeRelayCtl struct {
+	Enabled bool `json:"enabled"`
+	// Chunk is the largest raw body slice one node.req frame may carry; a
+	// longer body is split over several frames. Zero means NodeRelayChunk.
+	Chunk int `json:"chunk,omitempty"`
+}
+
+// NodeRelayChunk is the default (and largest) raw body bytes per relay frame:
+// base64 makes it 171 KiB, inside MaxFrame.
+const NodeRelayChunk = 128 << 10
+
+// NodeReq is one relayed request, or one slice of it: every frame of a
+// request carries the same envelope id, and all but the last set More. The
+// head fields (Method, Name, NodeID, IfNoneMatch) are read from the first.
+type NodeReq struct {
+	Method      string `json:"method,omitempty"`
+	Name        string `json:"name,omitempty"`
+	NodeID      int    `json:"node_id,omitempty"`
+	IfNoneMatch string `json:"if_none_match,omitempty"`
+	// Body is a base64 slice of the request body.
+	Body string `json:"body,omitempty"`
+	More bool   `json:"more,omitempty"`
+}
+
+// NodeRes is the panel's answer, or one slice of it (same id as the request).
+// Status is in every frame; ETag and ContentType only in the first.
+type NodeRes struct {
+	Status      int    `json:"status"`
+	ETag        string `json:"etag,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Body        string `json:"body,omitempty"`
+	More        bool   `json:"more,omitempty"`
 }
 
 // AuditCtl is the panel's audit switch in hello.ok. A nil pointer means "not

@@ -27,8 +27,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,6 +101,12 @@ type Config struct {
 	// be set. NodeID then selects the node inside the machine.
 	MachineID    int
 	MachineToken string
+
+	// RelaySocket (machine mode only) is the agent's local node API relay, a
+	// Unix socket. While it exists the node requests go through it, and the
+	// agent forwards them over its panel WebSocket; when it is missing or
+	// says it cannot forward, the request goes to APIHost as usual.
+	RelaySocket string
 }
 
 // Client talks to one Xboard node.
@@ -109,6 +117,7 @@ type Client struct {
 	machine bool
 	query   url.Values
 	http    *http.Client
+	relay   *http.Client
 
 	mu        sync.Mutex
 	configTag string
@@ -139,7 +148,7 @@ func New(cfg Config) *Client {
 	if machine {
 		prefix = machineBasePath
 	}
-	return &Client{
+	c := &Client{
 		cfg:     cfg,
 		base:    strings.TrimRight(cfg.APIHost, "/"),
 		prefix:  prefix,
@@ -147,7 +156,29 @@ func New(cfg Config) *Client {
 		query:   q,
 		http:    &http.Client{Timeout: cfg.Timeout},
 	}
+	if machine && cfg.RelaySocket != "" {
+		socket := cfg.RelaySocket
+		c.relay = &http.Client{
+			Timeout: cfg.Timeout,
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", socket)
+				},
+				MaxIdleConns:    4,
+				IdleConnTimeout: 90 * time.Second,
+			},
+		}
+	}
+	return c
 }
+
+// relayBase is the URL origin of requests sent to the relay socket.
+const relayBase = "http://w1ncray-relay"
+
+// RelayHeader is set by the relay on its answers. "unavailable" (with 503)
+// means the request was not forwarded, so it may go to the panel directly.
+const RelayHeader = "X-W1nCray-Relay"
 
 // Host returns the configured API host.
 func (c *Client) Host() string { return c.cfg.APIHost }
@@ -210,14 +241,59 @@ func (c *Client) attempt(ctx context.Context, method, name string, body any, eta
 	if strings.HasPrefix(name, "/") {
 		path = name // absolute API path, e.g. the V2 handshake
 	}
-	u := c.base + path + "?" + c.query.Encode()
-	var rd io.Reader
+	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		rd = bytes.NewReader(b)
+		payload = b
+	}
+	if c.relay != nil && !strings.HasPrefix(name, "/") {
+		resp, forwarded, err := c.viaRelay(ctx, method, name, path, payload, etag)
+		if forwarded {
+			return resp, err
+		}
+	}
+	resp, err := c.send(ctx, c.http, c.base, method, name, path, payload, etag)
+	if err != nil {
+		return nil, err
+	}
+	return c.check(name, resp)
+}
+
+// viaRelay sends one request through the agent's relay. forwarded is false
+// when the panel certainly never saw it — no socket, a refused connection, or
+// the relay's "unavailable" answer — and the caller then goes to the panel
+// directly. A GET may always be repeated; a POST that failed after it reached
+// the relay is not, exactly like a POST whose answer was lost on HTTPS.
+func (c *Client) viaRelay(ctx context.Context, method, name, path string, payload []byte, etag string) (*http.Response, bool, error) {
+	if _, err := os.Stat(c.cfg.RelaySocket); err != nil {
+		return nil, false, nil
+	}
+	resp, err := c.send(ctx, c.relay, relayBase, method, name, path, payload, etag)
+	if err != nil {
+		var op *net.OpError
+		if method == http.MethodGet || (errors.As(err, &op) && op.Op == "dial") {
+			return nil, false, nil
+		}
+		return nil, true, err
+	}
+	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(RelayHeader) == "unavailable" {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return nil, false, nil
+	}
+	resp, err = c.check(name, resp)
+	return resp, true, err
+}
+
+// send builds and sends one request to base (the panel, or the relay).
+func (c *Client) send(ctx context.Context, hc *http.Client, base, method, name, path string, payload []byte, etag string) (*http.Response, error) {
+	u := base + path + "?" + c.query.Encode()
+	var rd io.Reader
+	if payload != nil {
+		rd = bytes.NewReader(payload)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
@@ -225,7 +301,7 @@ func (c *Client) attempt(ctx context.Context, method, name string, body any, eta
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "W1nCray")
-	if body != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.machine {
@@ -235,10 +311,15 @@ func (c *Client) attempt(ctx context.Context, method, name string, body any, eta
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request %s: %w", name, c.redact(err))
 	}
+	return resp, nil
+}
+
+// check turns a non-2xx answer into an error (304: ErrNotModified).
+func (c *Client) check(name string, resp *http.Response) (*http.Response, error) {
 	if resp.StatusCode == http.StatusNotModified {
 		resp.Body.Close()
 		return nil, ErrNotModified
