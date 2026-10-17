@@ -83,6 +83,17 @@ type Status struct {
 	// (AuditPath and AuditCtlPath). It is independent of whether collection is
 	// switched on right now, so an old agent that ignores it is unaffected.
 	Audit bool `json:"audit,omitempty"`
+	// Runtime is where the running instance took its outbounds, routing and
+	// DNS from: "panel" (the machine's runtime profile, handoff 44) or
+	// "files" (custom_outbound.json, route.json, dns.json). Empty from a
+	// kernel that predates the profile.
+	Runtime string `json:"runtime,omitempty"`
+	// RuntimeVersion is the version of the runtime profile in use ("" in
+	// files mode).
+	RuntimeVersion string `json:"runtime_version,omitempty"`
+	// RuntimeError is why the panel's latest runtime profile is not in use
+	// (unreachable, or refused by Xray's builder); "" when it is.
+	RuntimeError string `json:"runtime_error,omitempty"`
 }
 
 // AuditBatch is the JSON body of GET AuditPath: one bounded page of the

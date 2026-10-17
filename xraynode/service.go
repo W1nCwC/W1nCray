@@ -1,7 +1,9 @@
 package xraynode
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -83,6 +85,17 @@ type Service struct {
 	// and nil/"" when machine mode is off or nothing runs.
 	machineClient  *xboard.Client
 	machineVersion string
+	// runtime is the machine's runtime profile the running instance was built
+	// from (nil: files mode); runtimeKnown says whether the panel has answered
+	// at least once, so a later failed fetch can keep the mode instead of
+	// guessing it (handoff 44).
+	runtime      *xboard.Runtime
+	runtimeKnown bool
+	// runtimeErr is why the last fetched profile is not in use ("" when it
+	// is); runtimeRejected is the version Xray refused, so the retry does not
+	// rebuild for it again.
+	runtimeErr      string
+	runtimeRejected string
 	// machineSyncMu serialises the hint-driven node fetches, so two hints
 	// arriving together cannot both report the same change as theirs.
 	machineSyncMu sync.Mutex
@@ -284,10 +297,29 @@ func (s *Service) startXrayLocked(cfg *Config) (err error) {
 	var machineCtx context.Context
 	var machineCancel context.CancelFunc
 	var machineWG sync.WaitGroup
+	// A rebuild whose discovery fails keeps the mode the panel last chose
+	// rather than falling back to files the panel may have replaced.
+	var rt *xboard.Runtime
+	if s.runtimeKnown {
+		rt = s.runtime
+	}
+	var runtimeStale, runtimeUnknown bool
 	if pc := machinePanel(cfg); pc != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		machineCtx, machineCancel = ctx, cancel
+		static := len(nodes)
 		c, version, derr := s.discoverMachineNodes(pc, certs, &nodes)
+		if derr == nil {
+			// The runtime profile decides where outbounds, routing and DNS
+			// come from; without an answer the machine nodes cannot be built
+			// correctly, so an unknown mode counts as a failed discovery.
+			var ok bool
+			if rt, runtimeStale, ok = s.machineRuntimeLocked(c, cfg); !ok {
+				derr = errors.New("runtime profile unavailable and never fetched before")
+				nodes = nodes[:static]
+				runtimeUnknown = true
+			}
+		}
 		if derr != nil {
 			log.Warnf("machine nodes: %v (static nodes keep running; retrying)", derr)
 			s.scheduleMachineRetry(ctx, &machineWG, "machine node discovery failed")
@@ -333,6 +365,14 @@ func (s *Service) startXrayLocked(cfg *Config) (err error) {
 	// (see audit.go). It is reinstalled on every rebuild, so the switch survives
 	// a reload.
 	opts := coreOptions(cfg, ns)
+	applyRuntime(&opts, rt)
+	if runtimeUnknown {
+		// The panel answered the node list but not the profile: this machine
+		// may be in panel mode, whose files are stale or gone. Start the
+		// static part without them (default outbounds only) so the instance
+		// stays up and the scheduled retry can bring the machine nodes back.
+		opts.DNSConfigPath, opts.RouteConfigPath, opts.InboundConfigPath, opts.OutboundConfigPath = "", "", "", ""
+	}
 	opts.AfterStart = func() { s.installAuditLocked(cfg) }
 	cr, cerr := core.New(opts)
 	if cerr != nil {
@@ -351,6 +391,9 @@ func (s *Service) startXrayLocked(cfg *Config) (err error) {
 	// picked up without a config change.
 	if machine != nil {
 		s.startMachineWatch(machineCtx, &machineWG, machine, machineVersion)
+		if runtimeStale {
+			s.startRuntimeRetry(machineCtx, &machineWG, machine, runtimeVersion(rt), s.runtimeRejected)
+		}
 	}
 	s.machineClient, s.machineVersion = machine, machineVersion
 	s.core, s.nodes = cr, nodes
@@ -471,6 +514,109 @@ func (s *Service) discoverMachineNodes(pc *AgentPanelConfig, certs *cert.Manager
 	logUnassignedNodeControllers(pc, list)
 	log.Infof("machine %d: %d node(s) assigned by the panel", pc.MachineID, len(list))
 	return c, version, nil
+}
+
+// machineRuntimeLocked fetches the machine's runtime profile and checks it with
+// Xray's own builder before anything is torn down, so a profile Xray would
+// refuse never replaces a working one. ok is false only when there is no
+// usable answer and the panel never gave one before: the caller then cannot
+// know whether to use the panel's documents or the files. Otherwise a failed
+// fetch or a refused profile keeps the profile in use and reports it as stale,
+// so the caller watches for a usable one. The caller holds s.mu.
+func (s *Service) machineRuntimeLocked(c *xboard.Client, cfg *Config) (rt *xboard.Runtime, stale, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), machineRequestTimeout)
+	defer cancel()
+	fresh, err := c.GetMachineRuntime(ctx)
+	if err == nil && fresh != nil {
+		probe := coreOptions(cfg, nil)
+		applyRuntime(&probe, fresh)
+		if verr := core.Validate(probe); verr != nil {
+			err = fmt.Errorf("profile %s refused by xray: %w", fresh.Version, verr)
+			s.runtimeRejected = fresh.Version
+		}
+	}
+	if err == nil {
+		s.runtime, s.runtimeKnown, s.runtimeErr, s.runtimeRejected = fresh, true, "", ""
+		if fresh != nil {
+			log.Infof("runtime profile %s: outbounds, routing and DNS come from the panel", fresh.Version)
+		}
+		return fresh, false, true
+	}
+	s.runtimeErr = err.Error()
+	if !s.runtimeKnown {
+		log.Errorf("runtime profile: %v", err)
+		return nil, false, false
+	}
+	log.Errorf("runtime profile: %v (keeping the one in use: %s)", err, runtimeVersion(s.runtime))
+	return s.runtime, true, true
+}
+
+// startRuntimeRetry polls the runtime profile while the instance runs on a
+// stale copy, and asks for a rebuild once the panel answers with a different
+// profile. The node-list version already carries the profile hash, so an
+// unchanged answer just ends the retry: there is nothing to rebuild.
+//
+// A profile Xray refused (rejected) does not trigger a rebuild either: it
+// would be refused again. The retry keeps polling until the panel serves a
+// different one.
+func (s *Service) startRuntimeRetry(ctx context.Context, wg *sync.WaitGroup, c *xboard.Client, inUse, rejected string) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(machinePollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			reqCtx, cancel := context.WithTimeout(ctx, machineRequestTimeout)
+			fresh, err := c.GetMachineRuntime(reqCtx)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Warnf("runtime profile: %v (still using %s)", err, inUse)
+				continue
+			}
+			if runtimeVersion(fresh) == inUse {
+				log.Infof("runtime profile reachable again; %s is current", inUse)
+				return
+			}
+			if rejected != "" && runtimeVersion(fresh) == rejected {
+				continue
+			}
+			s.requestReload("runtime profile changed")
+			return
+		}
+	}()
+}
+
+// runtimeVersion names a runtime profile for logs and comparisons; files mode
+// is "files".
+func runtimeVersion(rt *xboard.Runtime) string {
+	if rt == nil {
+		return "files"
+	}
+	return rt.Version
+}
+
+// applyRuntime points the core at the panel's documents. In panel mode none of
+// the four files is read: the profile replaces custom_outbound.json,
+// route.json and dns.json, and carries no inbounds (custom_inbound.json is
+// left out on purpose; the panel's nodes are the inbounds).
+func applyRuntime(opts *core.Options, rt *xboard.Runtime) {
+	if rt == nil {
+		return
+	}
+	opts.DNSConfigPath, opts.RouteConfigPath, opts.InboundConfigPath, opts.OutboundConfigPath = "", "", "", ""
+	opts.OutboundConfig = rt.Outbounds
+	opts.RouteConfig = rt.Routing
+	if d := bytes.TrimSpace(rt.DNS); len(d) > 0 && string(d) != "null" {
+		opts.DNSConfig = rt.DNS
+	}
 }
 
 // machineNodeConfig returns the ControllerConfig of one machine node: a
@@ -971,8 +1117,13 @@ func (s *Service) Status() xrayapi.Status {
 		// Audit reports that this kernel serves /audit and /audit/ctl. It is
 		// independent of whether collection is on, and an old agent that does
 		// not know the field ignores it.
-		Audit: true,
+		Audit:   true,
+		Runtime: "files",
 	}
+	if s.runtime != nil {
+		st.Runtime, st.RuntimeVersion = "panel", s.runtime.Version
+	}
+	st.RuntimeError = s.runtimeErr
 	if p := s.lastError.Load(); p != nil {
 		st.LastError = *p
 	}

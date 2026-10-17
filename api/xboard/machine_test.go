@@ -18,6 +18,7 @@ type machineReq struct {
 	method, path, rawQuery string
 	machineID, auth        string
 	ifNoneMatch            string
+	runtime                string
 }
 
 func newMachineServer(t *testing.T, nodeID int, handler func(r *machineReq, w http.ResponseWriter)) (*Client, *[]machineReq) {
@@ -31,6 +32,7 @@ func newMachineServer(t *testing.T, nodeID int, handler func(r *machineReq, w ht
 			machineID:   r.Header.Get("X-Machine-Id"),
 			auth:        r.Header.Get("Authorization"),
 			ifNoneMatch: r.Header.Get("If-None-Match"),
+			runtime:     r.Header.Get(RuntimeHeader),
 		}
 		reqs = append(reqs, rec)
 		handler(&rec, w)

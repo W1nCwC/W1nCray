@@ -57,6 +57,14 @@ type Options struct {
 	InboundConfigPath  string
 	OutboundConfigPath string
 
+	// DNSConfig, RouteConfig and OutboundConfig carry the same documents as
+	// the three paths above, already in memory: the runtime profile the panel
+	// delivers to a machine (handoff 44). A non-empty value wins over the
+	// path, so a machine in panel mode never reads those files.
+	DNSConfig      json.RawMessage
+	RouteConfig    json.RawMessage
+	OutboundConfig json.RawMessage
+
 	Connection  ConnectionPolicy
 	NameServers []NameServer
 
@@ -103,17 +111,9 @@ func (c *Core) Stats() stats.Manager {
 
 // New builds (but does not start) the Xray instance.
 func New(opts Options) (*Core, error) {
-	cfgJSON, rm, err := buildConfig(opts)
+	pbConfig, rm, err := compile(opts)
 	if err != nil {
 		return nil, err
-	}
-	var c conf.Config
-	if err := json.Unmarshal(cfgJSON, &c); err != nil {
-		return nil, fmt.Errorf("parse xray config: %w", err)
-	}
-	pbConfig, err := c.Build()
-	if err != nil {
-		return nil, fmt.Errorf("build xray config: %w", err)
 	}
 	replaced := false
 	for i, app := range pbConfig.App {
@@ -186,6 +186,53 @@ func readJSONFile(path string) (json.RawMessage, error) {
 	return b, nil
 }
 
+// compile builds the Xray protobuf config from opts with Xray's own config
+// builder, without creating an instance.
+func compile(opts Options) (*xcore.Config, *RuleManager, error) {
+	cfgJSON, rm, err := buildConfig(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	var c conf.Config
+	if err := json.Unmarshal(cfgJSON, &c); err != nil {
+		return nil, nil, fmt.Errorf("parse xray config: %w", err)
+	}
+	pbConfig, err := c.Build()
+	if err != nil {
+		return nil, nil, fmt.Errorf("build xray config: %w", err)
+	}
+	return pbConfig, rm, nil
+}
+
+// Validate reports whether New would accept opts, using the same builder but
+// creating nothing: no listener, no outbound, no goroutine. A caller checks a
+// runtime profile with it before tearing the running instance down.
+func Validate(opts Options) error {
+	_, _, err := compile(opts)
+	return err
+}
+
+// document returns the in-memory document when there is one, otherwise the
+// content of path; name is how errors refer to it. Both empty means the
+// document is not configured (nil, "", nil).
+func document(mem json.RawMessage, path, kind string) (json.RawMessage, string, error) {
+	if len(mem) > 0 {
+		b := bytes.TrimSpace(mem)
+		if !json.Valid(b) {
+			return nil, "", fmt.Errorf("%s config from the panel: invalid JSON", kind)
+		}
+		return b, kind + " config from the panel", nil
+	}
+	if path == "" {
+		return nil, "", nil
+	}
+	raw, err := readJSONFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s config: %w", kind, err)
+	}
+	return raw, kind + " config " + path, nil
+}
+
 func buildConfig(opts Options) ([]byte, *RuleManager, error) {
 	cfg := map[string]any{
 		"log": map[string]any{
@@ -216,13 +263,13 @@ func buildConfig(opts Options) ([]byte, *RuleManager, error) {
 
 	// DNS: local file plus panel "dns" routes.
 	dns := map[string]any{}
-	if opts.DNSConfigPath != "" {
-		raw, err := readJSONFile(opts.DNSConfigPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dns config: %w", err)
-		}
+	raw, name, err := document(opts.DNSConfig, opts.DNSConfigPath, "dns")
+	if err != nil {
+		return nil, nil, err
+	}
+	if raw != nil {
 		if err := json.Unmarshal(raw, &dns); err != nil {
-			return nil, nil, fmt.Errorf("dns config %s: %w", opts.DNSConfigPath, err)
+			return nil, nil, fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	if len(opts.NameServers) > 0 {
@@ -244,20 +291,20 @@ func buildConfig(opts Options) ([]byte, *RuleManager, error) {
 	// them between the per-node security rules and the per-node fallbacks.
 	rm := &RuleManager{nodes: make(map[string]*NodeRules)}
 	routing := map[string]any{}
-	if opts.RouteConfigPath != "" {
-		raw, err := readJSONFile(opts.RouteConfigPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("route config: %w", err)
-		}
+	raw, name, err = document(opts.RouteConfig, opts.RouteConfigPath, "route")
+	if err != nil {
+		return nil, nil, err
+	}
+	if raw != nil {
 		var rc struct {
 			Rules     []json.RawMessage `json:"rules"`
 			Balancers json.RawMessage   `json:"balancers"`
 		}
 		if err := json.Unmarshal(raw, &rc); err != nil {
-			return nil, nil, fmt.Errorf("route config %s: %w", opts.RouteConfigPath, err)
+			return nil, nil, fmt.Errorf("%s: %w", name, err)
 		}
 		if err := json.Unmarshal(raw, &routing); err != nil {
-			return nil, nil, fmt.Errorf("route config %s: %w", opts.RouteConfigPath, err)
+			return nil, nil, fmt.Errorf("%s: %w", name, err)
 		}
 		rm.global = rc.Rules
 		rm.balancers = rc.Balancers
@@ -277,13 +324,13 @@ func buildConfig(opts Options) ([]byte, *RuleManager, error) {
 	// Outbounds: the first custom outbound stays the default handler (as in
 	// XrayR); a direct freedom outbound is the default otherwise.
 	var outbounds []json.RawMessage
-	if opts.OutboundConfigPath != "" {
-		raw, err := readJSONFile(opts.OutboundConfigPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("custom outbound config: %w", err)
-		}
+	raw, name, err = document(opts.OutboundConfig, opts.OutboundConfigPath, "custom outbound")
+	if err != nil {
+		return nil, nil, err
+	}
+	if raw != nil {
 		if err := json.Unmarshal(raw, &outbounds); err != nil {
-			return nil, nil, fmt.Errorf("custom outbound config %s: %w", opts.OutboundConfigPath, err)
+			return nil, nil, fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	if len(outbounds) == 0 {

@@ -42,6 +42,16 @@ const (
 	machineBasePath = "/api/v2/server/machine/agent/node/"
 	// machineNodesPath is absolute: the node list is not under the node/ prefix.
 	machineNodesPath = "/api/v2/server/machine/agent/nodes"
+	// machineRuntimePath is the machine's runtime profile (handoff 44).
+	machineRuntimePath = "/api/v2/server/machine/agent/runtime"
+
+	// RuntimeHeader tells the panel that this kernel applies the runtime
+	// profile, so the panel folds the profile into the node-list version.
+	RuntimeHeader = "X-W1nCray-Runtime"
+
+	// maxRuntimeBytes bounds the runtime profile body. The panel refuses to
+	// save a profile whose compiled form exceeds 8 MiB.
+	maxRuntimeBytes = 16 << 20
 )
 
 // ErrNotModified is returned when the panel answers 304.
@@ -87,6 +97,18 @@ type MachineNode struct {
 	Type      string // vless, vmess, trojan, ... (empty: the panel decides)
 	Name      string
 	UpdatedAt int64
+}
+
+// Runtime is the machine's runtime profile (handoff 44): the documents of
+// custom_outbound.json, route.json and dns.json, managed on the panel instead
+// of on disk. Routing holds the panel's geosite/geoip references already
+// expanded, so a machine in panel mode needs no geo files. DNS is null when
+// the profile has none.
+type Runtime struct {
+	Version   string          `json:"version"`
+	Outbounds json.RawMessage `json:"outbounds"`
+	Routing   json.RawMessage `json:"routing"`
+	DNS       json.RawMessage `json:"dns"`
 }
 
 // Config configures a Client.
@@ -307,6 +329,9 @@ func (c *Client) send(ctx context.Context, hc *http.Client, base, method, name, 
 	if c.machine {
 		req.Header.Set("X-Machine-Id", strconv.Itoa(c.cfg.MachineID))
 		req.Header.Set("Authorization", "Bearer "+c.cfg.MachineToken)
+		// This kernel understands the runtime profile: the panel then folds
+		// the profile into the node-list version (handoff 44).
+		req.Header.Set(RuntimeHeader, "1")
 	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
@@ -499,6 +524,41 @@ func (c *Client) ListMachineNodes(ctx context.Context) ([]MachineNode, string, e
 		})
 	}
 	return out, string(body.Version), nil
+}
+
+// GetMachineRuntime fetches the machine's runtime profile: the outbounds,
+// routing and DNS the panel manages for this machine. It returns nil, nil when
+// the profile is off (204) and when the panel predates it (404), so the caller
+// keeps using its files exactly as before. Any other failure is an error: a
+// kernel that cannot tell which mode it is in must not guess.
+func (c *Client) GetMachineRuntime(ctx context.Context) (*Runtime, error) {
+	resp, err := c.do(ctx, http.MethodGet, machineRuntimePath, nil, "")
+	if err != nil {
+		var se *StatusError
+		if errors.As(err, &se) && se.Code == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRuntimeBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read runtime: %s", c.redactString(err.Error()))
+	}
+	if len(body) > maxRuntimeBytes {
+		return nil, fmt.Errorf("runtime profile larger than %d bytes", maxRuntimeBytes)
+	}
+	var rt Runtime
+	if err := json.Unmarshal(body, &rt); err != nil {
+		return nil, fmt.Errorf("decode runtime: %s", c.redactString(err.Error()))
+	}
+	if rt.Version == "" {
+		return nil, errors.New("decode runtime: missing version")
+	}
+	return &rt, nil
 }
 
 func (c *Client) post(ctx context.Context, name string, body any) error {

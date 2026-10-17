@@ -38,6 +38,13 @@ type machineFakePanel struct {
 	// nodesHits counts /nodes requests, configHits the V2 config requests.
 	nodesHits  int
 	configHits map[int]int
+	// runtimeStatus and runtimeBody answer /runtime; 0 means 404 (a panel
+	// that predates the runtime profile). runtimeHits counts the requests and
+	// runtimeHeader records the last X-W1nCray-Runtime value seen on /nodes.
+	runtimeStatus int
+	runtimeBody   string
+	runtimeHits   int
+	runtimeHeader string
 }
 
 func newMachineFakePanel(t *testing.T) *machineFakePanel {
@@ -82,6 +89,7 @@ func (m *machineFakePanel) handle(w http.ResponseWriter, r *http.Request) {
 			m.denyNodes--
 		}
 		m.nodesHits++
+		m.runtimeHeader = r.Header.Get("X-W1nCray-Runtime")
 		nodes, version := m.nodes, m.version
 		m.mu.Unlock()
 		if deny > 0 {
@@ -90,6 +98,19 @@ func (m *machineFakePanel) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"nodes": nodes, "version": version})
+	case p == "/api/v2/server/machine/agent/runtime":
+		if !m.auth(w, r) {
+			return
+		}
+		m.mu.Lock()
+		m.runtimeHits++
+		status, body := m.runtimeStatus, m.runtimeBody
+		m.mu.Unlock()
+		if status == 0 {
+			status = http.StatusNotFound
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, body)
 	case strings.HasPrefix(p, "/api/v2/server/machine/agent/node/"):
 		if !m.auth(w, r) {
 			return
@@ -628,4 +649,10 @@ func TestCheckMachineNodesOnline(t *testing.T) {
 			t.Errorf("the report prints the token:\n%s", w.String())
 		}
 	})
+}
+
+func (m *machineFakePanel) setRuntime(status int, body string) {
+	m.mu.Lock()
+	m.runtimeStatus, m.runtimeBody = status, body
+	m.mu.Unlock()
 }
