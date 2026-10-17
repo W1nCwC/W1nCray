@@ -11,6 +11,7 @@ import (
 	"errors"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/W1nCwC/W1nCray/agent/agentcfg"
 	"github.com/W1nCwC/W1nCray/agent/driver"
@@ -411,37 +412,64 @@ func (p runtimeProbe) ServiceComponents() []wsproto.Component {
 			// the agent already performs: the audit capability then costs
 			// nothing extra and still follows a kernel that was upgraded.
 			p.rt.auditSupported.Store(ks.Audit)
-			if comp.Version == "" {
-				comp.Version = ks.Version
-			}
-			if ks.StartedAt > 0 {
-				if up := time.Now().Unix() - ks.StartedAt; up > 0 {
-					comp.UptimeS = up
-				}
-			}
-			insts := make([]wsproto.ComponentInstance, 0, len(ks.Nodes))
-			for _, n := range ks.Nodes {
-				state := wsproto.StateRunning
-				if n.Error != "" {
-					state = wsproto.StateFailed
-				}
-				insts = append(insts, wsproto.ComponentInstance{
-					ID:    n.Tag,
-					State: state,
-					// Conns carries the node's online-user count: the wire
-					// instance has no user field, and this is the number the
-					// panel shows next to a node.
-					Conns: n.Online,
-				})
-			}
-			comp.Instances = insts
-			comp.LastError = ks.LastError
-			if !ks.Running {
-				comp.State = wsproto.StateFailed
-			}
+			applyKernelStatus(&comp, ks, time.Now())
 		}
 	}
 	return []wsproto.Component{comp}
+}
+
+// maxRuntimeErrorBytes caps the kernel's runtime profile error on the wire: it
+// is shown next to the profile in the panel, and an Xray builder message can
+// be long.
+const maxRuntimeErrorBytes = 512
+
+// applyKernelStatus fills the Xray component from the kernel's own status
+// document: version (when the service manager has none), uptime, one instance
+// per node, the last reload error and the runtime profile state.
+func applyKernelStatus(comp *wsproto.Component, ks xrayapi.Status, now time.Time) {
+	if comp.Version == "" {
+		comp.Version = ks.Version
+	}
+	if ks.StartedAt > 0 {
+		if up := now.Unix() - ks.StartedAt; up > 0 {
+			comp.UptimeS = up
+		}
+	}
+	insts := make([]wsproto.ComponentInstance, 0, len(ks.Nodes))
+	for _, n := range ks.Nodes {
+		state := wsproto.StateRunning
+		if n.Error != "" {
+			state = wsproto.StateFailed
+		}
+		insts = append(insts, wsproto.ComponentInstance{
+			ID:    n.Tag,
+			State: state,
+			// Conns carries the node's online-user count: the wire
+			// instance has no user field, and this is the number the
+			// panel shows next to a node.
+			Conns: n.Online,
+		})
+	}
+	comp.Instances = insts
+	comp.LastError = ks.LastError
+	if !ks.Running {
+		comp.State = wsproto.StateFailed
+	}
+	comp.Runtime = ks.Runtime
+	comp.RuntimeVersion = ks.RuntimeVersion
+	comp.RuntimeError = truncateUTF8(ks.RuntimeError, maxRuntimeErrorBytes)
+}
+
+// truncateUTF8 shortens s to at most n bytes without splitting a rune.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // frpSupervisorID finds the supervisor id of one frp instance. The role (portal

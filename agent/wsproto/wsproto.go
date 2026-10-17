@@ -356,6 +356,14 @@ type Component struct {
 	// LastError is the last error the component reported (the Xray kernel's
 	// status endpoint); empty when there is none.
 	LastError string `json:"last_error,omitempty"`
+	// Runtime, RuntimeVersion and RuntimeError are the Xray kernel's runtime
+	// profile state (handoff 44): where its outbounds, routing and DNS come
+	// from ("panel" or "files"), the profile version in use, and why the last
+	// fetched profile is not in use. Empty for other components and for a
+	// kernel that predates the profile.
+	Runtime        string `json:"runtime,omitempty"`
+	RuntimeVersion string `json:"runtime_version,omitempty"`
+	RuntimeError   string `json:"runtime_error,omitempty"`
 }
 
 type ComponentInstance struct {
