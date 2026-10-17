@@ -94,6 +94,7 @@ type Relay struct {
 	srv  *http.Server
 	ln   net.Listener
 	path string
+	stop chan struct{}
 }
 
 // call is one forwarded request waiting for its answer.
@@ -211,28 +212,103 @@ func (r *Relay) Listen(path string) error {
 		return fmt.Errorf("noderelay: %w", err)
 	}
 	_ = os.Remove(path) // left behind by a crashed process
+	ln, err := listenSocket(path)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.ln, r.path = ln, path
+	r.stop = make(chan struct{})
+	stop := r.stop
+	r.mu.Unlock()
+	r.srv = &http.Server{Handler: r, ReadHeaderTimeout: 10 * time.Second}
+	r.serve(ln)
+	go r.watch(path, stop)
+	return nil
+}
+
+// listenSocket binds the 0600 socket.
+func listenSocket(path string) (net.Listener, error) {
 	ln, err := net.Listen("unix", path)
 	if err != nil {
-		return fmt.Errorf("noderelay: %w", err)
+		return nil, fmt.Errorf("noderelay: %w", err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		ln.Close()
 		_ = os.Remove(path)
-		return fmt.Errorf("noderelay: %w", err)
+		return nil, fmt.Errorf("noderelay: %w", err)
 	}
-	r.ln, r.path = ln, path
-	r.srv = &http.Server{Handler: r, ReadHeaderTimeout: 10 * time.Second}
+	return ln, nil
+}
+
+func (r *Relay) serve(ln net.Listener) {
 	go func() {
-		if err := r.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && r.opts.Log != nil {
+		if err := r.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && r.opts.Log != nil && !r.isOld(ln) {
 			r.opts.Log.Warnf("noderelay: %v", err)
 		}
 	}()
-	return nil
+}
+
+func (r *Relay) isOld(ln net.Listener) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ln != ln
+}
+
+// WatchInterval is how often the socket file is checked.
+var WatchInterval = 2 * time.Second
+
+// watch binds the socket again when its file disappears. systemd removes the
+// whole /run/W1nCray directory (RuntimeDirectory=) when the kernel's service is
+// stopped or restarted, e.g. by a kernel upgrade, which leaves the listener
+// open on an unlinked path that no kernel can reach: it would stay on HTTPS
+// until the agent restarts.
+func (r *Relay) watch(path string, stop chan struct{}) {
+	t := time.NewTicker(WatchInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		if _, err := os.Lstat(path); err == nil {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			continue
+		}
+		ln, err := listenSocket(path)
+		if err != nil {
+			if r.opts.Log != nil {
+				r.opts.Log.Warnf("noderelay: cannot bind %s again: %v", path, err)
+			}
+			continue
+		}
+		r.mu.Lock()
+		old := r.ln
+		r.ln = ln
+		r.mu.Unlock()
+		if u, ok := old.(*net.UnixListener); ok {
+			u.SetUnlinkOnClose(false) // the path now belongs to the new listener
+		}
+		_ = old.Close()
+		r.serve(ln)
+		if r.opts.Log != nil {
+			r.opts.Log.Infof("noderelay: socket %s was removed; bound again", path)
+		}
+	}
 }
 
 // Close stops the listener and removes the socket, so the kernel goes back to
 // HTTPS at once.
 func (r *Relay) Close() {
+	r.mu.Lock()
+	if r.stop != nil {
+		close(r.stop)
+		r.stop = nil
+	}
+	r.mu.Unlock()
 	if r.srv != nil {
 		_ = r.srv.Close()
 	}

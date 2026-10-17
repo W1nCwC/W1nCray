@@ -5,8 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -198,5 +202,44 @@ func TestAForwardedRequestNeverFallsBack(t *testing.T) {
 	}
 	if r.Waiting() != 0 {
 		t.Fatal("the timed out call must be forgotten")
+	}
+}
+
+// systemd removes /run/W1nCray when the kernel's service restarts; the relay
+// must bind its socket again instead of listening on an unlinked path.
+func TestListenRebindsRemovedSocket(t *testing.T) {
+	old := WatchInterval
+	WatchInterval = 20 * time.Millisecond
+	defer func() { WatchInterval = old }()
+
+	dir, err := os.MkdirTemp("", "nr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "run", "panel-relay.sock")
+	r := New(Options{MachineID: 1, Token: "t"})
+	if err := r.Listen(path); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if err := os.RemoveAll(filepath.Dir(path)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, err := net.Dial("unix", path)
+		if err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("socket was not bound again: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if fi, err := os.Stat(path); err != nil || (runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600) {
+		t.Fatalf("stat: %v %v", fi, err)
 	}
 }
