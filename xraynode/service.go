@@ -1062,7 +1062,7 @@ func (s *Service) watch(ready chan<- struct{}) {
 			s.reload()
 		case ev := <-events:
 			abs, _ := filepath.Abs(ev.Name)
-			if watched[abs] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+			if watched[abs] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 && !s.ignoredInPanelMode(abs) {
 				// Remember which file changed for the dedup check.
 				debounceFiles = mergeFiles(debounceFiles, []string{abs})
 				if debounce == nil {
@@ -1092,6 +1092,28 @@ func (s *Service) watchedFiles() []string {
 	cfg, path := s.cfg, s.path
 	s.mu.Unlock()
 	return cfg.WatchedFiles(path)
+}
+
+// ignoredInPanelMode reports whether a change of the file at abs must not
+// trigger a rebuild: in panel mode the DNS, route, inbound and outbound files
+// are not read (the runtime profile replaces them), so touching them would only
+// rebuild the core for nothing. The files stay on the watch list, so switching
+// back to files mode picks their changes up again.
+func (s *Service) ignoredInPanelMode(abs string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runtime == nil || s.cfg == nil {
+		return false
+	}
+	for _, f := range []string{s.cfg.DnsConfigPath, s.cfg.RouteConfigPath, s.cfg.InboundConfigPath, s.cfg.OutboundConfigPath} {
+		if f == "" {
+			continue
+		}
+		if a, err := filepath.Abs(f); err == nil && a == abs {
+			return true
+		}
+	}
+	return false
 }
 
 // Fingerprint returns the content fingerprint of the watched files at the last

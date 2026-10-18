@@ -240,3 +240,39 @@ func TestMachineRuntimeStaleKeepsModeThenUpdates(t *testing.T) {
 		t.Fatal("rebuild did not switch to the new profile")
 	}
 }
+
+// In panel mode the four files are not read, so changing one must not rebuild
+// the core; after the profile is switched off the files count again.
+func TestMachineRuntimePanelModeIgnoresFileChanges(t *testing.T) {
+	port := freePort(t)
+	fp := newMachineFakePanel(t)
+	fp.ports = map[int]int{1: port}
+	fp.setNodes([]map[string]any{machineNodeJSON(1, "a", 1)}, "v1")
+	fp.setRuntime(http.StatusOK, runtimeBody("r1", "direct4"))
+
+	dir := t.TempDir()
+	extra := brokenFiles(t, dir)
+	path := writeMachineConfig(t, dir, fp.srv.URL, extra)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New(path, cfg)
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	waitRuntime(t, p, "panel", "r1", "panel mode")
+
+	reloads := p.lastReloadAt.Load()
+	if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte("{still not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3500 * time.Millisecond) // the watcher debounces for 2 s
+	if got := p.lastReloadAt.Load(); got != reloads {
+		t.Fatalf("a change of an unread file rebuilt the core in panel mode (%d -> %d)", reloads, got)
+	}
+	if st := p.Status(); !st.Running || st.Runtime != "panel" {
+		t.Fatalf("status = running %v, runtime %q", st.Running, st.Runtime)
+	}
+}
