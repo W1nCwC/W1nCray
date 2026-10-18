@@ -373,6 +373,9 @@ func (s *Service) startXrayLocked(cfg *Config) (err error) {
 		// stays up and the scheduled retry can bring the machine nodes back.
 		opts.DNSConfigPath, opts.RouteConfigPath, opts.InboundConfigPath, opts.OutboundConfigPath = "", "", "", ""
 	}
+	for _, serr := range seedConfigFiles(&opts) {
+		log.Warnf("config files: %v", serr)
+	}
 	opts.AfterStart = func() { s.installAuditLocked(cfg) }
 	cr, cerr := core.New(opts)
 	if cerr != nil {
