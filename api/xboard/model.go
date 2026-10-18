@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -33,6 +34,26 @@ func (i *Int) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("invalid integer %s", b)
 	}
 	*i = Int(f)
+	return nil
+}
+
+// Bool decodes a JSON bool, number or string. Anything that is not true, 1 or
+// a non-zero number (null, "yes", ...) is false. It never fails, so a panel
+// field of an unexpected shape cannot make the whole node config unreadable.
+type Bool bool
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (b *Bool) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	if s == "true" {
+		*b = true
+		return nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) {
+		*b = Bool(f != 0)
+		return nil
+	}
+	*b = false
 	return nil
 }
 
@@ -218,6 +239,10 @@ type NodeConfig struct {
 	CustomOutbounds []json.RawMessage `json:"custom_outbounds"`
 	CustomRoutes    []json.RawMessage `json:"custom_routes"`
 	CertConfig      *CertConfig       `json:"cert_config"`
+
+	// AcceptProxyProtocol is the panel per-node switch. The panel only sends
+	// it when true; the agent ORs it with the local EnableProxyProtocol.
+	AcceptProxyProtocol Bool `json:"accept_proxy_protocol"`
 
 	// shadowsocks
 	Cipher     String `json:"cipher"`

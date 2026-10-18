@@ -36,7 +36,7 @@ Nodes:
       DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6
       DisableUploadTraffic: false # 不上报流量
       DisableGetRule: false # 不使用面板下发的路由规则
-      EnableProxyProtocol: false # 入站接受 PROXY protocol（TCP/WS/HTTPUpgrade/XHTTP/gRPC）
+      EnableProxyProtocol: false # 本地强制开启入站接受 PROXY protocol；与面板节点开关取 OR（TCP/WS/HTTPUpgrade/XHTTP/gRPC）
       DisableSniffing: false # 关闭流量嗅探
       DisableWebSocket: false # 不使用面板 WebSocket（面板开启时，用户/配置变更秒级生效；HTTP 轮询始终作为兜底）
       BlockPrivateIP: true # 阻止用户访问内网/保留地址（推荐开启）
