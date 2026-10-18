@@ -155,13 +155,7 @@ func (s *inboundSpec) build(users []nodeUser) (*xcore.InboundHandlerConfig, erro
 	if err != nil {
 		return nil, err
 	}
-	listen := s.cfg.ListenIP
-	if listen == "" {
-		listen = string(s.node.ListenIP)
-	}
-	if listen == "" {
-		listen = "0.0.0.0"
-	}
+	listen := s.listenIP()
 	if s.node.ServerPort <= 0 || s.node.ServerPort > 65535 {
 		return nil, fmt.Errorf("invalid server port %d", s.node.ServerPort)
 	}
@@ -474,10 +468,35 @@ func (s *inboundSpec) stream() (map[string]any, error) {
 		st["tlsSettings"] = ts
 	}
 
-	if s.cfg.EnableProxyProtocol && network != "hysteria" && network != "kcp" {
+	if s.acceptProxyProtocol() && proxyProtocolCapable(network) {
 		st["sockopt"] = map[string]any{"acceptProxyProtocol": true}
 	}
 	return st, nil
+}
+
+// acceptProxyProtocol reports whether the inbound accepts PROXY protocol: the
+// local switch OR the panel per-node switch.
+func (s *inboundSpec) acceptProxyProtocol() bool {
+	return s.cfg.EnableProxyProtocol || bool(s.node.AcceptProxyProtocol)
+}
+
+// proxyProtocolCapable reports whether a transport can carry PROXY protocol.
+// Only TCP-based transports can; hysteria and kcp are UDP.
+func proxyProtocolCapable(network string) bool {
+	return network != "hysteria" && network != "kcp"
+}
+
+// listenIP returns the address the inbound listens on. The local ListenIP
+// takes precedence over the panel listen_ip, defaulting to 0.0.0.0.
+func (s *inboundSpec) listenIP() string {
+	listen := s.cfg.ListenIP
+	if listen == "" {
+		listen = string(s.node.ListenIP)
+	}
+	if listen == "" {
+		listen = "0.0.0.0"
+	}
+	return listen
 }
 
 func (s *inboundSpec) tls() (map[string]any, error) {

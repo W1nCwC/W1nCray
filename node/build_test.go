@@ -194,3 +194,75 @@ func TestEmails(t *testing.T) {
 		t.Fatal("separator")
 	}
 }
+
+// PROXY protocol: the inbound gets sockopt.acceptProxyProtocol when either the
+// local switch or the panel per-node switch is on, on TCP-based transports.
+func TestStreamProxyProtocol(t *testing.T) {
+	cases := []struct {
+		name  string
+		json  string
+		panel bool
+		local bool
+		want  bool
+	}{
+		{"vmess-tcp-panel", `{"protocol":"vmess","server_port":10101,"network":"tcp","tls":0}`, true, false, true},
+		{"vmess-tcp-local", `{"protocol":"vmess","server_port":10101,"network":"tcp","tls":0}`, false, true, true},
+		{"vmess-tcp-off", `{"protocol":"vmess","server_port":10101,"network":"tcp","tls":0}`, false, false, false},
+		{"vmess-ws", `{"protocol":"vmess","server_port":10102,"network":"ws","networkSettings":{"path":"/ws"},"tls":0}`, true, false, true},
+		{"vmess-grpc", `{"protocol":"vmess","server_port":10103,"network":"grpc","networkSettings":{"serviceName":"svc"},"tls":0}`, true, false, true},
+		{"vmess-httpupgrade", `{"protocol":"vmess","server_port":10104,"network":"httpupgrade","networkSettings":{"path":"/hu"},"tls":0}`, true, false, true},
+		{"vless-xhttp", `{"protocol":"vless","server_port":10105,"network":"xhttp","networkSettings":{"path":"/x","mode":"auto"},"tls":0}`, true, false, true},
+		{"vmess-kcp", `{"protocol":"vmess","server_port":10106,"network":"kcp","networkSettings":{"seed":"abc","header":{"type":"wechat-video"}},"tls":0}`, true, false, false},
+		{"hysteria2", `{"protocol":"hysteria","server_port":10107,"version":2,"tls_settings":{"server_name":"node.example.com"}}`, true, false, false},
+		{"shadowsocks", `{"protocol":"shadowsocks","server_port":10108,"cipher":"aes-256-gcm"}`, true, false, true},
+		{"socks", `{"protocol":"socks","server_port":10109,"tls":0}`, true, false, true},
+		{"http", `{"protocol":"http","server_port":10110,"tls":0}`, true, false, true},
+		{"vless-reality-vision", `{"protocol":"vless","server_port":10111,"network":"tcp","tls":2,"flow":"xtls-rprx-vision","tls_settings":{"server_name":"www.microsoft.com","server_port":"443","private_key":"uNNh2FBnbIe4CMT3VHGTe8wtJ7Tqc6tXeIpzQfXd0lQ","short_id":"0123abcd"}}`, true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nc := parseNode(t, tc.json)
+			if tc.panel {
+				nc.AcceptProxyProtocol = true
+			}
+			p, err := checkProtocol(nc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			cfg.EnableProxyProtocol = tc.local
+			spec := &inboundSpec{tag: "node-1@test", protocol: p, node: nc, cfg: cfg, cert: testCert(t)}
+			if _, err := spec.build(usersFor(p, spec.tag)); err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			st, err := spec.stream()
+			if err != nil {
+				t.Fatalf("stream: %v", err)
+			}
+			_, got := st["sockopt"]
+			if got != tc.want {
+				t.Fatalf("sockopt present = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A change of the panel PROXY protocol switch must change the config key, so
+// the node is rebuilt; a change of base_config alone must not.
+func TestConfigKeyProxyProtocol(t *testing.T) {
+	withRaw := func(s string) *xboard.NodeConfig {
+		nc := parseNode(t, s)
+		nc.Raw = []byte(s)
+		return nc
+	}
+	off := withRaw(`{"protocol":"vless","server_port":1,"base_config":{"push_interval":60,"pull_interval":60}}`)
+	on := withRaw(`{"protocol":"vless","server_port":1,"accept_proxy_protocol":true,"base_config":{"push_interval":60,"pull_interval":60}}`)
+	intervals := withRaw(`{"protocol":"vless","server_port":1,"base_config":{"push_interval":30,"pull_interval":30}}`)
+
+	if configKey(off) == configKey(on) {
+		t.Fatal("accept_proxy_protocol change must change configKey")
+	}
+	if configKey(off) != configKey(intervals) {
+		t.Fatal("base_config-only change must not change configKey")
+	}
+}

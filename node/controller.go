@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -20,6 +21,16 @@ import (
 	"github.com/W1nCwC/W1nCray/common/limiter"
 	"github.com/W1nCwC/W1nCray/core"
 )
+
+// isPrivateOrLoopback reports whether a listen address is loopback or private.
+// Empty, unspecified and hostname values count as public.
+func isPrivateOrLoopback(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsUnspecified() {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
+}
 
 // Options configures a Controller.
 type Options struct {
@@ -472,6 +483,13 @@ func (c *Controller) applyNode(nc *xboard.NodeConfig, users []xboard.User) error
 
 	c.setIntervals(nc)
 	spec := &inboundSpec{tag: c.tag, protocol: p, node: nc, cfg: c.cfg}
+	if spec.acceptProxyProtocol() {
+		if !proxyProtocolCapable(spec.network()) {
+			c.log.Warnf("accept_proxy_protocol ignored: transport %s is not TCP", spec.network())
+		} else if !isPrivateOrLoopback(spec.listenIP()) {
+			c.log.Warnf("accept_proxy_protocol is on and %s is a public listen address: PROXY headers can be forged, allow only the relay IP in the firewall", spec.listenIP())
+		}
+	}
 	if spec.needsTLS() {
 		paths, err := c.ensureCert(nc)
 		if err != nil {
