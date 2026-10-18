@@ -15,6 +15,7 @@ package kernelx
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -68,6 +69,11 @@ type Ensurer struct {
 	kernelsRoot string
 	labeler     *selinux.Labeler
 	log         driver.Logger
+	// ghBase, ghClient and allowHTTP are the GitHub release source of the
+	// Xray default version (ghlatest.go); tests point ghBase at httptest.
+	ghBase    string
+	ghClient  *http.Client
+	allowHTTP bool
 }
 
 var _ interface {
@@ -110,6 +116,9 @@ func New(o Options) (*Ensurer, error) {
 		kernelsRoot: filepath.Join(root, "kernels"),
 		labeler:     o.Labeler,
 		log:         o.Log,
+		ghBase:      ownReleaseBase,
+		ghClient:    defaultClient(),
+		allowHTTP:   o.AllowHTTP,
 	}
 	if o.ManifestPath != "" {
 		raw, err := os.ReadFile(o.ManifestPath)
@@ -205,8 +214,27 @@ func (e *Ensurer) EnsureForce(ctx context.Context, pin spec.KernelPin) (driver.I
 // ensure is Ensure/EnsureForce without the labelling step.
 func (e *Ensurer) ensure(ctx context.Context, pin spec.KernelPin, force bool) (driver.Installed, error) {
 	if pin.Version == "" {
+		// Xray: the newest GitHub release first (hash-pinned direct install);
+		// any failure falls back to the signed manifest below.
+		var ghErr error
+		if pin.Name == xrayKernelName {
+			inst, err := e.installXrayLatest(ctx)
+			if err == nil {
+				return inst, nil
+			}
+			if ctx.Err() != nil {
+				return driver.Installed{}, err
+			}
+			ghErr = err
+			if e.log != nil {
+				e.log.Warnf("kernel: 无法从 GitHub 最新发行版安装 Xray，回落到签名清单: %v", err)
+			}
+		}
 		v, err := e.defaultVersion(pin.Name)
 		if err != nil {
+			if ghErr != nil {
+				return driver.Installed{}, fmt.Errorf("%w（GitHub 最新发行版也失败: %v）", err, ghErr)
+			}
 			return driver.Installed{}, err
 		}
 		pin.Version = v

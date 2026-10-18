@@ -238,7 +238,7 @@ func xrayInstallCmd() *cobra.Command {
 	)
 	c := &cobra.Command{
 		Use:   "install [version]",
-		Short: "Install the Xray kernel (newest manifest version by default) and start its service",
+		Short: "Install the Xray kernel (newest GitHub release by default) and start its service",
 		Long: "Install the Xray kernel and start its service.\n" +
 			"Without flags the newest version of the signed manifest is installed.\n" +
 			"With --file (and the required --sha256) a build already on this machine is\n" +
