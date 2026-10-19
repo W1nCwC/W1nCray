@@ -36,15 +36,20 @@ const (
 	// stream (W1NCRAY-D2): {"enabled":bool}. It is a command of this agent
 	// build; a machine whose kernel predates the collector answers
 	// not_supported, and an older panel never sends it at all.
-	CmdAuditCtl   = "audit_ctl"
-	CmdSelfUpdate = "self_update"
-	CmdFileList   = "file_list"
-	CmdFileRead   = "file_read"
-	CmdFileWrite  = "file_write"
-	CmdFileDelete = "file_delete"
-	CmdFileMkdir  = "file_mkdir"
-	CmdFileRename = "file_rename"
-	CmdFilesApply = "files_apply"
+	CmdAuditCtl = "audit_ctl"
+	// CmdForwardProbe is the user forward reachability test (W1NCRAY-FB-T5):
+	// {"host":string,"port":int,"timeout_ms":int}, answered with
+	// {"ok":bool,"rtt_ms":int|null,"error_code":string|null}. Agents older than
+	// 0.11.0 answer unsupported, so the panel gates on the version first.
+	CmdForwardProbe = "forward_probe"
+	CmdSelfUpdate   = "self_update"
+	CmdFileList     = "file_list"
+	CmdFileRead     = "file_read"
+	CmdFileWrite    = "file_write"
+	CmdFileDelete   = "file_delete"
+	CmdFileMkdir    = "file_mkdir"
+	CmdFileRename   = "file_rename"
+	CmdFilesApply   = "files_apply"
 	// CmdFilesValidate stages and validates the managed files without writing
 	// or reloading anything; CmdFilesRollback restores the last good set and
 	// reloads (docs/WS-PROTOCOL.md section 7 ruling 9).

@@ -245,6 +245,11 @@ func New(d Deps) (*Registry, error) {
 	if err := registerAudit(r, d); err != nil {
 		return nil, err
 	}
+	// forward_probe (W1NCRAY-FB-T5) is registered unconditionally: the probe is
+	// a plain TCP dial and needs no runtime dependency.
+	if err := registerForward(r, d); err != nil {
+		return nil, err
+	}
 	return r, nil
 }
 

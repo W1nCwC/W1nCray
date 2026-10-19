@@ -165,6 +165,7 @@ func TestRegistryWhitelistIsTheRegisteredTypes(t *testing.T) {
 		panelclient.CmdFilesApply,
 		panelclient.CmdFilesRollback,
 		panelclient.CmdFilesValidate,
+		panelclient.CmdForwardProbe,
 		panelclient.CmdKernelInstall,
 		panelclient.CmdKernelList,
 		panelclient.CmdKernelRemove,
