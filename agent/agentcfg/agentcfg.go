@@ -6,6 +6,7 @@ package agentcfg
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -472,10 +474,21 @@ func Load(path string) (*Config, error) {
 	cleaned := raw
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == "" || ext == ".yml" || ext == ".yaml" {
-		var removed []string
+		var removed []RemovedPanelOwnedKey
 		cleaned, removed = SanitizePanelOwnedControllerFields(raw)
-		for _, where := range removed {
-			fmt.Fprintf(os.Stderr, "agent config %s: ignoring panel-owned key %s (the panel decides it per node)\n", path, where)
+		for _, r := range removed {
+			fmt.Fprintf(os.Stderr, "agent config %s: ignoring panel-owned key %s.%s = %s (the panel decides it per node)\n", path, r.Where, r.Key, r.Value)
+		}
+		if len(removed) > 0 {
+			audit, _ := json.MarshalIndent(map[string]any{
+				"at":      time.Now().Format(time.RFC3339),
+				"config":  path,
+				"removed": removed,
+			}, "", "  ")
+			// Best effort: the state directory may be read-only. The panel
+			// reads this file (the file manager does not exclude it) to set the
+			// per-node switches that the old local values used to imply.
+			_ = os.WriteFile(path+".migrated-keys.json", audit, 0600)
 		}
 	} else if err := CheckPanelOwnedControllerFields(raw); err != nil {
 		return nil, fmt.Errorf("agent config %s: %w", path, err)
@@ -499,9 +512,18 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// RemovedPanelOwnedKey is one stale local key the sanitizer dropped. Value is
+// only a boolean or a short string; a map (REALITYConfigs) is reported as
+// "<redacted>" so a private-key block can never reach the audit file.
+type RemovedPanelOwnedKey struct {
+	Where string `json:"where"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 // SanitizePanelOwnedControllerFields removes the panel-owned keys from a
 // machine-mode agent YAML document and returns the cleaned document plus the
-// paths it removed. A document that is not YAML, has no Panel section, or has
+// keys it removed. A document that is not YAML, has no Panel section, or has
 // nothing to remove is returned unchanged.
 //
 // This is the fleet-upgrade path for a machine whose agent.yml predates the
@@ -509,7 +531,7 @@ func Load(path string) (*Config, error) {
 // REALITY per node, so the stale local values are dropped instead of refusing
 // to start. CheckPanelOwnedControllerFields stays the strict helper used by the
 // non-YAML loader and by the tests.
-func SanitizePanelOwnedControllerFields(raw []byte) ([]byte, []string) {
+func SanitizePanelOwnedControllerFields(raw []byte) ([]byte, []RemovedPanelOwnedKey) {
 	var doc map[string]any
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return raw, nil
@@ -519,13 +541,20 @@ func SanitizePanelOwnedControllerFields(raw []byte) ([]byte, []string) {
 		return raw, nil
 	}
 
-	var removed []string
+	var removed []RemovedPanelOwnedKey
 	remove := func(where string, cc map[string]any) {
 		for _, key := range nodecfg.PanelOwnedControllerKeys {
-			for k := range cc {
+			for k, v := range cc {
 				if strings.EqualFold(k, key) {
+					value := "<redacted>"
+					switch typed := v.(type) {
+					case bool:
+						value = strconv.FormatBool(typed)
+					case string:
+						value = typed
+					}
 					delete(cc, k)
-					removed = append(removed, where+"."+key)
+					removed = append(removed, RemovedPanelOwnedKey{Where: where, Key: key, Value: value})
 					break
 				}
 			}

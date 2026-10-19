@@ -828,6 +828,16 @@ func TestSanitizePanelOwnedControllerFields(t *testing.T) {
 	if len(removed) != 3 {
 		t.Fatalf("removed = %v, want the three owned keys", removed)
 	}
+	seen := map[string]string{}
+	for _, r := range removed {
+		seen[r.Key] = r.Value
+	}
+	if seen["EnableProxyProtocol"] != "true" || seen["EnableREALITY"] != "true" {
+		t.Errorf("boolean values were not reported: %v", removed)
+	}
+	if seen["REALITYConfigs"] != "<redacted>" {
+		t.Errorf("a REALITYConfigs block must be redacted, got %q", seen["REALITYConfigs"])
+	}
 	for _, key := range []string{"EnableProxyProtocol", "EnableREALITY", "REALITYConfigs"} {
 		if strings.Contains(string(out), key) {
 			t.Errorf("%s is still in the sanitized document:\n%s", key, out)
@@ -860,6 +870,13 @@ Panel:
 	}
 	if cc := cfg.Panel.NodeControllers[3]; cc == nil || cc.SendIP != "10.0.0.2" {
 		t.Fatalf("the local NodeControllers entry was lost: %+v", cfg.Panel.NodeControllers)
+	}
+	audit, readErr := os.ReadFile(path + ".migrated-keys.json")
+	if readErr != nil {
+		t.Fatalf("the migration audit was not written: %v", readErr)
+	}
+	if !strings.Contains(string(audit), "EnableProxyProtocol") || !strings.Contains(string(audit), `"true"`) {
+		t.Errorf("the audit does not name the removed key/value:\n%s", audit)
 	}
 	// nodecfg.Config no longer has the field, so the removal itself is asserted
 	// by TestSanitizePanelOwnedControllerFields; here the point is that Load
