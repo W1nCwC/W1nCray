@@ -211,6 +211,12 @@ func TestLinkConvertsMatchingNodesAndPreservesControllerConfig(t *testing.T) {
 	if err := runLink(cfgPath, linkTestOpts(), &out); err != nil {
 		t.Fatalf("link failed: %v\n%s", err, out.String())
 	}
+	planOut := out.String()
+	if !strings.Contains(planOut, "注意（本机覆盖会压过面板开关）") ||
+		!strings.Contains(planOut, "    - 节点 173") ||
+		strings.Contains(planOut, "    - 节点 119") {
+		t.Errorf("the plan must warn only about node 173's inherited EnableProxyProtocol:\n%s", planOut)
+	}
 
 	after, err := config.Load(cfgPath)
 	if err != nil {

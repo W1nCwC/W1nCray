@@ -1125,6 +1125,11 @@ type linkNode struct {
 	ccLines    []string
 	convert    bool
 	reason     string
+	// proxyProtocol says the copied ControllerConfig turns on
+	// EnableProxyProtocol. The value survives under Panel.NodeControllers[id]
+	// and the agent ORs it with the panel switch, so the node keeps accepting
+	// PROXY protocol even when the panel switch is off.
+	proxyProtocol bool
 }
 
 type linkOverride struct {
@@ -1464,9 +1469,24 @@ func parseLinkNode(lines []linkLine, raw []string, start, end int, panelOrigin s
 	copied := append([]string(nil), raw[ccIdx+1:ccEnd]...)
 	if hasYAMLContent(copied) {
 		n.ccLines = copied
+		n.proxyProtocol = controllerEnablesProxyProtocol(copied)
 	}
 	n.convert = true
 	return n
+}
+
+// controllerEnablesProxyProtocol reports whether a copied ControllerConfig
+// turns on EnableProxyProtocol. link copies the block verbatim, so a true value
+// lands in agent.yml's Panel.NodeControllers[id] and keeps the node accepting
+// PROXY protocol even after the panel switch is turned off.
+func controllerEnablesProxyProtocol(lines []string) bool {
+	for _, l := range lines {
+		k, v, ok := lineKey(makeLine(l))
+		if ok && k == "EnableProxyProtocol" && strings.EqualFold(scalarValue(v), "true") {
+			return true
+		}
+	}
+	return false
 }
 
 // apiOverrideReason reports a local ApiConfig override machine mode cannot
@@ -1590,6 +1610,20 @@ func (p *linkPlan) text(tokenPath, backupPath string) string {
 	b.WriteString("转换计划：\n")
 	if ids := p.convertedIDs(); len(ids) > 0 {
 		fmt.Fprintf(&b, "  将转换的节点: %s\n", joinIDs(ids))
+	}
+	var proxyNodes []string
+	for _, n := range p.nodes {
+		if n.convert && n.proxyProtocol {
+			proxyNodes = append(proxyNodes, fmt.Sprintf("    - 节点 %d", n.id))
+		}
+	}
+	if len(proxyNodes) > 0 {
+		b.WriteString("  注意（本机覆盖会压过面板开关）:\n")
+		for _, s := range proxyNodes {
+			b.WriteString(s + "\n")
+		}
+		b.WriteString("    以上节点的 ControllerConfig.EnableProxyProtocol 为 true，迁移后会写入 Panel.NodeControllers[id] 并继续强制接收 PROXY protocol；\n")
+		b.WriteString("    面板上同名开关关闭也不会生效（本机值 OR 面板值）。如需由面板控制，请在 agent.yml 里把对应值改为 false。\n")
 	}
 	var skipped []string
 	for _, n := range p.nodes {
