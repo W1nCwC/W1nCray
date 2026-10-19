@@ -16,7 +16,6 @@ type (
 	Config               = nodecfg.Config
 	AutoSpeedLimitConfig = nodecfg.AutoSpeedLimitConfig
 	FallBackConfig       = nodecfg.FallBackConfig
-	REALITYConfig        = nodecfg.REALITYConfig
 )
 
 // DefaultConfig returns XrayR's controller defaults.

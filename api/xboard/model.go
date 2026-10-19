@@ -241,7 +241,7 @@ type NodeConfig struct {
 	CertConfig      *CertConfig       `json:"cert_config"`
 
 	// AcceptProxyProtocol is the panel per-node switch. The panel only sends
-	// it when true; the agent ORs it with the local EnableProxyProtocol.
+	// it when true; it is the only owner of the setting.
 	AcceptProxyProtocol Bool `json:"accept_proxy_protocol"`
 
 	// shadowsocks

@@ -187,7 +187,7 @@ func TestMigrate(t *testing.T) {
 	if i := strings.IndexByte(text, '\n'); i >= 0 && strings.HasPrefix(text, "# Migrated from XrayR") {
 		text = text[i+1:]
 	}
-	for _, gone := range []string{"EnableVless", "VlessFlow", "DisableIVCheck", "GlobalDeviceLimitConfig", "DisableLocalREALITYConfig", "SSpanel", from + "/"} {
+	for _, gone := range []string{"EnableVless", "VlessFlow", "DisableIVCheck", "GlobalDeviceLimitConfig", "DisableLocalREALITYConfig", "EnableProxyProtocol", "EnableREALITY", "REALITYConfigs", "SSpanel", from + "/"} {
 		if strings.Contains(text, gone) {
 			t.Errorf("migrated config still contains %q", gone)
 		}
@@ -208,9 +208,6 @@ func TestMigrate(t *testing.T) {
 	n0, n1, n2 := cfg.NodesConfig[0], cfg.NodesConfig[1], cfg.NodesConfig[2]
 	if n0.PanelType != "Xboard" || n0.ApiConfig.NodeType != "vless" || n1.ApiConfig.NodeType != "trojan" || n2.ApiConfig.NodeType != "shadowsocks" {
 		t.Fatalf("panel/node types: %s %s %s %s", n0.PanelType, n0.ApiConfig.NodeType, n1.ApiConfig.NodeType, n2.ApiConfig.NodeType)
-	}
-	if n0.ControllerConfig.EnableREALITY {
-		t.Fatal("DisableLocalREALITYConfig: true must become EnableREALITY: false")
 	}
 	if cfg.DnsConfigPath != to+"/dns.json" || cfg.RouteConfigPath != to+"/route.json" || cfg.OutboundConfigPath != to+"/custom_outbound.json" || cfg.LogConfig.ErrorPath != to+"/error.log" {
 		t.Fatalf("paths not rewritten: %+v %+v", cfg, cfg.LogConfig)

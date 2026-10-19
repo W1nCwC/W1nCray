@@ -177,7 +177,6 @@ func checkMachineNodes(w io.Writer, pc *AgentPanelConfig, online bool) error {
 	fmt.Fprintf(w, "  ✓ 机器节点列表（机器 ID %d）: %d 个节点，版本 %s\n", pc.MachineID, len(list), version)
 	for _, mn := range list {
 		note := ""
-		local := machineNodeConfig(pc, mn.ID).EnableProxyProtocol
 		nodeClient := xboard.New(xboard.Config{
 			APIHost:      pc.URL,
 			MachineID:    pc.MachineID,
@@ -190,10 +189,8 @@ func checkMachineNodes(w io.Writer, pc *AgentPanelConfig, online bool) error {
 		switch {
 		case ncErr != nil:
 			note = fmt.Sprintf("；面板 PROXY 开关未知（%v）", ncErr)
-		default:
-			if src := proxyProtocolSource(local, bool(nc.AcceptProxyProtocol)); src != "" {
-				note = "；接收 PROXY protocol（来源：" + src + "）"
-			}
+		case bool(nc.AcceptProxyProtocol):
+			note = "；接收 PROXY protocol（来源：面板）"
 		}
 		fmt.Fprintf(w, "      - 节点 %d: %s %s%s\n", mn.ID, mn.Type, mn.Name, note)
 	}
@@ -201,20 +198,6 @@ func checkMachineNodes(w io.Writer, pc *AgentPanelConfig, online bool) error {
 		fmt.Fprintln(w, "  ! 面板当前没有给这台机器分配节点")
 	}
 	return nil
-}
-
-// proxyProtocolSource names where the PROXY protocol switch comes from: the
-// local ControllerConfig, the panel, or both (the agent ORs them).
-func proxyProtocolSource(local, panel bool) string {
-	switch {
-	case local && panel:
-		return "本地与面板"
-	case local:
-		return "本地"
-	case panel:
-		return "面板"
-	}
-	return ""
 }
 
 // quietKernelLog drops kernel messages below warning. Building configs before

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	yaml "go.yaml.in/yaml/v3"
 
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
 	"github.com/W1nCwC/W1nCray/agent/selfupdate"
@@ -458,6 +459,13 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("agent config %s: %w", path, err)
 	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("agent config %s: %w", path, err)
+	}
+	if err := CheckPanelOwnedControllerFields(raw); err != nil {
+		return nil, fmt.Errorf("agent config %s: %w", path, err)
+	}
 	v := viper.New()
 	v.SetConfigFile(path)
 	switch strings.ToLower(filepath.Ext(path)) {
@@ -473,6 +481,91 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse agent config %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// CheckPanelOwnedControllerFields refuses a machine-mode ControllerConfig
+// override that sets a key the panel owns. The panel decides PROXY protocol
+// and REALITY for every node; a local value used to be ORed or preferred, so
+// the panel could show a node as off while it was on. Only the agent.yml root
+// "Panel" section is inspected: it is the layout link and the installer write.
+// A file that is not YAML (or has no Panel section) is left to the loader.
+func CheckPanelOwnedControllerFields(raw []byte) error {
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil // the loader reports the parse error with the file name
+	}
+	panel, ok := mapLookup(doc, "Panel")
+	if !ok {
+		return nil
+	}
+	if cc, ok := mapLookup(panel, "NodeController"); ok {
+		if err := rejectPanelOwnedFields("Panel.NodeController", cc); err != nil {
+			return err
+		}
+	}
+	if list, ok := mapLookup(panel, "NodeControllers"); ok {
+		for id, entry := range list {
+			cc, ok := asMap(entry)
+			if !ok {
+				continue
+			}
+			if err := rejectPanelOwnedFields("Panel.NodeControllers["+id+"]", cc); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// rejectPanelOwnedFields reports the first panel-owned key written in cc.
+func rejectPanelOwnedFields(where string, cc map[string]any) error {
+	for _, key := range nodecfg.PanelOwnedControllerKeys {
+		if mapHas(cc, key) {
+			return fmt.Errorf("%s.%s is owned by the panel and cannot be set locally; remove it (the panel decides it per node)", where, key)
+		}
+	}
+	return nil
+}
+
+// mapHas reports whether m contains key, ignoring ASCII case. Unlike mapLookup
+// it does not care about the value's type: a scalar such as `true` is a hit.
+func mapHas(m map[string]any, key string) bool {
+	for k := range m {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// mapLookup finds key in m ignoring ASCII case. YAML keys are case-sensitive,
+// but the XrayR-compatible files are written in CamelCase and people type
+// variants; matching case-insensitively makes the refusal reliable.
+func mapLookup(m map[string]any, key string) (map[string]any, bool) {
+	for k, v := range m {
+		if !strings.EqualFold(k, key) {
+			continue
+		}
+		return asMap(v)
+	}
+	return nil, false
+}
+
+// asMap returns v as a string-keyed map. A YAML mapping whose keys are all
+// strings decodes to map[string]any, but a mapping with a numeric key (the
+// node ids of NodeControllers) decodes to map[any]any; both shapes reach here.
+func asMap(v any) (map[string]any, bool) {
+	switch m := v.(type) {
+	case map[string]any:
+		return m, true
+	case map[any]any:
+		out := make(map[string]any, len(m))
+		for k, child := range m {
+			out[fmt.Sprint(k)] = child
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // Validate checks the agent section. It is deliberately shallow: the policy is

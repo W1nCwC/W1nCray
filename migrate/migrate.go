@@ -106,9 +106,6 @@ type migration struct {
 	planned map[string]string // target -> source
 	order   []string
 	origin  map[string]string // rewritten path -> XrayR path
-	// realityNote is set when some node relied on XrayR ignoring the panel
-	// REALITY settings (see convertNode).
-	realityNote bool
 }
 
 // Run performs the migration.
@@ -224,9 +221,6 @@ func (m *migration) convert(root *yaml.Node) error {
 		kept = append(kept, n)
 	}
 	nodes.Content = kept
-	if m.realityNote {
-		m.report.warn("XrayR 仅在 DisableLocalREALITYConfig: true 时使用面板 REALITY；W1nCray 在面板节点 tls=2 时直接使用面板 REALITY 配置")
-	}
 	if len(kept) == 0 {
 		return errors.New("no XrayR node uses a supported panel (V2board/NewV2board/Xboard)")
 	}
@@ -328,16 +322,13 @@ func (m *migration) convertNode(i int, n *yaml.Node) bool {
 	if cc == nil {
 		return true
 	}
-	if v := mapGet(cc, "DisableLocalREALITYConfig"); v != nil {
-		if strings.EqualFold(v.Value, "true") {
-			// XrayR used the panel REALITY settings only with this flag;
-			// W1nCray uses them by default and EnableREALITY means "local".
-			mapSet(cc, "EnableREALITY", "false", "!!bool")
-			m.report.change("%s: DisableLocalREALITYConfig: true -> EnableREALITY: false（使用面板 REALITY 配置）", label)
+	for _, k := range []string{"EnableProxyProtocol", "EnableREALITY", "REALITYConfigs"} {
+		if mapDelete(cc, k) {
+			m.report.change("%s: 删除 ControllerConfig.%s（由面板按节点管理）", label, k)
 		}
-		mapDelete(cc, "DisableLocalREALITYConfig")
-	} else if er := mapGet(cc, "EnableREALITY"); er == nil || !strings.EqualFold(er.Value, "true") {
-		m.realityNote = true
+	}
+	if mapDelete(cc, "DisableLocalREALITYConfig") {
+		m.report.change("%s: 删除 DisableLocalREALITYConfig（W1nCray 在面板 tls=2 时直接使用面板 REALITY）", label)
 	}
 	if mapDelete(cc, "DisableIVCheck") {
 		m.report.change("%s: 删除 DisableIVCheck（Xray 已移除该功能）", label)

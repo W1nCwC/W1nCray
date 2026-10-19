@@ -212,10 +212,11 @@ func TestLinkConvertsMatchingNodesAndPreservesControllerConfig(t *testing.T) {
 		t.Fatalf("link failed: %v\n%s", err, out.String())
 	}
 	planOut := out.String()
-	if !strings.Contains(planOut, "注意（本机覆盖会压过面板开关）") ||
-		!strings.Contains(planOut, "    - 节点 173") ||
+	if !strings.Contains(planOut, "已剥离面板拥有的本机字段") ||
+		!strings.Contains(planOut, "    - 节点 173: EnableProxyProtocol") ||
+		!strings.Contains(planOut, "    - 节点 138: REALITYConfigs") ||
 		strings.Contains(planOut, "    - 节点 119") {
-		t.Errorf("the plan must warn only about node 173's inherited EnableProxyProtocol:\n%s", planOut)
+		t.Errorf("the plan must strip only the panel-owned fields of nodes 173 and 138:\n%s", planOut)
 	}
 
 	after, err := config.Load(cfgPath)
@@ -1306,15 +1307,20 @@ func TestLinkRealV03Config(t *testing.T) {
 			t.Errorf("NodeControllers[%d] = %+v, want the original ControllerConfig %+v", id, got, w)
 		}
 	}
-	if got := pc.NodeControllers[173]; got == nil || !got.EnableProxyProtocol {
-		t.Errorf("NodeControllers[173] = %+v, want EnableProxyProtocol true", got)
+	agentYML, err := os.ReadFile(filepath.Join(dir, "agent.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, owned := range []string{"EnableProxyProtocol", "EnableREALITY", "REALITYConfigs"} {
+		if strings.Contains(string(agentYML), owned) {
+			t.Errorf("agent.yml still contains the panel-owned %s", owned)
+		}
 	}
 	if got := pc.NodeControllers[173]; got == nil || got.CertConfig == nil || len(got.CertConfig.DNSEnv) != 2 {
 		t.Errorf("NodeControllers[173].CertConfig = %+v, want the two DNSEnv keys", got)
 	}
-	if got := pc.NodeControllers[138]; got == nil || !got.EnableDNS || got.DNSType != "UseIPv4" ||
-		got.REALITYConfigs == nil || !got.REALITYConfigs.Show {
-		t.Errorf("NodeControllers[138] = %+v, want EnableDNS/DNSType/REALITYConfigs", got)
+	if got := pc.NodeControllers[138]; got == nil || !got.EnableDNS || got.DNSType != "UseIPv4" {
+		t.Errorf("NodeControllers[138] = %+v, want EnableDNS/DNSType", got)
 	}
 
 	backups, err := filepath.Glob(cfgPath + ".bak-link-*")

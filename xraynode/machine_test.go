@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/W1nCwC/W1nCray/node"
-	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 const machineToken = "panel-machine-token-0123456789"
@@ -641,33 +640,24 @@ func TestCheckMachineNodesOnline(t *testing.T) {
 			t.Errorf("the report prints the token:\n%s", out)
 		}
 	})
-	t.Run("names where the PROXY protocol switch comes from", func(t *testing.T) {
+	t.Run("shows the panel PROXY protocol switch", func(t *testing.T) {
 		fp := newMachineFakePanel(t)
 		fp.setNodes([]map[string]any{
 			machineNodeJSON(1, "panel-on", 1),
-			machineNodeJSON(2, "local-on", 2),
-			machineNodeJSON(3, "both-on", 3),
+			machineNodeJSON(2, "panel-off", 2),
 		}, "v1")
 		fp.setProxy(1, true)
-		fp.setProxy(3, true)
 		p := pc(fp.srv.URL)
-		p.NodeControllers = map[int]*nodecfg.Config{
-			2: {EnableProxyProtocol: true},
-			3: {EnableProxyProtocol: true},
-		}
 		var w bytes.Buffer
 		if err := checkMachineNodes(&w, p, true); err != nil {
 			t.Fatalf("%v\n%s", err, w.String())
 		}
 		out := w.String()
-		for _, want := range []string{
-			"节点 1: vmess panel-on；接收 PROXY protocol（来源：面板）",
-			"节点 2: vmess local-on；接收 PROXY protocol（来源：本地）",
-			"节点 3: vmess both-on；接收 PROXY protocol（来源：本地与面板）",
-		} {
-			if !strings.Contains(out, want) {
-				t.Errorf("missing %q in:\n%s", want, out)
-			}
+		if !strings.Contains(out, "节点 1: vmess panel-on；接收 PROXY protocol（来源：面板）") {
+			t.Errorf("missing the panel source for node 1 in:\n%s", out)
+		}
+		if strings.Contains(out, "节点 2: vmess panel-off；接收 PROXY protocol") {
+			t.Errorf("node 2 has no switch but the report says it has:\n%s", out)
 		}
 		if strings.Contains(out, machineToken) {
 			t.Errorf("the report prints the token:\n%s", out)

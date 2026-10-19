@@ -37,6 +37,17 @@ type APIConfig struct {
 	RelaySocket string `mapstructure:"-"`
 }
 
+// PanelOwnedControllerKeys are the ControllerConfig keys the panel owns. A
+// machine's local NodeController / NodeControllers must not set them: the
+// panel decides PROXY protocol and REALITY for every node, and a local value
+// used to be ORed or preferred, which made the panel display differ from what
+// the node actually ran.
+var PanelOwnedControllerKeys = []string{
+	"EnableProxyProtocol",
+	"EnableREALITY",
+	"REALITYConfigs",
+}
+
 // Config is the "ControllerConfig" section of a node (XrayR compatible).
 type Config struct {
 	ListenIP             string                `mapstructure:"ListenIP"`
@@ -46,15 +57,12 @@ type Config struct {
 	DNSType              string                `mapstructure:"DNSType"`
 	DisableUploadTraffic bool                  `mapstructure:"DisableUploadTraffic"`
 	DisableGetRule       bool                  `mapstructure:"DisableGetRule"`
-	EnableProxyProtocol  bool                  `mapstructure:"EnableProxyProtocol"`
 	DisableSniffing      bool                  `mapstructure:"DisableSniffing"`
 	DisableWebSocket     bool                  `mapstructure:"DisableWebSocket"`
 	BlockPrivateIP       *bool                 `mapstructure:"BlockPrivateIP"`
 	AutoSpeedLimitConfig *AutoSpeedLimitConfig `mapstructure:"AutoSpeedLimitConfig"`
 	EnableFallback       bool                  `mapstructure:"EnableFallback"`
 	FallBackConfigs      []*FallBackConfig     `mapstructure:"FallBackConfigs"`
-	EnableREALITY        bool                  `mapstructure:"EnableREALITY"`
-	REALITYConfigs       *REALITYConfig        `mapstructure:"REALITYConfigs"`
 	CertConfig           *certcfg.Config       `mapstructure:"CertConfig"`
 
 	// Deprecated XrayR options, accepted so old configs still load.
@@ -78,19 +86,6 @@ type FallBackConfig struct {
 	Path             string `mapstructure:"Path"`
 	Dest             string `mapstructure:"Dest"`
 	ProxyProtocolVer uint64 `mapstructure:"ProxyProtocolVer"`
-}
-
-// REALITYConfig is a local REALITY config that overrides the panel's.
-type REALITYConfig struct {
-	Show             bool     `mapstructure:"Show"`
-	Dest             string   `mapstructure:"Dest"`
-	ProxyProtocolVer uint64   `mapstructure:"ProxyProtocolVer"`
-	ServerNames      []string `mapstructure:"ServerNames"`
-	PrivateKey       string   `mapstructure:"PrivateKey"`
-	MinClientVer     string   `mapstructure:"MinClientVer"`
-	MaxClientVer     string   `mapstructure:"MaxClientVer"`
-	MaxTimeDiff      uint64   `mapstructure:"MaxTimeDiff"`
-	ShortIds         []string `mapstructure:"ShortIds"`
 }
 
 // DefaultConfig returns XrayR's controller defaults.

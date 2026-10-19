@@ -83,7 +83,7 @@ func captureLogs(t *testing.T) *logCapture {
 // template, and the override itself is completed with the node defaults.
 func TestNodeControllersOverrideSelection(t *testing.T) {
 	path := writeNodeControllersConfig(t, t.TempDir(), `      173:
-        EnableProxyProtocol: true
+        DisableSniffing: true
         CertConfig:
           CertMode: dns
           CertDomain: node173.example.com
@@ -106,8 +106,8 @@ func TestNodeControllersOverrideSelection(t *testing.T) {
 	// 173: the override wins as a whole. ListenIP is the node default, not the
 	// template's 127.0.0.1: the two are never merged field by field.
 	o := machineNodeConfig(pc, 173)
-	if !o.EnableProxyProtocol {
-		t.Errorf("173: EnableProxyProtocol not applied: %+v", o)
+	if !o.DisableSniffing {
+		t.Errorf("173: DisableSniffing not applied: %+v", o)
 	}
 	if o.ListenIP != "0.0.0.0" || o.SendIP != "0.0.0.0" || o.DNSType != "AsIs" {
 		t.Errorf("173: defaults not applied / template leaked: %+v", o)
@@ -122,13 +122,13 @@ func TestNodeControllersOverrideSelection(t *testing.T) {
 	if !o.EnableDNS || o.DNSType != "UseIPv4" || o.ListenIP != "0.0.0.0" {
 		t.Errorf("138: %+v", o)
 	}
-	if o.EnableProxyProtocol {
+	if o.DisableSniffing {
 		t.Errorf("138 inherited 173's override: %+v", o)
 	}
 
 	// 119: no entry, so the shared template applies.
 	o = machineNodeConfig(pc, 119)
-	if o.ListenIP != "127.0.0.1" || o.EnableProxyProtocol || o.EnableDNS {
+	if o.ListenIP != "127.0.0.1" || o.DisableSniffing || o.EnableDNS {
 		t.Errorf("119 should use the template: %+v", o)
 	}
 }
@@ -256,7 +256,6 @@ Agent:
     NodeController: {ListenIP: 127.0.0.1}
     NodeControllers:
       173:
-        EnableProxyProtocol: true
         CertConfig:
           CertMode: dns
           CertDomain: node173.example.com
@@ -324,7 +323,7 @@ Agent:
     NodeController: {ListenIP: 127.0.0.1}
     NodeControllers:
       173:
-        EnableProxyProtocol: true
+        UpdatePeriodic: 30
       5:
         ListenIP: 127.0.0.1
 `, filepath.Join(dir, "state"), fp.srv.URL, machineToken)
@@ -335,7 +334,7 @@ Agent:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cc := cfg.Agent.Panel.NodeControllers[173]; cc == nil || !cc.EnableProxyProtocol {
+	if cc := cfg.Agent.Panel.NodeControllers[173]; cc == nil || cc.UpdatePeriodic != 30 {
 		t.Fatalf("the override did not survive LoadConfig: %+v", cc)
 	}
 	p := New(path, cfg)

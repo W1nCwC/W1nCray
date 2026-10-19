@@ -119,7 +119,7 @@ logread -f -e W1nCray            # procd（OpenWRT）
 
 ## 配置
 
-配置文件默认在 `/etc/W1nCray/config.yml`（`install.sh:38–42`）。最小示例（完整示例见 [release/config/config.yml.example](release/config/config.yml.example)）：
+配置文件默认在 `/etc/W1nCray/config.yml`（`install.sh:38–42`）。推荐使用机器模式：节点和它们的 PROXY protocol、REALITY 参数都由面板按节点下发，本机不写 `Nodes:`。静态 `Nodes:` 模式（XrayR 兼容）已弃用，仅作为迁移过渡保留；`W1nCray link` 可把它转换到机器模式。静态示例（完整示例见 [release/config/config.yml.example](release/config/config.yml.example)）：
 
 ```yaml
 Log:
@@ -132,7 +132,7 @@ Nodes:
       NodeID: 1
 ```
 
-机器模式下，agent 自身配置由安装器写入 `/etc/W1nCray/agent.yml`，一般不需要手写；只要它存在，就整体覆盖 `config.yml` 里遗留的 `Agent:` 段，`config.yml` 只保留 Xray 内核的配置（`install.sh:40–42,1848–1849`）。
+机器模式下，agent 自身配置由安装器写入 `/etc/W1nCray/agent.yml`，一般不需要手写；只要它存在，就整体覆盖 `config.yml` 里遗留的 `Agent:` 段，`config.yml` 只保留 Xray 内核的配置（`install.sh:40–42,1848–1849`）。`Panel.NodeController` / `Panel.NodeControllers` 只允许面板没有的本机设置（监听地址、出口地址、证书兜底、DNS、嗅探等）；`EnableProxyProtocol`、`EnableREALITY`、`REALITYConfigs` 由面板拥有，写在本机会被拒绝。
 
 安装器在首次安装时还会：按 CPU 架构自检，跑不起来就自动换更低要求的版本；检测到 `/etc/XrayR/config.yml` 时自动迁移（XrayR 的文件只读、不会被改动）；缺少 `geoip.dat` / `geosite.dat` 时按需下载（`--no-geo` 可跳过）（`install.sh:1000–1013,450–475`）。已是拆分后版本的机器执行 `update` 只更新 agent（`install.sh:1837–1842`）。
 
@@ -146,7 +146,7 @@ Nodes:
 W1nCray migrate --from /etc/XrayR --to /etc/W1nCray [--dry-run] [--force]
 ```
 
-`--dry-run` 只预览，`--force` 覆盖目标目录里已存在的文件（`cmd/migrate.go:33–36`）。命令会逐项打印它做了什么，转换后的配置建议再用 `W1nCray check -c /etc/W1nCray/config.yml --online` 核对。
+`--dry-run` 只预览，`--force` 覆盖目标目录里已存在的文件（`cmd/migrate.go:33–36`）。命令会逐项打印它做了什么；`EnableProxyProtocol`、`EnableREALITY`、`REALITYConfigs` 会被删除（面板按节点管理），静态节点迁移到机器模式时由 `W1nCray link` 一并剥离。转换后的配置建议再用 `W1nCray check -c /etc/W1nCray/config.yml --online` 核对。
 
 ## 从源码构建
 

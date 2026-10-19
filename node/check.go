@@ -34,14 +34,7 @@ func (c *Controller) Check(ctx context.Context) (string, error) {
 	var notes []string
 	if spec.acceptProxyProtocol() {
 		if proxyProtocolCapable(spec.network()) {
-			src := "面板"
-			switch {
-			case c.cfg.EnableProxyProtocol && bool(nc.AcceptProxyProtocol):
-				src = "本地与面板"
-			case c.cfg.EnableProxyProtocol:
-				src = "本地"
-			}
-			notes = append(notes, "接收 PROXY protocol（来源："+src+"）")
+			notes = append(notes, "接收 PROXY protocol（来源：面板）")
 		} else {
 			notes = append(notes, fmt.Sprintf("接收 PROXY protocol 已忽略：传输 %s 不是 TCP", spec.network()))
 		}

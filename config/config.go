@@ -264,6 +264,9 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+	if len(c.NodesConfig) > 0 {
+		log.Warnf("config: static Nodes are deprecated; bind the nodes to a machine and use Agent.Panel.MachineNodes")
+	}
 	seen := make(map[string]bool)
 	for i, n := range c.NodesConfig {
 		if n == nil || n.ApiConfig == nil {

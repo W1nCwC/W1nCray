@@ -143,7 +143,7 @@ func (s *inboundSpec) useREALITY() bool {
 	if s.protocol != protoVLESS && s.protocol != protoTrojan {
 		return false
 	}
-	return s.node.TLS == 2 || (s.cfg.EnableREALITY && s.cfg.REALITYConfigs != nil)
+	return s.node.TLS == 2
 }
 
 func (s *inboundSpec) build(users []nodeUser) (*xcore.InboundHandlerConfig, error) {
@@ -474,10 +474,10 @@ func (s *inboundSpec) stream() (map[string]any, error) {
 	return st, nil
 }
 
-// acceptProxyProtocol reports whether the inbound accepts PROXY protocol: the
-// local switch OR the panel per-node switch.
+// acceptProxyProtocol reports whether the inbound accepts PROXY protocol. The
+// switch is owned by the panel; a machine cannot turn it on locally.
 func (s *inboundSpec) acceptProxyProtocol() bool {
-	return s.cfg.EnableProxyProtocol || bool(s.node.AcceptProxyProtocol)
+	return bool(s.node.AcceptProxyProtocol)
 }
 
 // proxyProtocolCapable reports whether a transport can carry PROXY protocol.
@@ -542,28 +542,6 @@ func (s *inboundSpec) reality(network string) (map[string]any, error) {
 	if network != "tcp" && network != "xhttp" && network != "grpc" {
 		return nil, fmt.Errorf("REALITY only supports RAW (tcp), XHTTP and gRPC, not %s", network)
 	}
-	if s.cfg.EnableREALITY && s.cfg.REALITYConfigs != nil {
-		r := s.cfg.REALITYConfigs
-		if r.PrivateKey == "" || r.Dest == "" || len(r.ServerNames) == 0 {
-			return nil, fmt.Errorf("local REALITYConfigs requires Dest, ServerNames and PrivateKey")
-		}
-		shortIDs := r.ShortIds
-		if len(shortIDs) == 0 {
-			shortIDs = []string{""}
-		}
-		return map[string]any{
-			"show":         r.Show,
-			"target":       r.Dest,
-			"xver":         r.ProxyProtocolVer,
-			"serverNames":  r.ServerNames,
-			"privateKey":   r.PrivateKey,
-			"minClientVer": r.MinClientVer,
-			"maxClientVer": r.MaxClientVer,
-			"maxTimeDiff":  r.MaxTimeDiff,
-			"shortIds":     shortIDs,
-		}, nil
-	}
-
 	t := s.node.TLSConfig()
 	if t.ServerName == "" || t.PrivateKey == "" {
 		return nil, fmt.Errorf("REALITY requires server_name and private_key in the panel reality settings")

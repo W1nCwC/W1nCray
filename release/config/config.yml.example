@@ -36,7 +36,7 @@ Nodes:
       DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6
       DisableUploadTraffic: false # 不上报流量
       DisableGetRule: false # 不使用面板下发的路由规则
-      EnableProxyProtocol: false # 本地强制开启入站接受 PROXY protocol；与面板节点开关取 OR（TCP/WS/HTTPUpgrade/XHTTP/gRPC）
+      # 接收 PROXY protocol 由面板按节点开关管理，本机不再提供开关
       DisableSniffing: false # 关闭流量嗅探
       DisableWebSocket: false # 不使用面板 WebSocket（面板开启时，用户/配置变更秒级生效；HTTP 轮询始终作为兜底）
       BlockPrivateIP: true # 阻止用户访问内网/保留地址（推荐开启）
@@ -52,19 +52,7 @@ Nodes:
           Path: # HTTP 路径，留空匹配任意
           Dest: 80 # 必填，回落目标，见 https://xtls.github.io/config/features/fallback.html
           ProxyProtocolVer: 0 # 发送 PROXY protocol 版本，0 为不发送
-      EnableREALITY: false # 使用下方本地 REALITY 配置覆盖面板（仅 VLESS / Trojan）
-      REALITYConfigs:
-        Show: false
-        Dest: www.example.com:443 # 必填，REALITY 目标
-        ProxyProtocolVer: 0
-        ServerNames: # 必填
-          - www.example.com
-        PrivateKey: YOUR_PRIVATE_KEY # 必填，执行 `W1nCray x25519` 生成
-        MinClientVer:
-        MaxClientVer:
-        MaxTimeDiff: 0
-        ShortIds:
-          - ""
+      # REALITY 参数由面板按节点下发（tls=2 时使用面板 reality_settings），本机不再覆盖
       # 面板节点下发 cert_config 时以面板为准，否则使用此处配置
       CertConfig:
         CertMode: none # none, file, self, http, tls, dns

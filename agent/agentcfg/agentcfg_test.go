@@ -771,3 +771,55 @@ func TestSelfUpdateWindowsAreALocalArchitectureAwareOverride(t *testing.T) {
 		t.Error("a negative window must be refused")
 	}
 }
+
+func TestPanelOwnedControllerFieldsAreRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"template proxy", "Panel:\n  NodeController:\n    EnableProxyProtocol: true\n", "Panel.NodeController.EnableProxyProtocol"},
+		{"override reality", "Panel:\n  NodeControllers:\n    173:\n      REALITYConfigs:\n        Show: true\n", "Panel.NodeControllers[173].REALITYConfigs"},
+		{"override enable reality", "Panel:\n  NodeControllers:\n    3:\n      EnableREALITY: true\n", "Panel.NodeControllers[3].EnableREALITY"},
+		{"case insensitive", "Panel:\n  NodeController:\n    enableproxyprotocol: true\n", "Panel.NodeController.EnableProxyProtocol"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckPanelOwnedControllerFields([]byte(tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want it to name %s", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPanelOwnedControllerFieldsAllowLocalOnly(t *testing.T) {
+	body := `Panel:
+  NodeController:
+    ListenIP: 127.0.0.1
+  NodeControllers:
+    173:
+      CertConfig:
+        CertMode: file
+      SendIP: 10.0.0.2
+      DisableSniffing: true
+`
+	if err := CheckPanelOwnedControllerFields([]byte(body)); err != nil {
+		t.Fatalf("local-only fields refused: %v", err)
+	}
+}
+
+func TestLoadRefusesPanelOwnedControllerField(t *testing.T) {
+	dir := t.TempDir()
+	path := writeFile(t, filepath.Join(dir, FileName), `Enabled: true
+Panel:
+  Enabled: true
+  MachineNodes: true
+  NodeControllers:
+    3:
+      EnableProxyProtocol: true
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "EnableProxyProtocol") {
+		t.Fatalf("err = %v, want a refusal naming EnableProxyProtocol", err)
+	}
+}

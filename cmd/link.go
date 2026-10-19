@@ -1125,11 +1125,10 @@ type linkNode struct {
 	ccLines    []string
 	convert    bool
 	reason     string
-	// proxyProtocol says the copied ControllerConfig turns on
-	// EnableProxyProtocol. The value survives under Panel.NodeControllers[id]
-	// and the agent ORs it with the panel switch, so the node keeps accepting
-	// PROXY protocol even when the panel switch is off.
-	proxyProtocol bool
+	// stripped names the ControllerConfig keys the panel owns that link removed
+	// from the copied block. Moving them into agent.yml would make the agent
+	// refuse the file (the panel decides PROXY protocol and REALITY).
+	stripped []string
 }
 
 type linkOverride struct {
@@ -1467,22 +1466,51 @@ func parseLinkNode(lines []linkLine, raw []string, start, end int, panelOrigin s
 	}
 	ccEnd := blockEnd(lines, ccIdx, end, lines[ccIdx].indent)
 	copied := append([]string(nil), raw[ccIdx+1:ccEnd]...)
-	if hasYAMLContent(copied) {
-		n.ccLines = copied
-		n.proxyProtocol = controllerEnablesProxyProtocol(copied)
+	kept, stripped := stripPanelOwnedControllerLines(copied)
+	if hasYAMLContent(kept) {
+		n.ccLines = kept
 	}
+	n.stripped = stripped
 	n.convert = true
 	return n
 }
 
-// controllerEnablesProxyProtocol reports whether a copied ControllerConfig
-// turns on EnableProxyProtocol. link copies the block verbatim, so a true value
-// lands in agent.yml's Panel.NodeControllers[id] and keeps the node accepting
-// PROXY protocol even after the panel switch is turned off.
-func controllerEnablesProxyProtocol(lines []string) bool {
-	for _, l := range lines {
-		k, v, ok := lineKey(makeLine(l))
-		if ok && k == "EnableProxyProtocol" && strings.EqualFold(scalarValue(v), "true") {
+// stripPanelOwnedControllerLines removes the panel-owned keys from a copied
+// ControllerConfig body, together with their nested blocks. link must not move
+// them into agent.yml: the agent refuses them on load, because the panel owns
+// them per node.
+func stripPanelOwnedControllerLines(lines []string) (kept []string, removed []string) {
+	for i := 0; i < len(lines); {
+		l := makeLine(lines[i])
+		key, _, ok := lineKey(l)
+		if !ok || !panelOwnsControllerKey(key) {
+			kept = append(kept, lines[i])
+			i++
+			continue
+		}
+		removed = append(removed, key)
+		base := l.indent
+		i++
+		for i < len(lines) {
+			next := makeLine(lines[i])
+			if next.blank {
+				i++
+				continue
+			}
+			if next.indent <= base {
+				break
+			}
+			i++
+		}
+	}
+	return kept, removed
+}
+
+// panelOwnsControllerKey reports whether the panel owns a ControllerConfig key
+// and the agent refuses a local value for it.
+func panelOwnsControllerKey(key string) bool {
+	for _, owned := range nodecfg.PanelOwnedControllerKeys {
+		if strings.EqualFold(key, owned) {
 			return true
 		}
 	}
@@ -1611,19 +1639,18 @@ func (p *linkPlan) text(tokenPath, backupPath string) string {
 	if ids := p.convertedIDs(); len(ids) > 0 {
 		fmt.Fprintf(&b, "  将转换的节点: %s\n", joinIDs(ids))
 	}
-	var proxyNodes []string
+	var stripped []string
 	for _, n := range p.nodes {
-		if n.convert && n.proxyProtocol {
-			proxyNodes = append(proxyNodes, fmt.Sprintf("    - 节点 %d", n.id))
+		if n.convert && len(n.stripped) > 0 {
+			stripped = append(stripped, fmt.Sprintf("    - 节点 %d: %s", n.id, strings.Join(n.stripped, ", ")))
 		}
 	}
-	if len(proxyNodes) > 0 {
-		b.WriteString("  注意（本机覆盖会压过面板开关）:\n")
-		for _, s := range proxyNodes {
+	if len(stripped) > 0 {
+		b.WriteString("  已剥离面板拥有的本机字段（不会写入 agent.yml）:\n")
+		for _, s := range stripped {
 			b.WriteString(s + "\n")
 		}
-		b.WriteString("    以上节点的 ControllerConfig.EnableProxyProtocol 为 true，迁移后会写入 Panel.NodeControllers[id] 并继续强制接收 PROXY protocol；\n")
-		b.WriteString("    面板上同名开关关闭也不会生效（本机值 OR 面板值）。如需由面板控制，请在 agent.yml 里把对应值改为 false。\n")
+		b.WriteString("    面板按节点管理这些设置；如需修改请在面板上操作。\n")
 	}
 	var skipped []string
 	for _, n := range p.nodes {
