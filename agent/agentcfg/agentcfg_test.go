@@ -809,7 +809,38 @@ func TestPanelOwnedControllerFieldsAllowLocalOnly(t *testing.T) {
 	}
 }
 
-func TestLoadRefusesPanelOwnedControllerField(t *testing.T) {
+func TestSanitizePanelOwnedControllerFields(t *testing.T) {
+	raw := `Panel:
+  NodeController:
+    EnableProxyProtocol: true
+    ListenIP: 127.0.0.1
+  NodeControllers:
+    173:
+      REALITYConfigs:
+        Show: true
+      CertConfig:
+        CertMode: file
+    3:
+      EnableREALITY: true
+      SendIP: 10.0.0.2
+`
+	out, removed := SanitizePanelOwnedControllerFields([]byte(raw))
+	if len(removed) != 3 {
+		t.Fatalf("removed = %v, want the three owned keys", removed)
+	}
+	for _, key := range []string{"EnableProxyProtocol", "EnableREALITY", "REALITYConfigs"} {
+		if strings.Contains(string(out), key) {
+			t.Errorf("%s is still in the sanitized document:\n%s", key, out)
+		}
+	}
+	for _, keep := range []string{"ListenIP", "CertConfig", "SendIP"} {
+		if !strings.Contains(string(out), keep) {
+			t.Errorf("the sanitizer dropped the local field %s:\n%s", keep, out)
+		}
+	}
+}
+
+func TestLoadStripsPanelOwnedControllerField(t *testing.T) {
 	dir := t.TempDir()
 	path := writeFile(t, filepath.Join(dir, FileName), `Enabled: true
 Panel:
@@ -818,8 +849,19 @@ Panel:
   NodeControllers:
     3:
       EnableProxyProtocol: true
+      SendIP: 10.0.0.2
 `)
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "EnableProxyProtocol") {
-		t.Fatalf("err = %v, want a refusal naming EnableProxyProtocol", err)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load = %v, want the stale panel-owned key to be ignored", err)
 	}
+	if cfg == nil || !cfg.Enabled || cfg.Panel == nil || !cfg.Panel.MachineNodes {
+		t.Fatalf("the rest of the config was not loaded: %+v", cfg)
+	}
+	if cc := cfg.Panel.NodeControllers[3]; cc == nil || cc.SendIP != "10.0.0.2" {
+		t.Fatalf("the local NodeControllers entry was lost: %+v", cfg.Panel.NodeControllers)
+	}
+	// nodecfg.Config no longer has the field, so the removal itself is asserted
+	// by TestSanitizePanelOwnedControllerFields; here the point is that Load
+	// accepts the stale document instead of refusing to start.
 }

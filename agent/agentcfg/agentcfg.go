@@ -5,6 +5,7 @@
 package agentcfg
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -463,17 +464,32 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("agent config %s: %w", path, err)
 	}
-	if err := CheckPanelOwnedControllerFields(raw); err != nil {
+	// v0.11.1: a machine that was upgraded from v0.9.x still carries the
+	// panel-owned controller keys in agent.yml. They are removed from the
+	// in-memory document (the panel decides them per node) and reported, so
+	// the fleet can upgrade without a manual per-machine edit. The file itself
+	// is left untouched: a rollback to the old binary still finds its keys.
+	cleaned := raw
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == "" || ext == ".yml" || ext == ".yaml" {
+		var removed []string
+		cleaned, removed = SanitizePanelOwnedControllerFields(raw)
+		for _, where := range removed {
+			fmt.Fprintf(os.Stderr, "agent config %s: ignoring panel-owned key %s (the panel decides it per node)\n", path, where)
+		}
+	} else if err := CheckPanelOwnedControllerFields(raw); err != nil {
 		return nil, fmt.Errorf("agent config %s: %w", path, err)
 	}
 	v := viper.New()
-	v.SetConfigFile(path)
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".yml", ".yaml", ".json", ".toml":
-	default:
-		v.SetConfigType("yaml")
+	configType := "yaml"
+	switch ext {
+	case ".json":
+		configType = "json"
+	case ".toml":
+		configType = "toml"
 	}
-	if err := v.ReadInConfig(); err != nil {
+	v.SetConfigType(configType)
+	if err := v.ReadConfig(bytes.NewReader(cleaned)); err != nil {
 		return nil, fmt.Errorf("read agent config %s: %w", path, err)
 	}
 	cfg := new(Config)
@@ -481,6 +497,59 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse agent config %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// SanitizePanelOwnedControllerFields removes the panel-owned keys from a
+// machine-mode agent YAML document and returns the cleaned document plus the
+// paths it removed. A document that is not YAML, has no Panel section, or has
+// nothing to remove is returned unchanged.
+//
+// This is the fleet-upgrade path for a machine whose agent.yml predates the
+// panel ownership change (v0.10.0): the panel decides PROXY protocol and
+// REALITY per node, so the stale local values are dropped instead of refusing
+// to start. CheckPanelOwnedControllerFields stays the strict helper used by the
+// non-YAML loader and by the tests.
+func SanitizePanelOwnedControllerFields(raw []byte) ([]byte, []string) {
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return raw, nil
+	}
+	panel, ok := mapLookup(doc, "Panel")
+	if !ok {
+		return raw, nil
+	}
+
+	var removed []string
+	remove := func(where string, cc map[string]any) {
+		for _, key := range nodecfg.PanelOwnedControllerKeys {
+			for k := range cc {
+				if strings.EqualFold(k, key) {
+					delete(cc, k)
+					removed = append(removed, where+"."+key)
+					break
+				}
+			}
+		}
+	}
+	if cc, ok := mapLookup(panel, "NodeController"); ok {
+		remove("Panel.NodeController", cc)
+	}
+	if list, ok := mapLookup(panel, "NodeControllers"); ok {
+		for id, entry := range list {
+			if cc, ok := asMap(entry); ok {
+				remove("Panel.NodeControllers["+fmt.Sprint(id)+"]", cc)
+			}
+		}
+	}
+	if len(removed) == 0 {
+		return raw, nil
+	}
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return raw, nil
+	}
+
+	return out, removed
 }
 
 // CheckPanelOwnedControllerFields refuses a machine-mode ControllerConfig
