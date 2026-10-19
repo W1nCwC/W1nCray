@@ -530,6 +530,25 @@ func (s *Service) machineRuntimeLocked(c *xboard.Client, cfg *Config) (rt *xboar
 	ctx, cancel := context.WithTimeout(context.Background(), machineRequestTimeout)
 	defer cancel()
 	fresh, err := c.GetMachineRuntime(ctx)
+	// 204: the panel explicitly has no profile for this machine. A machine
+	// that never had one keeps reading its files (nothing to break), but the
+	// fallback is reported instead of being silent. A machine that already
+	// used a panel profile keeps it: dropping to files would switch the
+	// outbound set behind the administrator's back.
+	if errors.Is(err, xboard.ErrNoRuntimeProfile) {
+		if s.runtimeKnown && s.runtime != nil {
+			s.runtimeErr = "面板不再提供运行配置，保留上一版"
+			log.Errorf("runtime profile: %v (keeping the one in use: %s)", err, runtimeVersion(s.runtime))
+			return s.runtime, true, true
+		}
+		const msg = "面板没有该机器的运行配置，降级读本机文件"
+		if s.runtimeErr != msg {
+			log.Warnf("runtime profile: %v; reading the local files instead", err)
+		}
+		s.runtime, s.runtimeKnown, s.runtimeRejected = nil, true, ""
+		s.runtimeErr = msg
+		return nil, false, true
+	}
 	if err == nil && fresh != nil {
 		probe := coreOptions(cfg, nil)
 		applyRuntime(&probe, fresh)

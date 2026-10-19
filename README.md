@@ -29,6 +29,7 @@ W1nCray 作为 W1nCBoard 的**节点后端**运行：它按 W1nCBoard 的 UniPro
 - **默认阻止访问内网**：`BlockPrivateIP` 未写时即为开启，命中内网/保留地址的流量被阻断（`nodecfg/config.go:104–109`；`node/rules.go:15–30,138–140`）。
 - **面板证书下发**：节点 `cert_config` 优先于本地 `CertConfig`；支持 `none`、`file`、`self`、`http`、`tls`、`dns` 模式，以及面板直接下发证书内容（`node/controller.go:689–711`；`common/cert/cert.go:87–108`；`common/certcfg/certcfg.go:21–30`）。
 - **路由与自定义出入站**：面板路由（`block` / `direct` / `proxy` / `dns`）、本地 RuleList、`custom_outbounds` / `custom_routes`、全局 `dns.json` / `route.json` / `custom_inbound.json` / `custom_outbound.json`（`node/rules.go:136–193,196–209,236–283`）。
+- **运行配置由面板接管（v0.10.0）**：面板保存机器的出站/路由/DNS 后，agent 只使用面板编译的文档，不再读取 `custom_outbound.json` / `route.json` / `dns.json`；面板没有该机器的运行配置时保持本机文件模式，并把降级原因写进内核状态（`xraynode/service.go`）。
 - **配置热重载**：`config.yml` 及其引用的 DNS / 路由 / 出入站 / 规则文件变化后自动重建，无需重启（`config/watch.go:18–40`；`xraynode/service.go:874–929`）。
 - **外部转发内核**：agent 可经面板管理外部转发内核（gost / frp / realm）（`driver/gost`、`driver/frp`、`driver/realm`；`agent/spec/spec.go:22–26`）。
 

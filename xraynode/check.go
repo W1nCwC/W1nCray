@@ -175,6 +175,16 @@ func checkMachineNodes(w io.Writer, pc *AgentPanelConfig, online bool) error {
 		return err
 	}
 	fmt.Fprintf(w, "  ✓ 机器节点列表（机器 ID %d）: %d 个节点，版本 %s\n", pc.MachineID, len(list), version)
+	switch rt, rerr := c.GetMachineRuntime(ctx); {
+	case errors.Is(rerr, xboard.ErrNoRuntimeProfile):
+		fmt.Fprintln(w, "  运行配置: 面板尚未保存该机器的运行配置（agent 降级读本机文件）")
+	case rerr != nil:
+		fmt.Fprintf(w, "  ! 运行配置: %v\n", rerr)
+	case rt == nil:
+		fmt.Fprintln(w, "  运行配置: 面板不支持（旧面板）")
+	default:
+		fmt.Fprintf(w, "  ✓ 运行配置: 面板下发（版本 %s）\n", rt.Version)
+	}
 	for _, mn := range list {
 		note := ""
 		nodeClient := xboard.New(xboard.Config{

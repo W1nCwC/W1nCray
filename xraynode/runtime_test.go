@@ -241,8 +241,55 @@ func TestMachineRuntimeStaleKeepsModeThenUpdates(t *testing.T) {
 	}
 }
 
+// 204 is an explicit "no profile": a machine that never had one keeps files
+// mode, and the fallback is reported instead of being silent.
+func TestMachineRuntimeNoProfileReportsFilesFallback(t *testing.T) {
+	port := freePort(t)
+	fp := newMachineFakePanel(t)
+	fp.ports = map[int]int{1: port}
+	fp.setNodes([]map[string]any{machineNodeJSON(1, "a", 1)}, "v1")
+	fp.setRuntime(http.StatusNoContent, "")
+
+	p := startMachine(t, fp, "")
+	waitRuntime(t, p, "files", "", "no profile")
+	if err := p.Status().RuntimeError; !strings.Contains(err, "降级读本机文件") {
+		t.Fatalf("RuntimeError = %q, want the degraded fallback", err)
+	}
+	if !hasOutbound(p, "direct") {
+		t.Fatal("files mode lost its default direct outbound")
+	}
+	waitDial(t, fmt.Sprintf("127.0.0.1:%d", port), true, 15*time.Second, "node listens on files")
+}
+
+// A profile that was in use is never dropped to files because the panel now
+// answers 204: the last profile is kept and retried as stale.
+func TestMachineRuntimeNoProfileAfterUseKeepsProfile(t *testing.T) {
+	oldPoll, oldWindow := machinePollInterval, machineDebounceWindow
+	machinePollInterval, machineDebounceWindow = 100*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { machinePollInterval, machineDebounceWindow = oldPoll, oldWindow })
+
+	fp := newMachineFakePanel(t)
+	fp.ports = map[int]int{1: freePort(t), 2: freePort(t)}
+	fp.setNodes([]map[string]any{machineNodeJSON(1, "a", 1)}, "v1")
+	fp.setRuntime(http.StatusOK, runtimeBody("r1", "direct4"))
+
+	p := startMachine(t, fp, "broken")
+	waitRuntime(t, p, "panel", "r1", "initial")
+
+	fp.setRuntime(http.StatusNoContent, "")
+	fp.setNodes([]map[string]any{machineNodeJSON(1, "a", 1), machineNodeJSON(2, "b", 2)}, "v2")
+	waitNodes(t, p, 2, "rebuild after the profile disappeared")
+	waitRuntime(t, p, "panel", "r1", "profile kept after 204")
+	if !hasOutbound(p, "direct4") {
+		t.Fatal("204 dropped the profile that was in use")
+	}
+	if err := p.Status().RuntimeError; !strings.Contains(err, "保留上一版") {
+		t.Fatalf("RuntimeError = %q, want the keep notice", err)
+	}
+}
+
 // In panel mode the four files are not read, so changing one must not rebuild
-// the core; after the profile is switched off the files count again.
+// the core.
 func TestMachineRuntimePanelModeIgnoresFileChanges(t *testing.T) {
 	port := freePort(t)
 	fp := newMachineFakePanel(t)

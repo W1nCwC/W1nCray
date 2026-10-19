@@ -41,14 +41,15 @@ func TestNodeModeDoesNotAnnounceRuntime(t *testing.T) {
 
 func TestGetMachineRuntime(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		status  int
-		body    string
-		wantNil bool
-		wantErr string
+		name          string
+		status        int
+		body          string
+		wantNil       bool
+		wantNoProfile bool
+		wantErr       string
 	}{
 		{name: "on", status: 200, body: `{"version":"abc","outbounds":[{"tag":"direct4","protocol":"freedom"}],"routing":{"domainStrategy":"AsIs","rules":[]},"dns":null}`},
-		{name: "off", status: 204, wantNil: true},
+		{name: "off", status: 204, wantNil: true, wantNoProfile: true},
 		{name: "panel predates runtime", status: 404, body: `{"message":"not found"}`, wantNil: true},
 		{name: "missing version", status: 200, body: `{"outbounds":[]}`, wantErr: "missing version"},
 		{name: "bad json", status: 200, body: `{`, wantErr: "decode runtime"},
@@ -60,6 +61,12 @@ func TestGetMachineRuntime(t *testing.T) {
 				io.WriteString(w, tc.body)
 			})
 			rt, err := c.GetMachineRuntime(context.Background())
+			if tc.wantNoProfile {
+				if !errors.Is(err, ErrNoRuntimeProfile) || rt != nil {
+					t.Fatalf("GetMachineRuntime = %+v, %v; want ErrNoRuntimeProfile", rt, err)
+				}
+				return
+			}
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want %q", err, tc.wantErr)

@@ -526,11 +526,18 @@ func (c *Client) ListMachineNodes(ctx context.Context) ([]MachineNode, string, e
 	return out, string(body.Version), nil
 }
 
+// ErrNoRuntimeProfile means the panel answered 204: it has no runtime profile
+// for this machine. It is distinct from a panel that predates the endpoint
+// (404, returned as nil, nil): the caller reports the former as a degraded
+// files fallback and keeps the latter silent.
+var ErrNoRuntimeProfile = errors.New("panel has no runtime profile for this machine")
+
 // GetMachineRuntime fetches the machine's runtime profile: the outbounds,
-// routing and DNS the panel manages for this machine. It returns nil, nil when
-// the profile is off (204) and when the panel predates it (404), so the caller
-// keeps using its files exactly as before. Any other failure is an error: a
-// kernel that cannot tell which mode it is in must not guess.
+// routing and DNS the panel manages for this machine. It returns
+// ErrNoRuntimeProfile when the panel has none (204), and nil, nil when the
+// panel predates it (404), so the caller keeps using its files exactly as
+// before. Any other failure is an error: a kernel that cannot tell which mode
+// it is in must not guess.
 func (c *Client) GetMachineRuntime(ctx context.Context) (*Runtime, error) {
 	resp, err := c.do(ctx, http.MethodGet, machineRuntimePath, nil, "")
 	if err != nil {
@@ -542,7 +549,7 @@ func (c *Client) GetMachineRuntime(ctx context.Context) (*Runtime, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent {
-		return nil, nil
+		return nil, ErrNoRuntimeProfile
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRuntimeBytes+1))
 	if err != nil {
