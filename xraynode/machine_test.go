@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/W1nCwC/W1nCray/node"
+	"github.com/W1nCwC/W1nCray/nodecfg"
 )
 
 const machineToken = "panel-machine-token-0123456789"
@@ -31,6 +32,9 @@ type machineFakePanel struct {
 	version string
 	// ports maps a machine node id to the port its config listens on.
 	ports map[int]int
+	// proxy marks the machine nodes whose panel config turns on
+	// accept_proxy_protocol.
+	proxy map[int]bool
 	// staticPort is the port of the V1 node (NodeID 1).
 	staticPort int
 	// denyNodes is how many upcoming /nodes requests are refused with 401.
@@ -48,7 +52,7 @@ type machineFakePanel struct {
 }
 
 func newMachineFakePanel(t *testing.T) *machineFakePanel {
-	m := &machineFakePanel{test: t, ports: map[int]int{}, configHits: map[int]int{}}
+	m := &machineFakePanel{test: t, ports: map[int]int{}, proxy: map[int]bool{}, configHits: map[int]int{}}
 	m.srv = httptest.NewServer(http.HandlerFunc(m.handle))
 	t.Cleanup(m.srv.Close)
 	return m
@@ -71,9 +75,14 @@ func (m *machineFakePanel) auth(w http.ResponseWriter, r *http.Request) bool {
 func (m *machineFakePanel) nodeConfig(w http.ResponseWriter, id int) {
 	m.mu.Lock()
 	port := m.ports[id]
+	proxy := m.proxy[id]
 	m.configHits[id]++
 	m.mu.Unlock()
-	fmt.Fprintf(w, `{"protocol":"vmess","server_port":%d,"network":"tcp","tls":0,"routes":[],"base_config":{"push_interval":60,"pull_interval":60}}`, port)
+	extra := ""
+	if proxy {
+		extra = `,"accept_proxy_protocol":true`
+	}
+	fmt.Fprintf(w, `{"protocol":"vmess","server_port":%d,"network":"tcp","tls":0%s,"routes":[],"base_config":{"push_interval":60,"pull_interval":60}}`, port, extra)
 }
 
 func (m *machineFakePanel) handle(w http.ResponseWriter, r *http.Request) {
@@ -156,6 +165,13 @@ func (m *machineFakePanel) handle(w http.ResponseWriter, r *http.Request) {
 func (m *machineFakePanel) setNodes(nodes []map[string]any, version string) {
 	m.mu.Lock()
 	m.nodes, m.version = nodes, version
+	m.mu.Unlock()
+}
+
+// setProxy makes the panel config of node id turn on accept_proxy_protocol.
+func (m *machineFakePanel) setProxy(id int, on bool) {
+	m.mu.Lock()
+	m.proxy[id] = on
 	m.mu.Unlock()
 }
 
@@ -620,6 +636,38 @@ func TestCheckMachineNodesOnline(t *testing.T) {
 		out := w.String()
 		if !strings.Contains(out, "2 个节点") || !strings.Contains(out, "版本 v1") || !strings.Contains(out, "机器 ID 9") {
 			t.Errorf("report:\n%s", out)
+		}
+		if strings.Contains(out, machineToken) {
+			t.Errorf("the report prints the token:\n%s", out)
+		}
+	})
+	t.Run("names where the PROXY protocol switch comes from", func(t *testing.T) {
+		fp := newMachineFakePanel(t)
+		fp.setNodes([]map[string]any{
+			machineNodeJSON(1, "panel-on", 1),
+			machineNodeJSON(2, "local-on", 2),
+			machineNodeJSON(3, "both-on", 3),
+		}, "v1")
+		fp.setProxy(1, true)
+		fp.setProxy(3, true)
+		p := pc(fp.srv.URL)
+		p.NodeControllers = map[int]*nodecfg.Config{
+			2: {EnableProxyProtocol: true},
+			3: {EnableProxyProtocol: true},
+		}
+		var w bytes.Buffer
+		if err := checkMachineNodes(&w, p, true); err != nil {
+			t.Fatalf("%v\n%s", err, w.String())
+		}
+		out := w.String()
+		for _, want := range []string{
+			"节点 1: vmess panel-on；接收 PROXY protocol（来源：面板）",
+			"节点 2: vmess local-on；接收 PROXY protocol（来源：本地）",
+			"节点 3: vmess both-on；接收 PROXY protocol（来源：本地与面板）",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing %q in:\n%s", want, out)
+			}
 		}
 		if strings.Contains(out, machineToken) {
 			t.Errorf("the report prints the token:\n%s", out)
