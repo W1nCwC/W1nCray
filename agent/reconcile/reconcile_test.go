@@ -1191,3 +1191,41 @@ func TestEngineOrderIsDeterministic(t *testing.T) {
 		eq(t, "order", got, []string{"xray", "realm", "gost"})
 	}
 }
+
+// A panel that re-publishes identical content under a new revision must not
+// leave the reconciler reporting the old revision. The unchanged branch keeps
+// the running plan, and Health() (which every /report carries) has to name the
+// revision the panel last applied. Regression seen on a production machine:
+// the ack said revision 14 while health.revision stayed 12.
+func TestUnchangedApplyKeepsInstancesAndMovesHealthRevision(t *testing.T) {
+	e := newEnv(t)
+	a := fwd(t, "fwd-5", "gost")
+	b := entry(t, "fwd-6-in", "gost", secretA)
+	rep12 := e.mustApply(desired(12, a, b))
+	if len(rep12.Instances) != 2 {
+		t.Fatalf("revision 12 instances = %+v", rep12.Instances)
+	}
+	if h := e.r.Health(context.Background()); h.Revision != 12 {
+		t.Fatalf("health revision before = %d, want 12", h.Revision)
+	}
+
+	// Same instances, same content: only the revision number differs, so the
+	// hash is identical and the apply takes the unchanged branch.
+	rep14, err := e.apply(desired(14, a, b))
+	if err != nil {
+		t.Fatalf("unchanged apply: %v", err)
+	}
+	if rep14.Status != StatusApplied || !strings.Contains(rep14.Message, "unchanged") {
+		t.Fatalf("unchanged apply report = %s/%q", rep14.Status, rep14.Message)
+	}
+	if len(rep14.Instances) != 2 {
+		t.Fatalf("unchanged report instances = %+v", rep14.Instances)
+	}
+	last, ok := e.r.Last()
+	if !ok || last.Revision != 14 || len(last.Instances) != 2 {
+		t.Fatalf("last = revision %d with %d instance(s) (ok=%v), want 14 with 2", last.Revision, len(last.Instances), ok)
+	}
+	if h := e.r.Health(context.Background()); h.Revision != 14 || h.Hash != rep14.Hash {
+		t.Fatalf("health after = revision %d hash %q, want revision 14 hash %q", h.Revision, h.Hash, rep14.Hash)
+	}
+}

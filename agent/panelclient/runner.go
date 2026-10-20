@@ -714,8 +714,32 @@ func (r *Runner) reportOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The panel answers with the seq it acknowledged. A value above the one
+	// just sent means this report was treated as a duplicate of an earlier
+	// run: the panel's /config writes the new instance_id on the first poll
+	// but does not reset last_seq, so every report of a restarted agent is
+	// compared against the previous run's counter (the hello reset only wins
+	// when the socket handshake beats the immediate first pull, which it
+	// normally does not). Following the answer makes the next report the first
+	// one accepted instead of leaving the whole run a duplicate - and with it
+	// the per-instance status the panel stores only for accepted reports -
+	// until seq passes the old one. A panel that omits ack_seq answers 0 and
+	// changes nothing.
+	r.observeAckSeq(resp.AckSeq)
 	r.handleCommands(ctx, resp.Commands)
 	return nil
+}
+
+// observeAckSeq moves the local report seq up to a higher acknowledged one.
+func (r *Runner) observeAckSeq(ackSeq uint64) {
+	if ackSeq == 0 {
+		return
+	}
+	r.mu.Lock()
+	if ackSeq > r.seq {
+		r.seq = ackSeq
+	}
+	r.mu.Unlock()
 }
 
 // mergeInstances joins the instances of the last report with the counters by

@@ -1584,3 +1584,122 @@ func TestPermanentClassification(t *testing.T) {
 		t.Error("429 must be retried")
 	}
 }
+
+// A panel that re-publishes identical content under a new revision makes the
+// applier return the previous report with the new revision (the reconciler's
+// unchanged branch). The next /report must still carry every instance: the
+// panel stores the per-instance status only from this body, so an unchanged
+// apply must never empty it.
+func TestReportCarriesInstancesAfterUnchangedApply(t *testing.T) {
+	h := newHarness(t, hopts{pull: 10 * time.Second, report: 40 * time.Second})
+	var previous reconcile.Report
+	h.app.applyFn = func(d spec.Desired) (reconcile.Report, error) {
+		if previous.Status == "" {
+			previous = okReport(d)
+			return previous, nil
+		}
+		out := previous
+		out.Revision = d.Revision
+		out.Message = "unchanged: this desired state is already applied"
+		previous = out
+		return out, nil
+	}
+	both := instJSON("fwd-5", "gost", "") + "," + instJSON("fwd-6-in", "gost", "")
+	h.panel.setConfig(func(n int, req ConfigRequest) (int, string) {
+		switch n {
+		case 1:
+			return 200, desiredBody(12, "sha256:aa", both, "")
+		case 2:
+			return 200, desiredBody(14, "sha256:bb", both, "")
+		}
+		return 200, unchangedBody(14, "")
+	})
+	h.panel.waitCount("ack", 1)
+	h.clock.fire(t, 10*time.Second)
+	h.panel.waitCount("ack", 2)
+
+	ack := h.panel.ackReq(1)
+	if ack.Revision != 14 || len(ack.Report.Instances) != 2 {
+		t.Fatalf("unchanged ack = revision %d with %d instance(s)", ack.Revision, len(ack.Report.Instances))
+	}
+
+	h.clock.fire(t, 40*time.Second)
+	h.panel.waitCount("report", 1)
+	var rep ReportRequest
+	if err := json.Unmarshal(h.panel.bodies("report")[0], &rep); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, in := range rep.Instances {
+		ids[in.ID] = in.State
+	}
+	if ids["fwd-5"] != reconcile.StateRunning || ids["fwd-6-in"] != reconcile.StateRunning {
+		t.Fatalf("report instances = %+v, want both running", rep.Instances)
+	}
+}
+
+// After a restart the panel keeps the previous run's last_seq: its /config
+// writes the new instance_id without resetting the counter, so every report of
+// the new run is a duplicate until seq passes the old value. The panel says so
+// in ack_seq; the runner must follow it, or the whole run's instance status is
+// never stored (the production symptom: last_report_at fresh, health fresh,
+// v2_agent_instance_status frozen).
+func TestReportFollowsAckSeqOutOfADuplicateStall(t *testing.T) {
+	h := newHarness(t, hopts{pull: 10 * time.Second, report: 40 * time.Second})
+	both := instJSON("fwd-5", "gost", "") + "," + instJSON("fwd-6-in", "gost", "")
+	h.panel.setConfig(func(n int, req ConfigRequest) (int, string) {
+		if n == 1 {
+			return 200, desiredBody(14, "sha256:aa", both, "")
+		}
+		return 200, unchangedBody(14, "")
+	})
+
+	var (
+		mu       sync.Mutex
+		lastSeq  = uint64(100) // accepted by the previous agent run
+		accepted []uint64
+		stored   [][]string
+	)
+	h.panel.setReport(func(n int, req ReportRequest) (int, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		duplicate := req.Seq <= lastSeq && lastSeq > 0
+		if !duplicate {
+			lastSeq = req.Seq
+			accepted = append(accepted, req.Seq)
+			ids := make([]string, 0, len(req.Instances))
+			for _, in := range req.Instances {
+				ids = append(ids, in.ID)
+			}
+			stored = append(stored, ids)
+		}
+		return 200, fmt.Sprintf(`{"ok":true,"ack_seq":%d}`, lastSeq)
+	})
+	h.panel.waitCount("ack", 1)
+
+	// First report of the run: seq 1, dropped by the panel as a duplicate of
+	// the previous run, but it answers with the seq it holds.
+	h.clock.fire(t, 40*time.Second)
+	h.panel.waitCount("report", 1)
+
+	// The runner followed ack_seq, so the next report is accepted and its
+	// instances reach the panel.
+	h.clock.fire(t, 40*time.Second)
+	h.panel.waitCount("report", 2)
+
+	var second ReportRequest
+	if err := json.Unmarshal(h.panel.bodies("report")[1], &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Seq != 101 {
+		t.Fatalf("second report seq = %d, want 101 (ack_seq 100 + 1)", second.Seq)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(accepted) != 1 || accepted[0] != 101 {
+		t.Fatalf("accepted seqs = %v, want [101]", accepted)
+	}
+	if len(stored) != 1 || len(stored[0]) != 2 {
+		t.Fatalf("stored instances = %v, want both of fwd-5 and fwd-6-in", stored)
+	}
+}

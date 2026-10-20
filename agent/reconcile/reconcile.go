@@ -323,6 +323,17 @@ func (r *Reconciler) apply(ctx context.Context, d spec.Desired) (Report, error) 
 	if cur := r.currentApplied(); cur != nil && cur.hash == hash {
 		out := cur.report.clone()
 		out.Revision, out.At, out.Message = d.Revision, rep.At, "unchanged: this desired state is already applied"
+		// The content is identical by definition, so the running plan is the
+		// same one under a new revision. Publishing it keeps Health() and
+		// Stats() on the revision the panel last applied instead of the one
+		// before it: a panel that re-publishes identical content under a new
+		// revision must not leave health.revision behind forever.
+		upd := *cur
+		upd.desired = d
+		upd.report = out.clone()
+		r.snapMu.Lock()
+		r.cur = &upd
+		r.snapMu.Unlock()
 		return out, nil
 	}
 	// Same content as what already failed: do not hammer the machine.
