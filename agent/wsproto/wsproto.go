@@ -53,11 +53,15 @@ const (
 	// alive, alivelist, status) can travel as node.req frames on this socket.
 	// Whether the panel takes them is hello.ok.node_relay.enabled.
 	CapNodeRelay = "node_relay"
+	// CapPrismNodes promises the panel that this agent runs the nodes of the
+	// Prism kernel itself (handoff 69): the panel then keeps them out of the
+	// node inventory the xray kernel serves.
+	CapPrismNodes = "prism_nodes"
 )
 
 // CapabilitiesAll is the closed set a hello.capabilities may contain. The
 // panel must not gate a feature on anything outside this list.
-var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapAudit, CapTelemetry, CapNodeRelay}
+var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapAudit, CapTelemetry, CapNodeRelay, CapPrismNodes}
 
 // Audit bounds. MaxAuditItems is both the largest batch a single audit.log
 // frame may carry and the largest max a page request may ask the kernel for;

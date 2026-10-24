@@ -28,6 +28,8 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/fwopen"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
+	"github.com/W1nCwC/W1nCray/agent/prismnode"
+	"github.com/W1nCwC/W1nCray/agent/prismsvc"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/selfupdate"
 	"github.com/W1nCwC/W1nCray/agent/selinux"
@@ -170,6 +172,15 @@ type Runtime struct {
 	// XrayManager manages the Xray kernel service (nil when it is unavailable
 	// on this machine).
 	XrayManager *xraysvc.Manager
+	// Prism drives the second kernel (handoff 69) and PrismManager its service;
+	// both are nil until the panel link starts and when the machine cannot run
+	// Prism nodes. prismOn is true while the controller runs: the capability
+	// prism_nodes is declared from it.
+	Prism        *prismnode.Controller
+	PrismManager *prismsvc.Manager
+	prismOn      atomic.Bool
+	// stateDir is the agent state directory (Options.StateDir).
+	stateDir string
 	// Audit is the client of the kernel's access-log collector (/audit and
 	// /audit/ctl, W1NCRAY-D2). It is nil when this machine has no Xray kernel
 	// configuration at all; the WebSocket channel then declares no audit
@@ -287,6 +298,7 @@ func Boot(opts Options) (*Runtime, error) {
 		Xray:        opts.Xray,
 		XrayManager: xrayMgr,
 		xrayNeeded:  opts.XrayNeeded,
+		stateDir:    opts.StateDir,
 	}
 	// The access-log collector client (W1NCRAY-D2) needs the kernel's local
 	// endpoint and, for the support bit, the kernel's status document. Both

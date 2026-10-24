@@ -42,6 +42,19 @@ func TestAgentDoesNotLinkACME(t *testing.T) {
 	}
 }
 
+// TestAgentDoesNotLinkTheUpstreamProxyCore is the handoff 69 guard: the Prism
+// kernel is a separate GPL-3.0 program and the (MPL-2.0) agent only talks to it
+// over its local control socket. A dependency on the upstream proxy core or on
+// any of its sibling libraries would turn the agent into a derivative work.
+func TestAgentDoesNotLinkTheUpstreamProxyCore(t *testing.T) {
+	deps := goListDeps(t, ".")
+	for _, d := range deps {
+		if strings.HasPrefix(d, "github.com/sagernet/") {
+			t.Errorf("the agent main package depends on %s", d)
+		}
+	}
+}
+
 // goListDeps returns the transitive dependencies of pkg, one per line.
 func goListDeps(t *testing.T, pkg string) []string {
 	t.Helper()

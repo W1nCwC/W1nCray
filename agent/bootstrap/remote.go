@@ -386,7 +386,7 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		// machine without the kernel, which degrades to the kernel's poll).
 		agentOpts.Nodes = o.WSNodes
 		if agentOpts.Nodes == nil {
-			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), xray: r.Xray, log: log}
+			agentOpts.Nodes = xrayNodeHint{enabled: o.AgentConfig.XrayNodesEnabled(), xray: r.Xray, log: log, rt: r}
 		}
 		// The access-log stream (W1NCRAY-D2) is wired only when this machine
 		// has a kernel to read it from; a nil source is what keeps the audit
@@ -490,6 +490,10 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 		go startup.WatchStalled(runCtx, r.selfUpdateStalledReporter(version))
 	}
 
+	// The Prism controller starts before the socket does, so the hello already
+	// declares prism_nodes when this machine runs Prism nodes.
+	stopPrism := r.startPrism(runCtx, o, log)
+
 	runnerDone := make(chan struct{})
 	go func() {
 		defer close(runnerDone)
@@ -522,6 +526,7 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 				r.nodeRelay.Store(false)
 				relay.Close()
 			}
+			stopPrism()
 			cancelHTTP()
 			<-runnerDone
 			cancelRun()

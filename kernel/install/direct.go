@@ -64,6 +64,9 @@ func DefaultKernelRun(name string) manifest.Run {
 		return manifest.Run{Binary: "frpc", VersionCmd: []string{"-v"}}
 	case "xray":
 		return manifest.Run{Binary: "xray", VersionCmd: []string{"version"}}
+	case "prism":
+		// The second kernel (handoff 69): "W1nCray-prism v0.1.0 (core 1.14.3, api 1)".
+		return manifest.Run{Binary: "W1nCray-prism", VersionCmd: []string{"version"}, VersionRegex: `W1nCray-prism v?([0-9][0-9.]*)`}
 	}
 	return manifest.Run{}
 }

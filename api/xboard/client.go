@@ -44,6 +44,8 @@ const (
 	machineNodesPath = "/api/v2/server/machine/agent/nodes"
 	// machineRuntimePath is the machine's runtime profile (handoff 44).
 	machineRuntimePath = "/api/v2/server/machine/agent/runtime"
+	// machinePrismPath is the document of the machine's Prism kernel (handoff 69).
+	machinePrismPath = "/api/v2/server/machine/agent/prism"
 
 	// RuntimeHeader tells the panel that this kernel applies the runtime
 	// profile, so the panel folds the profile into the node-list version.
@@ -566,6 +568,65 @@ func (c *Client) GetMachineRuntime(ctx context.Context) (*Runtime, error) {
 		return nil, errors.New("decode runtime: missing version")
 	}
 	return &rt, nil
+}
+
+// ErrNoPrismNodes means the panel answered 204: no node of this machine runs on
+// the Prism kernel.
+var ErrNoPrismNodes = errors.New("no node of this machine runs on the Prism kernel")
+
+// Prism is the document of the machine's Prism kernel: the nodes it serves (the
+// kernel inbound tag of each) and the configuration, which the agent hands to
+// the kernel unchanged.
+type Prism struct {
+	Version string          `json:"version"`
+	Nodes   []PrismNode     `json:"nodes"`
+	Config  json.RawMessage `json:"config"`
+}
+
+// PrismNode is one node served by the Prism kernel.
+type PrismNode struct {
+	ID   int    `json:"id"`
+	Type string `json:"type"`
+	Tag  string `json:"tag"`
+}
+
+// GetMachinePrism fetches the Prism document. etag is the version of the
+// document the caller already has: an unchanged one comes back as
+// ErrNotModified. ErrNoPrismNodes is the 204; a panel that predates the
+// endpoint (404) is also reported as ErrNoPrismNodes, so an old panel simply
+// never starts the kernel.
+func (c *Client) GetMachinePrism(ctx context.Context, etag string) (*Prism, error) {
+	tag := ""
+	if etag != "" {
+		tag = `"` + etag + `"`
+	}
+	resp, err := c.do(ctx, http.MethodGet, machinePrismPath, nil, tag)
+	if err != nil {
+		var se *StatusError
+		if errors.As(err, &se) && se.Code == http.StatusNotFound {
+			return nil, ErrNoPrismNodes
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil, ErrNoPrismNodes
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRuntimeBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read prism document: %s", c.redactString(err.Error()))
+	}
+	if len(body) > maxRuntimeBytes {
+		return nil, fmt.Errorf("prism document larger than %d bytes", maxRuntimeBytes)
+	}
+	var p Prism
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("decode prism document: %s", c.redactString(err.Error()))
+	}
+	if p.Version == "" || len(p.Config) == 0 {
+		return nil, errors.New("decode prism document: missing version or config")
+	}
+	return &p, nil
 }
 
 func (c *Client) post(ctx context.Context, name string, body any) error {

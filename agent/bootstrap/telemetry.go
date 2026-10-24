@@ -113,6 +113,11 @@ func (s runtimeStreams) Capabilities() []string {
 	if s.rt != nil && s.rt.nodeRelay.Load() {
 		caps = append(caps, wsproto.CapNodeRelay)
 	}
+	// prism_nodes: the Prism controller runs, so the nodes the panel resolves
+	// to that kernel are served here and not by the xray kernel (handoff 69).
+	if s.rt != nil && s.rt.prismOn.Load() {
+		caps = append(caps, wsproto.CapPrismNodes)
+	}
 	return caps
 }
 
@@ -298,6 +303,8 @@ type xrayNodeHint struct {
 	enabled bool
 	xray    xrayapi.Service
 	log     driver.Logger
+	// rt lets the hint reach the Prism controller too (nil in tests).
+	rt *Runtime
 }
 
 func (h xrayNodeHint) SyncXrayNodes(ctx context.Context) error {
@@ -305,6 +312,8 @@ func (h xrayNodeHint) SyncXrayNodes(ctx context.Context) error {
 		h.log.Warnf("bootstrap: xray nodes hint refused: Modules.XrayNodes is false on this machine")
 		return errXrayNodesDisabled
 	}
+	// The same hint makes the Prism controller re-fetch its document.
+	h.rt.hintPrism()
 	if h.xray == nil {
 		h.log.Warnf("bootstrap: xray nodes hint: the Xray kernel is not installed; falling back to its 60s machine-node poll")
 		return nil
@@ -388,7 +397,19 @@ func (p runtimeProbe) SupervisedProcesses() []telemetry.SupervisedProcess {
 // removed while the agent runs, so the WebSocket audit loop needs no probe
 // schedule of its own beyond the bounded one it runs at start-up.
 func (p runtimeProbe) ServiceComponents() []wsproto.Component {
-	if p.rt == nil || p.rt.XrayManager == nil {
+	if p.rt == nil {
+		return nil
+	}
+	comps := p.xrayComponents()
+	if pc := p.rt.prismComponent(); pc != nil {
+		comps = append(comps, *pc)
+	}
+	return comps
+}
+
+// xrayComponents is the Xray kernel's entry of ServiceComponents.
+func (p runtimeProbe) xrayComponents() []wsproto.Component {
+	if p.rt.XrayManager == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
