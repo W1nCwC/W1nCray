@@ -249,7 +249,9 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("prismapi: bad answer: %w", err)
+		// The kernel answered, so it is reachable: IsUnavailable must not say
+		// otherwise.
+		return &Error{Code: resp.StatusCode, Kind: "bad_answer", Message: err.Error()}
 	}
 	return nil
 }
