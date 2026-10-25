@@ -57,11 +57,15 @@ const (
 	// Prism kernel itself (handoff 69): the panel then keeps them out of the
 	// node inventory the xray kernel serves.
 	CapPrismNodes = "prism_nodes"
+	// CapPortHop promises the panel that this agent can install the local
+	// firewall redirect of Hysteria port hopping (nftables or iptables was
+	// probed usable and the local switch Firewall.PortHop is on).
+	CapPortHop = "port_hop"
 )
 
 // CapabilitiesAll is the closed set a hello.capabilities may contain. The
 // panel must not gate a feature on anything outside this list.
-var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapAudit, CapTelemetry, CapNodeRelay, CapPrismNodes}
+var CapabilitiesAll = []string{CapTerminal, CapFiles, CapKernel, CapUpgrade, CapXrayNodes, CapAudit, CapTelemetry, CapNodeRelay, CapPrismNodes, CapPortHop}
 
 // Audit bounds. MaxAuditItems is both the largest batch a single audit.log
 // frame may carry and the largest max a page request may ask the kernel for;
@@ -348,7 +352,7 @@ const (
 
 type Component struct {
 	Name      string              `json:"name"` // agent | xray | gost | realm | frp
-	Kind      string              `json:"kind"` // agent | kernel
+	Kind      string              `json:"kind"` // agent | kernel | firewall
 	Version   string              `json:"version,omitempty"`
 	State     string              `json:"state"`
 	PID       int                 `json:"pid,omitempty"`

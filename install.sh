@@ -45,6 +45,8 @@ XRAYR_DIR="${XRAYR_DIR:-$ROOT/etc/XrayR}"
 XRAYR_UNIT="XrayR"
 # The Xray kernel's fixed service name (agent/xraysvc.ServiceName).
 XRAY_UNIT="W1nCray-xray"
+# The Prism kernel's fixed service name (agent/prismsvc.ServiceName).
+PRISM_UNIT="W1nCray-prism"
 GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 DEFAULT_PREFIX="$ROOT/usr/local/W1nCray"
 # Seconds to watch a service after start / switch (tests shorten them).
@@ -1758,6 +1760,37 @@ cmd_uninstall() {
 				svc remove "$XRAY_UNIT" || true
 			fi
 		fi
+	fi
+	# The Prism kernel is a service of its own too (systemd / OpenRC): its
+	# command stops it, takes it out of the boot sequence and deletes the unit
+	# or init script (kernel files stay). When it cannot run, fall back to the
+	# backend. A machine whose Prism kernel runs under the agent has no such
+	# service; the shell calls below are then harmless no-ops.
+	if [ -x "$BIN" ]; then
+		if ! "$BIN" -c "$CONF" prism remove; then
+			yellow "W1nCray prism remove 未能完成，按当前服务后端清理 $PRISM_UNIT"
+			if [ "$BACKEND" != none ]; then
+				svc stop "$PRISM_UNIT" >/dev/null 2>&1 || true
+				svc disable "$PRISM_UNIT" >/dev/null 2>&1 || true
+				svc remove "$PRISM_UNIT" || true
+			fi
+		fi
+	fi
+	# Hysteria port hopping leaves a firewall redirect that outlives the agent
+	# process (own nft tables / own iptables chain, nothing else): remove it.
+	# The command also forgets the recorded state; when it cannot run, delete
+	# the objects by name. Every step may fail (nothing installed, tool missing).
+	if [ -x "$BIN" ] && "$BIN" -c "$CONF" porthop clear; then
+		:
+	else
+		yellow "W1nCray porthop clear 未能完成，直接删除端口跳跃防火墙规则"
+		nft delete table ip w1ncray_porthop >/dev/null 2>&1 || true
+		nft delete table ip6 w1ncray_porthop >/dev/null 2>&1 || true
+		for _ipt in iptables ip6tables; do
+			"$_ipt" -t nat -D PREROUTING -j W1NCRAY-PORTHOP >/dev/null 2>&1 || true
+			"$_ipt" -t nat -F W1NCRAY-PORTHOP >/dev/null 2>&1 || true
+			"$_ipt" -t nat -X W1NCRAY-PORTHOP >/dev/null 2>&1 || true
+		done
 	fi
 	rm -f "$BIN" "$BIN.pre-v11" "$BIN_DIR/install.sh" "$MGR"
 	rmdir "$BIN_DIR" 2>/dev/null || true

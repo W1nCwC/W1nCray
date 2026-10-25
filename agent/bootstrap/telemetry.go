@@ -17,6 +17,7 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/driver"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
 	"github.com/W1nCwC/W1nCray/agent/panelclient"
+	"github.com/W1nCwC/W1nCray/agent/prismapi"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
 	"github.com/W1nCwC/W1nCray/agent/spec"
 	"github.com/W1nCwC/W1nCray/agent/telemetry"
@@ -117,6 +118,11 @@ func (s runtimeStreams) Capabilities() []string {
 	// to that kernel are served here and not by the xray kernel (handoff 69).
 	if s.rt != nil && s.rt.prismOn.Load() {
 		caps = append(caps, wsproto.CapPrismNodes)
+	}
+	// port_hop: a firewall backend was probed usable and the local switch is
+	// on, so the redirect for Hysteria port ranges can really be installed.
+	if s.rt != nil && s.rt.portHopOn.Load() {
+		caps = append(caps, wsproto.CapPortHop)
 	}
 	return caps
 }
@@ -312,8 +318,10 @@ func (h xrayNodeHint) SyncXrayNodes(ctx context.Context) error {
 		h.log.Warnf("bootstrap: xray nodes hint refused: Modules.XrayNodes is false on this machine")
 		return errXrayNodesDisabled
 	}
-	// The same hint makes the Prism controller re-fetch its document.
+	// The same hint makes the Prism controller re-fetch its document, and the
+	// port-hop controller its rules.
 	h.rt.hintPrism()
+	h.rt.hintPortHop()
 	if h.xray == nil {
 		h.log.Warnf("bootstrap: xray nodes hint: the Xray kernel is not installed; falling back to its 60s machine-node poll")
 		return nil
@@ -403,6 +411,9 @@ func (p runtimeProbe) ServiceComponents() []wsproto.Component {
 	comps := p.xrayComponents()
 	if pc := p.rt.prismComponent(); pc != nil {
 		comps = append(comps, *pc)
+	}
+	if hc := p.rt.portHopComponent(); hc != nil {
+		comps = append(comps, *hc)
 	}
 	return comps
 }
@@ -556,6 +567,14 @@ func (r *Runtime) KernelEntries() ([]wsproto.KernelEntry, error) {
 				entry.Service = &wsproto.KernelService{Backend: st.Backend, State: st.State, ManagedBy: st.ManagedBy}
 			}
 			cancel()
+		}
+		if e.Name == prismapi.KernelName && r.PrismManager != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			st := r.PrismManager.Status(ctx)
+			cancel()
+			if st.Backend != "" {
+				entry.Service = &wsproto.KernelService{Backend: st.Backend, State: st.State, ManagedBy: st.ManagedBy}
+			}
 		}
 		if !e.InstalledAt.IsZero() {
 			entry.InstalledAt = e.InstalledAt.Unix()

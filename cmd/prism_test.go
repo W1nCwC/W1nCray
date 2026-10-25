@@ -51,3 +51,30 @@ func TestPrismInstallNeedsBothFlags(t *testing.T) {
 		t.Fatal("--file without --sha256 must fail before touching any configuration")
 	}
 }
+
+type fakePrismRemover struct {
+	backend string
+	removed int
+	err     error
+}
+
+func (f *fakePrismRemover) Backend() string              { return f.backend }
+func (f *fakePrismRemover) Remove(context.Context) error { f.removed++; return f.err }
+
+func TestPrismRemoveCallsTheManagerOnASupportedMachine(t *testing.T) {
+	f := &fakePrismRemover{backend: "openrc"}
+	if err := prismRemove(context.Background(), f); err != nil || f.removed != 1 {
+		t.Fatalf("err = %v removed = %d", err, f.removed)
+	}
+}
+
+func TestPrismRemoveDoesNothingWithoutABackendAndReportsFailures(t *testing.T) {
+	f := &fakePrismRemover{}
+	if err := prismRemove(context.Background(), f); err != nil || f.removed != 0 {
+		t.Fatalf("err = %v removed = %d", err, f.removed)
+	}
+	f = &fakePrismRemover{backend: "systemd", err: errors.New("boom")}
+	if err := prismRemove(context.Background(), f); err == nil {
+		t.Fatal("a failed removal must be an error")
+	}
+}

@@ -64,6 +64,11 @@ func (r *Runtime) startPrism(ctx context.Context, o RemoteOptions, log driver.Lo
 	}
 	if r.Sup != nil { // a nil *Supervisor must not become a non-nil interface
 		popts.Sup = r.Sup
+		sup := r.Sup
+		popts.RecoverOrphan = func(ctx context.Context, id string) error {
+			_, err := sup.RecoverOrphan(ctx, id)
+			return err
+		}
 	}
 	mgr, err := prismsvc.New(popts)
 	if err != nil {
@@ -71,7 +76,7 @@ func (r *Runtime) startPrism(ctx context.Context, o RemoteOptions, log driver.Lo
 		return func() {}
 	}
 	if mgr.Backend() == "" {
-		log.Infof("bootstrap: Prism nodes are not supported on this machine's init system; the capability is not declared")
+		log.Infof("bootstrap: Prism nodes are not supported on this machine's init system (procd without the agent supervisor); the capability is not declared")
 		return func() {}
 	}
 	ctrl, err := prismnode.New(prismnode.Options{

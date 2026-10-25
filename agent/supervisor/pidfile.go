@@ -125,45 +125,72 @@ func (s *Supervisor) RecoverOrphans(ctx context.Context) ([]Orphan, error) {
 
 	var out []Orphan
 	for _, n := range names {
-		path := filepath.Join(dir, n)
-		b, err := os.ReadFile(path)
-		if err != nil {
-			continue
+		if o, ok := s.recoverRecord(ctx, filepath.Join(dir, n)); ok {
+			out = append(out, o)
 		}
-		var rec pidRecord
-		if err := json.Unmarshal(b, &rec); err != nil || rec.PID <= 1 {
-			_ = os.Remove(path)
-			out = append(out, Orphan{ID: rec.ID, PID: rec.PID, Action: "stale"})
-			continue
-		}
-		s.mu.Lock()
-		_, managed := s.procs[rec.ID]
-		s.mu.Unlock()
-		if managed {
-			continue
-		}
-		o := Orphan{ID: rec.ID, PID: rec.PID}
-		switch {
-		case rec.PID == os.Getpid() || !pidAlive(rec.PID):
-			o.Action = "stale"
-		default:
-			exe, ok := procExe(rec.PID)
-			switch {
-			case !ok:
-				o.Action = "unverified"
-				s.log.Warnf("supervisor: %s: pid %d from a previous run is alive but its identity cannot be verified here; leaving it alone", rec.ID, rec.PID)
-			case exe != filepath.Clean(rec.Exe) && exe != filepath.Clean(rec.Path):
-				o.Action = "reused"
-			default:
-				s.log.Warnf("supervisor: terminating orphan %s (pid %d) left by a previous run", rec.ID, rec.PID)
-				terminatePID(ctx, rec.PID, DefaultStopTimeout)
-				o.Action = "terminated"
-			}
-		}
-		_ = os.Remove(path)
-		out = append(out, o)
 	}
 	return out, nil
+}
+
+// RecoverOrphan applies the RecoverOrphans rules to the single record of id
+// (<PIDDir>/<id>.pid). It returns nil when there is no record (or no PID
+// directory, or the supervisor manages id itself); otherwise what was done.
+func (s *Supervisor) RecoverOrphan(ctx context.Context, id string) (*Orphan, error) {
+	if s.opts.PIDDir == "" {
+		return nil, nil
+	}
+	path := s.pidPath(id)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("supervisor: %w", err)
+	}
+	o, ok := s.recoverRecord(ctx, path)
+	if !ok {
+		return nil, nil
+	}
+	return &o, nil
+}
+
+// recoverRecord handles one pid record file. ok is false when the record was
+// unreadable or belongs to a process this supervisor manages (left in place).
+func (s *Supervisor) recoverRecord(ctx context.Context, path string) (Orphan, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Orphan{}, false
+	}
+	var rec pidRecord
+	if err := json.Unmarshal(b, &rec); err != nil || rec.PID <= 1 {
+		_ = os.Remove(path)
+		return Orphan{ID: rec.ID, PID: rec.PID, Action: "stale"}, true
+	}
+	s.mu.Lock()
+	_, managed := s.procs[rec.ID]
+	s.mu.Unlock()
+	if managed {
+		return Orphan{}, false
+	}
+	o := Orphan{ID: rec.ID, PID: rec.PID}
+	switch {
+	case rec.PID == os.Getpid() || !pidAlive(rec.PID):
+		o.Action = "stale"
+	default:
+		exe, ok := procExe(rec.PID)
+		switch {
+		case !ok:
+			o.Action = "unverified"
+			s.log.Warnf("supervisor: %s: pid %d from a previous run is alive but its identity cannot be verified here; leaving it alone", rec.ID, rec.PID)
+		case exe != filepath.Clean(rec.Exe) && exe != filepath.Clean(rec.Path):
+			o.Action = "reused"
+		default:
+			s.log.Warnf("supervisor: terminating orphan %s (pid %d) left by a previous run", rec.ID, rec.PID)
+			terminatePID(ctx, rec.PID, DefaultStopTimeout)
+			o.Action = "terminated"
+		}
+	}
+	_ = os.Remove(path)
+	return o, true
 }
 
 // terminatePID asks the process group of pid to stop, then kills it.

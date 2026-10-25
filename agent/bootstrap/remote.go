@@ -493,6 +493,8 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 	// The Prism controller starts before the socket does, so the hello already
 	// declares prism_nodes when this machine runs Prism nodes.
 	stopPrism := r.startPrism(runCtx, o, log)
+	// Port hopping likewise: the hello must already carry port_hop.
+	stopPortHop := r.startPortHop(runCtx, o, log)
 
 	runnerDone := make(chan struct{})
 	go func() {
@@ -527,6 +529,8 @@ func (r *Runtime) StartRemote(ctx context.Context, o RemoteOptions) (stop func()
 				relay.Close()
 			}
 			stopPrism()
+			// Stops the poll only; the installed redirect stays.
+			stopPortHop()
 			cancelHTTP()
 			<-runnerDone
 			cancelRun()

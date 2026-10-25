@@ -303,6 +303,14 @@ type ModuleConfig struct {
 // firewall, whatever the field says.
 type FirewallConfig struct {
 	AutoOpen *bool `mapstructure:"AutoOpen"`
+	// PortHop is the local switch of Hysteria port hopping (a DNAT from the
+	// range the panel hands out to the node's real port). nil (not written)
+	// means ON; false makes the agent clear its rules at start and never
+	// declare the port_hop capability. The panel cannot change it.
+	PortHop *bool `mapstructure:"PortHop"`
+	// PortHopBackend selects the firewall tool: auto (nft first, then
+	// iptables; also the empty value), nft or iptables.
+	PortHopBackend string `mapstructure:"PortHopBackend"`
 }
 
 // KernelsConfig is the local kernel-source policy (D-M1). AllowHTTP permits
@@ -449,6 +457,30 @@ func (c *Config) FirewallAutoOpen(openWrt bool) bool {
 		return true
 	}
 	return *c.Firewall.AutoOpen
+}
+
+// PortHopEnabled returns the effective Firewall.PortHop: on unless the local
+// configuration says false.
+func (c *Config) PortHopEnabled() bool {
+	if c == nil || c.Firewall == nil || c.Firewall.PortHop == nil {
+		return true
+	}
+	return *c.Firewall.PortHop
+}
+
+// PortHopBackendName returns the effective Firewall.PortHopBackend: "auto",
+// "nft" or "iptables" (the empty value is "auto").
+func (c *Config) PortHopBackendName() string {
+	if c == nil || c.Firewall == nil {
+		return "auto"
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Firewall.PortHopBackend)) {
+	case "nft":
+		return "nft"
+	case "iptables":
+		return "iptables"
+	}
+	return "auto"
 }
 
 // Load reads an agent.yml. A missing file returns (nil, nil): the caller then
@@ -685,6 +717,13 @@ func (c *Config) Validate() error {
 	}
 	if c.SelfUpdate != nil && (c.SelfUpdate.AliveWindowSec < 0 || c.SelfUpdate.DeadlineSec < 0) {
 		return fmt.Errorf("config: Agent.SelfUpdate.AliveWindowSec and DeadlineSec must not be negative")
+	}
+	if c.Firewall != nil {
+		switch strings.ToLower(strings.TrimSpace(c.Firewall.PortHopBackend)) {
+		case "", "auto", "nft", "iptables":
+		default:
+			return fmt.Errorf("config: Agent.Firewall.PortHopBackend must be auto, nft or iptables, got %q", c.Firewall.PortHopBackend)
+		}
 	}
 	if !c.Enabled {
 		if c.Panel != nil && (c.Panel.Enabled || c.Panel.MachineNodes) {

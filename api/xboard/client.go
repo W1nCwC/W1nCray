@@ -46,6 +46,8 @@ const (
 	machineRuntimePath = "/api/v2/server/machine/agent/runtime"
 	// machinePrismPath is the document of the machine's Prism kernel (handoff 69).
 	machinePrismPath = "/api/v2/server/machine/agent/prism"
+	// machinePortHopPath is the machine's Hysteria port-hop rule set.
+	machinePortHopPath = "/api/v2/server/machine/agent/porthop"
 
 	// RuntimeHeader tells the panel that this kernel applies the runtime
 	// profile, so the panel folds the profile into the node-list version.
@@ -625,6 +627,61 @@ func (c *Client) GetMachinePrism(ctx context.Context, etag string) (*Prism, erro
 	}
 	if p.Version == "" || len(p.Config) == 0 {
 		return nil, errors.New("decode prism document: missing version or config")
+	}
+	return &p, nil
+}
+
+// PortHop is the machine's port-hop rule set (GET .../agent/porthop). The
+// shape mirrors the panel contract; the agent converts it for its firewall
+// manager, so this package does not depend on agent/porthop.
+type PortHop struct {
+	Version string        `json:"version"`
+	Rules   []PortHopRule `json:"rules"`
+}
+
+// PortHopRule redirects the UDP (or TCP) port range Ports to the port To for
+// the node NodeID.
+type PortHopRule struct {
+	NodeID int    `json:"node_id"`
+	Proto  string `json:"proto"`
+	Ports  string `json:"ports"`
+	To     int    `json:"to"`
+}
+
+// maxPortHopBytes bounds the port-hop body; a rule is under 100 bytes.
+const maxPortHopBytes = 1 << 20
+
+// GetMachinePortHop fetches the port-hop rules. etag is the version the caller
+// already holds: an unchanged set comes back as ErrNotModified. A panel that
+// predates the endpoint (404) is reported as an empty rule set with an empty
+// version, so the agent removes what it installed earlier.
+func (c *Client) GetMachinePortHop(ctx context.Context, etag string) (*PortHop, error) {
+	tag := ""
+	if etag != "" {
+		tag = `"` + etag + `"`
+	}
+	resp, err := c.do(ctx, http.MethodGet, machinePortHopPath, nil, tag)
+	if err != nil {
+		var se *StatusError
+		if errors.As(err, &se) && se.Code == http.StatusNotFound {
+			return &PortHop{Rules: []PortHopRule{}}, nil
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPortHopBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read port-hop rules: %s", c.redactString(err.Error()))
+	}
+	if len(body) > maxPortHopBytes {
+		return nil, fmt.Errorf("port-hop rules larger than %d bytes", maxPortHopBytes)
+	}
+	var p PortHop
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("decode port-hop rules: %s", c.redactString(err.Error()))
+	}
+	if p.Version == "" {
+		return nil, errors.New("decode port-hop rules: missing version")
 	}
 	return &p, nil
 }

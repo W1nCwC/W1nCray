@@ -110,6 +110,25 @@ func (m *Manager) ensureSystemd(ctx context.Context, cur driver.Installed) error
 	return m.waitHealthy(ctx)
 }
 
+// removeSystemd stops and disables the service and deletes its unit file. It
+// never renders the unit.
+func (m *Manager) removeSystemd(ctx context.Context) error {
+	if !exists(m.o.Root, systemdUnitPath) {
+		return nil
+	}
+	if err := m.systemctl(ctx, "stop", ServiceName); err != nil {
+		return err
+	}
+	if err := m.systemctl(ctx, "disable", ServiceName); err != nil {
+		return err
+	}
+	if err := os.Remove(resolve(m.o.Root, systemdUnitPath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	return m.systemctl(ctx, "daemon-reload")
+}
+
 func (m *Manager) isActive(ctx context.Context) bool {
 	out, _ := m.o.Runner.Run(ctx, "systemctl", "is-active", ServiceName)
 	switch strings.TrimSpace(string(out)) {

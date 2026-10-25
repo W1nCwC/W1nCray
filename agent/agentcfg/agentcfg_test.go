@@ -732,6 +732,50 @@ func TestFirewallAutoOpenDefaults(t *testing.T) {
 	}
 }
 
+// TestFirewallPortHopSwitchAndBackend pins the local port-hop switch: on unless
+// written false, and a backend that is auto, nft or iptables (anything else is
+// refused at validation).
+func TestFirewallPortHopSwitchAndBackend(t *testing.T) {
+	on, off := true, false
+	var nilCfg *Config
+	for _, c := range []struct {
+		name    string
+		cfg     *Config
+		enabled bool
+		backend string
+	}{
+		{"nil config", nilCfg, true, "auto"},
+		{"not written", &Config{}, true, "auto"},
+		{"firewall without the keys", &Config{Firewall: &FirewallConfig{}}, true, "auto"},
+		{"explicit on", &Config{Firewall: &FirewallConfig{PortHop: &on}}, true, "auto"},
+		{"explicit off", &Config{Firewall: &FirewallConfig{PortHop: &off}}, false, "auto"},
+		{"nft", &Config{Firewall: &FirewallConfig{PortHopBackend: "nft"}}, true, "nft"},
+		{"iptables upper case", &Config{Firewall: &FirewallConfig{PortHopBackend: " IPTables "}}, true, "iptables"},
+	} {
+		if got := c.cfg.PortHopEnabled(); got != c.enabled {
+			t.Errorf("%s: PortHopEnabled = %v, want %v", c.name, got, c.enabled)
+		}
+		if got := c.cfg.PortHopBackendName(); got != c.backend {
+			t.Errorf("%s: PortHopBackendName = %q, want %q", c.name, got, c.backend)
+		}
+	}
+	bad := &Config{Firewall: &FirewallConfig{PortHopBackend: "pf"}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "PortHopBackend") {
+		t.Errorf("Validate(PortHopBackend=pf) = %v", err)
+	}
+	path := writeFile(t, filepath.Join(t.TempDir(), FileName), `Firewall:
+  PortHop: false
+  PortHopBackend: iptables
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PortHopEnabled() || cfg.PortHopBackendName() != "iptables" {
+		t.Errorf("loaded Firewall = %+v", cfg.Firewall)
+	}
+}
+
 // TestSelfUpdateWindowsAreALocalArchitectureAwareOverride pins the D-M7 timing
 // rule: the watchdog windows come from the architecture by default, a local
 // agent.yml value overrides them, and a deadline that is not above the window is

@@ -231,3 +231,45 @@ func TestRecoverOrphansIgnoresReusedPid(t *testing.T) {
 		t.Fatal("an unrelated process was killed because its pid matched a stale record")
 	}
 }
+
+func TestRecoverOrphanHandlesOnlyTheNamedRecord(t *testing.T) {
+	pidDir := t.TempDir()
+	crashed := New(Options{PIDDir: pidDir}) // stands for the previous agent run
+	p := helperSpec(t, "prism", "sleep")
+	if err := crashed.Start(bg(), p); err != nil {
+		t.Fatal(err)
+	}
+	other := helperSpec(t, "other", "sleep")
+	if err := crashed.Start(bg(), other); err != nil {
+		t.Fatal(err)
+	}
+	pid, otherPID := crashed.Status("prism").PID, crashed.Status("other").PID
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = syscall.Kill(-otherPID, syscall.SIGKILL)
+	})
+
+	fresh := New(Options{PIDDir: pidDir})
+	if o, err := fresh.RecoverOrphan(bg(), "absent"); o != nil || err != nil {
+		t.Fatalf("no record: %+v %v", o, err)
+	}
+	o, err := fresh.RecoverOrphan(bg(), "prism")
+	if err != nil || o == nil || o.PID != pid || o.ID != "prism" {
+		t.Fatalf("got %+v %v", o, err)
+	}
+	if runtime.GOOS == "linux" {
+		if o.Action != "terminated" {
+			t.Fatalf("action %q", o.Action)
+		}
+		waitDead(t, pid)
+	}
+	if !pidAlive(otherPID) {
+		t.Fatal("RecoverOrphan touched another record's process")
+	}
+	if _, err := os.Stat(filepath.Join(pidDir, "other.pid")); err != nil {
+		t.Fatalf("the other record is gone: %v", err)
+	}
+	if o, err := New(Options{}).RecoverOrphan(bg(), "prism"); o != nil || err != nil {
+		t.Fatalf("without a PID dir: %+v %v", o, err)
+	}
+}

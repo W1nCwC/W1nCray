@@ -25,6 +25,7 @@ type fakeRunner struct {
 	mu     sync.Mutex
 	calls  []string
 	active string // what "systemctl is-active" answers
+	rcUp   bool   // what "rc-service <svc> status" answers (exit 0)
 	fail   map[string]error
 }
 
@@ -37,6 +38,20 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 		if strings.Contains(line, k) {
 			return []byte("boom"), err
 		}
+	}
+	if name == "rc-service" && len(args) == 2 {
+		switch args[1] {
+		case "status":
+			if r.rcUp {
+				return nil, nil
+			}
+			return []byte(" * status: stopped"), errors.New("exit status 3")
+		case "start", "restart":
+			r.rcUp = true
+		case "stop":
+			r.rcUp = false
+		}
+		return nil, nil
 	}
 	if len(args) > 0 && args[0] == "is-active" {
 		return []byte(r.active), nil
@@ -236,21 +251,15 @@ func TestWithoutSystemdTheAgentSupervisorRunsTheKernel(t *testing.T) {
 	}
 }
 
-func TestOpenRCWithoutASupervisorIsUnsupported(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "sbin"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "sbin", "openrc-run"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+func TestRunningOpenRCWithoutASupervisorIsTheOpenRCBackend(t *testing.T) {
+	root := openrcRoot(t)
 	m, err := New(Options{Root: root, Kernels: fakeKernels{inst: driver.Installed{Path: "/k/prism"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := m.Ensure(context.Background()); !errors.Is(err, ErrUnsupportedInit) {
-		t.Fatalf("err = %v", err)
+	if m.Backend() != BackendOpenRC {
+		t.Fatalf("backend = %q", m.Backend())
 	}
 }
 

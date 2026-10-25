@@ -39,9 +39,9 @@ var prismKernelRun = manifest.Run{
 func prismCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "prism",
-		Short: "Manage the local Prism kernel (install --file, status)",
+		Short: "Manage the local Prism kernel (install --file, status, remove)",
 	}
-	c.AddCommand(prismInstallCmd(), prismStatusCmd())
+	c.AddCommand(prismInstallCmd(), prismStatusCmd(), prismRemoveCmd())
 
 	return c
 }
@@ -135,4 +135,54 @@ func prismStatusCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// prismRemover is the service-manager surface `prism remove` needs
+// (*prismsvc.Manager implements it).
+type prismRemover interface {
+	Backend() string
+	Remove(ctx context.Context) error
+}
+
+// noKernels is the kernel lookup of a manager that only removes a service
+// definition: it never needs the installed binary.
+type noKernels struct{}
+
+func (noKernels) Current(string) (driver.Installed, error) {
+	return driver.Installed{}, prismsvc.ErrNotInstalled
+}
+
+func prismRemoveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "remove",
+		Short: "Stop the Prism kernel service and remove its service definition",
+		Long: "Stop the W1nCray-prism service, take it out of the boot sequence and delete its\n" +
+			"unit or init script. The installed kernel file is kept. A machine whose kernel\n" +
+			"runs under the agent (no systemd/OpenRC service) has nothing to remove here.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// No supervisor: only a real service backend can be detected.
+			mgr, err := prismsvc.New(prismsvc.Options{Kernels: noKernels{}})
+			if err != nil {
+				fmt.Println("没有 Prism 服务需要移除（内核由 agent 托管或未安装服务）")
+				return nil
+			}
+
+			return prismRemove(cmd.Context(), mgr)
+		},
+	}
+}
+
+// prismRemove is separate from the command so it can be tested.
+func prismRemove(ctx context.Context, mgr prismRemover) error {
+	if mgr.Backend() == "" {
+		fmt.Println("没有 Prism 服务需要移除（此机器的 init 系统不受支持）")
+		return nil
+	}
+	if err := mgr.Remove(ctx); err != nil {
+		return fmt.Errorf("移除 Prism 服务: %w", err)
+	}
+	fmt.Println("已移除 Prism 服务（内核文件保留）")
+
+	return nil
 }

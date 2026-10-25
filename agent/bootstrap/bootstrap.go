@@ -28,6 +28,8 @@ import (
 	"github.com/W1nCwC/W1nCray/agent/fwopen"
 	"github.com/W1nCwC/W1nCray/agent/kernelx"
 	"github.com/W1nCwC/W1nCray/agent/opscmd"
+	"github.com/W1nCwC/W1nCray/agent/porthop"
+	"github.com/W1nCwC/W1nCray/agent/portledger"
 	"github.com/W1nCwC/W1nCray/agent/prismnode"
 	"github.com/W1nCwC/W1nCray/agent/prismsvc"
 	"github.com/W1nCwC/W1nCray/agent/reconcile"
@@ -179,6 +181,17 @@ type Runtime struct {
 	Prism        *prismnode.Controller
 	PrismManager *prismsvc.Manager
 	prismOn      atomic.Bool
+	// PortHop keeps the Hysteria port-hop firewall redirect in line with the
+	// panel; nil until the panel link starts and when this machine cannot
+	// offer port hopping. portHopOn is true while the controller runs: the
+	// capability port_hop is declared from it.
+	PortHop   *portHopCtl
+	portHopOn atomic.Bool
+	// Test seams of startPortHop; zero in production.
+	portHopExec     porthop.Executor
+	portHopPanel    portHopPanel
+	portHopPlatform func(openWrt bool) bool
+	portHopEvery    time.Duration
 	// stateDir is the agent state directory (Options.StateDir).
 	stateDir string
 	// Audit is the client of the kernel's access-log collector (/audit and
@@ -279,6 +292,9 @@ func Boot(opts Options) (*Runtime, error) {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 	rec := &reconcile.Reconciler{
+		// The ledger is created here (and not lazily by the reconciler) so the
+		// port-hop controller can read the forwards' ports without a race.
+		Ports:    portledger.New(),
 		Drivers:  drivers,
 		Kernels:  kern,
 		Sup:      sup,

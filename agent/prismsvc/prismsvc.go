@@ -5,9 +5,11 @@
 // The kernel binary is installed by the generic kernel installer (the panel's
 // kernel_install command pins the release asset). This package only writes the
 // service definition, starts the service and waits until the kernel's control
-// API answers. It supports systemd and, on a machine without it, the agent's
-// own supervisor (the kernel then stops with the agent). OpenRC and procd are
-// not supported yet; such a machine reports why instead of guessing.
+// API answers. It supports systemd and OpenRC (the kernel is then a service of
+// its own and survives the agent) and, on a machine without a supported
+// service manager, the agent's own supervisor (the kernel then stops with the
+// agent). procd is not supported yet; a procd machine without the supervisor
+// reports why instead of guessing.
 //
 // Every path and every service-file line is generated here from the agent's
 // own configuration. Nothing the panel sends can name a path or a command.
@@ -37,7 +39,14 @@ const BinaryName = "W1nCray-prism"
 // Backends.
 const (
 	BackendSystemd = "systemd"
+	BackendOpenRC  = "openrc"
 	BackendAgent   = "agent"
+)
+
+// ManagedBy values of Status.
+const (
+	ManagedByService = "service"
+	ManagedByAgent   = "agent"
 )
 
 // Service states.
@@ -53,7 +62,7 @@ var ErrNotInstalled = errors.New("prismsvc: the Prism kernel is not installed (i
 
 // ErrUnsupportedInit means the machine runs an init system this package does
 // not drive and no agent supervisor is available.
-var ErrUnsupportedInit = errors.New("prismsvc: this machine's init system (OpenRC / procd) is not supported by the Prism kernel yet")
+var ErrUnsupportedInit = errors.New("prismsvc: this machine's init system (procd) is not supported by the Prism kernel yet")
 
 // Kernels is the kernel installer surface the manager needs
 // (*kernelx.Ensurer implements it).
@@ -82,6 +91,10 @@ type Options struct {
 	HealthTimeout time.Duration
 	// HealthInterval is how often the API is polled meanwhile (default 500 ms).
 	HealthInterval time.Duration
+	// RecoverOrphan ends a leftover kernel process an earlier agent run
+	// started under the supervisor (nil: skipped). The OpenRC backend calls it
+	// once before its first start so two kernels never fight for the socket.
+	RecoverOrphan func(ctx context.Context, id string) error
 	// Backend overrides detection (tests).
 	Backend string
 }
@@ -91,6 +104,10 @@ type Manager struct {
 	o       Options
 	backend string
 	mu      sync.Mutex
+
+	// OpenRC bookkeeping (guarded by mu).
+	enabled  bool // rc-update add succeeded in this process
+	migrated bool // the supervisor's leftover was dealt with
 }
 
 // New builds a Manager and detects the service backend.
@@ -113,7 +130,11 @@ func New(o Options) (*Manager, error) {
 		switch {
 		case exists(o.Root, "run/systemd/system"):
 			be = BackendSystemd
+		case exists(o.Root, "sbin/openrc-run") && exists(o.Root, openrcSoftlevel):
+			be = BackendOpenRC // OpenRC is the running init
 		case exists(o.Root, "sbin/openrc-run"), exists(o.Root, "sbin/procd"):
+			// OpenRC installed but not running as init (a container, say), or
+			// procd: only the agent's supervisor can run the kernel.
 			if o.Sup == nil {
 				m.backend = ""
 				return m, nil // Ensure reports ErrUnsupportedInit
@@ -170,6 +191,8 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	switch m.backend {
 	case BackendSystemd:
 		return m.ensureSystemd(ctx, cur)
+	case BackendOpenRC:
+		return m.ensureOpenRC(ctx, cur)
 	default:
 		return m.ensureAgent(ctx, cur)
 	}
@@ -185,6 +208,28 @@ func (m *Manager) Stop(ctx context.Context) error {
 			return nil
 		}
 		return m.systemctl(ctx, "stop", ServiceName)
+	case BackendOpenRC:
+		if !exists(m.o.Root, openrcScriptPath) {
+			return nil
+		}
+		return m.rcService(ctx, "stop")
+	case BackendAgent:
+		return m.o.Sup.Stop(ctx, agentProcID)
+	}
+	return nil
+}
+
+// Remove stops the service and removes its definition (the unit or init
+// script and the boot-time enablement). The installed kernel file stays. It
+// works for every backend and is safe to repeat.
+func (m *Manager) Remove(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch m.backend {
+	case BackendSystemd:
+		return m.removeSystemd(ctx)
+	case BackendOpenRC:
+		return m.removeOpenRC(ctx)
 	case BackendAgent:
 		return m.o.Sup.Stop(ctx, agentProcID)
 	}
@@ -194,15 +239,24 @@ func (m *Manager) Stop(ctx context.Context) error {
 // Status reports the installed version and the service state.
 type Status struct {
 	Backend string
-	State   string
-	Version string
-	Path    string
-	Error   string
+	// ManagedBy is "service" when the kernel is a service of its own (it
+	// survives the agent) and "agent" when the agent's supervisor runs it.
+	ManagedBy string
+	State     string
+	Version   string
+	Path      string
+	Error     string
 }
 
 // Status reads the service state.
 func (m *Manager) Status(ctx context.Context) Status {
 	st := Status{Backend: m.backend}
+	switch m.backend {
+	case BackendSystemd, BackendOpenRC:
+		st.ManagedBy = ManagedByService
+	case BackendAgent:
+		st.ManagedBy = ManagedByAgent
+	}
 	cur, err := m.o.Kernels.Current(prismapi.KernelName)
 	if err != nil || cur.Path == "" {
 		st.State = StateNotInstalled
@@ -233,6 +287,8 @@ func (m *Manager) Status(ctx context.Context) Status {
 		default:
 			st.State = StateStopped
 		}
+	case BackendOpenRC:
+		st.State = m.openrcState(ctx)
 	case BackendAgent:
 		if m.o.Sup.Status(agentProcID).Running {
 			st.State = StateRunning

@@ -17,6 +17,9 @@
 #                                    OpenWrt; the agent has no separate lite
 #                                    build any more (no DNS providers, no ACME)
 #
+#     w1ncray-v<ver>-linux-<arch>.gz  byte-for-byte copy of the .gz above under
+#                                    the name the panel looks for (12 of them)
+#
 #   Xray kernel (./cmd/w1ncray-xray):
 #     W1nCray-xray-linux-<arch>.gz       full build
 #     W1nCray-xray-linux-<arch>-lite.gz  -tags dnslite,fallbackroots (OpenWrt)
@@ -64,6 +67,12 @@ mod=github.com/W1nCwC/W1nCray
 # The same version goes into both programs: cmd.version for the agent and
 # xraynode.Version for the kernel, which prints it as "W1nCray-xray v..." and
 # therefore takes the version WITHOUT the leading "v" (it would print "vv").
+# Version part of the panel-facing asset name: always one leading "v" (a bare
+# "dev" build keeps "dev").
+case "$version" in
+	v* | dev) asset_ver="$version" ;;
+	*) asset_ver="v$version" ;;
+esac
 agent_ldflags="-s -w -X $mod/cmd.version=$version"
 xray_ldflags="-s -w -X $mod/xraynode.Version=${version#v}"
 
@@ -84,6 +93,10 @@ build_agent() {
 	# Compatibility copy: pre-v11 install.sh versions pick the "-lite" name on
 	# OpenWrt. Same bytes, same SHA256SUMS entry, so the check still passes.
 	cp "$out.gz" "$out-lite.gz"
+	# The panel recognises the agent by this versioned lower-case asset name
+	# (docs/handoff 70 records it once going missing from a release). Same bytes
+	# again, so the SHA256SUMS entry stays valid.
+	cp "$out.gz" "dist/w1ncray-$asset_ver-linux-$name.gz"
 	if [ "$name" = amd64 ] || [ "$name" = arm64 ]; then
 		: # the raw file stays for installers older than v0.3.0
 	else
@@ -296,6 +309,20 @@ env CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /dev/null ./agent/termin
 	echo "build matrix: agent/terminal does not compile for windows/amd64" >&2
 	exit 1
 }
+
+# The panel-facing agent copies must exist, one per built architecture, and be
+# identical to the plain .gz.
+for t in "${targets[@]}"; do
+	IFS=: read -r name goarch extra <<<"$t"
+	if [ ${#want[@]} -gt 0 ] && [[ ! " ${want[*]} " =~ " $name " ]]; then
+		continue
+	fi
+	panel_art="dist/w1ncray-$asset_ver-linux-$name.gz"
+	if ! cmp -s "$panel_art" "dist/W1nCray-linux-$name.gz"; then
+		echo "build matrix: $panel_art is missing or differs from W1nCray-linux-$name.gz" >&2
+		exit 1
+	fi
+done
 
 echo "build matrix: ok (${#targets[@]} linux targets, agent + W1nCray-xray, terminal on $terminal_archs)"
 ls -l dist
