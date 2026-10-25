@@ -239,6 +239,42 @@ func TestOpenRCUnhealthyRunningServiceIsRestarted(t *testing.T) {
 	}
 }
 
+func TestOpenRCBriefUnhealthinessIsLeftToTheSupervisor(t *testing.T) {
+	r := &fakeRunner{rcUp: true}
+	var calls int
+	down := false
+	m, err := New(Options{
+		Root: openrcRoot(t), Kernels: fakeKernels{inst: driver.Installed{Path: "/k/prism", Version: "0.1.0"}}, Runner: r,
+		HealthInterval: time.Millisecond, HealthTimeout: 200 * time.Millisecond,
+		Status: func(context.Context) (prismapi.Status, error) {
+			if !down {
+				return prismapi.Status{State: "running", Version: "0.1.0"}, nil
+			}
+			calls++
+			if calls < 3 { // the supervisor is respawning the kernel
+				return prismapi.Status{}, errors.New("no socket")
+			}
+			return prismapi.Status{State: "running", Version: "0.1.0"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.reset()
+	down = true
+
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if r.has("rc-service W1nCray-prism restart") || r.has("rc-service W1nCray-prism start") {
+		t.Fatalf("a kernel that comes back by itself must not be restarted: %v", r.calls)
+	}
+}
+
 func TestOpenRCRcUpdateIsNotRepeatedEveryPass(t *testing.T) {
 	r := &fakeRunner{}
 	m, _ := newOpenRC(t, r, "/k/prism", "0.1.0", nil)

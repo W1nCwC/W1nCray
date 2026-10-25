@@ -123,6 +123,13 @@ func (m *Manager) ensureOpenRC(ctx context.Context, cur driver.Installed) error 
 	case active && m.healthy(ctx) && !m.versionDiffers(ctx, cur.Version):
 		return nil
 	case active:
+		// supervise-daemon may be respawning the kernel right now (it waits
+		// respawn_delay seconds): give it the health window before a restart,
+		// which would replace the supervisor itself.
+		if m.waitHealthy(ctx) == nil && !m.versionDiffers(ctx, cur.Version) {
+			return nil
+		}
+		m.logf("prismsvc: %s 在运行但不健康，重启", ServiceName)
 		m.recoverOrphan(ctx)
 		if err := m.rcService(ctx, "restart"); err != nil {
 			return err

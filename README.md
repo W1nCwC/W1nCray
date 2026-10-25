@@ -115,7 +115,7 @@ logread -f -e W1nCray            # procd（OpenWRT）
 ```
 
 - systemd：`Restart=always`、`RestartSec=5`，`WorkingDirectory` 为配置目录。
-- OpenRC（Alpine）：`supervise-daemon` 托管，崩溃后每 10 秒重启。
+- OpenRC（Alpine）：`supervise-daemon` 托管，崩溃后每 5 秒重启。
 - procd（OpenWRT）：`respawn 3600 10 0`；内存小于 1 GiB 时自动设置 `GOMEMLIMIT`。路由器内置闪存通常装不下，请把外部存储挂载后用 `--prefix` 安装。配置与服务脚本会写入 `/etc/sysupgrade.conf`，固件升级后配置保留，但程序文件需要重新执行安装命令（`install.sh:876–886,1518–1520`）。
 
 ## 配置
