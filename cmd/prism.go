@@ -158,7 +158,9 @@ func prismRemoveCmd() *cobra.Command {
 		Short: "Stop the Prism kernel service and remove its service definition",
 		Long: "Stop the W1nCray-prism service, take it out of the boot sequence and delete its\n" +
 			"unit or init script. The installed kernel file is kept. A machine whose kernel\n" +
-			"runs under the agent (no systemd/OpenRC service) has nothing to remove here.",
+			"runs under the agent (no systemd/OpenRC/procd service) has nothing to remove here.\n" +
+			"While the machine still has Prism nodes, a running agent creates the service again\n" +
+			"within a minute: disable or unbind the nodes first (or stop the agent).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// No supervisor: only a real service backend can be detected.
@@ -183,6 +185,7 @@ func prismRemove(ctx context.Context, mgr prismRemover) error {
 		return fmt.Errorf("移除 Prism 服务: %w", err)
 	}
 	fmt.Println("已移除 Prism 服务（内核文件保留）")
+	fmt.Println("提示：机器上仍有 Prism 节点时，运行中的 agent 会重新创建该服务；请先停用或解绑节点（或先停止 agent）")
 
 	return nil
 }
