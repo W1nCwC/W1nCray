@@ -25,7 +25,7 @@ type fakeRunner struct {
 	mu     sync.Mutex
 	calls  []string
 	active string // what "systemctl is-active" answers
-	rcUp   bool   // what "rc-service <svc> status" answers (exit 0)
+	rcUp   bool   // what "rc-service <svc> status" / "<script> running" answers (exit 0)
 	fail   map[string]error
 }
 
@@ -46,6 +46,21 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 				return nil, nil
 			}
 			return []byte(" * status: stopped"), errors.New("exit status 3")
+		case "start", "restart":
+			r.rcUp = true
+		case "stop":
+			r.rcUp = false
+		}
+		return nil, nil
+	}
+	if len(args) == 1 && strings.HasSuffix(strings.ReplaceAll(name, "\\", "/"), "/etc/init.d/"+ServiceName) {
+		// the procd init script run by path
+		switch args[0] {
+		case "running":
+			if r.rcUp {
+				return nil, nil
+			}
+			return nil, errors.New("exit status 1")
 		case "start", "restart":
 			r.rcUp = true
 		case "stop":

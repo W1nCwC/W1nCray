@@ -87,57 +87,88 @@ func (m *Manager) openrcState(ctx context.Context) string {
 	return StateStopped
 }
 
+// scriptedInit is what differs between the script-based backends (OpenRC and
+// procd): the script text, how the service is enabled, called and queried.
+type scriptedInit struct {
+	script string
+	path   string                                       // script path relative to the root
+	write  func() error                                 // when enabling (procd: sysupgrade.conf)
+	enable func(ctx context.Context) error              // boot-time enablement
+	state  func(ctx context.Context) string             // StateRunning / StateFailed / StateStopped
+	call   func(ctx context.Context, verb string) error // start / restart
+}
+
 // ensureOpenRC writes the init script, enables it at boot and makes sure the
 // service runs the installed binary. The logic mirrors ensureSystemd.
 func (m *Manager) ensureOpenRC(ctx context.Context, cur driver.Installed) error {
-	path := resolve(m.o.Root, openrcScriptPath)
-	want := openrcScript(cur.Path)
+	return m.ensureScripted(ctx, cur, scriptedInit{
+		script: openrcScript(cur.Path),
+		path:   openrcScriptPath,
+		enable: func(ctx context.Context) error {
+			out, err := m.o.Runner.Run(ctx, "rc-update", "add", ServiceName, "default")
+			if err != nil {
+				return fmt.Errorf("启用 %s 服务: rc-update add %s default: %w: %s", ServiceName, ServiceName, err, oneLine(out))
+			}
+			return nil
+		},
+		state: m.openrcState,
+		call:  func(ctx context.Context, verb string) error { return m.rcService(ctx, verb) },
+	})
+}
+
+// ensureScripted is the shared body of the OpenRC and procd backends.
+func (m *Manager) ensureScripted(ctx context.Context, cur driver.Installed, in scriptedInit) error {
+	path := resolve(m.o.Root, in.path)
 	old, _ := os.ReadFile(path)
-	changed := string(old) != want
+	changed := string(old) != in.script
 	if changed {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		if err := writeAtomic(path, []byte(want), 0o755); err != nil {
+		if err := writeAtomic(path, []byte(in.script), 0o755); err != nil {
 			return err
 		}
 	}
-	// rc-update is not repeated on every pass (the controller calls Ensure
-	// often): only for a new script, or once per process.
+	// The enablement is not repeated on every pass (the controller calls
+	// Ensure often): only for a new script, or once per process.
 	if changed || !m.enabled {
-		out, err := m.o.Runner.Run(ctx, "rc-update", "add", ServiceName, "default")
-		if err != nil {
-			return fmt.Errorf("启用 %s 服务: rc-update add %s default: %w: %s", ServiceName, ServiceName, err, oneLine(out))
+		if in.write != nil {
+			if err := in.write(); err != nil {
+				return err
+			}
+		}
+		if err := in.enable(ctx); err != nil {
+			return err
 		}
 		m.enabled = true
 	}
 
-	active := m.openrcState(ctx) == StateRunning
+	active := in.state(ctx) == StateRunning
 	switch {
 	case changed && active:
 		m.logf("prismsvc: 服务定义已变化，重启 %s", ServiceName)
 		m.recoverOrphan(ctx)
-		if err := m.rcService(ctx, "restart"); err != nil {
+		if err := in.call(ctx, "restart"); err != nil {
 			return err
 		}
 	case active && m.healthy(ctx) && !m.versionDiffers(ctx, cur.Version):
 		return nil
 	case active:
-		// supervise-daemon may be respawning the kernel right now (it waits
-		// respawn_delay seconds): give it the health window before a restart,
-		// which would replace the supervisor itself.
+		// The supervisor may be respawning the kernel right now (it waits
+		// a few seconds): give it the health window before a restart, which
+		// would replace the supervisor itself.
 		if m.waitHealthy(ctx) == nil && !m.versionDiffers(ctx, cur.Version) {
 			return nil
 		}
 		m.logf("prismsvc: %s 在运行但不健康，重启", ServiceName)
 		m.recoverOrphan(ctx)
-		if err := m.rcService(ctx, "restart"); err != nil {
+		if err := in.call(ctx, "restart"); err != nil {
 			return err
 		}
 	default:
 		m.logf("prismsvc: 启动 %s %s", ServiceName, cur.Version)
 		m.recoverOrphan(ctx)
-		if err := m.rcService(ctx, "start"); err != nil {
+		if err := in.call(ctx, "start"); err != nil {
 			return err
 		}
 	}

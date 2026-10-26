@@ -311,6 +311,10 @@ type FirewallConfig struct {
 	// PortHopBackend selects the firewall tool: auto (nft first, then
 	// iptables; also the empty value), nft or iptables.
 	PortHopBackend string `mapstructure:"PortHopBackend"`
+	// PortHopAllowTCP admits port-hop rules for TCP (mieru's TCP transport) in
+	// addition to UDP. nil (not written) means ON; false refuses tcp rules
+	// locally. The panel cannot change it.
+	PortHopAllowTCP *bool `mapstructure:"PortHopAllowTCP"`
 }
 
 // KernelsConfig is the local kernel-source policy (D-M1). AllowHTTP permits
@@ -466,6 +470,15 @@ func (c *Config) PortHopEnabled() bool {
 		return true
 	}
 	return *c.Firewall.PortHop
+}
+
+// PortHopAllowTCPEnabled returns the effective Firewall.PortHopAllowTCP: on
+// unless the local configuration says false.
+func (c *Config) PortHopAllowTCPEnabled() bool {
+	if c == nil || c.Firewall == nil || c.Firewall.PortHopAllowTCP == nil {
+		return true
+	}
+	return *c.Firewall.PortHopAllowTCP
 }
 
 // PortHopBackendName returns the effective Firewall.PortHopBackend: "auto",

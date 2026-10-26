@@ -369,6 +369,47 @@ func TestPortHopProbeFailureDeclaresNothingAndChangesNothing(t *testing.T) {
 	}
 }
 
+var hopRuleTCP = xboard.PortHopRule{NodeID: 31, Proto: "tcp", Ports: "30000-30100", To: 8443}
+
+func TestPortHopAdmitsTCPByDefaultAndRefusesItWhenTheLocalPolicyIsOff(t *testing.T) {
+	g := newHopRig(t, t.TempDir(), hopConfig(nil), 10*time.Millisecond)
+	g.panel.set(hopDoc("v1", hopRuleTCP), nil)
+	g.start(t)
+	waitHop(t, "the tcp rule to be installed", func() bool { return g.fw.tables() > 0 })
+	g.fw.mu.Lock()
+	body := g.fw.installed["ip"]
+	g.fw.mu.Unlock()
+	if !strings.Contains(body, "tcp dport 30000-30100 counter redirect to :8443") {
+		t.Fatalf("nft table = %q", body)
+	}
+
+	off := false
+	cfg := hopConfig(nil)
+	cfg.Firewall = &agentcfg.FirewallConfig{PortHopAllowTCP: &off}
+	g2 := newHopRig(t, t.TempDir(), cfg, 10*time.Millisecond)
+	g2.panel.set(hopDoc("v1", hopRuleTCP), nil)
+	g2.start(t)
+	waitHop(t, "the refusal to be reported", func() bool {
+		c := g2.rt.portHopComponent()
+		return c != nil && len(c.Instances) == 1
+	})
+	if c := g2.rt.portHopComponent(); c.Instances[0].State != wsproto.StateFailed || !strings.Contains(c.LastError, "not allowed") {
+		t.Fatalf("component = %+v", c)
+	}
+	if g2.fw.tables() != 0 {
+		t.Fatal("a tcp rule was installed although the local policy refuses tcp")
+	}
+}
+
+func TestPortHopTCPForwardBlocksOnlyTheTCPRange(t *testing.T) {
+	g := newHopRig(t, t.TempDir(), hopConfig(nil), 10*time.Millisecond)
+	// a UDP forward inside a TCP hop range is no conflict; a TCP one is
+	g.rt.Reconciler.Ports.Commit([]driver.PortClaim{{Proto: "udp", Addr: "0.0.0.0", Port: 30050, Owner: "fwd1"}})
+	g.panel.set(hopDoc("v1", hopRuleTCP), nil)
+	g.start(t)
+	waitHop(t, "the tcp rule to be installed", func() bool { return g.fw.tables() > 0 })
+}
+
 func TestPortHopNotOfferedOnAnUnsupportedPlatform(t *testing.T) {
 	g := newHopRig(t, t.TempDir(), hopConfig(nil), time.Hour)
 	g.rt.portHopPlatform = func(bool) bool { return false }

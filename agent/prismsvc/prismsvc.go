@@ -6,10 +6,11 @@
 // kernel_install command pins the release asset). This package only writes the
 // service definition, starts the service and waits until the kernel's control
 // API answers. It supports systemd and OpenRC (the kernel is then a service of
-// its own and survives the agent) and, on a machine without a supported
-// service manager, the agent's own supervisor (the kernel then stops with the
-// agent). procd is not supported yet; a procd machine without the supervisor
-// reports why instead of guessing.
+// its own and survives the agent), procd (OpenWrt, an init script on top of
+// /etc/rc.common) and, on a machine without a supported service manager, the
+// agent's own supervisor (the kernel then stops with the agent). A procd
+// machine without /etc/rc.common and without the supervisor reports why
+// instead of guessing.
 //
 // Every path and every service-file line is generated here from the agent's
 // own configuration. Nothing the panel sends can name a path or a command.
@@ -40,6 +41,7 @@ const BinaryName = "W1nCray-prism"
 const (
 	BackendSystemd = "systemd"
 	BackendOpenRC  = "openrc"
+	BackendProcd   = "procd"
 	BackendAgent   = "agent"
 )
 
@@ -62,7 +64,7 @@ var ErrNotInstalled = errors.New("prismsvc: the Prism kernel is not installed (i
 
 // ErrUnsupportedInit means the machine runs an init system this package does
 // not drive and no agent supervisor is available.
-var ErrUnsupportedInit = errors.New("prismsvc: this machine's init system (procd) is not supported by the Prism kernel yet")
+var ErrUnsupportedInit = errors.New("prismsvc: this machine's init system (procd without /etc/rc.common, or an OpenRC that is not running) is not supported by the Prism kernel")
 
 // Kernels is the kernel installer surface the manager needs
 // (*kernelx.Ensurer implements it).
@@ -106,7 +108,7 @@ type Manager struct {
 	mu      sync.Mutex
 
 	// OpenRC bookkeeping (guarded by mu).
-	enabled  bool // rc-update add succeeded in this process
+	enabled  bool // rc-update add / procd enable succeeded in this process
 	migrated bool // the supervisor's leftover was dealt with
 }
 
@@ -132,9 +134,12 @@ func New(o Options) (*Manager, error) {
 			be = BackendSystemd
 		case exists(o.Root, "sbin/openrc-run") && exists(o.Root, openrcSoftlevel):
 			be = BackendOpenRC // OpenRC is the running init
+		case exists(o.Root, "sbin/procd") && exists(o.Root, procdFramework):
+			be = BackendProcd // OpenWrt
 		case exists(o.Root, "sbin/openrc-run"), exists(o.Root, "sbin/procd"):
 			// OpenRC installed but not running as init (a container, say), or
-			// procd: only the agent's supervisor can run the kernel.
+			// procd without OpenWrt's rc.common: only the agent's supervisor
+			// can run the kernel.
 			if o.Sup == nil {
 				m.backend = ""
 				return m, nil // Ensure reports ErrUnsupportedInit
@@ -193,6 +198,8 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return m.ensureSystemd(ctx, cur)
 	case BackendOpenRC:
 		return m.ensureOpenRC(ctx, cur)
+	case BackendProcd:
+		return m.ensureProcd(ctx, cur)
 	default:
 		return m.ensureAgent(ctx, cur)
 	}
@@ -213,6 +220,11 @@ func (m *Manager) Stop(ctx context.Context) error {
 			return nil
 		}
 		return m.rcService(ctx, "stop")
+	case BackendProcd:
+		if !exists(m.o.Root, procdScriptPath) {
+			return nil
+		}
+		return m.procdCall(ctx, "stop")
 	case BackendAgent:
 		return m.o.Sup.Stop(ctx, agentProcID)
 	}
@@ -230,6 +242,8 @@ func (m *Manager) Remove(ctx context.Context) error {
 		return m.removeSystemd(ctx)
 	case BackendOpenRC:
 		return m.removeOpenRC(ctx)
+	case BackendProcd:
+		return m.removeProcd(ctx)
 	case BackendAgent:
 		return m.o.Sup.Stop(ctx, agentProcID)
 	}
@@ -252,7 +266,7 @@ type Status struct {
 func (m *Manager) Status(ctx context.Context) Status {
 	st := Status{Backend: m.backend}
 	switch m.backend {
-	case BackendSystemd, BackendOpenRC:
+	case BackendSystemd, BackendOpenRC, BackendProcd:
 		st.ManagedBy = ManagedByService
 	case BackendAgent:
 		st.ManagedBy = ManagedByAgent
@@ -289,6 +303,8 @@ func (m *Manager) Status(ctx context.Context) Status {
 		}
 	case BackendOpenRC:
 		st.State = m.openrcState(ctx)
+	case BackendProcd:
+		st.State = m.procdState(ctx)
 	case BackendAgent:
 		if m.o.Sup.Status(agentProcID).Running {
 			st.State = StateRunning

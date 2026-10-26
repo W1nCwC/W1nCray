@@ -651,3 +651,61 @@ func TestAuditCursorDoesNotMoveWhenTheSendFails(t *testing.T) {
 		t.Errorf("cursor = %d after the page was accepted, want 41", cursor)
 	}
 }
+
+// TestAuditEnabledIsLoggedOncePerStateChange: the first page of a session shows
+// the agent the kernel's epoch, which re-sends the enable once (the switch may
+// belong to another process). That repeat must not print "已开启" a second time;
+// only a real off -> on change does.
+func TestAuditEnabledIsLoggedOncePerStateChange(t *testing.T) {
+	ts := newTestServer(t, "7", "secret-token")
+	src := &fakeAuditSource{supported: true}
+	pages := make([]xrayapi.AuditBatch, 0, 20)
+	for i := 0; i < 20; i++ {
+		pages = append(pages, auditPage(1000, uint64(i+1), 1))
+	}
+	src.setPages(pages...)
+	log := &recordLogger{}
+	ag := newAgentUnderTest(t, ts, AgentOptions{
+		Streams:           newAuditStreams(),
+		Audit:             src,
+		AuditPullInterval: auditInterval,
+		Log:               log,
+	}, Options{})
+	runAgent(t, ag)
+
+	tc, _ := handshake(t, ts, "session-1", 1, 1)
+	tc.send(t, helloOKAudit(t, "session-1", true))
+	tc.recvType(t, wsproto.TypeAuditLog)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, setCalls, _, _, _ := src.state(); setCalls >= 2 {
+			break // the epoch rule re-sent the enable
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, _, setCalls, _, _, _ := src.state(); setCalls < 2 {
+		t.Fatalf("SetEnabled calls = %d, want the first-epoch re-send", setCalls)
+	}
+
+	// A kernel restart re-sends the enable again, still silently.
+	src.setPages(auditPage(2000, 1, 1))
+	tc.recvType(t, wsproto.TypeAuditLog)
+	if n := strings.Count(log.all(), "内核访问日志采集已开启"); n != 1 {
+		t.Fatalf("\"已开启\" was logged %d times, want 1:\n%s", n, log.all())
+	}
+
+	// Off and on again is a real state change: logged again.
+	ag.SetAuditEnabled(false)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(log.all(), "已关闭") {
+		time.Sleep(5 * time.Millisecond)
+	}
+	ag.SetAuditEnabled(true)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && strings.Count(log.all(), "内核访问日志采集已开启") < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := strings.Count(log.all(), "内核访问日志采集已开启"); n != 2 {
+		t.Fatalf("after off and on: \"已开启\" logged %d times, want 2:\n%s", n, log.all())
+	}
+}

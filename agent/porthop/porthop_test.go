@@ -192,6 +192,103 @@ func TestGoldenNft(t *testing.T) {
 	}
 }
 
+func TestGoldenNftTCP(t *testing.T) {
+	rule := Rule{NodeID: 31, Proto: "tcp", Ports: "30000-30100", To: 8443}
+	got := renderNft([]accepted{{Rule: rule, Lo: 30000, Hi: 30100}}, false)
+	want := `table ip w1ncray_porthop
+delete table ip w1ncray_porthop
+table ip w1ncray_porthop {
+	chain prerouting {
+		type nat hook prerouting priority -100; policy accept;
+		fib daddr type local tcp dport 30000-30100 counter redirect to :8443 comment "w1ncray node 31"
+	}
+}
+`
+	if got != want {
+		t.Fatalf("nft tcp text mismatch:\n%s", got)
+	}
+	// both protocols side by side, one rule each
+	both := renderNft([]accepted{
+		{Rule: r12, Lo: 20000, Hi: 30000},
+		{Rule: rule, Lo: 30000, Hi: 30100},
+	}, false)
+	if !strings.Contains(both, "udp dport 20000-30000 counter redirect to :8443") ||
+		!strings.Contains(both, "tcp dport 30000-30100 counter redirect to :8443") {
+		t.Fatalf("mixed rules:\n%s", both)
+	}
+}
+
+func TestGoldenIptablesTCP(t *testing.T) {
+	rule := Rule{NodeID: 31, Proto: "tcp", Ports: "30000-30100", To: 8443}
+	got := renderIptables([]accepted{{Rule: rule, Lo: 30000, Hi: 30100}})
+	want := `*nat
+:W1NCRAY-PORTHOP - [0:0]
+-F W1NCRAY-PORTHOP
+-A W1NCRAY-PORTHOP -p tcp -m addrtype --dst-type LOCAL --dport 30000:30100 -m comment --comment "w1ncray node 31" -j REDIRECT --to-ports 8443
+COMMIT
+`
+	if got != want {
+		t.Fatalf("iptables tcp text mismatch:\n%s", got)
+	}
+}
+
+func TestTCPRuleIsInstalledWhenAllowedAndRefusedWhenNot(t *testing.T) {
+	rule := Rule{NodeID: 31, Proto: "tcp", Ports: "30000-30100", To: 8443}
+	f := newFake()
+	m := newMgr(t, f, func(c *Config) { c.AllowTCP = true })
+	if err := m.Apply(context.Background(), []Rule{rule}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(m.dir(), "rules.nft"))
+	if err != nil || !strings.Contains(string(b), "tcp dport 30000-30100") {
+		t.Fatalf("rules.nft = %q, %v", b, err)
+	}
+
+	f2 := newFake()
+	m2 := newMgr(t, f2, nil)
+	_ = m2.Apply(context.Background(), []Rule{rule})
+	if st := m2.Status().Rules; len(st) != 1 || st[0].OK || !strings.Contains(st[0].Reason, "not allowed") {
+		t.Fatalf("status = %+v", st)
+	}
+}
+
+func TestLedgerConflictIsPerProtocol(t *testing.T) {
+	// a TCP forward on 30050 blocks a TCP hop range but not a UDP one
+	tcpPorts := map[int]bool{30050: true}
+	f := newFake()
+	m := newMgr(t, f, func(c *Config) {
+		c.Checker = nil
+		c.AllowTCP = true
+		c.ProcRoot = t.TempDir()
+		c.ForwardPortsFor = func(proto string) map[int]bool {
+			if proto == "tcp" {
+				return tcpPorts
+			}
+			return nil
+		}
+	})
+	_ = m.Apply(context.Background(), []Rule{
+		{NodeID: 1, Proto: "tcp", Ports: "30000-30100", To: 8443},
+		{NodeID: 2, Proto: "udp", Ports: "31000-31100", To: 8444},
+	})
+	st := m.Status().Rules
+	if len(st) != 2 {
+		t.Fatalf("status = %+v", st)
+	}
+	for _, s := range st {
+		switch s.NodeID {
+		case 1:
+			if s.OK || !strings.Contains(s.Reason, "30050") {
+				t.Fatalf("tcp rule: %+v", s)
+			}
+		case 2:
+			if !s.OK {
+				t.Fatalf("udp rule: %+v", s)
+			}
+		}
+	}
+}
+
 func TestGoldenIptables(t *testing.T) {
 	if got := renderIptables([]accepted{{Rule: r12, Lo: 20000, Hi: 30000}}); got != wantIpt {
 		t.Fatalf("iptables text mismatch:\n%s", got)
@@ -415,7 +512,7 @@ func TestGates(t *testing.T) {
 		{"to too big", Rule{1, "udp", "20000-30000", 65536}, nil, "target port"},
 		{"to inside range", Rule{1, "udp", "20000-30000", 25000}, nil, "inside the hop range"},
 		{"to at range edge", Rule{1, "udp", "20000-30000", 30000}, nil, "inside the hop range"},
-		{"tcp rejected", Rule{1, "tcp", "20000-30000", 8443}, nil, "not allowed"},
+		{"tcp rejected while AllowTCP is off", Rule{1, "tcp", "20000-30000", 8443}, nil, "not allowed"},
 		{"tcp allowed", Rule{1, "tcp", "20000-30000", 8443}, func(c *Config) { c.AllowTCP = true }, ""},
 		{"other proto", Rule{1, "sctp", "20000-30000", 8443}, nil, "unsupported proto"},
 		{"node id 0", Rule{0, "udp", "20000-30000", 8443}, nil, "node_id"},

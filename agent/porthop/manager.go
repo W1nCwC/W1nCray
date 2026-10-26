@@ -29,7 +29,11 @@ type Config struct {
 	StateDir string
 	// MaxSpan is the largest accepted range (ports); 0 means DefaultMaxSpan.
 	MaxSpan int
-	// AllowTCP lifts the default "udp only" policy.
+	// AllowTCP admits rules with proto "tcp" (mieru can hop over a TCP
+	// transport). The zero value refuses them; the agent sets it from
+	// Firewall.PortHopAllowTCP, which is on unless the local configuration says
+	// false. A tcp rule still passes every other gate: range start, span,
+	// local forwards and listening sockets (LISTEN state only).
 	AllowTCP bool
 	// ProcRoot is the proc filesystem root; "" means /proc.
 	ProcRoot string
@@ -39,6 +43,10 @@ type Config struct {
 	// ForwardPorts returns the ports local forwards occupy (reconcile ledger).
 	// Nil disables that check.
 	ForwardPorts func() map[int]bool
+	// ForwardPortsFor is ForwardPorts per protocol ("udp" or "tcp"): a TCP
+	// forward must not block a UDP hop range or the other way round. When set
+	// it replaces ForwardPorts.
+	ForwardPortsFor func(proto string) map[int]bool
 	// Checker replaces the default conflict checks (ledger + /proc/net).
 	Checker ConflictChecker
 	// Exec runs the firewall tools; nil means SystemExecutor.
@@ -109,7 +117,10 @@ func New(cfg Config) *Manager {
 	}
 	if cfg.Checker == nil {
 		var cs chain
-		if cfg.ForwardPorts != nil {
+		switch {
+		case cfg.ForwardPortsFor != nil:
+			cs = append(cs, ledgerChecker{byProto: cfg.ForwardPortsFor})
+		case cfg.ForwardPorts != nil:
 			cs = append(cs, NewLedgerChecker(cfg.ForwardPorts))
 		}
 		cs = append(cs, NewProcChecker(cfg.ProcRoot, cfg.SelfPID))

@@ -776,6 +776,38 @@ func TestFirewallPortHopSwitchAndBackend(t *testing.T) {
 	}
 }
 
+// TestFirewallPortHopAllowTCPIsOnUnlessWrittenFalse pins the local tcp policy
+// of port hopping: mieru's TCP transport is admitted by default.
+func TestFirewallPortHopAllowTCPIsOnUnlessWrittenFalse(t *testing.T) {
+	on, off := true, false
+	var nilCfg *Config
+	for _, c := range []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"nil config", nilCfg, true},
+		{"not written", &Config{}, true},
+		{"firewall without the key", &Config{Firewall: &FirewallConfig{PortHop: &off}}, true},
+		{"explicit on", &Config{Firewall: &FirewallConfig{PortHopAllowTCP: &on}}, true},
+		{"explicit off", &Config{Firewall: &FirewallConfig{PortHopAllowTCP: &off}}, false},
+	} {
+		if got := c.cfg.PortHopAllowTCPEnabled(); got != c.want {
+			t.Errorf("%s: PortHopAllowTCPEnabled = %v, want %v", c.name, got, c.want)
+		}
+	}
+	path := writeFile(t, filepath.Join(t.TempDir(), FileName), `Firewall:
+  PortHopAllowTCP: false
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PortHopAllowTCPEnabled() || !cfg.PortHopEnabled() {
+		t.Errorf("loaded Firewall = %+v", cfg.Firewall)
+	}
+}
+
 // TestSelfUpdateWindowsAreALocalArchitectureAwareOverride pins the D-M7 timing
 // rule: the watchdog windows come from the architecture by default, a local
 // agent.yml value overrides them, and a deadline that is not above the window is

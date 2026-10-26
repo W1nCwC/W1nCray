@@ -887,8 +887,9 @@ keep_on_sysupgrade() {
 
 # drop_sysupgrade_entries removes what keep_on_sysupgrade added; the config
 # directory entry stays unless the config itself is purged. The Xray kernel
-# service adds its own init-script entry on procd (agent/xraysvc); it is dropped
-# here too so uninstall leaves no dangling line.
+# service and the Prism kernel service add their own init-script entries on procd
+# (agent/xraysvc, agent/prismsvc); they are dropped here too so uninstall leaves
+# no dangling line.
 drop_sysupgrade_entries() { # $1 = 1 to drop the config directory entry too
 	is_openwrt || return 0
 	_sc="$ROOT/etc/sysupgrade.conf"
@@ -896,6 +897,8 @@ drop_sysupgrade_entries() { # $1 = 1 to drop the config directory entry too
 	_tmp="$(mktemp)"
 	grep -vxF "/etc/init.d/W1nCray" "$_sc" >"$_tmp" || true
 	grep -vxF "/etc/init.d/W1nCray-xray" "$_tmp" >"$_tmp.2" || true
+	mv "$_tmp.2" "$_tmp"
+	grep -vxF "/etc/init.d/W1nCray-prism" "$_tmp" >"$_tmp.2" || true
 	mv "$_tmp.2" "$_tmp"
 	if [ "$1" -eq 1 ]; then
 		grep -vxF "/etc/W1nCray/" "$_tmp" >"$_tmp.2" || true

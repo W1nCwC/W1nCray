@@ -247,3 +247,12 @@ func joinLines(lines []string) string {
 	}
 	return strings.Join(lines, "\n") + "\n"
 }
+
+// EnsureSysupgrade adds entries to /etc/sysupgrade.conf (see ensureSysupgrade);
+// the Prism kernel's procd backend shares it.
+func EnsureSysupgrade(path string, entries ...string) error {
+	return ensureSysupgrade(path, entries...)
+}
+
+// DropSysupgrade removes exact lines from /etc/sysupgrade.conf.
+func DropSysupgrade(path string, entries ...string) error { return dropSysupgrade(path, entries...) }

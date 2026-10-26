@@ -169,6 +169,10 @@ type auditState struct {
 	// epoch means the kernel restarted, its switch is off again, and the
 	// enable must be re-sent.
 	appliedEpoch int64
+	// announced is set once the "collection on" line was logged and cleared
+	// when collection goes off: an enable that is only re-sent (the first
+	// kernel epoch seen, a kernel restart) does not log it again.
+	announced bool
 	// cursor is the last sequence number the panel acknowledged by receiving a
 	// frame. It only moves after a successful send, so a frame that never left
 	// is retried instead of being skipped.
@@ -1314,6 +1318,9 @@ func (a *Agent) auditOK() {
 func (a *Agent) applyAudit(ctx context.Context, want bool) {
 	a.auditMu.Lock()
 	if a.audit.applied == want {
+		if !want {
+			a.audit.announced = false
+		}
 		a.auditMu.Unlock()
 		return
 	}
@@ -1341,9 +1348,18 @@ func (a *Agent) applyAudit(ctx context.Context, want bool) {
 	}
 	a.auditMu.Lock()
 	a.audit.applied = want
+	first := want && !a.audit.announced
+	a.audit.announced = want
 	a.auditMu.Unlock()
 	if want {
-		a.logf().Infof("ws: 内核访问日志采集已开启，开始转发 audit.log")
+		// applied is cleared by the first epoch the pull sees (and by every
+		// kernel restart), so the same enable is sent again; log the state
+		// change once, not the repeat.
+		if first {
+			a.logf().Infof("ws: 内核访问日志采集已开启，开始转发 audit.log")
+		} else {
+			a.logf().Debugf("ws: 已重新向内核下发访问日志采集开关")
+		}
 		return
 	}
 	a.logf().Infof("ws: 内核访问日志采集已关闭，停止转发 audit.log")

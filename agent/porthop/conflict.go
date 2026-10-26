@@ -17,7 +17,10 @@ type ConflictChecker interface {
 }
 
 // ledgerChecker rejects ranges that contain a port claimed by a local forward.
-type ledgerChecker struct{ ports func() map[int]bool }
+type ledgerChecker struct {
+	ports   func() map[int]bool
+	byProto func(proto string) map[int]bool // takes precedence when set
+}
 
 // NewLedgerChecker wraps a function returning the ports local forwards occupy
 // (for example the reconcile ledger's ports).
@@ -25,11 +28,16 @@ func NewLedgerChecker(ports func() map[int]bool) ConflictChecker {
 	return ledgerChecker{ports: ports}
 }
 
-func (l ledgerChecker) Check(_ string, lo, hi, to int) error {
-	if l.ports == nil {
+func (l ledgerChecker) Check(proto string, lo, hi, to int) error {
+	var set map[int]bool
+	switch {
+	case l.byProto != nil:
+		set = l.byProto(proto)
+	case l.ports != nil:
+		set = l.ports()
+	default:
 		return nil
 	}
-	set := l.ports()
 	for p := lo; p <= hi; p++ {
 		if p != to && set[p] {
 			return fmt.Errorf("port %d is used by a local forward", p)

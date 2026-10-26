@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,7 +155,7 @@ func (c *portHopCtl) run(ctx context.Context) {
 
 // startPortHop wires Hysteria port hopping: the local firewall redirect from
 // the panel's port range to the node's real port. It declares the port_hop
-// capability only when the platform allows it (Linux, not OpenWrt, root), the
+// capability only when the platform allows it (Linux, root; OpenWrt included), the
 // local switch Firewall.PortHop is on and a firewall backend probed usable. It
 // returns a stop function; stopping never removes the installed rules.
 func (r *Runtime) startPortHop(ctx context.Context, o RemoteOptions, log driver.Logger) func() {
@@ -175,18 +176,21 @@ func (r *Runtime) startPortHop(ctx context.Context, o RemoteOptions, log driver.
 	}
 	rec := r.Reconciler
 	mgr := porthop.New(porthop.Config{
-		Enabled:  o.AgentConfig.PortHopEnabled(),
+		Enabled: o.AgentConfig.PortHopEnabled(),
+		// tcp (mieru's TCP transport) is admitted unless the local
+		// configuration turns it off; the other gates still apply.
+		AllowTCP: o.AgentConfig.PortHopAllowTCPEnabled(),
 		Backend:  o.AgentConfig.PortHopBackendName(),
 		StateDir: r.stateDir,
 		Exec:     r.portHopExec,
 		Logf:     log.Infof,
-		ForwardPorts: func() map[int]bool {
+		ForwardPortsFor: func(proto string) map[int]bool {
 			out := map[int]bool{}
 			if rec == nil || rec.Ports == nil {
 				return out
 			}
 			for _, cl := range rec.Ports.Claims() {
-				if cl.Proto == "udp" {
+				if strings.EqualFold(cl.Proto, proto) {
 					out[cl.Port] = true
 				}
 			}
