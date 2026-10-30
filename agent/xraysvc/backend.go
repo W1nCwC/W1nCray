@@ -284,7 +284,9 @@ func (b procdBackend) initEntry() string {
 
 func (b procdBackend) removeUnit() error {
 	err := removeIfExists(b.unitPath())
-	if derr := dropSysupgrade(b.path("etc/sysupgrade.conf"), b.initEntry()); derr != nil && err == nil {
+	// DropSysupgrade (not dropSysupgrade) so the line is forgotten in the
+	// record too; a line left in the record would be treated as ours later.
+	if derr := DropSysupgrade(b.path("etc/sysupgrade.conf"), b.initEntry()); derr != nil && err == nil {
 		err = derr
 	}
 	return err

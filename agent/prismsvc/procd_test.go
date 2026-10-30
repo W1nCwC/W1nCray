@@ -414,3 +414,54 @@ func TestProcdStatusReadsTheRunningCommand(t *testing.T) {
 		t.Fatalf("status = %+v", st)
 	}
 }
+
+// A kernel base that moves (a changed StateDir or KernelsDir) must not stay
+// listed: sysupgrade would then back up both trees, and the bigger backup is
+// what overflowed a small /boot (handoff 89). The user's own lines are kept.
+func TestProcdMovedKernelBaseIsRemovedFromSysupgradeConf(t *testing.T) {
+	r := &fakeRunner{}
+	root := procdRoot(t)
+	conf := filepath.Join(root, "etc", "sysupgrade.conf")
+	if err := os.MkdirAll(filepath.Dir(conf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(conf, []byte("/etc/user-line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ensure := func(bin string) {
+		m, err := New(Options{
+			Root: root, Kernels: fakeKernels{inst: driver.Installed{Path: bin, Version: "0.3.1"}},
+			Runner: r, Status: healthy, HealthInterval: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Backend() != BackendProcd {
+			t.Fatalf("backend = %q", m.Backend())
+		}
+		if err := m.Ensure(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldBase := filepath.Join(root, "old", "state", "kernels")
+	newBase := filepath.Join(root, "new", "state", "kernels")
+	ensure(filepath.Join(oldBase, "kernels", "prism", "0.3.1", "W1nCray-prism"))
+	ensure(filepath.Join(newBase, "kernels", "prism", "0.3.1", "W1nCray-prism"))
+
+	raw, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+	if strings.Contains(got, oldBase) {
+		t.Fatalf("sysupgrade.conf still lists the old kernel base: %q", got)
+	}
+	if !strings.Contains(got, newBase) {
+		t.Fatalf("sysupgrade.conf does not list the new kernel base: %q", got)
+	}
+	if !strings.Contains(got, "/etc/user-line") {
+		t.Fatalf("sysupgrade.conf lost the user's line: %q", got)
+	}
+}

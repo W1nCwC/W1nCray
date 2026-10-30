@@ -174,9 +174,71 @@ func gomemLimit(root string) string {
 	return ""
 }
 
+// sysupgradeRecordSuffix names the sidecar that remembers which lines this
+// program put into sysupgrade.conf. It is what makes a stale entry removable:
+// when the kernel base directory moves (a changed StateDir or KernelsDir) the
+// old one has to go, or sysupgrade backs up both trees and the bigger backup is
+// what overflowed a small /boot (handoff 89). Lines the user wrote are never
+// recorded, so they are never removed.
+const sysupgradeRecordSuffix = ".w1ncray"
+
+func sysupgradeRecordPath(path string) string { return path + sysupgradeRecordSuffix }
+
+// readSysupgradeRecord returns the entries written last time, or nil when the
+// record is missing — which degrades to the old add-only behaviour rather than
+// guessing at what to remove.
+func readSysupgradeRecord(path string) []string {
+	b, err := os.ReadFile(sysupgradeRecordPath(path))
+	if err != nil {
+		return nil
+	}
+	lines, _ := splitLines(string(b))
+	return lines
+}
+
+// writeSysupgradeRecord replaces the record with entries, dropping empty ones.
+// An empty list removes the record file.
+func writeSysupgradeRecord(path string, entries []string) error {
+	var keep []string
+	for _, e := range entries {
+		if e != "" {
+			keep = append(keep, e)
+		}
+	}
+	rec := sysupgradeRecordPath(path)
+	if len(keep) == 0 {
+		if err := os.Remove(rec); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	_, err := writeIfChanged(rec, joinLines(keep), 0o644)
+	return err
+}
+
 // ensureSysupgrade adds entries to /etc/sysupgrade.conf, one per line, without
-// duplicating a line that is already there. The file's other content is kept.
+// duplicating a line that is already there, and takes back the entries it wrote
+// earlier that are no longer wanted. The file's other content is kept, and a
+// line the user wrote is never in the record, so it is never removed.
 func ensureSysupgrade(path string, entries ...string) error {
+	keep := map[string]bool{}
+	for _, e := range entries {
+		if e != "" {
+			keep[e] = true
+		}
+	}
+	var stale []string
+	for _, prev := range readSysupgradeRecord(path) {
+		if prev != "" && !keep[prev] {
+			stale = append(stale, prev)
+		}
+	}
+	if len(stale) > 0 {
+		if err := dropSysupgrade(path, stale...); err != nil {
+			return err
+		}
+	}
+
 	content, _ := os.ReadFile(path)
 	lines, trailing := splitLines(string(content))
 	have := map[string]bool{}
@@ -192,11 +254,12 @@ func ensureSysupgrade(path string, entries ...string) error {
 		have[e] = true
 		changed = true
 	}
-	if !changed && !trailing {
-		return nil
+	if changed || trailing {
+		if _, err := writeIfChanged(path, joinLines(lines), 0o644); err != nil {
+			return err
+		}
 	}
-	_, err := writeIfChanged(path, joinLines(lines), 0o644)
-	return err
+	return writeSysupgradeRecord(path, entries)
 }
 
 // dropSysupgrade removes exact lines from /etc/sysupgrade.conf.
@@ -254,5 +317,27 @@ func EnsureSysupgrade(path string, entries ...string) error {
 	return ensureSysupgrade(path, entries...)
 }
 
-// DropSysupgrade removes exact lines from /etc/sysupgrade.conf.
-func DropSysupgrade(path string, entries ...string) error { return dropSysupgrade(path, entries...) }
+// DropSysupgrade removes exact lines from /etc/sysupgrade.conf and forgets them
+// in the record, so a later Ensure does not treat them as its own.
+func DropSysupgrade(path string, entries ...string) error {
+	if err := dropSysupgrade(path, entries...); err != nil {
+		return err
+	}
+	drop := map[string]bool{}
+	for _, e := range entries {
+		drop[e] = true
+	}
+	var keep []string
+	changed := false
+	for _, r := range readSysupgradeRecord(path) {
+		if drop[r] {
+			changed = true
+			continue
+		}
+		keep = append(keep, r)
+	}
+	if !changed {
+		return nil
+	}
+	return writeSysupgradeRecord(path, keep)
+}
