@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -172,6 +173,12 @@ func (in *Installer) now() time.Time { return in.cfg.Now() }
 func (in *Installer) logf(format string, args ...any) {
 	if in.cfg.Log != nil {
 		in.cfg.Log.Infof(format, args...)
+	}
+}
+
+func (in *Installer) warnf(format string, args ...any) {
+	if in.cfg.Log != nil {
+		in.cfg.Log.Warnf(format, args...)
 	}
 }
 
@@ -373,11 +380,18 @@ func (in *Installer) ensure(ctx context.Context, pin spec.KernelPin, force bool)
 		// records a fresh count (recordFailure below).
 		in.clearFailure(name, version)
 	}
-	if mk := in.readMarker(name, version); mk != nil && mk.ArchiveSHA256 == t.ArchiveSHA256 && in.filesIntact(name, version, t) {
-		if err := in.activate(name, version); err != nil {
-			return driver.Installed{}, err
+	if mk := in.readMarker(name, version); mk != nil && mk.ArchiveSHA256 == t.ArchiveSHA256 {
+		if in.filesIntact(name, version, t) {
+			if err := in.activate(name, version); err != nil {
+				return driver.Installed{}, err
+			}
+			return in.installedOf(name, version, mk), nil
 		}
-		return in.installedOf(name, version, mk), nil
+		// The marker matches this exact archive but the files on disk do not:
+		// the version was damaged after the install (for example a truncated
+		// backup restore). That was never a failed attempt, so the retry
+		// back-off must not stand between the damage and its repair.
+		in.clearFailure(name, version)
 	}
 	if err := in.checkBackoff(name, version); err != nil {
 		return driver.Installed{}, err
@@ -619,6 +633,67 @@ func (in *Installer) readMarker(name, version string) *marker {
 		return nil
 	}
 	return &m
+}
+
+// markerIntact checks that every file the marker recorded still exists on disk
+// with the recorded size. The install library writes those sizes from the
+// manifest (or from the bytes it just extracted), so a file that is missing,
+// truncated or no longer regular means the version on disk is not the version
+// the marker describes — most commonly a backup/restore (for example an
+// OpenWrt sysupgrade) that ran out of room part-way through and left a
+// byte-prefix of the binary behind.
+//
+// The check is os.Stat per recorded file (one version carries one or two
+// files); it never reads file contents, and there is deliberately no hash to
+// compare against: the marker holds the *archive* hash, not the extracted
+// files'. A Stat error that is not "does not exist" (for example a permission
+// problem or an I/O error) is also reported as not intact — the caller refuses
+// the version either way — but the distinguishing detail is logged.
+func (in *Installer) markerIntact(name, version string, mk *marker) bool {
+	if len(mk.Files) == 0 {
+		// A marker that lists no files describes nothing to verify. It should
+		// not exist (every install path records at least the binary), so treat
+		// it like a damaged record.
+		in.warnf("kernel: %s %s: 标记文件未记录任何文件，按未安装处理", name, version)
+		return false
+	}
+	for _, f := range mk.Files {
+		fi, err := os.Stat(filepath.Join(in.verDir(name, version), f.To))
+		switch {
+		case err == nil && fi.Mode().IsRegular() && fi.Size() == f.Size:
+			// intact
+		case err != nil && errors.Is(err, fs.ErrNotExist):
+			in.warnf("kernel: %s %s: 文件 %s 缺失（应 %d 字节），按未安装处理", name, version, f.To, f.Size)
+			return false
+		case err != nil:
+			in.warnf("kernel: %s %s: 检查文件 %s 失败: %v，按未安装处理", name, version, f.To, err)
+			return false
+		case !fi.Mode().IsRegular():
+			in.warnf("kernel: %s %s: 文件 %s 不再是普通文件（%v），按未安装处理", name, version, f.To, fi.Mode().Type())
+			return false
+		default:
+			in.warnf("kernel: %s %s: 文件 %s 大小 %d 与记录的 %d 不符，可能被备份恢复截断，按未安装处理", name, version, f.To, fi.Size(), f.Size)
+			return false
+		}
+	}
+	return true
+}
+
+// currentIntact applies markerIntact to the kernel version the current pointer
+// names. ok=false means Current/Files must answer "not installed" instead of
+// handing out a binary that may be a truncated byte-prefix.
+func (in *Installer) currentIntact(name, version string, mk *marker) bool {
+	if mk == nil {
+		return false
+	}
+	if in.markerIntact(name, version, mk) {
+		return true
+	}
+	// Also drop the failure record: the next Ensure of the same pin must be
+	// allowed to reinstall immediately, not sit out a back-off caused by the
+	// damage itself.
+	in.clearFailure(name, version)
+	return false
 }
 
 // filesIntact is the cheap fast-path check (existence, size, exec bit); the

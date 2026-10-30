@@ -20,8 +20,6 @@ package install
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/W1nCwC/W1nCray/agent/driver"
@@ -105,20 +103,11 @@ func (in *Installer) ownEntry(name, version string) (ownKernel, error) {
 
 // ownFilesIntact is the fast-path check of the built-in table: the marker of a
 // previous install of this exact archive lists the files it wrote, and each
-// must still be a regular file of the recorded size. It is filesIntact for the
-// table path, where the manifest's per-file sizes do not exist (the marker
-// holds them).
+// must still be a regular file of the recorded size. It is markerIntact (the
+// marker holds the per-file sizes the table path has no manifest for) and
+// logs a damaged version exactly like every other path does.
 func (in *Installer) ownFilesIntact(name, version string, mk *marker) bool {
-	if len(mk.Files) == 0 {
-		return false
-	}
-	for _, f := range mk.Files {
-		fi, err := os.Stat(filepath.Join(in.verDir(name, version), f.To))
-		if err != nil || !fi.Mode().IsRegular() || fi.Size() != f.Size {
-			return false
-		}
-	}
-	return true
+	return in.markerIntact(name, version, mk)
 }
 
 // ensureOwn installs name@version from the built-in table. The caller holds
@@ -146,11 +135,16 @@ func (in *Installer) ensureOwn(ctx context.Context, pin spec.KernelPin, force bo
 		in.clearFailure(name, version)
 	}
 	// Already installed from this very archive: activate it, no network at all.
-	if mk := in.readMarker(name, version); mk != nil && mk.ArchiveSHA256 == entry.SHA256 && in.ownFilesIntact(name, version, mk) {
-		if err := in.activate(name, version); err != nil {
-			return driver.Installed{}, err
+	// A marker that matches this archive but whose files are damaged was never
+	// a failed attempt, so its retry back-off is cleared before reinstalling.
+	if mk := in.readMarker(name, version); mk != nil && mk.ArchiveSHA256 == entry.SHA256 {
+		if in.ownFilesIntact(name, version, mk) {
+			if err := in.activate(name, version); err != nil {
+				return driver.Installed{}, err
+			}
+			return in.installedOf(name, version, mk), nil
 		}
-		return in.installedOf(name, version, mk), nil
+		in.clearFailure(name, version)
 	}
 	if err := in.checkBackoff(name, version); err != nil {
 		return driver.Installed{}, err

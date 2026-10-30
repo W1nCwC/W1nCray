@@ -38,6 +38,11 @@ type BadInfo struct {
 
 // Current returns the kernel that Ensure/Rollback last made current. It does
 // no network I/O and needs no manifest (driver.Detect uses it).
+//
+// The version is checked for on-disk integrity against its marker (see
+// markerIntact): a version whose files are missing or truncated answers
+// ErrNotInstalled, exactly like an absent version — a backup/restore that cut
+// a binary in half must never be handed to a driver to execute.
 func (in *Installer) Current(name string) (driver.Installed, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -49,8 +54,8 @@ func (in *Installer) Current(name string) (driver.Installed, error) {
 		return driver.Installed{}, kernel.Newf(kernel.ErrNotInstalled, name, "", "no current version")
 	}
 	mk := in.readMarker(name, cur)
-	if mk == nil {
-		return driver.Installed{}, kernel.Newf(kernel.ErrNotInstalled, name, cur, "installation record missing or damaged")
+	if mk == nil || !in.currentIntact(name, cur, mk) {
+		return driver.Installed{}, kernel.Newf(kernel.ErrNotInstalled, name, cur, "installation record missing, damaged or its files are truncated")
 	}
 	return in.installedOf(name, cur, mk), nil
 }
@@ -69,8 +74,8 @@ func (in *Installer) Files(name string) (map[string]string, error) {
 		return nil, kernel.Newf(kernel.ErrNotInstalled, name, "", "no current version")
 	}
 	mk := in.readMarker(name, cur)
-	if mk == nil {
-		return nil, kernel.Newf(kernel.ErrNotInstalled, name, cur, "installation record missing or damaged")
+	if mk == nil || !in.currentIntact(name, cur, mk) {
+		return nil, kernel.Newf(kernel.ErrNotInstalled, name, cur, "installation record missing, damaged or its files are truncated")
 	}
 	out := make(map[string]string, len(mk.Files))
 	for _, f := range mk.Files {
@@ -80,7 +85,11 @@ func (in *Installer) Files(name string) (map[string]string, error) {
 }
 
 // List returns all installed versions, sorted by name then version
-// descending.
+// descending. Versions whose on-disk files no longer match their marker
+// (missing or truncated — see markerIntact) are left out, and the current/
+// previous flags are then recomputed from what remains, so a list never
+// advertises a damaged version as current: Current() answers "not installed"
+// for exactly those versions List() drops.
 func (in *Installer) List() ([]Entry, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -109,9 +118,15 @@ func (in *Installer) List() ([]Entry, error) {
 			if mk == nil {
 				continue
 			}
+			if !in.markerIntact(name, v.Name(), mk) {
+				// Damaged: not an installable version any more. Clear any
+				// failure record so a later Ensure reinstalls right away, and
+				// forget the version here; the flags are recomputed below.
+				in.clearFailure(name, v.Name())
+				continue
+			}
 			e := Entry{
 				Name: name, Version: v.Name(), Path: filepath.Join(in.verDir(name, v.Name()), mk.Binary),
-				Current: v.Name() == cur, Previous: v.Name() == prev,
 				Target: mk.Target, Variant: mk.Variant, ArchiveSHA256: mk.ArchiveSHA256, InstalledAt: mk.InstalledAt,
 			}
 			for _, f := range mk.Files {
@@ -123,6 +138,17 @@ func (in *Installer) List() ([]Entry, error) {
 			entries = append(entries, e)
 		}
 		sort.Slice(entries, func(i, j int) bool { return manifest.CompareVersions(entries[i].Version, entries[j].Version) > 0 })
+		// The flags follow the surviving versions only: if the pointer names a
+		// version that was just dropped as damaged, nothing is flagged current
+		// — exactly what Current() reports for that version.
+		for i := range entries {
+			if cur != "" && entries[i].Version == cur {
+				entries[i].Current = true
+			}
+			if prev != "" && entries[i].Version == prev {
+				entries[i].Previous = true
+			}
+		}
 		out = append(out, entries...)
 	}
 	return out, nil
@@ -267,7 +293,7 @@ func (in *Installer) Rollback(name string) (driver.Installed, error) {
 		return driver.Installed{}, kernel.Newf(kernel.ErrNotInstalled, name, "", "no previous version to roll back to")
 	}
 	mk := in.readMarker(name, prev)
-	if mk == nil {
+	if mk == nil || !in.markerIntact(name, prev, mk) {
 		return driver.Installed{}, kernel.Newf(kernel.ErrNotInstalled, name, prev, "previous version damaged or removed")
 	}
 	if cur != "" {

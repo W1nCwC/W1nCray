@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -35,7 +36,11 @@ func writeFakeKernel(t *testing.T, kernelsDir, name, version string, size int64)
 	if err := os.WriteFile(filepath.Join(dir, ".installed.json"), b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, name), []byte("fake kernel"), 0o755); err != nil {
+	// The fake binary must really have the size the marker records: the
+	// installer treats a version whose files do not match their recorded sizes
+	// as damaged and reports it as not installed (kernel/install, markerIntact).
+	data := bytes.Repeat([]byte("fake kernel\n"), int(size/12+1))[:size]
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0o755); err != nil {
 		t.Fatal(err)
 	}
 }
