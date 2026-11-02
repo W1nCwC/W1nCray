@@ -26,7 +26,11 @@ type fakeRunner struct {
 	calls  []string
 	active string // what "systemctl is-active" answers
 	rcUp   bool   // what "rc-service <svc> status" / "<script> running" answers (exit 0)
-	fail   map[string]error
+	// rcStatus overrides the text "rc-service <svc> status" prints when rcUp is
+	// false, so a test can put the service in a specific OpenRC state such as
+	// "crashed" or "unsupervised". Empty keeps the plain "stopped" line.
+	rcStatus string
+	fail     map[string]error
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -44,6 +48,9 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 		case "status":
 			if r.rcUp {
 				return nil, nil
+			}
+			if r.rcStatus != "" {
+				return []byte(r.rcStatus), errors.New("exit status 3")
 			}
 			return []byte(" * status: stopped"), errors.New("exit status 3")
 		case "start", "restart":

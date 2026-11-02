@@ -75,13 +75,19 @@ func (m *Manager) rcService(ctx context.Context, args ...string) error {
 }
 
 // openrcState reads the service state from `rc-service <name> status`: exit 0
-// is running, "crashed" in the output is failed, anything else stopped.
+// is running, "crashed" or "unsupervised" in the output is failed, anything
+// else stopped.
+//
+// "unsupervised" is what OpenRC reports after supervise-daemon itself died: the
+// kernel keeps running and keeps holding the control socket, so a plain start
+// would collide with it. It is a failure state, not a stopped one (handoff 98).
 func (m *Manager) openrcState(ctx context.Context) string {
 	out, err := m.o.Runner.Run(ctx, "rc-service", ServiceName, "status")
 	if err == nil {
 		return StateRunning
 	}
-	if strings.Contains(string(out), "crashed") {
+	s := string(out)
+	if strings.Contains(s, "crashed") || strings.Contains(s, "unsupervised") {
 		return StateFailed
 	}
 	return StateStopped
@@ -143,10 +149,20 @@ func (m *Manager) ensureScripted(ctx context.Context, cur driver.Installed, in s
 		m.enabled = true
 	}
 
-	active := in.state(ctx) == StateRunning
+	st := in.state(ctx)
+	active := st == StateRunning
 	switch {
 	case changed && active:
 		m.logf("prismsvc: 服务定义已变化，重启 %s", ServiceName)
+		m.recoverOrphan(ctx)
+		if err := in.call(ctx, "restart"); err != nil {
+			return err
+		}
+	case st == StateFailed:
+		// A crashed service, or a kernel that outlived its supervise-daemon,
+		// still holds the control socket: stop it before starting a fresh one,
+		// or the new instance cannot bind.
+		m.logf("prismsvc: %s 处于异常状态，重启", ServiceName)
 		m.recoverOrphan(ctx)
 		if err := in.call(ctx, "restart"); err != nil {
 			return err

@@ -468,3 +468,53 @@ func TestSystemdUnitIsByteForByteTheV0120Text(t *testing.T) {
 		t.Fatalf("the systemd unit changed:\n--- got\n%s\n--- want\n%s", got, goldenSystemdUnit)
 	}
 }
+
+// A supervise-daemon that died leaves the kernel running and still holding the
+// control socket, and OpenRC reports "unsupervised" — not "crashed". Reading
+// that as stopped made the agent start a second kernel that could not bind
+// (handoff 98, verified on a real Alpine boot).
+func TestOpenRCUnsupervisedIsAFailureNotAStop(t *testing.T) {
+	r := &fakeRunner{rcStatus: " * status: unsupervised"}
+	m, _ := newOpenRC(t, r, "/opt/w1ncray/prism/W1nCray-prism", "0.1.0", nil)
+
+	if got := m.openrcState(context.Background()); got != StateFailed {
+		t.Fatalf("openrcState(unsupervised) = %q, want %q", got, StateFailed)
+	}
+}
+
+func TestOpenRCUnsupervisedIsRestartedRatherThanStarted(t *testing.T) {
+	r := &fakeRunner{rcStatus: " * status: unsupervised"}
+	m, _ := newOpenRC(t, r, "/opt/w1ncray/prism/W1nCray-prism", "0.1.0", nil)
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put the service back into the unsupervised state and run another pass.
+	r.mu.Lock()
+	r.calls = nil
+	r.rcUp = false
+	r.rcStatus = " * status: unsupervised"
+	r.mu.Unlock()
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	r.mu.Lock()
+	calls := append([]string(nil), r.calls...)
+	r.mu.Unlock()
+	restarted, started := false, false
+	for _, c := range calls {
+		if c == "rc-service "+ServiceName+" restart" {
+			restarted = true
+		}
+		if c == "rc-service "+ServiceName+" start" {
+			started = true
+		}
+	}
+	if !restarted {
+		t.Fatalf("calls = %v, want a restart", calls)
+	}
+	if started {
+		t.Fatalf("calls = %v, a plain start would collide with the kernel still holding the socket", calls)
+	}
+}
