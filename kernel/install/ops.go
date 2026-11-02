@@ -432,7 +432,11 @@ func (in *Installer) Catalog() ([]CatalogEntry, error) {
 		} else {
 			ce.Available = true
 			ce.ArchiveSize, ce.InstalledSize, ce.Variant = t.ArchiveSize, installedSizeOf(t), t.Variant
-			ce.Installed = in.readMarker(k.Name, k.Version) != nil
+			// Same rule as Current/List: a version whose files no longer match
+			// its marker is not installed, so the catalog never advertises a
+			// truncated kernel as present (handoff 96 §0, item 1).
+			mk := in.readMarker(k.Name, k.Version)
+			ce.Installed = mk != nil && in.markerIntact(k.Name, k.Version, mk)
 		}
 		out = append(out, ce)
 	}

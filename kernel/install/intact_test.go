@@ -242,3 +242,36 @@ func TestRollbackRefusesADamagedPrevious(t *testing.T) {
 		t.Fatalf("Current after refused rollback = %+v, %v", cur, err)
 	}
 }
+
+// Catalog used to answer from the marker alone, so a truncated version stayed
+// "installed" there while Current/List already called it missing (handoff 96
+// §0). All four now share one rule.
+func TestCatalogAgreesWithListOnADamagedVersion(t *testing.T) {
+	f := newFixture(t)
+	fs := newFileServer(t)
+	k := publish(t, f, fs, kern{Name: "gost", Version: "3.3.0"})
+	in := f.installer(t.TempDir())
+	if err := in.LoadManifest(f.sign(k)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.Ensure(context.Background(), pin("gost", "3.3.0")); err != nil {
+		t.Fatal(err)
+	}
+	before, err := in.Catalog()
+	if err != nil || len(before) != 1 || !before[0].Installed {
+		t.Fatalf("catalog before damage = %+v err=%v", before, err)
+	}
+
+	damage(t, in, "gost", "3.3.0", 128)
+
+	after, err := in.Catalog()
+	if err != nil || len(after) != 1 {
+		t.Fatalf("catalog after damage = %+v err=%v", after, err)
+	}
+	if after[0].Installed {
+		t.Fatalf("catalog still reports the truncated version as installed: %+v", after[0])
+	}
+	if list, err := in.List(); err != nil || len(list) != 0 {
+		t.Fatalf("List after damage = %+v err=%v, want it to drop the version too", list, err)
+	}
+}
